@@ -1,0 +1,133 @@
+"""
+TODO: write proper docstring.
+"""
+
+
+from dataclasses import dataclass
+
+from transformers import (
+  HfArgumentParser, set_seed, AutoTokenizer, AutoModelForSequenceClassification,
+  AutoModelForCausalLM,
+)
+from trl import ModelConfig, RLOOConfig, RLOOTrainer
+from peft import (
+  AutoPeftModelForSequenceClassification, AutoPeftModelForCausalLM
+)
+
+from data import *
+from writer_sft import CustomLoraConfig
+from utils import ScriptArguments
+
+
+def main():
+
+  ###############
+  # SETUP
+  ###############
+  parser = HfArgumentParser(
+    (
+      ScriptArguments,
+      RLOOConfig,
+      CustomLoraConfig,
+    )
+  )
+
+  (
+    script_args,
+    training_args,
+    peft_args,
+  ) = parser.parse_args_into_dataclasses()
+
+  # Set seed before instantiating the model, for reproducibility.
+  set_seed(training_args.seed)
+
+  tokenizer = AutoTokenizer.from_pretrained(
+    script_args.model_identifier,
+    padding_side="right",  # TODO: what should this be?
+  )
+
+  ########
+  # DATA #
+  ########
+  perl_data_halomi = load_dataset(script_args.dataset_name)
+
+  perl_data_halomi["train"] = (
+    perl_data_halomi["train"]
+    .select_columns(["input_ids", "attention_mask"])
+  )
+
+  ################
+  # REWARD MODEL #
+  ################
+  id2label = {
+    0: 'Yes',
+    1: 'No',
+  }
+  
+  label2id = {
+    'Yes': 0,
+    'No': 1,
+  }
+
+  reward_model = (
+    AutoModelForSequenceClassification.from_pretrained(
+      training_args.reward_model_path,
+      num_labels=2,
+      id2label=id2label,
+      label2id=label2id,
+      attn_implementation="eager",
+    )
+  )
+  
+  #############################
+  # REFERENCE POLICY + POLICY #
+  #############################
+  ref_policy = AutoModelForCausalLM.from_pretrained(
+    training_args.sft_model_path,
+    attn_implementation="eager",
+  )
+  
+  policy = AutoPeftModelForCausalLM.from_pretrained(
+    training_args.sft_model_path,
+    is_trainable=True,
+    attn_implementation="eager",
+  )
+
+  ####################
+  # EVALUATION SETUP #
+  ####################
+
+  # TODO: set up TRL Judges.
+
+  ###########
+  # TRAINER #
+  ###########
+  trainer = RLOOTrainer(
+    config=training_args,
+    processing_class=tokenizer,
+    ref_policy=ref_policy,
+    policy=policy,
+    reward_model=reward_model,
+    train_dataset=perl_data_halomi['train'],
+    eval_dataset=perl_data_halomi['test'],
+  )
+
+  ############
+  # TRAINING #
+  ############
+  if training_args.do_train:
+    trainer.train()
+    trainer.save_model()
+    if training_args.push_to_hub:
+      trainer.push_to_hub()
+
+  ##############
+  # EVALUATION #
+  ##############
+  if training_args.do_eval:
+    trainer.evaluate()
+
+
+if __name__=="__main__":
+  main()
+

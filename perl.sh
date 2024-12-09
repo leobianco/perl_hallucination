@@ -1,0 +1,36 @@
+accelerate launch \
+--config_file=/home/leobianco/.cache/huggingface/accelerate/zero3.yaml \
+perl.py \
+-- \
+--report_to "wandb" \
+--run_name "perl" \
+--logging_steps 10 \
+--output_dir ./checkpoints/halomi/perl/ \
+--overwrite_output_dir True \
+--push_to_hub True \
+--hub_model_id "leobianco/halomi_perl" \
+--seed 130104 \
+--dataset_name "leobianco/perl_halomi_processed" \
+--model_identifier "google/gemma-2-2b-it" \
+--do_train True \
+--save_strategy "no" \
+--num_train_epochs 3 \
+--learning_rate 1e-4 \
+--weight_decay 0.0 \
+--max_seq_len 512 \
+--per_device_train_batch_size 1 \
+--gradient_accumulation_steps 1 \
+--do_eval True \
+--eval_strategy "steps" \
+--eval_steps 50 \
+--per_device_eval_batch_size 1 \
+--eval_accumulation_steps 1 \
+--reward_model_path "leobianco/halomi_reward_model" \
+--sft_model_path "leobianco/halomi_writer_sft" \
+--r 4 \
+--kl_coef 0.05 \
+--rloo_k 2 \
+--num_ppo_epochs 2 \
+--num_mini_batches 2 \
+--total_episodes 30000 \
+--missing_eos_penalty 1.0 \
