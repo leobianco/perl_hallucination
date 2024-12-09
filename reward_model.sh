@@ -1,0 +1,31 @@
+accelerate launch \
+--config_file=/home/leobianco/.cache/huggingface/accelerate/zero3.yaml \
+reward_model.py \
+-- \
+--report_to "wandb" \
+--run_name "reward_model" \
+--logging_steps 5 \
+--output_dir ./checkpoints/halomi/reward_model/ \
+--overwrite_output_dir True \
+--push_to_hub True \
+--hub_model_id "leobianco/halomi_reward_model" \
+--seed 130104 \
+--dataset_name "leobianco/rm_halomi_processed" \
+--validation_size 0.2 \
+--model_identifier "google/gemma-2-2b-it" \
+--do_train True \
+--save_strategy "no" \
+--num_train_epochs 3 \
+--learning_rate 1e-4 \
+--weight_decay 0.0 \
+--max_seq_len 512 \
+--per_device_train_batch_size 1 \
+--gradient_accumulation_steps 1 \
+--do_eval True \
+--eval_on_start True \
+--eval_strategy "steps" \
+--eval_steps 20 \
+--per_device_eval_batch_size 1 \
+--eval_accumulation_steps 1 \
+--task_type "SEQ_CLS" \
+--r 4 \
