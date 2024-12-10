@@ -28,6 +28,7 @@ def main():
   #########
   # SETUP #
   #########
+
   parser = HfArgumentParser(
     (ScriptArguments, TrainingArguments, LoraConfig)
   )
@@ -49,6 +50,7 @@ def main():
   ########
   # DATA #
   ########
+
   rm_data_halomi = load_dataset(script_args.dataset_name)
 
   id2label = {
@@ -64,6 +66,7 @@ def main():
   #########
   # MODEL #
   #########
+
   reward_model = AutoModelForSequenceClassification.from_pretrained(
       script_args.model_identifier,
       num_labels=2,
@@ -83,6 +86,7 @@ def main():
   ####################
   # EVALUATION SETUP #
   ####################
+
   metric = evaluate.load("roc_auc")
 
   def compute_metrics(eval_preds):
@@ -115,6 +119,7 @@ def main():
   ###########
   # TRAINER #
   ###########
+
   trainer = Trainer(
     model=reward_model,
     args=training_args,
@@ -127,6 +132,7 @@ def main():
   ############
   # TRAINING #
   ############
+
   if training_args.do_train:
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     trainer.save_model()
@@ -137,6 +143,7 @@ def main():
   ##############
   # EVALUATION #
   ##############
+
   if training_args.do_eval:
     trainer.evaluate()
 

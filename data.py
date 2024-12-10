@@ -18,6 +18,7 @@ from copy import deepcopy
 #############################
 # GENERAL ENCODING FUNCTION #
 #############################
+
 def encode(batch, tokenizer=None, max_seq_length=512):
   return tokenizer(
     batch["prompt"],
@@ -31,6 +32,7 @@ def encode(batch, tokenizer=None, max_seq_length=512):
 #############################
 # HALOMI DATA PREPROCESSING #
 #############################
+
 def change_language_labels(entry):
   """Data processing utility function which replaces the language labels by the
   natural language correspondent version.
@@ -161,6 +163,7 @@ def load_halomi_data(seed: int = 12345):
 #####################
 # REWARD MODEL DATA #
 #####################
+
 def rm_prompt_halomi(entry, validation_test=False):
   """Function for transforming entries in the HalOmi dataset into training
   prompts for the reward model.
@@ -225,6 +228,7 @@ def process_halomi_data_for_rm(
 #################################
 # WRITER SFT DATA PREPROCESSING #
 #################################
+
 def writer_prompt_halomi(entry, SFT=False):
   """Function for transforming entries in the HalOmi dataset into prompts for
   the writer to translate.
@@ -307,6 +311,7 @@ def formatting_prompts_func(entry):
 ###########################
 # PERL DATA PREPROCESSING #
 ###########################
+
 def format_perl_translation_data(entry, src_lang: str, tgt_lang: str):
   """Helper function for formatting PERL data, to be mapped over dataset."""
 

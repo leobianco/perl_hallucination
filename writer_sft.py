@@ -28,6 +28,7 @@ def main():
   #########
   # SETUP #
   #########
+
   parser = TrlParser((ScriptArguments, SFTConfig, CustomLoraConfig))
   (
     script_args,
@@ -57,11 +58,13 @@ def main():
   ########
   # DATA #
   ########
+
   sft_data_halomi = load_dataset(script_args.dataset_name)
 
   ################
   # WRITER MODEL #
   ################
+
   model = AutoModelForCausalLM.from_pretrained(
     script_args.model_identifier,
     attn_implementation="eager",
@@ -70,6 +73,7 @@ def main():
   ###############
   # SFT TRAINER #
   ###############
+
   trainer = SFTTrainer(
     model,
     args=training_args,

@@ -21,9 +21,10 @@ from utils import ScriptArguments
 
 def main():
 
-  ###############
-  # SETUP
-  ###############
+  #########
+  # SETUP #
+  #########
+
   parser = HfArgumentParser(
     (
       ScriptArguments,
@@ -43,12 +44,13 @@ def main():
 
   tokenizer = AutoTokenizer.from_pretrained(
     script_args.model_identifier,
-    padding_side="right",  # TODO: what should this be?
+    padding_side="right",
   )
 
   ########
   # DATA #
   ########
+
   perl_data_halomi = load_dataset(script_args.dataset_name)
 
   perl_data_halomi["train"] = (
@@ -59,6 +61,7 @@ def main():
   ################
   # REWARD MODEL #
   ################
+
   id2label = {
     0: 'Yes',
     1: 'No',
@@ -82,6 +85,7 @@ def main():
   #############################
   # REFERENCE POLICY + POLICY #
   #############################
+
   ref_policy = AutoModelForCausalLM.from_pretrained(
     training_args.sft_model_path,
     attn_implementation="eager",
@@ -93,15 +97,10 @@ def main():
     attn_implementation="eager",
   )
 
-  ####################
-  # EVALUATION SETUP #
-  ####################
-
-  # TODO: set up TRL Judges.
-
   ###########
   # TRAINER #
   ###########
+
   trainer = RLOOTrainer(
     config=training_args,
     processing_class=tokenizer,
@@ -115,17 +114,12 @@ def main():
   ############
   # TRAINING #
   ############
+
   if training_args.do_train:
     trainer.train()
     trainer.save_model()
     if training_args.push_to_hub:
       trainer.push_to_hub()
-
-  ##############
-  # EVALUATION #
-  ##############
-  if training_args.do_eval:
-    trainer.evaluate()
 
 
 if __name__=="__main__":
