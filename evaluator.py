@@ -120,18 +120,26 @@ def get_fewshot_examples(data, n: int, seed: int):
 
 def evaluator_prompt_halomi(entry, fewshot_examples=None, use_mt_text=False):
   """Function for transforming entries in the HalOmi dataset into prompts for
-  the evaluator model.
+  the evaluator model. 
+
+  TO DO: perhaps split this function into two functions instead of using the 
+  use_mt_text parameter.
   """
+
+  preamble = (
+    "The following are examples of an expert translator and linguist noting "
+    "when the Translation to an Original text contains additional information "
+    "that is not part of the original text.\n\n"
+  )
 
   template = (
     "Original text in {src_lang}:{src_text}"
     "\nTranslated text in {tgt_lang}:{mt_text}"
-    "\nAnswer using a single word 'Yes' or 'No': does the translated text "
-    "contain additional information that is not part of the original text?"
-    "\nAnswer:{ans}"
+    "\nExpert translator and linguist review: The Translated text contains "
+    "additional information with respect to the Original text (Yes/No):{ans}"
   )
 
-  prompt = ""
+  prompt = preamble
 
   if use_mt_text:
     translation = entry["mt_text"]  # for HalOmi and evaluation of evaluator
@@ -156,12 +164,12 @@ def evaluator_prompt_halomi(entry, fewshot_examples=None, use_mt_text=False):
         ans=fewshot_example["class_hall"],
       )
 
-      prompt += fewshot_prompt + "\n"
+      prompt += fewshot_prompt + "\n\n"
 
     prompt += formatted_prompt
 
   else:
-    prompt = formatted_prompt
+    prompt += formatted_prompt
 
   return prompt
 
