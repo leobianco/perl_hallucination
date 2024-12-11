@@ -128,7 +128,7 @@ def evaluator_prompt_halomi(entry, fewshot_examples=None, use_mt_text=False):
 
   preamble = (
     "The following are examples of an expert translator and linguist noting "
-    "when the Translation to an Original text contains additional information "
+    "when the Translation of an Original text contains additional information "
     "that is not part of the original text.\n\n"
   )
 
@@ -354,6 +354,8 @@ if __name__=="__main__":
       if script_args.writer_model_base==script_args.writer_model_lora
       else True
     )
+
+    print("DEBUG - enable_lora", enable_lora)
     
     if enable_lora:
       # Dowload the LoRA adapters and save locally.
@@ -364,6 +366,8 @@ if __name__=="__main__":
 
     # Instantiate evaluated checkpoint as a vLLM LLM.
     llm = LLM(model=script_args.writer_model_base, enable_lora=enable_lora)
+
+    print("DEBUG - enable_lora", enable_lora)
   
     # Generate completions with writer.
     sampling_params = SamplingParams(
@@ -388,6 +392,11 @@ if __name__=="__main__":
       )
 
     generations = [output.outputs[0].text for output in outputs]
+
+    print("DEBUG - saving generations...")
+    with open(f"generations_enable_lora_{enable_lora}.txt", "w") as f:
+      for generation in generations:
+        f.write(generation + "\n")
   
     # Add generations to the val_data under a column named "completion".
     val_data = val_data.add_column("completion", generations)
@@ -405,16 +414,22 @@ if __name__=="__main__":
 
     # Instantiate evaluator.
     evaluator = AutoModelForCausalLM.from_pretrained(
-        script_args.evaluator_model,
-        device_map="auto",
-        attn_implementation="eager",
+      script_args.evaluator_model,
+      device_map="auto",
+      attn_implementation="eager",
     )
     evaluator.eval()
    
-    # Build the evaluator prompts using fewshot examples + completions.
+    # Build the evaluator prompts using fewshot examples + generations.
+    # (Generations are inside val_data since we added them in a new column)
     evaluator_prompts = [
       evaluator_prompt_halomi(entry, fewshot_examples) for entry in val_data
     ]
+
+    print("DEBUG - saving evaluator prompts...")
+    with open(f"evaluator_prompts_enable_lora_{enable_lora}.txt", "w") as f:
+      for prompt in evaluator_prompts:
+        f.write(prompt + "\n")
   
     # Tokenize them.
     tokenized_evaluator_prompts = [
