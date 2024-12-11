@@ -81,7 +81,7 @@ class ScriptArguments:
 
   top_p: float = field(default=0.9)
 
-  num_fewshot_examples: Optional[int] = field(default=None, metadata={
+  num_fewshot_examples: Optional[int] = field(default=0, metadata={
     "help": "The number of fewshot examples to give to the evaluator."
     }
   )
@@ -226,11 +226,14 @@ if __name__=="__main__":
   # Notice that the fewshot examples come from the HalOmi dataset,
   # and not from okezieowen's one, since the examples must be "balanced"
   # i.e., as many examples with hallucinations than examples without.
-  fewshot_examples = get_fewshot_examples(
-      data_halomi,
-      script_args.num_fewshot_examples,
-      seed=script_args.seed,
-  )
+  if script_args.num_fewshot_examples==0:
+    fewshot_examples = None
+  else:
+    fewshot_examples = get_fewshot_examples(
+        data_halomi,
+        script_args.num_fewshot_examples,
+        seed=script_args.seed,
+    )
 
   # Instantiate tokenizer.
   tokenizer = AutoTokenizer.from_pretrained(
@@ -316,6 +319,7 @@ if __name__=="__main__":
     plt.savefig(
       f"eval_evaluator_auc_curve_{script_args.num_fewshot_examples}_shot"
     )
+    plt.clf()
 
     # Histogram
     bins = np.arange(0, 1, 0.05)

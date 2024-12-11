@@ -59,7 +59,7 @@ def main():
   # DATA #
   ########
 
-  sft_data_halomi = load_dataset(script_args.dataset_name)
+  sft_data_halomi = load_dataset(script_args.dataset_name, split="train")
 
   ################
   # WRITER MODEL #
