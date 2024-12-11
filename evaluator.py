@@ -77,9 +77,9 @@ class ScriptArguments:
 
   max_tokens: int = field(default=128)
 
-  temperature: float = field(default=0.8)
+  temperature: float = field(default=1)
 
-  top_p: float = field(default=0.9)
+  top_p: float = field(default=1)
 
   num_fewshot_examples: Optional[int] = field(default=0, metadata={
     "help": "The number of fewshot examples to give to the evaluator."
@@ -451,6 +451,11 @@ if __name__=="__main__":
     )
 
     scores = [score.cpu().item() for score in scores]
+
+    print("DEBUG - saving evaluator scores...")
+    with open(f"evaluator_scores_enable_lora_{enable_lora}.txt", "w") as f:
+      for score in scores:
+        f.write(str(score) + "\n")
   
     # Compute global rate of hallucinations.
     classifs = [0 if score < script_args.threshold else 1 for score in scores]

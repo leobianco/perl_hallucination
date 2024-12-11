@@ -20,7 +20,7 @@ from peft import LoraConfig, PeftModel, get_peft_model, TaskType
 import evaluate
 
 from data import *
-from utils import ScriptArguments
+from utils import ScriptArguments, CustomLoraConfig
 
 
 def main():
@@ -30,7 +30,7 @@ def main():
   #########
 
   parser = HfArgumentParser(
-    (ScriptArguments, TrainingArguments, LoraConfig)
+    (ScriptArguments, TrainingArguments, CustomLoraConfig)
   )
 
   (
@@ -135,10 +135,10 @@ def main():
 
   if training_args.do_train:
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
-    trainer.save_model()
+    reward_model.save_pretrained(training_args.output_dir)
 
     if training_args.push_to_hub:
-      trainer.push_to_hub()
+      reward_model.push_to_hub(training_args.hub_model_id)
 
   ##############
   # EVALUATION #

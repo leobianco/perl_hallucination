@@ -11,14 +11,12 @@ reward_model.py \
 --hub_model_id "leobianco/halomi_reward_model" \
 --seed 130104 \
 --dataset_name "leobianco/rm_halomi_processed" \
---validation_size 0.2 \
 --model_identifier "google/gemma-2-2b-it" \
 --do_train True \
 --save_strategy "no" \
---num_train_epochs 3 \
+--num_train_epochs 5 \
 --learning_rate 1e-4 \
 --weight_decay 0.0 \
---max_seq_len 512 \
 --per_device_train_batch_size 1 \
 --gradient_accumulation_steps 1 \
 --do_eval True \
