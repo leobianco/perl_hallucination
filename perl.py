@@ -117,9 +117,9 @@ def main():
 
   if training_args.do_train:
     trainer.train()
-    trainer.save_model()
+    policy.save_pretrained(training_args.output_dir)
     if training_args.push_to_hub:
-      trainer.push_to_hub()
+      policy.push_to_hub(training_args.hub_model_id)
 
 
 if __name__=="__main__":
