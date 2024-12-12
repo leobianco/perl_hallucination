@@ -74,7 +74,6 @@ def main():
     data_collator=collator_completions,
     train_dataset=sft_data_halomi,
     processing_class=tokenizer,
-    # peft_config=peft_args,  # if loading Peft model outside trainer
     formatting_func=formatting_prompts_func,
   )
 

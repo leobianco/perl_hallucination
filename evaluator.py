@@ -208,6 +208,7 @@ if __name__=="__main__":
   # Parse the arguments
   parser = HfArgumentParser(ScriptArguments)
   script_args = parser.parse_args_into_dataclasses()[0]
+  name_for_saving = script_args.writer_model_lora.split("/")[1]
 
   # Load validation dataset.
   val_data = load_dataset(
@@ -355,8 +356,6 @@ if __name__=="__main__":
       else True
     )
 
-    print("DEBUG - enable_lora", enable_lora)
-    
     if enable_lora:
       # Dowload the LoRA adapters and save locally.
       lora_path = snapshot_download(
@@ -367,8 +366,6 @@ if __name__=="__main__":
     # Instantiate evaluated checkpoint as a vLLM LLM.
     llm = LLM(model=script_args.writer_model_base, enable_lora=enable_lora)
 
-    print("DEBUG - enable_lora", enable_lora)
-  
     # Generate completions with writer.
     sampling_params = SamplingParams(
       seed=script_args.seed,
@@ -393,10 +390,11 @@ if __name__=="__main__":
 
     generations = [output.outputs[0].text for output in outputs]
 
-    print("DEBUG - saving generations...")
-    with open(f"generations_enable_lora_{enable_lora}.txt", "w") as f:
+    print("Saving model generations...")
+    filepath = f"logs/generations_{name_for_saving}.txt"
+    with open(filepath, "w") as f:
       for generation in generations:
-        f.write(generation + "\n")
+        f.write(generation + "\n----------\n")
   
     # Add generations to the val_data under a column named "completion".
     val_data = val_data.add_column("completion", generations)
@@ -425,12 +423,7 @@ if __name__=="__main__":
     evaluator_prompts = [
       evaluator_prompt_halomi(entry, fewshot_examples) for entry in val_data
     ]
-
-    print("DEBUG - saving evaluator prompts...")
-    with open(f"evaluator_prompts_enable_lora_{enable_lora}.txt", "w") as f:
-      for prompt in evaluator_prompts:
-        f.write(prompt + "\n")
-  
+ 
     # Tokenize them.
     tokenized_evaluator_prompts = [
       tokenizer(prompt, return_tensors="pt") for prompt in evaluator_prompts 
@@ -451,14 +444,17 @@ if __name__=="__main__":
     )
 
     scores = [score.cpu().item() for score in scores]
-
-    print("DEBUG - saving evaluator scores...")
-    with open(f"evaluator_scores_enable_lora_{enable_lora}.txt", "w") as f:
-      for score in scores:
-        f.write(str(score) + "\n")
-  
+ 
     # Compute global rate of hallucinations.
     classifs = [0 if score < script_args.threshold else 1 for score in scores]
     rate_hallucination = 1 - sum(classifs)/len(classifs)
     print("Rate of hallucination:", rate_hallucination)
     
+    print("Saving evaluator scores...")
+    filepath = f"logs/scores_{name_for_saving}.txt"
+    with open(filepath, "w") as f:
+      for score in scores:
+        f.write(str(score) + "\n----------\n")
+      print("Saving rate of hallucination...")
+      f.write(str(rate_hallucination))
+
