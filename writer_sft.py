@@ -6,21 +6,13 @@ from dataclasses import dataclass, field
 
 from datasets import load_dataset
 from transformers import set_seed, AutoTokenizer, AutoModelForCausalLM
-from peft import LoraConfig
+from peft import LoraConfig, get_peft_model
 from trl import (
   TrlParser, SFTConfig, SFTTrainer, DataCollatorForCompletionOnlyLM,
 )
 
 from data import *
-from utils import ScriptArguments
-
-
-# Work around HfArgumentParser bug...
-@dataclass
-class CustomLoraConfig(LoraConfig):
-  init_lora_weights: bool = field(default=True)
-  layers_to_transform: int = field(default=None)
-  loftq_config: dict = field(default_factory=dict)
+from utils import ScriptArguments, CustomLoraConfig
 
 
 def main():
@@ -70,6 +62,8 @@ def main():
     attn_implementation="eager",
   )
 
+  model = get_peft_model(model, peft_args)
+
   ###############
   # SFT TRAINER #
   ###############
@@ -80,16 +74,15 @@ def main():
     data_collator=collator_completions,
     train_dataset=sft_data_halomi,
     processing_class=tokenizer,
-    peft_config=peft_args,
     formatting_func=formatting_prompts_func,
   )
 
   if training_args.do_train:
     trainer.train()
-    trainer.save_model()
+    model.save_pretrained(training_args.output_dir)
     
     if training_args.push_to_hub:
-      trainer.push_to_hub()
+      model.push_to_hub(training_args.hub_model_id)
   
 
 if __name__=="__main__":

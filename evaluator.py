@@ -27,6 +27,7 @@ The writer checkpoint will be loaded as a vLLM LLM.
 """
 
 
+import os
 import gc
 from dataclasses import dataclass, field
 from typing import Optional
@@ -77,9 +78,9 @@ class ScriptArguments:
 
   max_tokens: int = field(default=128)
 
-  temperature: float = field(default=0.8)
+  temperature: float = field(default=1)
 
-  top_p: float = field(default=0.9)
+  top_p: float = field(default=1)
 
   num_fewshot_examples: Optional[int] = field(default=0, metadata={
     "help": "The number of fewshot examples to give to the evaluator."
@@ -128,7 +129,7 @@ def evaluator_prompt_halomi(entry, fewshot_examples=None, use_mt_text=False):
 
   preamble = (
     "The following are examples of an expert translator and linguist noting "
-    "when the Translation to an Original text contains additional information "
+    "when the Translation of an Original text contains additional information "
     "that is not part of the original text.\n\n"
   )
 
@@ -208,6 +209,7 @@ if __name__=="__main__":
   # Parse the arguments
   parser = HfArgumentParser(ScriptArguments)
   script_args = parser.parse_args_into_dataclasses()[0]
+  name_for_saving = script_args.writer_model_lora.split("/")[1]
 
   # Load validation dataset.
   val_data = load_dataset(
@@ -354,7 +356,7 @@ if __name__=="__main__":
       if script_args.writer_model_base==script_args.writer_model_lora
       else True
     )
-    
+
     if enable_lora:
       # Dowload the LoRA adapters and save locally.
       lora_path = snapshot_download(
@@ -364,7 +366,7 @@ if __name__=="__main__":
 
     # Instantiate evaluated checkpoint as a vLLM LLM.
     llm = LLM(model=script_args.writer_model_base, enable_lora=enable_lora)
-  
+
     # Generate completions with writer.
     sampling_params = SamplingParams(
       seed=script_args.seed,
@@ -388,6 +390,13 @@ if __name__=="__main__":
       )
 
     generations = [output.outputs[0].text for output in outputs]
+
+    print("Saving model generations...")
+    filepath = f"logs/{name_for_saving}/generations.txt"
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, "w") as f:
+      for generation in generations:
+        f.write(generation + "\n----------\n")
   
     # Add generations to the val_data under a column named "completion".
     val_data = val_data.add_column("completion", generations)
@@ -405,17 +414,18 @@ if __name__=="__main__":
 
     # Instantiate evaluator.
     evaluator = AutoModelForCausalLM.from_pretrained(
-        script_args.evaluator_model,
-        device_map="auto",
-        attn_implementation="eager",
+      script_args.evaluator_model,
+      device_map="auto",
+      attn_implementation="eager",
     )
     evaluator.eval()
    
-    # Build the evaluator prompts using fewshot examples + completions.
+    # Build the evaluator prompts using fewshot examples + generations.
+    # (Generations are inside val_data since we added them in a new column)
     evaluator_prompts = [
       evaluator_prompt_halomi(entry, fewshot_examples) for entry in val_data
     ]
-  
+ 
     # Tokenize them.
     tokenized_evaluator_prompts = [
       tokenizer(prompt, return_tensors="pt") for prompt in evaluator_prompts 
@@ -436,9 +446,18 @@ if __name__=="__main__":
     )
 
     scores = [score.cpu().item() for score in scores]
-  
+ 
     # Compute global rate of hallucinations.
     classifs = [0 if score < script_args.threshold else 1 for score in scores]
     rate_hallucination = 1 - sum(classifs)/len(classifs)
     print("Rate of hallucination:", rate_hallucination)
     
+    print("Saving evaluator scores...")
+    filepath = f"logs/{name_for_saving}/scores.txt"
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, "w") as f:
+      for score in scores:
+        f.write(str(score) + "\n----------\n")
+      print("Saving rate of hallucination...")
+      f.write(str(rate_hallucination))
+
