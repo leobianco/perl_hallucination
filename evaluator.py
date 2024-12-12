@@ -27,6 +27,7 @@ The writer checkpoint will be loaded as a vLLM LLM.
 """
 
 
+import os
 import gc
 from dataclasses import dataclass, field
 from typing import Optional
@@ -391,7 +392,8 @@ if __name__=="__main__":
     generations = [output.outputs[0].text for output in outputs]
 
     print("Saving model generations...")
-    filepath = f"logs/generations_{name_for_saving}.txt"
+    filepath = f"logs/{name_for_saving}/generations.txt"
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
     with open(filepath, "w") as f:
       for generation in generations:
         f.write(generation + "\n----------\n")
@@ -451,7 +453,8 @@ if __name__=="__main__":
     print("Rate of hallucination:", rate_hallucination)
     
     print("Saving evaluator scores...")
-    filepath = f"logs/scores_{name_for_saving}.txt"
+    filepath = f"logs/{name_for_saving}/scores.txt"
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
     with open(filepath, "w") as f:
       for score in scores:
         f.write(str(score) + "\n----------\n")
