@@ -319,6 +319,7 @@ if __name__=="__main__":
     RocCurveDisplay.from_predictions(ground_truth, scores)
     plt.scatter([fpr[threshold_idx]], [tpr[threshold_idx]], c='r')
     plt.savefig(
+      "logs/{name_for_saving}/" +
       f"eval_evaluator_auc_curve_{script_args.num_fewshot_examples}_shot"
     )
     plt.clf()
@@ -340,6 +341,7 @@ if __name__=="__main__":
     plt.hist(scores_yes, bins=bins, alpha=0.5, label="Yes")
     plt.legend()
     plt.savefig(
+      "logs/{name_for_saving}/" +
       f"eval_evaluator_histogram_{script_args.num_fewshot_examples}_shot"
     )
 
