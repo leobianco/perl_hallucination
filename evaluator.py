@@ -459,7 +459,10 @@ if __name__=="__main__":
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     with open(filepath, "w") as f:
       for score in scores:
-        f.write(str(score) + "\n----------\n")
+        f.write(str(score) + "\n")
       print("Saving rate of hallucination...")
-      f.write(str(rate_hallucination))
+      f.write(
+        f"Rate of hallucination (threshold = {script_args.threshold}):\n" +
+        str(rate_hallucination)
+      )
 
