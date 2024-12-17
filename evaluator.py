@@ -427,6 +427,13 @@ if __name__=="__main__":
     evaluator_prompts = [
       evaluator_prompt_halomi(entry, fewshot_examples) for entry in val_data
     ]
+
+    print("Saving evaluator prompts...")
+    filepath = f"logs/{name_for_saving}/evaluator_prompts.txt"
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, "w") as f:
+      for prompt in evaluator_prompts:
+        f.write(prompt + "\n----------\n")
  
     # Tokenize them.
     tokenized_evaluator_prompts = [

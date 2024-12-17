@@ -55,6 +55,8 @@ def main():
     peft_args
   ) = parser.parse_args_into_dataclasses()
 
+  name_for_saving = training_args.run_name.split("/")[1]
+
   # Set seed before instantiating the model, for reproducibility.
   set_seed(training_args.seed)
 
@@ -106,7 +108,7 @@ def main():
 
   if training_args.do_train:
     trainer.train()
-    model.save_pretrained(training_args.output_dir)
+    model.save_pretrained(f"checkpoints/writer_sft/{name_for_saving}/")
     
     if training_args.push_to_hub:
       model.push_to_hub(training_args.hub_model_id)
