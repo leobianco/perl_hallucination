@@ -2,7 +2,7 @@ python -m IPython -i evaluator.py \
   -- \
   --seed 130104 \
   --writer_model_base "google/gemma-2-2b-it" \
-  --writer_model_lora "leobianco/HALOMI_SFT_seed_130401_epochs_10_lr_1e-4_lora_4" \
+  --writer_model_lora "leobianco/HALOMI_SFT_seed_130401_epochs_1_lr_1e-6_lora_4" \
   --max_tokens 256 \
   --evaluator_model "google/gemma-2-27b-it" \
   --num_fewshot_examples 4 \
