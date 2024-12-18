@@ -1,11 +1,31 @@
-python -m IPython -i evaluator.py \
-  -- \
-  --seed 130104 \
-  --writer_model_base "google/gemma-2-2b-it" \
-  --writer_model_lora "leobianco/HALOMI_SFT_seed_130401_epochs_1_lr_1e-6_lora_4" \
+#!/bin/bash
+
+# If calling from hyperparameter search script, import hyperparameters
+if [ $SHLVL -gt 2 ]
+then
+  :
+else
+  # If single-run (copy and paste identifier)
+  SEED=130104
+  RUN_IDENTIFIER="google/gemma-2-2b-it"
+fi
+
+BASE_MODEL="google/gemma-2-2b-it"
+EVALUATOR_MODEL="google/gemma-2-27b-it"
+NUM_FEWSHOT=4
+EVAL_EVALUATOR="False"
+THRESHOLD=0.144
+TEMPERATURE=1
+
+echo "Calling the evaluator script..."
+
+python3 evaluator.py \
+  --seed $SEED \
+  --writer_model_base ${BASE_MODEL} \
+  --writer_model_lora ${RUN_IDENTIFIER} \
   --max_tokens 256 \
-  --evaluator_model "google/gemma-2-27b-it" \
-  --num_fewshot_examples 4 \
-  --evaluate_evaluator False \
-  --threshold 0.144 \
-  --temperature 1 \
+  --evaluator_model ${EVALUATOR_MODEL} \
+  --num_fewshot_examples $NUM_FEWSHOT \
+  --evaluate_evaluator $EVAL_EVALUATOR \
+  --threshold $THRESHOLD \
+  --temperature $TEMPERATURE \

@@ -1,8 +1,20 @@
-SEED=130401
-NUM_TRAIN_EPOCHS=1
-LEARNING_RATE=1e-6
-LORA_RANK=4
-RUN_IDENTIFIER="leobianco/HALOMI_SFT_seed_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_lora_${LORA_RANK}"
+#!/bin/bash
+
+# If calling from hyperparameter search script, import variables from there
+if [ $SHLVL -gt 2 ]
+then
+  :
+else
+  # If single-run, set variables here
+  USER="leobianco"
+  EXPERIMENT_TYPE="HALOMI_SFT"
+  SEED=130401
+  NUM_TRAIN_EPOCHS=3
+  LEARNING_RATE=5e-5
+  LORA_RANK=8
+  RUN_IDENTIFIER="${USER}/${EXPERIMENT_TYPE}_seed_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_lora_${LORA_RANK}"
+fi
+
 accelerate launch \
 --config_file=/home/leobianco/.cache/huggingface/accelerate/zero3.yaml \
 writer_sft.py \
