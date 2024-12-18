@@ -19,11 +19,11 @@ for NUM_TRAIN_EPOCHS in "${NEPOCHS[@]}"; do
       export RUN_IDENTIFIER="${USER}/${EXPERIMENT_TYPE}_seed_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_lora_${LORA_RANK}"
       echo "Run identifier: ${RUN_IDENTIFIER}"
 
-#      /bin/bash ./writer_sft.sh
+      /bin/bash ./writer_sft.sh
       /bin/bash ./evaluator.sh
     done
   done
 done
 
 # Uncomment to shutdown instance after finished
-# sudo shutdown -h now
+sudo shutdown -h now
