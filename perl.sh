@@ -1,13 +1,22 @@
-SEED=130104
-NUM_TRAIN_EPOCHS=5
-LEARNING_RATE=1e-4
-LORA_RANK=4
-KL_COEFF=5e-2
-RLOO_K=2
-NUM_PPO_EPOCHS=2
-NUM_MINI_BATCHES=2
-TOTAL_EPISODES=5000
-RUN_IDENTIFIER="leobianco/HALOMI_PERL_seed_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lora_${LORA_RANK}_lr_${LEARNING_RATE}_klcoeff_${KL_COEFF}_rlook_${RLOO_K}_ppoepochs_{$NUM_PPO_EPOCHS}_minibatches_${NUM_MINI_BATCHES}_episodes_${TOTAL_EPISODES}"
+#!/bin/bash
+
+# If calling from hyperparameter search script,	variables are imported.
+if [ $SHLVL -gt 2 ]; then
+  :
+else
+  # If single-run, set variables here.
+  SEED=130104
+  NUM_TRAIN_EPOCHS=5
+  LEARNING_RATE=1e-4
+  LORA_RANK=4
+  KL_COEFF=5e-2
+  RLOO_K=2
+  NUM_PPO_EPOCHS=2
+  NUM_MINI_BATCHES=2
+  TOTAL_EPISODES=5000
+  RUN_IDENTIFIER="leobianco/HALOMI_PERL_seed_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lora_${LORA_RANK}_lr_${LEARNING_RATE}_klcoeff_${KL_COEFF}_rlook_${RLOO_K}_ppoepochs_{$NUM_PPO_EPOCHS}_minibatches_${NUM_MINI_BATCHES}_episodes_${TOTAL_EPISODES}"
+fi
+
 accelerate launch \
 --config_file=/home/leobianco/.cache/huggingface/accelerate/zero3.yaml \
 perl.py \

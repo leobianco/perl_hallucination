@@ -1,14 +1,15 @@
 """
+For an interactive Python shell after running evaluation, run:
 python -m IPython -i evaluator.py \
         -- \
         --seed 12345 \
         --writer_model_base "google/gemma-2-2b-it" \
-        --writer_model_lora "leobianco/halomi_writer_sft" \
+        --writer_model_lora "leobianco/HALOMI_SFT_seed_130104_epochs_1_lr_5e-5_lora_32" \
         --max_tokens 256 \
         --evaluator_model "google/gemma-2-27b-it" \
         --num_fewshot_examples 4 \
         --evaluate_evaluator False \
-        --threshold 0.268
+        --threshold 0.144
 
 Evaluation script.
 
@@ -189,7 +190,9 @@ def evaluator_score(
     with torch.no_grad():
       # Using cache was giving me errors, related to Gemma 2 or to the fact
       # that I need to use an older version of Transformers for RLOO to work...
+      # See https://huggingface.co/docs/transformers/en/kv_cache#model-specific-cache-classes
       # See https://github.com/huggingface/transformers/issues/33147
+      print(f"DEBUG: evaluator forward pass {idx}...")
       outputs = evaluator(**tokenized_prompt, use_cache=False)
 
     score_yes = torch.exp(outputs.logits[:, -1, yes_token_id])
@@ -367,7 +370,11 @@ if __name__=="__main__":
       )
 
     # Instantiate evaluated checkpoint as a vLLM LLM.
-    llm = LLM(model=script_args.writer_model_base, enable_lora=enable_lora)
+    llm = LLM(
+      model=script_args.writer_model_base,
+      enable_lora=enable_lora,
+      max_lora_rank=64,  # currently maximum available in vLLM.
+    )
 
     # Generate completions with writer.
     sampling_params = SamplingParams(
@@ -447,6 +454,7 @@ if __name__=="__main__":
     ]
   
     # Evaluate and bring back scores to cpu, make them floats. 
+    print("Scoring...")
     scores = evaluator_score(
       evaluator,
       tokenized_evaluator_prompts,

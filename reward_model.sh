@@ -1,8 +1,17 @@
-SEED=130104
-NUM_TRAIN_EPOCHS=5
-LEARNING_RATE=1e-4
-LORA_RANK=4
-RUN_IDENTIFIER="leobianco/HALOMI_RM_seed_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_lora_${LORA_RANK}"
+#!/bin/bash
+
+# If calling from hyperparameter search script, variables are imported.
+if [ $SHLVL -gt 2 ]; then
+  :
+else
+  # If single-run, set variables here.
+  SEED=130104
+  NUM_TRAIN_EPOCHS=5
+  LEARNING_RATE=1e-4
+  LORA_RANK=4
+  RUN_IDENTIFIER="leobianco/HALOMI_RM_seed_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_lora_${LORA_RANK}"
+fi
+
 accelerate launch \
 --config_file=/home/leobianco/.cache/huggingface/accelerate/zero3.yaml \
 reward_model.py \
