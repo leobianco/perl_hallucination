@@ -34,3 +34,6 @@ tpu_use_sudo: false
 use_cpu: false
 ```
 
+Please install the necessary Python header files by installing the `python-dev` package.
+
+Please install the CUDA drivers following the [Google Cloud CUDA Driver Installation Guide](https://cloud.google.com/compute/docs/gpus/install-drivers-gpu).

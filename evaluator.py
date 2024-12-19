@@ -2,10 +2,11 @@
 For an interactive Python shell after running evaluation, run:
 python -m IPython -i evaluator.py \
         -- \
-        --seed 12345 \
+        --seed 130104 \
         --writer_model_base "google/gemma-2-2b-it" \
         --writer_model_lora "leobianco/HALOMI_SFT_seed_130104_epochs_1_lr_5e-5_lora_32" \
         --max_tokens 256 \
+        --eval_batch_size 4 \
         --evaluator_model "google/gemma-2-27b-it" \
         --num_fewshot_examples 4 \
         --evaluate_evaluator False \
@@ -38,6 +39,8 @@ from sklearn.metrics import (
 )
 import numpy as np
 import torch
+from torch import nn
+from tqdm import tqdm
 import matplotlib.pyplot as plt
 from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
@@ -78,6 +81,8 @@ class ScriptArguments:
   seed: int = field(default=12345)
 
   max_tokens: int = field(default=128)
+
+  eval_batch_size: int = field(default=1)
 
   temperature: float = field(default=1)
 
@@ -173,32 +178,67 @@ def evaluator_prompt_halomi(entry, fewshot_examples=None, use_mt_text=False):
   else:
     prompt += formatted_prompt
 
-  return prompt
+  entry["evaluator_prompt"] = prompt
+
+  return entry
 
 
-def evaluator_score(
+def evaluator_score_batch(
     evaluator,
-    tokenized_evaluator_prompts,
+    tokenized_prompts,
     yes_token_id,
     no_token_id
   ):
   """Evaluator score for translation."""
 
-  scores = []
-
-  for idx, tokenized_prompt in enumerate(tokenized_evaluator_prompts):
-    with torch.no_grad():
-      # Using cache was giving me errors, related to Gemma 2 or to the fact
-      # that I need to use an older version of Transformers for RLOO to work...
-      # See https://huggingface.co/docs/transformers/en/kv_cache#model-specific-cache-classes
-      # See https://github.com/huggingface/transformers/issues/33147
-      print(f"DEBUG: evaluator forward pass {idx}...")
-      outputs = evaluator(**tokenized_prompt, use_cache=False)
-
+  with torch.no_grad():
+    # Cache in Gemma is different and was giving me errors, so I disable it.    
+    # See https://huggingface.co/docs/transformers/en/kv_cache#model-specific-cache-classes
+    # See https://github.com/huggingface/transformers/issues/33147
+    outputs = evaluator(**tokenized_prompts, use_cache=False)
     score_yes = torch.exp(outputs.logits[:, -1, yes_token_id])
     score_no = torch.exp(outputs.logits[:, -1, no_token_id])
-    score = score_no / (score_yes + score_no)
-    scores.append(score)
+    score_batch = score_no / (score_yes + score_no)
+
+  return score_batch
+
+
+def evaluator_score(
+    data,
+    script_args,
+    tokenizer,
+    evaluator,
+    yes_token_id,
+    no_token_id,
+  ):
+  """Scores the whole Dataset `data`, based on the column 'evaluator_prompt'."""
+
+  iterator = data.iter(batch_size=script_args.eval_batch_size)
+  num_batches = int(data.num_rows / script_args.eval_batch_size)
+  scores = torch.tensor([])
+
+  for batch in tqdm(iterator, desc="Evaluator scoring", total=num_batches):
+
+    tokenized_prompts = tokenizer(
+      batch["evaluator_prompt"],
+      return_tensors="pt",
+      padding="longest",
+    )
+    
+    tokenized_prompts = {
+      k: v.to(evaluator.device) for k, v in tokenized_prompts.items()
+    }
+
+    score_batch = evaluator_score_batch(
+      evaluator,
+      tokenized_prompts,
+      yes_token_id,
+      no_token_id
+    )
+
+    score_batch = score_batch.cpu()
+    scores = torch.cat((scores, score_batch))
+    del tokenized_prompts
 
   return scores
 
@@ -242,7 +282,7 @@ if __name__=="__main__":
 
   # Instantiate tokenizer.
   tokenizer = AutoTokenizer.from_pretrained(
-    script_args.evaluator_model
+    script_args.evaluator_model,
   )
   
   yes_token_id = tokenizer.convert_tokens_to_ids("Yes")
@@ -255,7 +295,6 @@ if __name__=="__main__":
     # SCORE HALOMI DATASET  #
     #########################
 
-    # Instantiate evaluator.
     evaluator = AutoModelForCausalLM.from_pretrained(
         script_args.evaluator_model,
         device_map="auto",
@@ -263,43 +302,27 @@ if __name__=="__main__":
     )
     evaluator.eval()
 
-    # Build the evaluator prompts.
-    evaluator_prompts = [
-      evaluator_prompt_halomi(
-        entry,
-        fewshot_examples,
-        use_mt_text=True
-      ) for entry in data_halomi
-    ]
-  
-    # Tokenize them.
-    tokenized_evaluator_prompts = [
-      tokenizer(prompt, return_tensors="pt") for prompt in evaluator_prompts 
-    ]
-  
-    # Send to device.
-    tokenized_evaluator_prompts = [
-      {k: v.to(evaluator.device) for k, v in tokenized_prompt.items()}
-      for tokenized_prompt in tokenized_evaluator_prompts
-    ]
+    data_halomi = data_halomi.map(
+      evaluator_prompt_halomi,
+      fn_kwargs=dict(fewshot_examples=fewshot_examples, use_mt_text=True),
+    )
 
-    # Score and bring back to cpu, transform back to list
     scores = evaluator_score(
+      data_halomi,
+      script_args,
+      tokenizer,
       evaluator,
-      tokenized_evaluator_prompts,
       yes_token_id,
       no_token_id,
     )
-
-    scores = [score.cpu().item() for score in scores]
-      
+     
     #####################
     # CALCULATE METRICS #
     #####################
 
     ground_truth = data_halomi["class_hall_num"]
     auc = roc_auc_score(ground_truth, scores)
-    fpr, tpr, thresholds = roc_curve(ground_truth, scores)
+    fpr, tpr, thresholds = roc_curve(ground_truth, scores.numpy())
     threshold_idx = np.argmax(tpr - fpr)
     threshold = thresholds[threshold_idx]
     classif_at_threshold = [
@@ -322,7 +345,7 @@ if __name__=="__main__":
     RocCurveDisplay.from_predictions(ground_truth, scores)
     plt.scatter([fpr[threshold_idx]], [tpr[threshold_idx]], c='r')
     plt.savefig(
-      "logs/{name_for_saving}/" +
+      f"logs/{name_for_saving}/" +
       f"eval_evaluator_auc_curve_{script_args.num_fewshot_examples}_shot"
     )
     plt.clf()
@@ -330,12 +353,12 @@ if __name__=="__main__":
     # Histogram
     bins = np.arange(0, 1, 0.05)
     scores_no = [
-      score 
+      score.item()
       for idx, score in enumerate(scores)
       if ground_truth[idx]==1
     ]
     scores_yes = [
-      score 
+      score.item()
       for idx, score in enumerate(scores)
       if ground_truth[idx]==0
     ]
@@ -344,7 +367,7 @@ if __name__=="__main__":
     plt.hist(scores_yes, bins=bins, alpha=0.5, label="Yes")
     plt.legend()
     plt.savefig(
-      "logs/{name_for_saving}/" +
+      f"logs/{name_for_saving}/" +
       f"eval_evaluator_histogram_{script_args.num_fewshot_examples}_shot"
     )
 
@@ -400,12 +423,12 @@ if __name__=="__main__":
 
     generations = [output.outputs[0].text for output in outputs]
 
-    print("Saving model generations...")
     filepath = f"logs/{name_for_saving}/generations.txt"
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     with open(filepath, "w") as f:
       for generation in generations:
         f.write(generation + "\n----------\n")
+    print(f"Generations saved to {filepath}")
   
     # Add generations to the val_data under a column named "completion".
     val_data = val_data.add_column("completion", generations)
@@ -418,7 +441,7 @@ if __name__=="__main__":
     torch.cuda.empty_cache()
   
     ########################
-    # EVALUATE COMPLETIONS #
+    # SCORE COMPLETIONS #
     ########################
 
     # Instantiate evaluator.
@@ -430,54 +453,43 @@ if __name__=="__main__":
     evaluator.eval()
    
     # Build the evaluator prompts using fewshot examples + generations.
-    # (Generations are inside val_data since we added them in a new column)
-    evaluator_prompts = [
-      evaluator_prompt_halomi(entry, fewshot_examples) for entry in val_data
-    ]
+    val_data = val_data.map(
+      evaluator_prompt_halomi,
+      fn_kwargs=dict(fewshot_examples=fewshot_examples),
+    )
 
-    print("Saving evaluator prompts...")
     filepath = f"logs/{name_for_saving}/evaluator_prompts.txt"
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     with open(filepath, "w") as f:
-      for prompt in evaluator_prompts:
+      for prompt in val_data["evaluator_prompt"]:
         f.write(prompt + "\n----------\n")
- 
-    # Tokenize them.
-    tokenized_evaluator_prompts = [
-      tokenizer(prompt, return_tensors="pt") for prompt in evaluator_prompts 
-    ]
-  
-    # Send to device.
-    tokenized_evaluator_prompts = [
-      {k: v.to(evaluator.device) for k, v in tokenized_prompt.items()}
-      for tokenized_prompt in tokenized_evaluator_prompts
-    ]
-  
-    # Evaluate and bring back scores to cpu, make them floats. 
-    print("Scoring...")
+    print(f"Evaluator prompts saved to {filepath}")
+
     scores = evaluator_score(
+      val_data,
+      script_args,
+      tokenizer,
       evaluator,
-      tokenized_evaluator_prompts,
       yes_token_id,
-      no_token_id
+      no_token_id,
     )
 
-    scores = [score.cpu().item() for score in scores]
- 
-    # Compute global rate of hallucinations.
-    classifs = [0 if score < script_args.threshold else 1 for score in scores]
-    rate_hallucination = 1 - sum(classifs)/len(classifs)
-    print("Rate of hallucination:", rate_hallucination)
-    
-    print("Saving evaluator scores...")
+    #####################
+    # CALCULATE METRICS #
+    #####################
+
+    t = nn.Threshold(script_args.threshold, 0, inplace=False)
+    classifs = torch.ceil(t(scores))
+    rate_hallucination = 1 - torch.mean(classifs)
+    print("Rate of hallucination:", rate_hallucination.item())
+
     filepath = f"logs/{name_for_saving}/scores.txt"
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     with open(filepath, "w") as f:
       for score in scores:
-        f.write(str(score) + "\n")
-      print("Saving rate of hallucination...")
+        f.write("{:.3f}".format(score.item()) + "\n")
       f.write(
         f"Rate of hallucination (threshold = {script_args.threshold}):\n" +
-        str(rate_hallucination)
+        str(rate_hallucination.item())
       )
-
+    print(f"Scores and rate of hallucination saved to {filepath}")
