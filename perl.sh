@@ -6,6 +6,7 @@ if [ $SHLVL -gt 2 ]; then
 else
   # If single-run, set variables here.
   SEED=130104
+  DEEPSPEED_CONFIG="./deepspeed_config.yaml"
   NUM_TRAIN_EPOCHS=5
   LEARNING_RATE=1e-4
   LORA_RANK=4
@@ -18,7 +19,7 @@ else
 fi
 
 accelerate launch \
---config_file=/home/leobianco/.cache/huggingface/accelerate/zero3.yaml \
+--config_file=${DEEPSPEED_CONFIG} \
 perl.py \
 -- \
 --seed $SEED \

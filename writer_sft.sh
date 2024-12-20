@@ -7,6 +7,7 @@ then
 else
   # If single-run, set variables here
   USER="leobianco"
+  DEEPSPEED_CONFIG="./deepspeed_config.yaml"
   EXPERIMENT_TYPE="HALOMI_SFT"
   SEED=130401
   NUM_TRAIN_EPOCHS=3
@@ -16,7 +17,7 @@ else
 fi
 
 accelerate launch \
---config_file=/home/leobianco/.cache/huggingface/accelerate/zero3.yaml \
+--config_file=${DEEPSPEED_CONFIG} \
 writer_sft.py \
 -- \
 --report_to "wandb" \
