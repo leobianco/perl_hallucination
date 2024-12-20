@@ -108,7 +108,7 @@ def main():
 
   if training_args.do_train:
     trainer.train()
-    model.save_pretrained(f"checkpoints/writer_sft/{name_for_saving}/")
+    model.save_pretrained(f"checkpoints/{name_for_saving}/")
     
     if training_args.push_to_hub:
       model.push_to_hub(training_args.hub_model_id)

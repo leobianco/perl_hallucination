@@ -2,7 +2,7 @@
 TODO: write proper docstring.
 """
 
-
+import os
 from dataclasses import dataclass
 
 from transformers import (
@@ -38,6 +38,8 @@ def main():
     training_args,
     peft_args,
   ) = parser.parse_args_into_dataclasses()
+
+  name_for_saving = training_args.run_name.split("/")[1]
 
   # Set seed before instantiating the model, for reproducibility.
   set_seed(training_args.seed)
@@ -117,10 +119,16 @@ def main():
 
   if training_args.do_train:
     trainer.train()
-    policy.save_pretrained(training_args.output_dir)
+    policy.save_pretrained(f"checkpoints/{name_for_saving}/")
     if training_args.push_to_hub:
       policy.push_to_hub(training_args.hub_model_id)
 
+  filepath = f"logs/{name_for_saving}/logs.txt"
+  os.makedirs(os.path.dirname(pathname), exist_ok=True)
+  with open(filepath, "w") as f:
+    for d in trainer.state.log_history:
+      f.write(str(d) + "\n----------\n")
+  print(f"Logs saved to {filepath}")
 
 if __name__=="__main__":
   main()

@@ -4,6 +4,7 @@ TODO: clean imports.
 """
 
 
+import os
 import numpy as np
 import torch
 from dataclasses import dataclass, field
@@ -38,6 +39,8 @@ def main():
     training_args,
     peft_args,
   ) = parser.parse_args_into_dataclasses()
+
+  name_for_saving = training_args.run_name.split("/")[1]
 
   # Set seed before instantiating the model, for reproducibility.
   set_seed(training_args.seed)
@@ -135,7 +138,7 @@ def main():
 
   if training_args.do_train:
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
-    reward_model.save_pretrained(training_args.output_dir)
+    reward_model.save_pretrained(f"checkpoints/{name_for_saving}/")
 
     if training_args.push_to_hub:
       reward_model.push_to_hub(training_args.hub_model_id)
@@ -146,6 +149,13 @@ def main():
 
   if training_args.do_eval:
     trainer.evaluate()
+  
+  filepath = f"logs/{name_for_saving}/logs.txt"
+  os.makedirs(os.path.dirname(filepath), exist_ok=True)
+  with open(filepath, "w") as f:
+    for d in trainer.state.log_history:
+      f.write(str(d) + "\n----------\n")
+  print(f"Logs saved to {filepath}")
 
 
 if __name__=="__main__":
