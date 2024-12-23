@@ -15,7 +15,7 @@ else
   NUM_PPO_EPOCHS=2
   NUM_MINIBATCHES=2
   TOTAL_EPISODES=5000
-  RUN_IDENTIFIER="leobianco/HALOMI_PERL_seed_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lora_${LORA_RANK}_lr_${LEARNING_RATE}_klcoeff_${KL_COEFF}_rlook_${RLOO_K}_ppoepochs_{$NUM_PPO_EPOCHS}_minibatches_${NUM_MINI_BATCHES}_episodes_${TOTAL_EPISODES}"
+  RUN_IDENTIFIER="leobianco/HALOMI_PERL_seed_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lora_${LORA_RANK}_lr_${LEARNING_RATE}_klcoeff_${KL_COEFF}_rlook_${RLOO_K}_episodes_${TOTAL_EPISODES}"
 fi
 
 accelerate launch \
@@ -44,7 +44,7 @@ perl.py \
 --eval_steps 50 \
 --per_device_eval_batch_size 1 \
 --eval_accumulation_steps 1 \
---reward_model_path "leobianco/HALOMI_RM_seed_130104_epochs_1_lr_5e-5_lora_16" \
+--reward_model_path "leobianco/HALOMI_RM_seed_130104_epochs_1_lr_5e-5_lora_8" \
 --sft_model_path "leobianco/HALOMI_SFT_seed_130401_epochs_5_lr_5e-6_lora_4" \
 --r $LORA_RANK \
 --kl_coef $KL_COEFF \

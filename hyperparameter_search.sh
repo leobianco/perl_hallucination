@@ -40,7 +40,7 @@ for NUM_TRAIN_EPOCHS in "${NEPOCHS[@]}"; do
 
 		  export KL_COEFF RLOO_K NUM_PPO_EPOCHS NUM_MINIBATCHES TOTAL_EPISODES
     	          # Append PERL-specific hyperparameters to run identifier.
-  	          export RUN_IDENTIFIER="${RUN_IDENTIFIER}_klcoeff_${KL_COEFF}_rlook_${RLOO_K}_ppoepochs_${NUM_PPO_EPOCHS}_minibatches_${NUM_MINIBATCHES}_episodes_${TOTAL_EPISODES}"
+  	          export RUN_IDENTIFIER="${RUN_IDENTIFIER}_klcoeff_${KL_COEFF}_rlook_${RLOO_K}_episodes_${TOTAL_EPISODES}"
                   echo "Run identifier: ${RUN_IDENTIFIER}"
                   /bin/bash ./perl.sh
                   /bin/bash ./evaluator.sh

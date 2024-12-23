@@ -60,6 +60,11 @@ def main():
     .select_columns(["input_ids", "attention_mask"])
   )
 
+  perl_data_halomi["test"] = (
+    perl_data_halomi["test"]
+    .select_columns(["input_ids", "attention_mask"])
+  )
+
   ################
   # REWARD MODEL #
   ################
