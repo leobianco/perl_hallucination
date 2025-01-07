@@ -3,11 +3,11 @@
 # Hyperparameters common to all
 declare -x -r USER="leobianco"
 declare -x -r DEEPSPEED_CONFIG="./deepspeed_config.yaml"
-declare -x -r EXPERIMENT_TYPE="HALOMI_PERL"
+declare -x -r EXPERIMENT_TYPE="HALOMI_RM"
 declare -x -i SEED=130104
-declare -x -a NEPOCHS=(1 3 5)
-declare -x -a LEARNING_RATES=(5e-5 5e-4)
-declare -x -a LORA_RANKS=(8 16)
+declare -x -a NEPOCHS=(10)
+declare -x -a LEARNING_RATES=(1e-6 5e-6 1e-5 5e-5 1e-4 5e-4 1e-3)
+declare -x -a LORA_RANKS=(4 8 16 32)
 
 # PERL specific hyperparameters
 declare -x -a KL_COEFFS=(5e-2)
