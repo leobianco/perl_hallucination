@@ -11,7 +11,7 @@ else
   LEARNING_RATE=1e-4
   LORA_RANK=8
   KL_COEFF=5e-2
-  RLOO_K=2
+  RLOO_K=4
   NUM_PPO_EPOCHS=4
   NUM_MINIBATCHES=1
   RUN_IDENTIFIER="leobianco/HALOMI_PERL_seed_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lora_${LORA_RANK}_lr_${LEARNING_RATE}_klcoeff_${KL_COEFF}_rlook_${RLOO_K}_ppoepochs_${NUM_PPO_EPOCHS}_minibatches_${NUM_MINIBATCHES}"
@@ -36,7 +36,7 @@ perl.py \
 --num_train_epochs $NUM_TRAIN_EPOCHS \
 --learning_rate $LEARNING_RATE \
 --weight_decay 0.0 \
---per_device_train_batch_size 1 \
+--per_device_train_batch_size 4 \
 --gradient_accumulation_steps 1 \
 --do_eval True \
 --eval_strategy "steps" \
@@ -50,5 +50,4 @@ perl.py \
 --rloo_k $RLOO_K \
 --num_ppo_epochs $NUM_PPO_EPOCHS \
 --num_mini_batches $NUM_MINIBATCHES \
---total_episodes $TOTAL_EPISODES \
 --missing_eos_penalty 1.0 \
