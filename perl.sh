@@ -7,15 +7,14 @@ else
   # If single-run, set variables here.
   SEED=130104
   DEEPSPEED_CONFIG="./deepspeed_config.yaml"
-  NUM_TRAIN_EPOCHS=5
+  NUM_TRAIN_EPOCHS=3
   LEARNING_RATE=1e-4
-  LORA_RANK=4
+  LORA_RANK=8
   KL_COEFF=5e-2
   RLOO_K=2
-  NUM_PPO_EPOCHS=2
-  NUM_MINIBATCHES=2
-  TOTAL_EPISODES=5000
-  RUN_IDENTIFIER="leobianco/HALOMI_PERL_seed_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lora_${LORA_RANK}_lr_${LEARNING_RATE}_klcoeff_${KL_COEFF}_rlook_${RLOO_K}_episodes_${TOTAL_EPISODES}"
+  NUM_PPO_EPOCHS=4
+  NUM_MINIBATCHES=1
+  RUN_IDENTIFIER="leobianco/HALOMI_PERL_seed_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lora_${LORA_RANK}_lr_${LEARNING_RATE}_klcoeff_${KL_COEFF}_rlook_${RLOO_K}_ppoepochs_${NUM_PPO_EPOCHS}_minibatches_${NUM_MINIBATCHES}"
 fi
 
 accelerate launch \
@@ -44,8 +43,8 @@ perl.py \
 --eval_steps 50 \
 --per_device_eval_batch_size 1 \
 --eval_accumulation_steps 1 \
---reward_model_path "leobianco/HALOMI_RM_seed_130104_epochs_1_lr_5e-5_lora_8" \
---sft_model_path "leobianco/HALOMI_SFT_seed_130401_epochs_5_lr_5e-6_lora_4" \
+--reward_model_path "leobianco/HALOMI_RM_seed_130104_epochs_5_lr_1e-3_lora_8" \
+--sft_model_path "leobianco/HALOMI_SFT_seed_130401_epochs_3_lr_1e-6_lora_8" \
 --r $LORA_RANK \
 --kl_coef $KL_COEFF \
 --rloo_k $RLOO_K \
