@@ -11,7 +11,7 @@ else
   LEARNING_RATE=1e-4
   LORA_RANK=8
   KL_COEFF=5e-2
-  RLOO_K=4
+  RLOO_K=1
   NUM_PPO_EPOCHS=4
   NUM_MINIBATCHES=1
   RUN_IDENTIFIER="leobianco/HALOMI_PERL_seed_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lora_${LORA_RANK}_lr_${LEARNING_RATE}_klcoeff_${KL_COEFF}_rlook_${RLOO_K}_ppoepochs_${NUM_PPO_EPOCHS}_minibatches_${NUM_MINIBATCHES}"
