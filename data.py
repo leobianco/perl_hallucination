@@ -170,11 +170,12 @@ def rm_prompt_halomi(entry, validation_test=False):
   """
 
   template = (
+    "<start_of_turn>user\n"
     "Original text in {src_lang}: {src_text}"
     "\nTranslated text in {tgt_lang}: {mt_text}"
     "\nQuestion: does the translated text contain more information than the "
     "original text?"
-    "\nAnswer:"  # It is important that there is no space here
+    "\nAnswer:<end_of_turn>\n<start_of_turn>model\n"
   )
 
   formatted_prompt = template.format(
@@ -235,10 +236,11 @@ def writer_prompt_halomi(entry, SFT=False):
   """
 
   template = (
+    "<start_of_turn>user\n"
     "Translate a text originally written in {src_lang} into {tgt_lang}. "
     "Generate only the translated text, and nothing else."
     "\nOriginal text: {src_text}"
-    "\nTranslated text: {ans}"
+    "\nTranslated text:<end_of_turn>\n<start_of_turn>model\n{ans}"
   )
 
   ans = entry["mt_text"] if SFT else ""
