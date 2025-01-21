@@ -31,7 +31,8 @@ writer_sft.py \
 --dataset_name "leobianco/writer_sft_halomi_processed" \
 --model_identifier "google/gemma-2-2b-it" \
 --do_train True \
---save_strategy "no" \
+--bf16 True \
+--save_strategy "epoch" \
 --num_train_epochs $NUM_TRAIN_EPOCHS \
 --learning_rate $LEARNING_RATE \
 --weight_decay 0.0 \

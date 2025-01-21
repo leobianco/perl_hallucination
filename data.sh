@@ -11,4 +11,4 @@ python -m IPython -i data.py \
 --perl_data_repo_id "okezieowen/english_to_spanish" \
 --perl_data_processed_repo_id "leobianco/perl_halomi_processed" \
 --perl_train_size 25000 \
---perl_validation_size 500 \
+--perl_validation_size 100 \

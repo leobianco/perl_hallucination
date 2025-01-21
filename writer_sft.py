@@ -11,35 +11,8 @@ from trl import (
   TrlParser, SFTConfig, SFTTrainer, DataCollatorForCompletionOnlyLM,
 )
 
-from data import *
+from data import formatting_prompts_func
 from utils import ScriptArguments, CustomLoraConfig
-
-
-def formatting_prompts_func(entry):
-  """Formatting function for training examples passed to SFTTrainer."""
-
-  template = (
-    "Translate a text originally written in {src_lang} into {tgt_lang}. "
-    "Generate only the translated text, and nothing else."
-    "\nOriginal text: {src_text}"
-  )
-
-  output_texts = []
-
-  for i in range(len(entry['src_text'])):
-    formatted_prompt = template.format(
-        src_lang=entry["src_lang"][i],
-        tgt_lang=entry["tgt_lang"][i],
-        src_text=entry["src_text"][i],
-    )
-
-    text = (
-        f"{formatted_prompt}\nTranslated text: {entry['completion'][i]}"
-    )
-
-    output_texts.append(text)
-
-  return output_texts
 
 
 def main():
@@ -62,11 +35,11 @@ def main():
 
   tokenizer = AutoTokenizer.from_pretrained(
     script_args.model_identifier,
-    padding_side="right",
+    padding_side="left",
   )
 
   # Train on completions only.
-  response_template = "\nTranslated text:"
+  response_template = "\nTranslated text:<end_of_turn>\n<start_of_turn>model\n"
   response_template_ids = tokenizer.encode(
       response_template,
       add_special_tokens=False

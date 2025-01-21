@@ -8,6 +8,7 @@ else
   SEED=130104
   DEEPSPEED_CONFIG="./deepspeed_config.yaml"
   TOTAL_EPISODES=25000
+  RESPONSE_LENGTH=128
   NUM_SAMPLE_GENERATIONS=20
   LEARNING_RATE=5e-6
   LORA_RANK=16
@@ -35,11 +36,13 @@ perl.py \
 --hub_model_id $RUN_IDENTIFIER \
 --dataset_name "leobianco/perl_halomi_processed" \
 --model_identifier "google/gemma-2-2b-it" \
+--stop_token "eos" \
 --do_train True \
 --save_strategy "steps" \
 --save_steps 15 \
 --total_episodes $TOTAL_EPISODES \
 --learning_rate $LEARNING_RATE \
+--response_length $RESPONSE_LENGTH \
 --weight_decay 0.0 \
 --gradient_accumulation_steps 1 \
 --per_device_eval_batch_size 1 \

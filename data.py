@@ -169,13 +169,22 @@ def rm_prompt_halomi(entry, validation_test=False):
   prompts for the reward model.
   """
 
+  # Old template (didn't match that of PERL)
+  # template = (
+  #   "<start_of_turn>user\n"
+  #   "Original text in {src_lang}: {src_text}"
+  #   "\nTranslated text in {tgt_lang}:<end_of_turn>\n<start_of_turn>model\n{mt_text}<end_of_turn>\n"
+  #   "<start_of_turn>user\nQuestion: does the translated text contain more information than the "
+  #   "original text?"
+  #   "\nAnswer:<end_of_turn>\n<start_of_turn>model\n"
+  # )
+
   template = (
     "<start_of_turn>user\n"
-    "Original text in {src_lang}: {src_text}"
-    "\nTranslated text in {tgt_lang}: {mt_text}"
-    "\nQuestion: does the translated text contain more information than the "
-    "original text?"
-    "\nAnswer:<end_of_turn>\n<start_of_turn>model\n"
+    "Translate a text originally written in {src_lang} into {tgt_lang}. "
+    "Generate only the translated text, and nothing else."
+    "\nOriginal text: {src_text}"
+    "\nTranslated text:<end_of_turn>\n<start_of_turn>model\n{mt_text}<end_of_turn><eos>"
   )
 
   formatted_prompt = template.format(
@@ -243,7 +252,7 @@ def writer_prompt_halomi(entry, SFT=False):
     "\nTranslated text:<end_of_turn>\n<start_of_turn>model\n{ans}"
   )
 
-  ans = entry["mt_text"] if SFT else ""
+  ans = (entry["mt_text"] + "<end_of_turn><eos>") if SFT else ""
 
   formatted_prompt = template.format(
       src_lang=entry["src_lang"],
@@ -257,35 +266,11 @@ def writer_prompt_halomi(entry, SFT=False):
   return entry
 
 
-def process_halomi_data_for_writer_sft(halomi_data):
-  """Check out 
-  https://huggingface.co/docs/trl/en/sft_trainer#dataset-format-support
-  to see the data format for the SFTTrainer. It just requires a 'prompt' and a 
-  'completion' column in the dataset, no need for tokenizing directly.
-  """
-
-  # Filter for examples without hallucinations and without coverage errors 
-  writer_sft_data = halomi_data.filter(
-    lambda example:
-    (example['class_hall']=='No' and example['class_omit']=='No')
-  )
-  
-  # Create 'prompt' column
-  writer_sft_data = writer_sft_data.map(writer_prompt_halomi)
-  
-  # Create 'completion' column
-  writer_sft_data = writer_sft_data.rename_column('mt_text', 'completion')
-  
-  # Keep only 'prompt' and 'completion' columns --> breaks train on completion
-  # writer_sft_data = writer_sft_data.select_columns(['prompt', 'completion'])
-
-  return writer_sft_data
-
-
 def formatting_prompts_func(entry):
-  """Weird function required by the SFTTrainer."""
+  """Formatting function for SFTTrainer. Imported in writer_sft.py."""
 
   template = (
+    "<start_of_turn>user\n"
     "Translate a text originally written in {src_lang} into {tgt_lang}. "
     "Generate only the translated text, and nothing else."
     "\nOriginal text: {src_text}"
@@ -302,7 +287,7 @@ def formatting_prompts_func(entry):
     )
 
     text = (
-        f"{formatted_prompt}\nTranslated text: {entry['completion'][i]}"
+        f"{formatted_prompt}\nTranslated text:<end_of_turn>\n<start_of_turn>model\n{entry['mt_text'][i]}"
     )
 
     output_texts.append(text)
@@ -479,8 +464,10 @@ if __name__=="__main__":
   )
 
   # Writer SFT data. 
-  writer_sft_processed = process_halomi_data_for_writer_sft(
-    data_halomi_processed
+  # Filter for examples without hallucinations and without coverage errors 
+  writer_sft_processed = data_halomi_processed.filter(
+    lambda example:
+    (example['class_hall']=='No' and example['class_omit']=='No')
   )
 
   writer_sft_processed.push_to_hub(
