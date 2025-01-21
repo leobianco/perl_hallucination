@@ -24,7 +24,7 @@ model.eval()
 # Config
 generation_config = GenerationConfig(
   max_new_tokens=53,
-  temperature=(1 + 1e-7),
+  temperature=(5e-2 + 1e-7),
   top_k=0.0,
   top_p=1.0,
   do_sample=True,
@@ -37,4 +37,3 @@ output = model.generate(
   return_dict_in_generate=True,
   output_scores=True,
 )
-
