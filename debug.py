@@ -11,7 +11,7 @@ query = queries[:5]
 # Load model + tokenizer
 tokenizer = AutoTokenizer.from_pretrained(
   "google/gemma-2-2b-it",
-  padding_side="right",
+  padding_side="left",
 )
 
 model = AutoModelForCausalLM.from_pretrained(

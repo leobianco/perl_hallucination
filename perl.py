@@ -11,12 +11,12 @@ from transformers import (
 )
 from trl import ModelConfig, RLOOConfig, RLOOTrainer
 from peft import (
-  AutoPeftModelForSequenceClassification, AutoPeftModelForCausalLM
+  AutoPeftModelForSequenceClassification, AutoPeftModelForCausalLM,
+  get_peft_model
 )
 
 from data import *
-from writer_sft import CustomLoraConfig
-from utils import ScriptArguments
+from utils import ScriptArguments, CustomLoraConfig
 
 
 def main():
@@ -98,11 +98,18 @@ def main():
     attn_implementation="eager",
   )
   
-  policy = AutoPeftModelForCausalLM.from_pretrained(
+  # policy = AutoPeftModelForCausalLM.from_pretrained(
+  #   training_args.sft_model_path,
+  #   is_trainable=True,
+  #   attn_implementation="eager",
+  # )
+
+  policy = AutoModelForCausalLM.from_pretrained(
     training_args.sft_model_path,
-    is_trainable=True,
     attn_implementation="eager",
   )
+
+  policy = get_peft_model(policy, peft_args)
 
   ###########
   # TRAINER #

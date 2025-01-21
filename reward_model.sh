@@ -7,9 +7,9 @@ else
   # If single-run, set variables here.
   DEEPSPEED_CONFIG="./deepspeed_config.yaml"
   SEED=130104
-  NUM_TRAIN_EPOCHS=5
-  LEARNING_RATE=1e-4
-  LORA_RANK=4
+  NUM_TRAIN_EPOCHS=3
+  LEARNING_RATE=1e-3
+  LORA_RANK=8
   RUN_IDENTIFIER="leobianco/HALOMI_RM_seed_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_lora_${LORA_RANK}"
 fi
 

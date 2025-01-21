@@ -7,14 +7,18 @@ else
   # If single-run, set variables here.
   SEED=130104
   DEEPSPEED_CONFIG="./deepspeed_config.yaml"
-  NUM_TRAIN_EPOCHS=3
-  LEARNING_RATE=1e-4
-  LORA_RANK=8
-  KL_COEFF=5e-2
-  RLOO_K=1
+  TOTAL_EPISODES=25000
+  NUM_SAMPLE_GENERATIONS=20
+  LEARNING_RATE=5e-6
+  LORA_RANK=16
+  KL_COEFF=3e-2
+  RLOO_K=2
   NUM_PPO_EPOCHS=4
-  NUM_MINIBATCHES=1
-  RUN_IDENTIFIER="leobianco/HALOMI_PERL_seed_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lora_${LORA_RANK}_lr_${LEARNING_RATE}_klcoeff_${KL_COEFF}_rlook_${RLOO_K}_ppoepochs_${NUM_PPO_EPOCHS}_minibatches_${NUM_MINIBATCHES}"
+  NUM_MINIBATCHES=16
+  PER_DEVICE_TRAIN_BATCH_SIZE=2
+  LOCAL_ROLLOUT_FORWARD_BATCH_SIZE=8
+  TEMPERATURE=7e-1
+  RUN_IDENTIFIER="leobianco/HALOMI_PERL_seed_${SEED}_episodes_${TOTAL_EPISODES}_lora_${LORA_RANK}_lr_${LEARNING_RATE}_klcoeff_${KL_COEFF}_rlook_${RLOO_K}_ppoepochs_${NUM_PPO_EPOCHS}"
 fi
 
 accelerate launch \
@@ -32,22 +36,23 @@ perl.py \
 --dataset_name "leobianco/perl_halomi_processed" \
 --model_identifier "google/gemma-2-2b-it" \
 --do_train True \
---save_strategy "no" \
---num_train_epochs $NUM_TRAIN_EPOCHS \
+--save_strategy "steps" \
+--save_steps 15 \
+--total_episodes $TOTAL_EPISODES \
 --learning_rate $LEARNING_RATE \
 --weight_decay 0.0 \
---per_device_train_batch_size 4 \
 --gradient_accumulation_steps 1 \
---do_eval True \
---eval_strategy "steps" \
---eval_steps 50 \
 --per_device_eval_batch_size 1 \
 --eval_accumulation_steps 1 \
---reward_model_path "leobianco/HALOMI_RM_seed_130104_epochs_5_lr_1e-3_lora_8" \
---sft_model_path "leobianco/HALOMI_SFT_seed_130401_epochs_3_lr_1e-6_lora_8" \
+--reward_model_path "leobianco/HALOMI_RM_seed_130104_epochs_3_lr_1e-3_lora_8" \
+--sft_model_path "google/gemma-2-2b-it" \
 --r $LORA_RANK \
 --kl_coef $KL_COEFF \
 --rloo_k $RLOO_K \
 --num_ppo_epochs $NUM_PPO_EPOCHS \
 --num_mini_batches $NUM_MINIBATCHES \
+--per_device_train_batch_size $PER_DEVICE_TRAIN_BATCH_SIZE \
+--local_rollout_forward_batch_size $LOCAL_ROLLOUT_FORWARD_BATCH_SIZE \
 --missing_eos_penalty 1.0 \
+--temperature $TEMPERATURE \
+--num_sample_generations $NUM_SAMPLE_GENERATIONS

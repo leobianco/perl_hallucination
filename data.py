@@ -439,7 +439,7 @@ if __name__=="__main__":
   # Tokenizer
   tokenizer = AutoTokenizer.from_pretrained(
     script_args.tokenizer_model,
-    padding_side="right",
+    padding_side="left",  # Pay close attention to this argument...
   )
 
   # Halomi data.
