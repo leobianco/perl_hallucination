@@ -181,3 +181,6 @@ checkpoints/
 *.synctex.gz
 *.dvi
 *.zip
+
+# Linting results
+errors.err
