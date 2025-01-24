@@ -134,16 +134,16 @@ def evaluator_prompt_halomi(entry, fewshot_examples=None, use_mt_text=False):
   """
 
   preamble = (
-    "The following are examples of an expert translator and linguist noting "
-    "when the Translation of an Original text contains additional information "
-    "that is not part of the original text.\n\n"
+    "<start_of_turn>user\nThe following are examples of an expert translator " "and linguist noting when the Translation of an Original text contains " "additional information that is not part of the original text.<end_of_turn>\n"
   )
 
   template = (
+    "<start_of_turn>user\n"
     "Original text in {src_lang}:{src_text}"
     "\nTranslated text in {tgt_lang}:{mt_text}"
     "\nExpert translator and linguist review: The Translated text contains "
-    "additional information with respect to the Original text (Yes/No):{ans}"
+    "additional information with respect to the Original text (Yes/No):"
+    "<end_of_turn>\n<start_of_turn>model\n{ans}"
   )
 
   prompt = preamble
@@ -171,7 +171,7 @@ def evaluator_prompt_halomi(entry, fewshot_examples=None, use_mt_text=False):
         ans=fewshot_example["class_hall"],
       )
 
-      prompt += fewshot_prompt + "\n\n"
+      prompt += fewshot_prompt + "<end_of_turn>\n"
 
     prompt += formatted_prompt
 
