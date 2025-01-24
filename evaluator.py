@@ -424,19 +424,7 @@ if __name__=="__main__":
         sampling_params
       )
 
-    print("LEO: debug - vLLM outputted generations")
     generations = [output.outputs[0].text for output in outputs]
-    print(generations[0])
-
-    print("LEO: debug - vLLM outputted indices")
-    indices = [output.outputs[0].token_ids for output in outputs]
-    print(indices[0])
-    
-    print("LEO: debug - truncated indices")
-    print(truncate_response(107, 0, indices[0]))
-
-    print("LEO: debug - truncated indices decoded")
-    print(tokenizer.decode(truncate_response(107, 0, indices[0])))
 
     filepath = f"logs/{name_for_saving}/generations.txt"
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
