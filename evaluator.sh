@@ -7,14 +7,14 @@ then
 else
   # If single-run (copy and paste identifier)
   SEED=130104
-  RUN_IDENTIFIER="google/gemma-2-2b-it"
+  RUN_IDENTIFIER="leobianco/HALOMI_SFT_seed_130401_epochs_3_lr_5e-5_lora_8"
 fi
 
 BASE_MODEL="google/gemma-2-2b-it"
 EVALUATOR_MODEL="google/gemma-2-27b-it"
 NUM_FEWSHOT=4
 EVAL_EVALUATOR="False"
-THRESHOLD=0.144
+THRESHOLD=0.15
 TEMPERATURE=1
 
 echo "Calling the evaluator script..."
