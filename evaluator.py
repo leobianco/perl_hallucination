@@ -52,6 +52,7 @@ from transformers import (
   HfArgumentParser, AutoModelForCausalLM, AutoTokenizer
 )
 from trl import BaseJudge
+from trl.trainer.utils import truncate_response
 
 from data import process_data_for_perl
 
@@ -299,6 +300,7 @@ if __name__=="__main__":
         script_args.evaluator_model,
         device_map="auto",
         attn_implementation="eager",
+        torch_dtype=torch.bfloat16,
     )
     evaluator.eval()
 
@@ -397,6 +399,7 @@ if __name__=="__main__":
       model=script_args.writer_model_base,
       enable_lora=enable_lora,
       max_lora_rank=64,  # currently maximum available in vLLM.
+      dtype="bfloat16",
     )
 
     # Generate completions with writer.
@@ -421,7 +424,19 @@ if __name__=="__main__":
         sampling_params
       )
 
+    print("LEO: debug - vLLM outputted generations")
     generations = [output.outputs[0].text for output in outputs]
+    print(generations[0])
+
+    print("LEO: debug - vLLM outputted indices")
+    indices = [output.outputs[0].token_ids for output in outputs]
+    print(indices[0])
+    
+    print("LEO: debug - truncated indices")
+    print(truncate_response(107, 0, indices[0]))
+
+    print("LEO: debug - truncated indices decoded")
+    print(tokenizer.decode(truncate_response(107, 0, indices[0])))
 
     filepath = f"logs/{name_for_saving}/generations.txt"
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
