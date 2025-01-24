@@ -429,8 +429,8 @@ if __name__=="__main__":
     filepath = f"logs/{name_for_saving}/generations.txt"
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     with open(filepath, "w") as f:
-      for generation in generations:
-        f.write(generation + "\n----------\n")
+      for idx, generation in enumerate(generations):
+        f.write(f"\n{idx}. ----------\n" + generation)
     print(f"Generations saved to {filepath}")
   
     # Add generations to the val_data under a column named "completion".
@@ -464,8 +464,8 @@ if __name__=="__main__":
     filepath = f"logs/{name_for_saving}/evaluator_prompts.txt"
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     with open(filepath, "w") as f:
-      for prompt in val_data["evaluator_prompt"]:
-        f.write(prompt + "\n----------\n")
+      for idx, prompt in enumerate(val_data["evaluator_prompt"]):
+        f.write(f"\n{idx}. ----------\n" + prompt)
     print(f"Evaluator prompts saved to {filepath}")
 
     scores = evaluator_score(
@@ -489,8 +489,8 @@ if __name__=="__main__":
     filepath = f"logs/{name_for_saving}/scores.txt"
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     with open(filepath, "w") as f:
-      for score in scores:
-        f.write("{:.3f}".format(score.item()) + "\n")
+      for idx, score in enumerate(scores):
+        f.write(f"\n{idx}.----------\n" + "{:.3f}".format(score.item()))
       f.write(
         f"Rate of hallucination (threshold = {script_args.threshold}):\n" +
         str(rate_hallucination.item())
