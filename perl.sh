@@ -39,7 +39,7 @@ perl.py \
 --stop_token "eos" \
 --do_train True \
 --save_strategy "steps" \
---save_steps 15 \
+--save_steps 150 \
 --total_episodes $TOTAL_EPISODES \
 --learning_rate $LEARNING_RATE \
 --response_length $RESPONSE_LENGTH \
