@@ -1,163 +1,156 @@
-""""
+""" "
 TODO: write proper docstring.
 TODO: clean imports.
 """
 
-
 import os
-import numpy as np
-import torch
-from dataclasses import dataclass, field
-from typing import Optional
-from sklearn.metrics import roc_auc_score
 
-from datasets import load_dataset
-from transformers import (
-  AutoModelForSequenceClassification, HfArgumentParser, TrainingArguments, 
-  set_seed, AutoTokenizer, Trainer, TrainerCallback, 
-  DataCollatorForLanguageModeling,
-)
-from peft import LoraConfig, PeftModel, get_peft_model, TaskType
 import evaluate
+import numpy as np
+from datasets import load_dataset
+from peft import PeftModel, get_peft_model
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    HfArgumentParser,
+    Trainer,
+    TrainingArguments,
+    set_seed,
+)
 
 from data import *
-from utils import ScriptArguments, CustomLoraConfig
+from utils import CustomLoraConfig, ScriptArguments
 
 
 def main():
+    #########
+    # SETUP #
+    #########
 
-  #########
-  # SETUP #
-  #########
-
-  parser = HfArgumentParser(
-    (ScriptArguments, TrainingArguments, CustomLoraConfig)
-  )
-
-  (
-    script_args,
-    training_args,
-    peft_args,
-  ) = parser.parse_args_into_dataclasses()
-
-  name_for_saving = training_args.run_name.split("/")[1]
-
-  # Set seed before instantiating the model, for reproducibility.
-  set_seed(training_args.seed)
-
-  tokenizer = AutoTokenizer.from_pretrained(
-    script_args.model_identifier,
-    padding_side="right",
-  )
-
-  ########
-  # DATA #
-  ########
-
-  rm_data_halomi = load_dataset(script_args.dataset_name)
-
-  id2label = {
-    0: 'Yes',
-    1: 'No',
-  }
-  
-  label2id = {
-    'Yes': 0,
-    'No': 1,
-  }
-
-  #########
-  # MODEL #
-  #########
-
-  reward_model = AutoModelForSequenceClassification.from_pretrained(
-      script_args.model_identifier,
-      num_labels=2,
-      id2label=id2label,
-      label2id=label2id,
-      attn_implementation="eager",
-  )
-
-  if training_args.resume_from_checkpoint is not None:
-    reward_model = PeftModel.from_pretrained(
-      reward_model, 
-      training_args.resume_from_checkpoint
+    parser = HfArgumentParser(
+        (ScriptArguments, TrainingArguments, CustomLoraConfig)
     )
 
-  reward_model = get_peft_model(reward_model, peft_args)
+    (
+        script_args,
+        training_args,
+        peft_args,
+    ) = parser.parse_args_into_dataclasses()
 
-  ####################
-  # EVALUATION SETUP #
-  ####################
+    name_for_saving = training_args.run_name.split("/")[1]
 
-  metric = evaluate.load("roc_auc")
+    # Set seed before instantiating the model, for reproducibility.
+    set_seed(training_args.seed)
 
-  def compute_metrics(eval_preds):
-    """Recall that whereas logits where torch tensors before, now they are numpy 
-    arrays.
-
-    logits here are the processed_logits from the process_logits_for_evaluation 
-    function.
-
-    metric is a 'global' function inside the scope of main.
-    """
-
-    # Compute scores
-    logits = eval_preds.predictions
-    yes_scores = np.exp(logits)[:, 0]
-    no_scores = np.exp(logits)[:, 1]
-    scores = no_scores / (yes_scores + no_scores)
-
-    # Compute ground truth
-    label_ids = eval_preds.label_ids
-
-    metrics = metric.compute(
-      references=label_ids,
-      prediction_scores=scores
+    tokenizer = AutoTokenizer.from_pretrained(
+        script_args.model_identifier,
+        padding_side="right",
     )
 
-    return metrics
+    ########
+    # DATA #
+    ########
+
+    rm_data_halomi = load_dataset(script_args.dataset_name)
+
+    id2label = {
+        0: "Yes",
+        1: "No",
+    }
+
+    label2id = {
+        "Yes": 0,
+        "No": 1,
+    }
+
+    #########
+    # MODEL #
+    #########
+
+    reward_model = AutoModelForSequenceClassification.from_pretrained(
+        script_args.model_identifier,
+        num_labels=2,
+        id2label=id2label,
+        label2id=label2id,
+        attn_implementation="eager",
+    )
+
+    if training_args.resume_from_checkpoint is not None:
+        reward_model = PeftModel.from_pretrained(
+            reward_model, training_args.resume_from_checkpoint
+        )
+
+    reward_model = get_peft_model(reward_model, peft_args)
+
+    ####################
+    # EVALUATION SETUP #
+    ####################
+
+    metric = evaluate.load("roc_auc")
+
+    def compute_metrics(eval_preds):
+        """Recall that whereas logits where torch tensors before, now they are numpy
+        arrays.
+
+        logits here are the processed_logits from the process_logits_for_evaluation
+        function.
+
+        metric is a 'global' function inside the scope of main.
+        """
+
+        # Compute scores
+        logits = eval_preds.predictions
+        yes_scores = np.exp(logits)[:, 0]
+        no_scores = np.exp(logits)[:, 1]
+        scores = no_scores / (yes_scores + no_scores)
+
+        # Compute ground truth
+        label_ids = eval_preds.label_ids
+
+        metrics = metric.compute(references=label_ids, prediction_scores=scores)
+
+        return metrics
+
+    ###########
+    # TRAINER #
+    ###########
+
+    trainer = Trainer(
+        model=reward_model,
+        args=training_args,
+        train_dataset=rm_data_halomi["train"],
+        eval_dataset=rm_data_halomi["test"],
+        processing_class=tokenizer,
+        compute_metrics=compute_metrics,
+    )
+
+    ############
+    # TRAINING #
+    ############
+
+    if training_args.do_train:
+        trainer.train(
+            resume_from_checkpoint=training_args.resume_from_checkpoint
+        )
+        reward_model.save_pretrained(f"checkpoints/{name_for_saving}/")
+
+        if training_args.push_to_hub:
+            reward_model.push_to_hub(training_args.hub_model_id)
+
+    ##############
+    # EVALUATION #
+    ##############
+
+    if training_args.do_eval:
+        trainer.evaluate()
+
+    filepath = f"logs/{name_for_saving}/logs.txt"
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, "w") as f:
+        for d in trainer.state.log_history:
+            f.write(str(d) + "\n----------\n")
+    print(f"Logs saved to {filepath}")
 
 
-  ###########
-  # TRAINER #
-  ###########
-
-  trainer = Trainer(
-    model=reward_model,
-    args=training_args,
-    train_dataset=rm_data_halomi['train'],
-    eval_dataset=rm_data_halomi['test'],
-    processing_class=tokenizer,
-    compute_metrics=compute_metrics,
-  )
-
-  ############
-  # TRAINING #
-  ############
-
-  if training_args.do_train:
-    trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
-    reward_model.save_pretrained(f"checkpoints/{name_for_saving}/")
-
-    if training_args.push_to_hub:
-      reward_model.push_to_hub(training_args.hub_model_id)
-
-  ##############
-  # EVALUATION #
-  ##############
-
-  if training_args.do_eval:
-    trainer.evaluate()
-  
-  filepath = f"logs/{name_for_saving}/logs.txt"
-  os.makedirs(os.path.dirname(filepath), exist_ok=True)
-  with open(filepath, "w") as f:
-    for d in trainer.state.log_history:
-      f.write(str(d) + "\n----------\n")
-  print(f"Logs saved to {filepath}")
-
-
-if __name__=="__main__":
-  main()
-  
+if __name__ == "__main__":
+    main()

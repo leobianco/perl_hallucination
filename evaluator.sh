@@ -1,8 +1,7 @@
 #!/bin/bash
 
 # If calling from hyperparameter search script, import hyperparameters
-if [ $SHLVL -gt 2 ]
-then
+if [ $SHLVL -gt 2 ]; then
   :
 else
   # If single-run (copy and paste identifier)
@@ -20,12 +19,12 @@ TEMPERATURE=1
 echo "Calling the evaluator script..."
 
 python3 evaluator.py \
-  --seed $SEED \
+  --seed "$SEED" \
   --writer_model_base ${BASE_MODEL} \
-  --writer_model_lora ${RUN_IDENTIFIER} \
+  --writer_model_lora "${RUN_IDENTIFIER}" \
   --max_tokens 256 \
   --evaluator_model ${EVALUATOR_MODEL} \
   --num_fewshot_examples $NUM_FEWSHOT \
   --evaluate_evaluator $EVAL_EVALUATOR \
   --threshold $THRESHOLD \
-  --temperature $TEMPERATURE \
+  --temperature $TEMPERATURE

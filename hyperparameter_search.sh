@@ -33,18 +33,18 @@ for NUM_TRAIN_EPOCHS in "${NEPOCHS[@]}"; do
       elif [ "${EXPERIMENT_TYPE}" = "HALOMI_PERL" ]; then
         for KL_COEFF in "${KL_COEFFS[@]}"; do
           for RLOO_K in "${RLOO_K_GRID[@]}"; do
-            for NUM_PPO_EPOCHS in "${NUM_PPO_EPOCHS_GRID[@]}"; do 
+            for NUM_PPO_EPOCHS in "${NUM_PPO_EPOCHS_GRID[@]}"; do
               for NUM_MINIBATCHES in "${NUM_MINIBATCHES_GRID[@]}"; do
                 export KL_COEFF RLOO_K NUM_PPO_EPOCHS NUM_MINIBATCHES TOTAL_EPISODES
-    	          # Append PERL-specific hyperparameters to run identifier.
+                # Append PERL-specific hyperparameters to run identifier.
                 export RUN_IDENTIFIER="${RUN_IDENTIFIER}_klcoeff_${KL_COEFF}_rlook_${RLOO_K}_ppoepochs_${NUM_PPO_EPOCHS}_minibatches_${NUM_MINIBATCHES}"
-                  echo "Run identifier: ${RUN_IDENTIFIER}"
-                  /bin/bash ./perl.sh
-                  /bin/bash ./evaluator.sh
-                done
+                echo "Run identifier: ${RUN_IDENTIFIER}"
+                /bin/bash ./perl.sh
+                /bin/bash ./evaluator.sh
               done
             done
           done
+        done
       fi
     done
   done

@@ -14,32 +14,32 @@ else
 fi
 
 accelerate launch \
---config_file=${DEEPSPEED_CONFIG} \
-reward_model.py \
--- \
---seed $SEED \
---report_to "wandb" \
---run_name $RUN_IDENTIFIER \
---logging_steps 5 \
---output_dir "./checkpoints/halomi/reward_model/${RUN_IDENTIFIER}" \
---overwrite_output_dir True \
---push_to_hub True \
---hub_model_id $RUN_IDENTIFIER \
---dataset_name "leobianco/rm_halomi_processed" \
---model_identifier "google/gemma-2-2b-it" \
---do_train True \
---bf16 True \
---save_strategy "epoch" \
---num_train_epochs $NUM_TRAIN_EPOCHS \
---learning_rate $LEARNING_RATE \
---weight_decay 0.0 \
---per_device_train_batch_size 1 \
---gradient_accumulation_steps 1 \
---do_eval True \
---eval_on_start True \
---eval_strategy "steps" \
---eval_steps 20 \
---per_device_eval_batch_size 1 \
---eval_accumulation_steps 1 \
---task_type "SEQ_CLS" \
---r $LORA_RANK \
+  --config_file="${DEEPSPEED_CONFIG}" \
+  reward_model.py \
+  -- \
+  --seed "$SEED" \
+  --report_to "wandb" \
+  --run_name "$RUN_IDENTIFIER" \
+  --logging_steps 5 \
+  --output_dir "./checkpoints/halomi/reward_model/${RUN_IDENTIFIER}" \
+  --overwrite_output_dir True \
+  --push_to_hub True \
+  --hub_model_id "$RUN_IDENTIFIER" \
+  --dataset_name "leobianco/rm_halomi_processed" \
+  --model_identifier "google/gemma-2-2b-it" \
+  --do_train True \
+  --bf16 True \
+  --save_strategy "epoch" \
+  --num_train_epochs "$NUM_TRAIN_EPOCHS" \
+  --learning_rate "$LEARNING_RATE" \
+  --weight_decay 0.0 \
+  --per_device_train_batch_size 1 \
+  --gradient_accumulation_steps 1 \
+  --do_eval True \
+  --eval_on_start True \
+  --eval_strategy "steps" \
+  --eval_steps 20 \
+  --per_device_eval_batch_size 1 \
+  --eval_accumulation_steps 1 \
+  --task_type "SEQ_CLS" \
+  --r "$LORA_RANK"
