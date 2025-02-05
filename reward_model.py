@@ -23,10 +23,8 @@ from utils import CustomLoraConfig, ScriptArguments
 
 
 def main():
-    #########
-    # SETUP #
-    #########
-
+    
+    # SETUP
     parser = HfArgumentParser(
         (ScriptArguments, TrainingArguments, CustomLoraConfig)
     )
@@ -39,19 +37,16 @@ def main():
 
     name_for_saving = training_args.run_name.split("/")[1]
 
-    # Set seed before instantiating the model, for reproducibility.
     set_seed(training_args.seed)
 
     tokenizer = AutoTokenizer.from_pretrained(
-        script_args.model_identifier,
-        padding_side="right",
+        script_args.model_repo_id,
+        padding_side="left",
     )
 
-    ########
-    # DATA #
-    ########
 
-    rm_data_halomi = load_dataset(script_args.dataset_name)
+    # DATA
+    rm_data_halomi = load_dataset(script_args.dataset_repo_id)
 
     id2label = {
         0: "Yes",
@@ -63,12 +58,10 @@ def main():
         "No": 1,
     }
 
-    #########
-    # MODEL #
-    #########
 
+    # MODEL
     reward_model = AutoModelForSequenceClassification.from_pretrained(
-        script_args.model_identifier,
+        script_args.model_repo_id,
         num_labels=2,
         id2label=id2label,
         label2id=label2id,
@@ -82,17 +75,15 @@ def main():
 
     reward_model = get_peft_model(reward_model, peft_args)
 
-    ####################
-    # EVALUATION SETUP #
-    ####################
 
+    # EVALUATION SETUP
     metric = evaluate.load("roc_auc")
 
     def compute_metrics(eval_preds):
-        """Recall that whereas logits where torch tensors before, now they are numpy
-        arrays.
+        """Recall that whereas logits where torch tensors before, now they are 
+        numpy arrays.
 
-        logits here are the processed_logits from the process_logits_for_evaluation
+        logits here are the processed_logits from the process_logits_for_evaluation 
         function.
 
         metric is a 'global' function inside the scope of main.
@@ -111,10 +102,8 @@ def main():
 
         return metrics
 
-    ###########
-    # TRAINER #
-    ###########
 
+    # TRAINING
     trainer = Trainer(
         model=reward_model,
         args=training_args,
@@ -123,10 +112,6 @@ def main():
         processing_class=tokenizer,
         compute_metrics=compute_metrics,
     )
-
-    ############
-    # TRAINING #
-    ############
 
     if training_args.do_train:
         trainer.train(
@@ -137,10 +122,8 @@ def main():
         if training_args.push_to_hub:
             reward_model.push_to_hub(training_args.hub_model_id)
 
-    ##############
-    # EVALUATION #
-    ##############
 
+    # EVALUATION
     if training_args.do_eval:
         trainer.evaluate()
 

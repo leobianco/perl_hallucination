@@ -1,15 +1,36 @@
 #!/usr/bin/env bash
-python -m IPython -i data.py \
-    -- \
-    --seed 12345 \
-    --tokenizer_model "google/gemma-2-2b-it" \
-    --max_seq_length 512 \
-    --halomi_repo_id "leobianco/halomi" \
-    --halomi_processed_repo_id "leobianco/halomi_processed" \
-    --rm_halomi_processed_repo_id "leobianco/rm_halomi_processed" \
-    --rm_validation_size 0.2 \
-    --writer_sft_halomi_processed_repo_id "leobianco/writer_sft_halomi_processed" \
-    --perl_data_repo_id "okezieowen/english_to_spanish" \
-    --perl_data_processed_repo_id "leobianco/perl_halomi_processed" \
-    --perl_train_size 25000 \
-    --perl_validation_size 100
+
+DATASET="$1"
+USER="leobianco"
+SEED=12345
+TOKENIZER_MODEL="google/gemma-2-2b-it"
+MAX_SEQ_LENGTH=512
+RAW_REPO_ID="${USER}/${DATASET}_raw"
+PROCESSED_REPO_ID="${USER}/${DATASET}_processed"
+RM_PROCESSED_REPO_ID="${USER}/${DATASET}_rm_processed"
+RM_VALIDATION_SIZE=0.2
+WRITER_SFT_PROCESSED_REPO_ID="${USER}/${DATASET}_writer_sft_processed"
+PERL_RAW_REPO_ID="okezieowen/english_to_spanish"
+PERL_PROCESSED_REPO_ID="${USER}/${DATASET}_perl_processed"
+PERL_TRAIN_SIZE=25000
+PERL_VALIDATION_SIZE=100
+
+if [ "$DATASET" != "halomi" ] && [ "$DATASET" != "npov" ]; then
+    echo "Invalid dataset name"
+    exit 1
+fi
+
+python data.py \
+    --dataset "$DATASET" \
+    --seed "$SEED" \
+    --tokenizer_model "$TOKENIZER_MODEL" \
+    --max_seq_length "$MAX_SEQ_LENGTH" \
+    --raw_repo_id "$RAW_REPO_ID" \
+    --processed_repo_id "$PROCESSED_REPO_ID" \
+    --rm_processed_repo_id "$RM_PROCESSED_REPO_ID" \
+    --rm_validation_size "$RM_VALIDATION_SIZE" \
+    --writer_sft_processed_repo_id "$WRITER_SFT_PROCESSED_REPO_ID" \
+    --perl_raw_repo_id "$PERL_RAW_REPO_ID" \
+    --perl_processed_repo_id "$PERL_PROCESSED_REPO_ID" \
+    --perl_train_size "$PERL_TRAIN_SIZE" \
+    --perl_validation_size "$PERL_VALIDATION_SIZE"
