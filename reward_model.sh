@@ -26,7 +26,7 @@ accelerate launch \
   --overwrite_output_dir True \
   --push_to_hub True \
   --hub_model_id "$RUN_IDENTIFIER" \
-  --dataset_name "leobianco/rm_${DATASET}_processed" \
+  --dataset_name "leobianco/${DATASET}_rm_processed" \
   --model_identifier "google/gemma-2-2b-it" \
   --do_train True \
   --bf16 True \
