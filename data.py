@@ -1,10 +1,8 @@
-"""TO DO:
-Write docstring.
-Add seed for reproducibility.
+"""Data processing functions for the HalOmi and NPOV datasets.
 
-Data processing utils.
-If this script is ran directly, it will load all the datasets involved,
-process them, and save their processed version to HF Hub.
+This script contains functions for loading, processing, and saving the HalOmi
+and NPOV to Hugging Face Hub. Call this script via the shell script data.sh
+with the dataset name as an argument ("halomi" or "npov").
 """
 
 from argparse import ArgumentParser
@@ -13,9 +11,10 @@ from copy import deepcopy
 from datasets import concatenate_datasets, load_dataset
 from transformers import AutoTokenizer
 
-#############################
-# GENERAL ENCODING FUNCTION #
-#############################
+
+#####################
+# GENERAL FUNCTIONS #
+#####################
 
 
 def encode(batch, tokenizer=None, max_seq_length=512):
@@ -28,12 +27,33 @@ def encode(batch, tokenizer=None, max_seq_length=512):
     )
 
 
-#############################
-# HALOMI DATA PREPROCESSING #
-#############################
+####################
+# HALOMI FUNCTIONS #
+####################
 
 
-def change_language_labels(entry):
+# Preprocessing
+
+
+def halomi_hallucination_labels_to_numerical(entry):
+    """Data processing utility function which replaces the hallucination labels by
+    a numerical version."""
+
+    entry["class_hall_num"] = 0 if entry["class_hall"] == "Yes" else 1
+
+    return entry
+
+
+def halomi_omission_labels_to_numerical(entry):
+    """Data processing utility function which replaces the omission labels by
+    a numerical version."""
+
+    entry["class_omit_num"] = 0 if entry["class_omit"] == "Yes" else 1
+
+    return entry
+
+
+def halomi_change_language_labels(entry):
     """Data processing utility function which replaces the language labels by the
     natural language correspondent version.
     """
@@ -56,7 +76,7 @@ def change_language_labels(entry):
     return entry
 
 
-def change_hallucination_labels(entry):
+def halomi_change_hallucination_labels(entry):
     """Data processing utility function which replaces the hallucination labels by
     a simplified version.
     """
@@ -73,7 +93,7 @@ def change_hallucination_labels(entry):
     return entry
 
 
-def change_omission_labels(entry):
+def halomi_change_omission_labels(entry):
     """Data processing utility function which replaces the omission labels by
     a simplified version.
     """
@@ -90,25 +110,7 @@ def change_omission_labels(entry):
     return entry
 
 
-def hallucination_labels_to_numerical(entry):
-    """Data processing utility function which replaces the hallucination labels by
-    a numerical version."""
-
-    entry["class_hall_num"] = 0 if entry["class_hall"] == "Yes" else 1
-
-    return entry
-
-
-def omission_labels_to_numerical(entry):
-    """Data processing utility function which replaces the omission labels by
-    a numerical version."""
-
-    entry["class_omit_num"] = 0 if entry["class_omit"] == "Yes" else 1
-
-    return entry
-
-
-def process_halomi_data(data_halomi, seed: int = 12345):
+def halomi_process_data(data_halomi, seed: int = 12345):
     """Preprocesses the HalOmi dataset."""
 
     # Select relevant subset of columns
@@ -134,19 +136,19 @@ def process_halomi_data(data_halomi, seed: int = 12345):
     )
 
     # Change language labels to natural language
-    data_halomi = data_halomi.map(change_language_labels)
+    data_halomi = data_halomi.map(halomi_change_language_labels)
 
     # Change hallucination labels to 'Yes' or 'No'
-    data_halomi = data_halomi.map(change_hallucination_labels)
+    data_halomi = data_halomi.map(halomi_change_hallucination_labels)
 
     # Add numerical version of hallucination
-    data_halomi = data_halomi.map(hallucination_labels_to_numerical)
+    data_halomi = data_halomi.map(halomi_hallucination_labels_to_numerical)
 
     # Change omission labels to 'Yes' or 'No'
-    data_halomi = data_halomi.map(change_omission_labels)
+    data_halomi = data_halomi.map(halomi_change_omission_labels)
 
     # Add numerical version of omission
-    data_halomi = data_halomi.map(omission_labels_to_numerical)
+    data_halomi = data_halomi.map(halomi_omission_labels_to_numerical)
 
     # Shuffle rows to mix languages and examples
     data_halomi = data_halomi.shuffle(seed=seed)
@@ -154,7 +156,7 @@ def process_halomi_data(data_halomi, seed: int = 12345):
     return data_halomi
 
 
-def load_halomi_data(seed: int = 12345):
+def halomi_load_and_process_data(seed: int = 12345):
     """Loads HalOmi data that is saved in my HF Hub."""
 
     data_halomi = load_dataset(
@@ -164,17 +166,15 @@ def load_halomi_data(seed: int = 12345):
         split="train",
     )
 
-    data_halomi = process_halomi_data(data_halomi, seed)
+    data_halomi = halomi_process_data(data_halomi, seed)
 
     return data_halomi
 
 
-#####################
-# REWARD MODEL DATA #
-#####################
+# Reward Model
 
 
-def rm_prompt_halomi(entry):
+def halomi_rm_prompt(entry):
     """Function for transforming entries in the HalOmi dataset into training
     prompts for the reward model.
     """
@@ -199,21 +199,21 @@ def rm_prompt_halomi(entry):
     return entry
 
 
-def process_halomi_data_for_rm(
-    data_halomi,
+def halomi_process_data_for_rm(
+    halomi_data,
     tokenizer,
     max_seq_length=512,
     validation_size=0.25,
     seed=12345,
 ):
     # Copy original Halomi data
-    rm_data_halomi = deepcopy(data_halomi)
+    halomi_rm_data = deepcopy(halomi_data)
 
     # Create reward model HalOmi prompts
-    rm_data_halomi = rm_data_halomi.map(rm_prompt_halomi)
+    halomi_rm_data = halomi_rm_data.map(halomi_rm_prompt)
 
     # Tokenize reward model prompts
-    rm_data_halomi = rm_data_halomi.map(
+    halomi_rm_data = halomi_rm_data.map(
         encode,
         batched=True,
         fn_kwargs={
@@ -221,25 +221,37 @@ def process_halomi_data_for_rm(
             "max_seq_length": max_seq_length,
         },
     )
-    rm_data_halomi.set_format("torch")  # due to using map()
+    halomi_rm_data.set_format("torch")  # due to using map()
 
     # Rename hallucination class to label
-    rm_data_halomi = rm_data_halomi.rename_column("class_hall_num", "label")
+    halomi_rm_data = halomi_rm_data.rename_column("class_hall_num", "label")
 
     # Split the dataset
-    rm_data_halomi = rm_data_halomi.train_test_split(
+    halomi_rm_data = halomi_rm_data.train_test_split(
         seed=seed, test_size=validation_size
     )
 
-    return rm_data_halomi
+    return halomi_rm_data
 
 
-#################################
-# WRITER SFT DATA PREPROCESSING #
-#################################
+# Writer SFT
 
 
-def writer_prompt_halomi(entry, SFT=False):
+def halomi_process_data_for_sft(halomi_processed_data):
+    """Data processing utility function which filters the HalOmi dataset to only
+    include examples that are not hallucinations or omissions.
+    """
+
+    writer_sft_processed = halomi_processed_data.filter(
+        lambda example: (
+            example["class_hall"] == "No" and example["class_omit"] == "No"
+        )
+    )
+
+    return writer_sft_processed
+
+
+def halomi_writer_prompt(entry, SFT=False):
     """Function for transforming entries in the HalOmi dataset into prompts for
     the writer to translate.
     """
@@ -266,7 +278,7 @@ def writer_prompt_halomi(entry, SFT=False):
     return entry
 
 
-def formatting_prompts_func(entry):
+def halomi_formatting_prompts_func(entry):
     """Formatting function for SFTTrainer. Imported in writer_sft.py."""
 
     template = (
@@ -292,12 +304,10 @@ def formatting_prompts_func(entry):
     return output_texts
 
 
-###########################
-# PERL DATA PREPROCESSING #
-###########################
+# PERL
 
 
-def format_perl_translation_data(entry, src_lang: str, tgt_lang: str):
+def halomi_format_perl_data(entry, src_lang: str, tgt_lang: str):
     """Helper function for formatting PERL data, to be mapped over dataset."""
 
     entry["src_lang"] = src_lang
@@ -308,8 +318,8 @@ def format_perl_translation_data(entry, src_lang: str, tgt_lang: str):
     return entry
 
 
-def process_data_for_perl(
-    perl_data_halomi,
+def halomi_process_data_for_perl(
+    halomi_perl_data,
     tokenizer,
     max_seq_length=512,
     seed=12345,
@@ -317,27 +327,27 @@ def process_data_for_perl(
     perl_validation_size=500,
 ):
     # Half of it will be English -> Spanish, the other half Spanish -> English.
-    n = perl_data_halomi.num_rows
-    first_half = perl_data_halomi.select(range(n // 2))
-    second_half = perl_data_halomi.select(range(n // 2, n))
+    n = halomi_perl_data.num_rows
+    first_half = halomi_perl_data.select(range(n // 2))
+    second_half = halomi_perl_data.select(range(n // 2, n))
 
     first_half = first_half.map(
-        format_perl_translation_data,
+        halomi_format_perl_data,
         fn_kwargs=dict(src_lang="English", tgt_lang="Spanish"),
     )
 
     second_half = second_half.map(
-        format_perl_translation_data,
+        halomi_format_perl_data,
         fn_kwargs=dict(src_lang="Spanish", tgt_lang="English"),
     )
 
-    perl_data_halomi = concatenate_datasets([first_half, second_half])
-    perl_data_halomi = perl_data_halomi.shuffle(seed=seed)
+    halomi_perl_data = concatenate_datasets([first_half, second_half])
+    halomi_perl_data = halomi_perl_data.shuffle(seed=seed)
 
     # Create and tokenize prompts for writer.
-    perl_data_halomi = perl_data_halomi.map(writer_prompt_halomi)
+    halomi_perl_data = halomi_perl_data.map(halomi_writer_prompt)
 
-    perl_data_halomi = perl_data_halomi.map(
+    halomi_perl_data = halomi_perl_data.map(
         encode,
         batched=True,
         fn_kwargs={
@@ -345,143 +355,330 @@ def process_data_for_perl(
             "max_seq_length": max_seq_length,
         },
     )
-    perl_data_halomi.set_format("torch")  # due to using map()
+    halomi_perl_data.set_format("torch")  # due to using map()
 
     # Split into training, validation, and test splits.
-    perl_data_halomi = perl_data_halomi.train_test_split(
+    halomi_perl_data = halomi_perl_data.train_test_split(
         seed=seed,
         train_size=perl_train_size,
         test_size=perl_validation_size,
     )
 
-    return perl_data_halomi
+    return halomi_perl_data
 
 
-if __name__ == "__main__":
+##################
+# NPOV FUNCTIONS #
+##################
+
+
+# Preprocessing
+
+
+def npov_hallucination_labels_to_numerical(entry):
+    """Data processing utility function which replaces the hallucination labels by
+    a numerical version."""
+
+    entry["class_hall_num"] = 0 if entry["has hallucination"] == "Yes" else 1
+
+    return entry
+
+
+def npov_omission_labels_to_numerical(entry):
+    """Data processing utility function which replaces the omission labels by
+    a numerical version."""
+
+    entry["class_omit_num"] = 0 if entry["has coverage issue"] == "Yes" else 1
+
+    return entry
+
+
+def npov_change_hallucination_labels(entry):
+    """Data processing utility function which replaces the hallucination labels by
+    a simplified version.
+    """
+
+    class_hallucination_to_label = {
+        "NO": "No",
+        "YES": "Yes",
+    }
+
+    entry["has hallucination"] = class_hallucination_to_label[
+        entry["has hallucination"]
+    ]
+
+    entry["has synthetic hallucination"] = class_hallucination_to_label[
+        entry["has synthetic hallucination"]
+    ]
+
+    return entry
+
+
+def npov_change_omission_labels(entry):
+    """Data processing utility function which replaces the omission labels by
+    a simplified version.
+    """
+
+    class_omission_to_label = {
+        "NO": "No",
+        "YES": "Yes",
+    }
+
+    entry["has coverage issue"] = class_omission_to_label[
+        entry["has coverage issue"]
+    ]
+
+    entry["has synthetic coverage issue"] = class_omission_to_label[
+        entry["has synthetic coverage issue"]
+    ]
+
+    return entry
+
+
+def npov_process_data(npov_data):
+    """Preprocesses NPOV dataset."""
+
+    # Select relevant subset of columns
+    npov_data = npov_data.select_columns(
+        [
+            "topic",
+            "user_query",
+            "npov_response",
+            "perspective_1",
+            "perspective_1_name",
+            "perspective_2",
+            "perspective_2_name",
+            "has hallucination",
+            "has synthetic hallucination",
+            "has coverage issue",
+            "has synthetic coverage issue",
+        ]
+    )
+
+    # Apply all preprocessing functions.
+    npov_data = npov_data.map(npov_change_hallucination_labels)
+    npov_data = npov_data.map(npov_change_omission_labels)
+    npov_data = npov_data.map(npov_hallucination_labels_to_numerical)
+    npov_data = npov_data.map(npov_omission_labels_to_numerical)
+
+    return npov_data
+
+
+def npov_load_and_process_data():
+    """Loads NPOV data that is saved in my HF Hub."""
+
+    npov_data = load_dataset(
+        "leobianco/npov",
+        data_files={
+            "train": "hc_rm5x_train.json",
+            "validation": "hc_rm5x_validation.json",
+            "test": "hc_rm5x_test.json",
+        },
+    )
+
+    for split in npov_data.keys():
+        npov_data[split] = npov_process_data(npov_data[split])
+
+    return npov_data
+
+
+# Reward Model
+
+
+def npov_rm_prompt(entry):
+    """Function for transforming entries in the NPOV dataset into training
+    prompts for the reward model.
+    """
+
+    template = (
+        "<start_of_turn>user\n"
+        "User query: {user_query}\n"
+        "{perspective_1_name} arguments provided: {perspective_1}\n"
+        "{perspective_2_name} arguments provided: {perspective_2}\n"
+        "Neutral point-of-view rewriting of provided arguments in natural "
+        "language:<end_of_turn>\n"
+        "<start_of_turn>model\n{npov_response}<end_of_turn><eos>"
+    )
+
+    formatted_prompt = template.format(
+        user_query=entry["user_query"],
+        perspective_1_name=entry["perspective_1_name"],
+        perspective_1=entry["perspective_1"],
+        perspective_2_name=entry["perspective_2_name"],
+        perspective_2=entry["perspective_2"],
+        npov_response=entry["npov_response"],
+    )
+
+    entry["prompt"] = formatted_prompt
+
+    return entry
+
+
+def npov_process_data_for_rm(
+    npov_data,
+    tokenizer,
+    max_seq_length=512,
+    validation_size=0.25,
+    seed=12345,
+):
+    # Copy original NPOV data
+    npov_rm_data = deepcopy(npov_data)
+
+    # Create reward model NPOV prompts
+    npov_rm_data = npov_rm_data.map(npov_rm_prompt)
+
+    # Tokenize reward model prompts
+    npov_rm_data = npov_rm_data.map(
+        encode,
+        batched=True,
+        fn_kwargs={
+            "tokenizer": tokenizer,
+            "max_seq_length": max_seq_length,
+        },
+    )
+    npov_rm_data.set_format("torch")  # due to using map()
+
+    # Rename hallucination class to label
+    npov_rm_data = npov_rm_data.rename_column("class_hall_num", "label")
+
+    return npov_rm_data
+
+
+# Writer SFT
+
+
+def npov_process_data_for_sft(npov_data):
+    """Data processing utility function which filters the NPOV dataset to only
+    include examples that are not hallucinations or omissions.
+    """
+
+    writer_sft_processed = npov_data.filter(
+        lambda example: (
+            example["has hallucination"] == "No"
+            and example["has synthetic hallucination"] == "No"
+            and example["has coverage issue"] == "No"
+            and example["has synthetic coverage issue"] == "No"
+        )
+    )
+
+    return writer_sft_processed
+
+
+def npov_writer_prompt():
+    pass
+
+
+def npov_formatting_prompts_func():
+    pass
+
+
+# PERL
+
+
+def npov_format_perl_data():
+    pass
+
+
+def npov_process_data_for_perl(npov_data):
+    pass
+
+
+def main():
     parser = ArgumentParser()
-
-    # General
+    parser.add_argument("--dataset", type=str)
     parser.add_argument("--seed", type=int, default=12345)
-
-    # Tokenizer
     parser.add_argument(
         "--tokenizer_model", type=str, default="google/gemma-2-2b-it"
     )
     parser.add_argument("--max_seq_length", type=int, default=512)
-
-    # Halomi
-    parser.add_argument(
-        "--halomi_repo_id", type=str, default="leobianco/halomi"
-    )
-    parser.add_argument(
-        "--halomi_processed_repo_id",
-        type=str,
-        default="leobianco/halomi_processed",
-    )
-
-    # Reward model
-    parser.add_argument(
-        "--rm_halomi_processed_repo_id",
-        type=str,
-        default="leobianco/rm_halomi_processed",
-    )
+    parser.add_argument("--raw_repo_id", type=str)
+    parser.add_argument("--processed_repo_id", type=str)
+    parser.add_argument("--rm_processed_repo_id", type=str)
     parser.add_argument("--rm_validation_size", type=float, default=0.2)
+    parser.add_argument("--writer_sft_processed_repo_id", type=str)
+    parser.add_argument("--perl_raw_repo_id", type=str)
+    parser.add_argument("--perl_processed_repo_id", type=str)
+    parser.add_argument("--perl_train_size", type=int)
+    parser.add_argument("--perl_validation_size", type=int)
+    args = parser.parse_args()
 
-    # Writer SFT
-    parser.add_argument(
-        "--writer_sft_halomi_processed_repo_id",
-        type=str,
-        default="leobianco/writer_sft_halomi_processed",
-    )
-
-    # PERL
-    parser.add_argument(
-        "--perl_data_repo_id",
-        type=str,
-        default="okezieowen/english_to_spanish",
-    )
-    parser.add_argument(
-        "--perl_data_processed_repo_id",
-        type=str,
-        default="leobianco/perl_halomi_processed",
-    )
-    parser.add_argument("--perl_train_size", type=int, default=1000)
-    parser.add_argument("--perl_validation_size", type=int, default=500)
-
-    script_args = parser.parse_args()
-
-    # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
-        script_args.tokenizer_model,
-        padding_side="left",  # Pay close attention to this argument...
+        args.tokenizer_model,
+        padding_side="left",  # Pay attention to this argument!
     )
 
-    # Halomi data.
-    data_halomi = load_dataset(
-        script_args.halomi_repo_id,
-        data_files={"train": "halomi_full.tsv"},
-        sep="\t",
-        split="train",
-    )
+    if args.dataset == "halomi":
+        halomi_processed_data = halomi_load_and_process_data(args.seed)
 
-    data_halomi_processed = process_halomi_data(data_halomi, script_args.seed)
-
-    data_halomi_processed.push_to_hub(
-        repo_id=script_args.halomi_processed_repo_id,
-    )
-
-    # Reward model data.
-    rm_data_halomi_processed = process_halomi_data_for_rm(
-        data_halomi_processed,
-        tokenizer,
-        max_seq_length=script_args.max_seq_length,
-        validation_size=script_args.rm_validation_size,
-        seed=script_args.seed,
-    )
-
-    rm_data_halomi_processed["train"].push_to_hub(
-        repo_id=script_args.rm_halomi_processed_repo_id,
-        split="train",
-    )
-
-    rm_data_halomi_processed["test"].push_to_hub(
-        repo_id=script_args.rm_halomi_processed_repo_id,
-        split="test",
-    )
-
-    # Writer SFT data.
-    # Filter for examples without hallucinations and without coverage errors
-    writer_sft_processed = data_halomi_processed.filter(
-        lambda example: (
-            example["class_hall"] == "No" and example["class_omit"] == "No"
+        halomi_processed_data.push_to_hub(
+            repo_id=args.processed_repo_id,
         )
-    )
 
-    writer_sft_processed.push_to_hub(
-        repo_id=script_args.writer_sft_halomi_processed_repo_id,
-    )
+        halomi_rm_processed_data = halomi_process_data_for_rm(
+            halomi_processed_data,
+            tokenizer,
+            max_seq_length=args.max_seq_length,
+            validation_size=args.rm_validation_size,
+            seed=args.seed,
+        )
 
-    # PERL data.
-    perl_data_halomi = load_dataset(
-        script_args.perl_data_repo_id,
-        split="train",
-    )
+        for split in halomi_rm_processed_data.keys():
+            halomi_rm_processed_data[split].push_to_hub(
+                repo_id=args.rm_processed_repo_id,
+                split=split,
+            )
 
-    perl_data_halomi_processed = process_data_for_perl(
-        perl_data_halomi,
-        tokenizer,
-        max_seq_length=script_args.max_seq_length,
-        seed=script_args.seed,
-        perl_train_size=script_args.perl_train_size,
-        perl_validation_size=script_args.perl_validation_size,
-    )
+        halomi_writer_sft_processed = halomi_process_data_for_sft(
+            halomi_processed_data
+        )
 
-    perl_data_halomi_processed["train"].push_to_hub(
-        repo_id=script_args.perl_data_processed_repo_id,
-        split="train",
-    )
+        halomi_writer_sft_processed.push_to_hub(
+            repo_id=args.writer_sft_processed_repo_id,
+        )
 
-    perl_data_halomi_processed["test"].push_to_hub(
-        repo_id=script_args.perl_data_processed_repo_id,
-        split="test",
-    )
+        halomi_perl_data = load_dataset(
+            args.perl_raw_repo_id,
+            split="train",
+        )
+
+        halomi_perl_data_processed = halomi_process_data_for_perl(
+            halomi_perl_data,
+            tokenizer,
+            max_seq_length=args.max_seq_length,
+            seed=args.seed,
+            perl_train_size=args.perl_train_size,
+            perl_validation_size=args.perl_validation_size,
+        )
+
+        for split in halomi_perl_data_processed.keys():
+            halomi_perl_data_processed[split].push_to_hub(
+                repo_id=args.perl_processed_repo_id,
+                split=split,
+            )
+
+    elif args.dataset == "npov":
+        npov_data_processed = npov_load_and_process_data()
+        for split in npov_data_processed.keys():
+            npov_data_processed[split].push_to_hub(
+                repo_id=args.processed_repo_id,
+                split=split,
+            )
+
+        npov_rm_processed_data = {}
+        for split in npov_data_processed.keys():
+            npov_rm_processed_data[split] = npov_process_data_for_rm(
+                npov_data_processed[split],
+                tokenizer,
+                max_seq_length=args.max_seq_length,
+                validation_size=args.rm_validation_size,
+                seed=args.seed,
+            )
+
+            npov_rm_processed_data[split].push_to_hub(
+                repo_id=args.rm_processed_repo_id,
+                split=split,
+            )
+
+
+if __name__ == "__main__":
+    main()
