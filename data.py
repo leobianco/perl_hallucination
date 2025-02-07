@@ -256,7 +256,7 @@ def halomi_writer_prompt(entry, SFT=False):
     the writer to translate.
 
     Previously used for SFT, but now used as prompt for generation during PERL.
-    The SFT now uses the "halomi_formatting_prompts_func" function, which has 
+    The SFT now uses the "halomi_formatting_prompts_func" function, which has
     the same prompt as this one, but is used by the SFTTrainer differently.
     """
 
@@ -439,55 +439,6 @@ def npov_change_omission_labels(entry):
     return entry
 
 
-def npov_process_data(npov_data):
-    """Preprocesses NPOV dataset."""
-
-    # Select relevant subset of columns
-    npov_data = npov_data.select_columns(
-        [
-            "topic",
-            "user_query",
-            "npov_response",
-            "perspective_1",
-            "perspective_1_name",
-            "perspective_2",
-            "perspective_2_name",
-            "has hallucination",
-            "has synthetic hallucination",
-            "has coverage issue",
-            "has synthetic coverage issue",
-        ]
-    )
-
-    # Apply all preprocessing functions.
-    npov_data = npov_data.map(npov_change_hallucination_labels)
-    npov_data = npov_data.map(npov_change_omission_labels)
-    npov_data = npov_data.map(npov_hallucination_labels_to_numerical)
-    npov_data = npov_data.map(npov_omission_labels_to_numerical)
-    npov_data = npov_data.rename_column("has hallucination", "class_hall")
-    npov_data = npov_data.rename_column("has coverage issue", "class_omit")
-
-    return npov_data
-
-
-def npov_load_and_process_data():
-    """Loads NPOV data that is saved in my HF Hub."""
-
-    npov_data = load_dataset(
-        "leobianco/npov",
-        data_files={
-            "train": "hc_rm5x_train.json",
-            "validation": "hc_rm5x_validation.json",
-            "test": "hc_rm5x_test.json",
-        },
-    )
-
-    for split in npov_data.keys():
-        npov_data[split] = npov_process_data(npov_data[split])
-
-    return npov_data
-
-
 # Reward Model
 
 
@@ -524,16 +475,36 @@ def npov_process_data_for_rm(
     npov_data,
     tokenizer,
     max_seq_length=512,
-    validation_size=0.25,
-    seed=12345,
 ):
     # Copy original NPOV data
     npov_rm_data = deepcopy(npov_data)
 
-    # Create reward model NPOV prompts
-    npov_rm_data = npov_rm_data.map(npov_rm_prompt)
+    # Select relevant subset of columns
+    npov_rm_data = npov_rm_data.select_columns(
+        [
+            "topic",
+            "user_query",
+            "npov_response",
+            "perspective_1",
+            "perspective_1_name",
+            "perspective_2",
+            "perspective_2_name",
+            "has hallucination",
+            "has synthetic hallucination",
+            "has coverage issue",
+            "has synthetic coverage issue",
+        ]
+    )
 
-    # Tokenize reward model prompts
+    npov_rm_data = npov_rm_data.map(npov_change_hallucination_labels)
+    npov_rm_data = npov_rm_data.map(npov_change_omission_labels)
+    npov_rm_data = npov_rm_data.map(npov_hallucination_labels_to_numerical)
+    npov_rm_data = npov_rm_data.map(npov_omission_labels_to_numerical)
+    npov_rm_data = npov_rm_data.rename_column("has hallucination", "class_hall")
+    npov_rm_data = npov_rm_data.rename_column(
+        "has coverage issue", "class_omit"
+    )
+    npov_rm_data = npov_rm_data.map(npov_rm_prompt)
     npov_rm_data = npov_rm_data.map(
         encode,
         batched=True,
@@ -543,8 +514,6 @@ def npov_process_data_for_rm(
         },
     )
     npov_rm_data.set_format("torch")  # due to using map()
-
-    # Rename hallucination class to label
     npov_rm_data = npov_rm_data.rename_column("class_hall_num", "label")
 
     return npov_rm_data
@@ -554,26 +523,34 @@ def npov_process_data_for_rm(
 
 
 def npov_process_data_for_sft(npov_data):
-    """Data processing utility function which filters the NPOV dataset to only
-    include examples that are not hallucinations or omissions.
-    """
+    """Preprocesses NPOV SFT dataset."""
 
-    writer_sft_processed = npov_data.filter(
-        lambda example: (
-            example["class_hall"] == "No"
-            and example["class_omit"] == "No"
-        )
+    # Select relevant subset of columns
+    npov_data = npov_data.select_columns(
+        [
+            "topic",
+            "user_query",
+            "npov_response_combined",
+            "perspective_1",
+            "perspective_1_name",
+            "perspective_2",
+            "perspective_2_name",
+        ]
     )
 
-    return writer_sft_processed
+    npov_data = npov_data.rename_column(
+        "npov_response_combined", "npov_response"
+    )
+
+    return npov_data
 
 
 def npov_writer_prompt(entry, SFT=False):
-    """Function for transforming entries in the NPOV dataset into prompts for 
+    """Function for transforming entries in the NPOV dataset into prompts for
     the writer to rewrite.
 
     Previously used for SFT, but now used as prompt for generation during PERL.
-    The SFT now uses the "npov_formatting_prompts_func" function, which has 
+    The SFT now uses the "npov_formatting_prompts_func" function, which has
     the same prompt as this one, but is used by the SFTTrainer differently.
     """
 
@@ -587,7 +564,9 @@ def npov_writer_prompt(entry, SFT=False):
         "<start_of_turn>model\n{npov_response}"
     )
 
-    npov_response = (entry["npov_response"] + "<end_of_turn><eos>") if SFT else ""
+    npov_response = (
+        (entry["npov_response"] + "<end_of_turn><eos>") if SFT else ""
+    )
 
     formatted_prompt = template.format(
         user_query=entry["user_query"],
@@ -640,6 +619,7 @@ def npov_formatting_prompts_func(entry):
 
 
 def npov_format_perl_data():
+    """Not sure this function is actually necessary for NPOV."""
     pass
 
 
@@ -721,37 +701,49 @@ def main():
             )
 
     elif args.dataset == "npov":
-        npov_data_processed = npov_load_and_process_data()
-        for split in npov_data_processed.keys():
-            npov_data_processed[split].push_to_hub(
-                repo_id=args.processed_repo_id,
-                split=split,
-            )
+        # Reward Model
+        npov_rm_data = load_dataset(
+            "leobianco/npov",
+            data_files={
+                "train": "hc_rm5x_train.json",
+                "validation": "hc_rm5x_validation.json",
+                "test": "hc_rm5x_test.json",
+            },
+        )
 
-        npov_rm_processed_data = {}
-        npov_writer_sft_processed = {}
-        for split in npov_data_processed.keys():
-            npov_rm_processed_data[split] = npov_process_data_for_rm(
-                npov_data_processed[split],
+        for split in npov_rm_data.keys():
+            npov_rm_data[split] = npov_process_data_for_rm(
+                npov_rm_data[split],
                 tokenizer,
                 max_seq_length=args.max_seq_length,
-                validation_size=args.rm_validation_size,
-                seed=args.seed,
             )
 
-            npov_rm_processed_data[split].push_to_hub(
+            npov_rm_data[split].push_to_hub(
                 repo_id=args.rm_processed_repo_id,
                 split=split,
             )
 
-            npov_writer_sft_processed[split] = npov_process_data_for_sft(
-                npov_data_processed[split]
+        # Writer SFT
+        npov_sft_data = load_dataset(
+            "leobianco/npov",
+            data_files={
+                "train": "writer_train.json",
+                "validation": "writer_validation.json",
+                "test": "writer_test.json",
+            },
+        )
+
+        for split in npov_sft_data.keys():
+            npov_sft_data[split] = npov_process_data_for_sft(
+                npov_sft_data[split]
             )
 
-            npov_writer_sft_processed[split].push_to_hub(
+            npov_sft_data[split].push_to_hub(
                 repo_id=args.writer_sft_processed_repo_id,
                 split=split,
             )
+
+        # PERL
 
 
 if __name__ == "__main__":
