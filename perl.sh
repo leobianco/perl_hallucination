@@ -34,8 +34,8 @@ accelerate launch \
   --overwrite_output_dir True \
   --push_to_hub True \
   --hub_model_id "$RUN_IDENTIFIER" \
-  --dataset_name "leobianco/perl_halomi_processed" \
-  --model_identifier "google/gemma-2-2b-it" \
+  --dataset_repo_id "leobianco/perl_halomi_processed" \
+  --model_repo_id "google/gemma-2-2b-it" \
   --stop_token "eos" \
   --do_train True \
   --save_strategy "steps" \

@@ -7,10 +7,11 @@ from peft import LoraConfig
 
 @dataclass
 class ScriptArguments:
-    """ "Arguments common to all scripts (reward model, SFT, PERL)."""
+    """Arguments common to all scripts (reward model, SFT, PERL)."""
 
-    dataset_name: str
-    model_identifier: str
+    dataset: str
+    dataset_repo_id: str
+    model_repo_id: str
 
 
 @dataclass

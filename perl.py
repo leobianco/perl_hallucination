@@ -46,7 +46,7 @@ def main():
     set_seed(training_args.seed)
 
     tokenizer = AutoTokenizer.from_pretrained(
-        script_args.model_identifier,
+        script_args.model_repo_id,
         padding_side="right",
     )
 
@@ -54,7 +54,7 @@ def main():
     # DATA #
     ########
 
-    perl_data_halomi = load_dataset(script_args.dataset_name)
+    perl_data_halomi = load_dataset(script_args.dataset_repo_id)
 
     perl_data_halomi["train"] = perl_data_halomi["train"].select_columns(
         ["input_ids", "attention_mask"]

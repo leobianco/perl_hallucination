@@ -14,6 +14,11 @@ else
   RUN_IDENTIFIER="leobianco/${DATASET}_RM_seed_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_lora_${LORA_RANK}"
 fi
 
+if [ "$DATASET" != "halomi" ] && [ "$DATASET" != "npov" ]; then
+    echo "Invalid dataset name"
+    exit 1
+fi
+
 accelerate launch \
   --config_file="${DEEPSPEED_CONFIG}" \
   reward_model.py \
@@ -26,8 +31,8 @@ accelerate launch \
   --overwrite_output_dir True \
   --push_to_hub True \
   --hub_model_id "$RUN_IDENTIFIER" \
-  --dataset_name "leobianco/${DATASET}_rm_processed" \
-  --model_identifier "google/gemma-2-2b-it" \
+  --dataset_repo_id "leobianco/${DATASET}_rm_processed" \
+  --model_repo_id "google/gemma-2-2b-it" \
   --do_train True \
   --bf16 True \
   --save_strategy "epoch" \

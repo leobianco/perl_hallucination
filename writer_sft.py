@@ -11,34 +11,41 @@ from trl import (
     TrlParser,
 )
 
-from data import formatting_prompts_func
+from data import halomi_formatting_prompts_func, npov_formatting_prompts_func
 from utils import CustomLoraConfig, ScriptArguments
 
 
 def main():
-    #########
-    # SETUP #
-    #########
-
     parser = TrlParser((ScriptArguments, SFTConfig, CustomLoraConfig))
     (script_args, training_args, peft_args) = (
         parser.parse_args_into_dataclasses()
     )
-
     name_for_saving = training_args.run_name.split("/")[1]
-
-    # Set seed before instantiating the model, for reproducibility.
     set_seed(training_args.seed)
 
+    # Data
+    sft_data = load_dataset(script_args.dataset_repo_id, split="train")
+
+    # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
-        script_args.model_identifier,
+        script_args.model_repo_id,
         padding_side="left",
     )
 
     # Train on completions only.
-    response_template = (
-        "\nTranslated text:<end_of_turn>\n<start_of_turn>model\n"
-    )
+    if script_args.dataset == "halomi":
+        response_template = (
+            "\nTranslated text:<end_of_turn>\n<start_of_turn>model\n"
+        )
+        formatting_prompts_func = halomi_formatting_prompts_func
+    elif script_args.dataset == "npov":
+        response_template = (
+            "\nNeutral point-of-view answer to user query, rewriting provided arguments in natural language:<end_of_turn>\n<start_of_turn>model\n"
+        )
+        formatting_prompts_func = npov_formatting_prompts_func
+    else:
+        raise ValueError("Invalid dataset.")
+
     response_template_ids = tokenizer.encode(
         response_template, add_special_tokens=False
     )
@@ -47,32 +54,17 @@ def main():
         tokenizer=tokenizer,
     )
 
-    ########
-    # DATA #
-    ########
-
-    sft_data_halomi = load_dataset(script_args.dataset_name, split="train")
-
-    ################
-    # WRITER MODEL #
-    ################
-
     model = AutoModelForCausalLM.from_pretrained(
-        script_args.model_identifier,
+        script_args.model_repo_id,
         attn_implementation="eager",
     )
-
     model = get_peft_model(model, peft_args)
-
-    ###############
-    # SFT TRAINER #
-    ###############
 
     trainer = SFTTrainer(
         model,
         args=training_args,
         data_collator=collator_completions,
-        train_dataset=sft_data_halomi,
+        train_dataset=sft_data,
         processing_class=tokenizer,
         formatting_func=formatting_prompts_func,
     )

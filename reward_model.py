@@ -40,13 +40,13 @@ def main():
     set_seed(training_args.seed)
 
     tokenizer = AutoTokenizer.from_pretrained(
-        script_args.model_identifier,
+        script_args.model_repo_id,
         padding_side="left",
     )
 
 
     # DATA
-    rm_data_halomi = load_dataset(script_args.dataset_name)
+    rm_data_halomi = load_dataset(script_args.dataset_repo_id)
 
     id2label = {
         0: "Yes",
@@ -61,7 +61,7 @@ def main():
 
     # MODEL
     reward_model = AutoModelForSequenceClassification.from_pretrained(
-        script_args.model_identifier,
+        script_args.model_repo_id,
         num_labels=2,
         id2label=id2label,
         label2id=label2id,

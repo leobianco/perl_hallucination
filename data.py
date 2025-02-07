@@ -254,6 +254,10 @@ def halomi_process_data_for_sft(halomi_processed_data):
 def halomi_writer_prompt(entry, SFT=False):
     """Function for transforming entries in the HalOmi dataset into prompts for
     the writer to translate.
+
+    Previously used for SFT, but now used as prompt for generation during PERL.
+    The SFT now uses the "halomi_formatting_prompts_func" function, which has 
+    the same prompt as this one, but is used by the SFTTrainer differently.
     """
 
     template = (
@@ -297,7 +301,7 @@ def halomi_formatting_prompts_func(entry):
             src_text=entry["src_text"][i],
         )
 
-        text = f"{formatted_prompt}\nTranslated text:<end_of_turn>\n<start_of_turn>model\n{entry['mt_text'][i]}"
+        text = f"{formatted_prompt}\nTranslated text:<end_of_turn>\n<start_of_turn>model\n{entry['mt_text'][i]}<end_of_turn><eos>"
 
         output_texts.append(text)
 
@@ -460,6 +464,8 @@ def npov_process_data(npov_data):
     npov_data = npov_data.map(npov_change_omission_labels)
     npov_data = npov_data.map(npov_hallucination_labels_to_numerical)
     npov_data = npov_data.map(npov_omission_labels_to_numerical)
+    npov_data = npov_data.rename_column("has hallucination", "class_hall")
+    npov_data = npov_data.rename_column("has coverage issue", "class_omit")
 
     return npov_data
 
@@ -495,8 +501,8 @@ def npov_rm_prompt(entry):
         "User query: {user_query}\n"
         "{perspective_1_name} arguments provided: {perspective_1}\n"
         "{perspective_2_name} arguments provided: {perspective_2}\n"
-        "Neutral point-of-view rewriting of provided arguments in natural "
-        "language:<end_of_turn>\n"
+        "Neutral point-of-view answer to user query, rewriting provided"
+        " arguments in natural language:<end_of_turn>\n"
         "<start_of_turn>model\n{npov_response}<end_of_turn><eos>"
     )
 
@@ -564,12 +570,72 @@ def npov_process_data_for_sft(npov_data):
     return writer_sft_processed
 
 
-def npov_writer_prompt():
-    pass
+def npov_writer_prompt(entry, SFT=False):
+    """Function for transforming entries in the NPOV dataset into prompts for 
+    the writer to rewrite.
+
+    Previously used for SFT, but now used as prompt for generation during PERL.
+    The SFT now uses the "npov_formatting_prompts_func" function, which has 
+    the same prompt as this one, but is used by the SFTTrainer differently.
+    """
+
+    template = (
+        "<start_of_turn>user\n"
+        "User query: {user_query}\n"
+        "{perspective_1_name} arguments provided: {perspective_1}\n"
+        "{perspective_2_name} arguments provided: {perspective_2}\n"
+        "Neutral point-of-view answer to user query, rewriting provided"
+        " arguments in natural language:<end_of_turn>\n"
+        "<start_of_turn>model\n{npov_response}"
+    )
+
+    npov_response = (entry["npov_response"] + "<end_of_turn><eos>") if SFT else ""
+
+    formatted_prompt = template.format(
+        user_query=entry["user_query"],
+        perspective_1_name=entry["perspective_1_name"],
+        perspective_1=entry["perspective_1"],
+        perspective_2_name=entry["perspective_2_name"],
+        perspective_2=entry["perspective_2"],
+        npov_response=npov_response,
+    )
+
+    entry["prompt"] = formatted_prompt
+
+    return entry
 
 
-def npov_formatting_prompts_func():
-    pass
+def npov_formatting_prompts_func(entry):
+    """Formatting function for SFTTrainer. Imported in writer_sft.py."""
+
+    template = (
+        "<start_of_turn>user\n"
+        "User query: {user_query}\n"
+        "{perspective_1_name} arguments provided: {perspective_1}\n"
+        "{perspective_2_name} arguments provided: {perspective_2}\n"
+    )
+
+    output_texts = []
+
+    for i in range(len(entry["user_query"])):
+        formatted_prompt = template.format(
+            user_query=entry["user_query"][i],
+            perspective_1_name=entry["perspective_1_name"][i],
+            perspective_1=entry["perspective_1"][i],
+            perspective_2_name=entry["perspective_2_name"][i],
+            perspective_2=entry["perspective_2"][i],
+        )
+
+        text = (
+            f"{formatted_prompt}\nNeutral point-of-view answer to user query, "
+            "rewriting provided arguments in natural language:<end_of_turn>\n"
+            f"<start_of_turn>model\n{entry['npov_response'][i]}"
+            "<end_of_turn><eos>"
+        )
+
+        output_texts.append(text)
+
+    return output_texts
 
 
 # PERL

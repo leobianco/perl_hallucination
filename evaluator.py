@@ -55,6 +55,17 @@ from vllm.lora.request import LoRARequest
 
 @dataclass
 class ScriptArguments:
+    dataset: str = field(
+        metadata={"help": "The dataset to use for evaluation (halomi or npov)."}
+    )
+
+    user: str = field(
+        default="leobianco",
+        metadata={
+            "help": "The user to use for writing and loading to and from HF."
+        },
+    )
+
     writer_model_base: str = field(
         metadata={"help": "The base model for the writer (name or path)."}
     )
@@ -122,12 +133,13 @@ def get_fewshot_examples(data, n: int, seed: int):
     return fewshot_examples
 
 
-def evaluator_prompt_halomi(entry, fewshot_examples=None, use_mt_text=False):
+def evaluator_prompt_halomi(entry, fewshot_examples=None, use_true_label=False):
     """Function for transforming entries in the HalOmi dataset into prompts for
     the evaluator model.
 
-    TO DO: perhaps split this function into two functions instead of using the
-    use_mt_text parameter.
+    TO DO (LEO): perhaps split this function into two functions instead of
+    using the use_true_label parameter. Either way you must do something, because
+    it looks really bad.
     """
 
     preamble = (
@@ -135,6 +147,8 @@ def evaluator_prompt_halomi(entry, fewshot_examples=None, use_mt_text=False):
         "and linguist noting when the Translation of an Original text contains "
         "additional information that is not part of the original text.<end_of_turn>\n"
     )
+
+    prompt = preamble
 
     template = (
         "<start_of_turn>user\n"
@@ -145,14 +159,8 @@ def evaluator_prompt_halomi(entry, fewshot_examples=None, use_mt_text=False):
         "<end_of_turn>\n<start_of_turn>model\n{ans}"
     )
 
-    prompt = preamble
-
-    if use_mt_text:
-        translation = entry["mt_text"]  # for HalOmi and evaluation of evaluator
-    else:
-        translation = entry[
-            "completion"
-        ]  # for evaluation of a writer checkpoint
+    # Depending if evaluation of evaluator or of writer checkpoint.
+    translation = entry["mt_text"] if use_true_label else entry["completion"]
 
     formatted_prompt = template.format(
         src_lang=entry["src_lang"],
@@ -171,7 +179,6 @@ def evaluator_prompt_halomi(entry, fewshot_examples=None, use_mt_text=False):
                 mt_text=fewshot_example["mt_text"],
                 ans=fewshot_example["class_hall"],
             )
-
             prompt += fewshot_prompt + "<end_of_turn>\n"
 
         prompt += formatted_prompt
@@ -184,10 +191,59 @@ def evaluator_prompt_halomi(entry, fewshot_examples=None, use_mt_text=False):
     return entry
 
 
+def evaluator_prompt_npov(entry, fewshot_examples=None, use_true_label=False):
+    """Function for transforming entries in the NPOV dataset into prompts for
+    the evaluator model.
+
+    TO DO (LEO): perhaps split this function into two functions instead of
+    using the use_true_label parameter. Either way you must do something, because
+    it looks really bad.
+    """
+
+    preamble = "<start_of_turn>user\nBelow are examples where an expert linguist identifies when the neutral natural language rewritings of arguments used to answer a user query contains additional arguments not present in the original list.<end_of_turn>\n"
+
+    prompt = preamble
+
+    template = "<start_of_turn>user\nUser query: {user_query}\n{perspective_1_name} arguments provided: {perspective_1}\n{perspective_2_name} arguments provided: {perspective_2}\nNeutral point-of-view answer to user query, rewriting provided arguments in natural language:{npov_response}\nExpert linguist review: the rewriting of the provided arguments contains additional arguments not present in the original list (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
+
+    # Depending if evaluation of evaluator or of writer checkpoint.
+    response = entry["npov_response"] if use_true_label else entry["completion"]
+
+    formatted_prompt = template.format(
+        user_query=entry["user_query"],
+        perspective_1_name=entry["perspective_1_name"],
+        perspective_1=entry["perspective_1"],
+        perspective_2_name=entry["perspective_2_name"],
+        perspective_2=entry["perspective_2"],
+        npov_response=response,
+        ans="",
+    )
+
+    if fewshot_examples is not None:
+        for fewshot_example in fewshot_examples:
+            fewshot_prompt = template.format(
+                user_query=fewshot_example["user_query"],
+                perspective_1_name=fewshot_example["perspective_1_name"],
+                perspective_1=fewshot_example["perspective_1"],
+                perspective_2_name=fewshot_example["perspective_2_name"],
+                perspective_2=fewshot_example["perspective_2"],
+                npov_response=fewshot_example["npov_response"],
+                ans=fewshot_example["class_hall"],
+            )
+            prompt += fewshot_prompt + "<end_of_turn>\n"
+        prompt += formatted_prompt
+    else:
+        prompt += formatted_prompt
+
+    entry["evaluator_prompt"] = prompt
+
+    return entry
+
+
 def evaluator_score_batch(
     evaluator, tokenized_prompts, yes_token_id, no_token_id
 ):
-    """Evaluator score for translation."""
+    """Evaluator scoring of a batch."""
 
     with torch.no_grad():
         # Cache in Gemma is different and was giving me errors, so I disable it.
@@ -238,54 +294,41 @@ def evaluator_score(
 
 
 if __name__ == "__main__":
-    #########
-    # SETUP #
-    #########
-
-    # Parse the arguments
     parser = HfArgumentParser(ScriptArguments)
     script_args = parser.parse_args_into_dataclasses()[0]
     name_for_saving = script_args.writer_model_lora.split("/")[1]
 
-    # Load validation dataset.
-    val_data = load_dataset(
-        "leobianco/perl_halomi_processed",
-        split="test",
-    )
-
-    # Load HalOmi data, either for evaluating the evaluator or for getting
+    # Load data, either for evaluating the evaluator or for getting
     # fewshot examples.
-    data_halomi = load_dataset(
-        "leobianco/halomi_processed",
+    data = load_dataset(
+        f"{script_args.user}/{script_args.dataset}_processed",
         split="train",
     )
 
-    # Get fewshot examples to aid the evaluator.
-    # Notice that the fewshot examples come from the HalOmi dataset,
-    # and not from okezieowen's one, since the examples must be "balanced"
-    # i.e., as many examples with hallucinations than examples without.
+    # Load validation dataset, where evaluation will really occur.
+    val_data = load_dataset(
+        f"{script_args.user}/perl_{script_args.dataset}_processed",
+        split="test",
+    )
+
+    # Get fewshot examples to aid the evaluator. These come from the dataset
+    # with labels.
     if script_args.num_fewshot_examples == 0:
         fewshot_examples = None
     else:
         fewshot_examples = get_fewshot_examples(
-            data_halomi,
+            data,
             script_args.num_fewshot_examples,
             seed=script_args.seed,
         )
 
-    # Instantiate tokenizer.
     tokenizer = AutoTokenizer.from_pretrained(
         script_args.evaluator_model,
     )
-
     yes_token_id = tokenizer.convert_tokens_to_ids("Yes")
     no_token_id = tokenizer.convert_tokens_to_ids("No")
 
     if script_args.evaluate_evaluator:
-        #########################
-        # SCORE HALOMI DATASET  #
-        #########################
-
         evaluator = AutoModelForCausalLM.from_pretrained(
             script_args.evaluator_model,
             device_map="auto",
@@ -294,13 +337,22 @@ if __name__ == "__main__":
         )
         evaluator.eval()
 
-        data_halomi = data_halomi.map(
-            evaluator_prompt_halomi,
-            fn_kwargs=dict(fewshot_examples=fewshot_examples, use_mt_text=True),
+        if script_args.dataset == "halomi":
+            evaluator_prompt = evaluator_prompt_halomi
+        elif script_args.dataset == "npov":
+            evaluator_prompt = evaluator_prompt_npov
+        else:
+            raise ValueError("Invalid dataset.")
+
+        data = data.map(
+            evaluator_prompt,
+            fn_kwargs=dict(
+                fewshot_examples=fewshot_examples, use_true_label=True
+            ),
         )
 
         scores = evaluator_score(
-            data_halomi,
+            data,
             script_args,
             tokenizer,
             evaluator,
@@ -308,11 +360,8 @@ if __name__ == "__main__":
             no_token_id,
         )
 
-        #####################
-        # CALCULATE METRICS #
-        #####################
-
-        ground_truth = data_halomi["class_hall_num"]
+        # Calculate Metrics
+        ground_truth = data["class_hall_num"]
         auc = roc_auc_score(ground_truth, scores)
         fpr, tpr, thresholds = roc_curve(ground_truth, scores.numpy())
         threshold_idx = np.argmax(tpr - fpr)
@@ -321,10 +370,7 @@ if __name__ == "__main__":
             0 if score < threshold else 1 for score in scores
         ]
 
-        ################################
-        # DISPLAY METRICS + SAVE PLOTS #
-        ################################
-
+        # Display Metrics and Save Plots
         print("AUC:", auc)
         print("Threshold:", threshold)
         print("TPR (recall):", tpr[threshold_idx])
@@ -363,9 +409,7 @@ if __name__ == "__main__":
         )
 
     else:
-        ########################
-        # GENERATE COMPLETIONS #
-        ########################
+        # Generate Completions
 
         # To evaluate the base model (no LoRA), just re-use the base model path
         # on the LoRA adapters path.
@@ -387,7 +431,7 @@ if __name__ == "__main__":
             model=script_args.writer_model_base,
             enable_lora=enable_lora,
             max_lora_rank=64,  # currently maximum available in vLLM.
-            dtype="bfloat16",
+            dtype="bfloat16",  # important for Gemma.
         )
 
         # Generate completions with writer.
@@ -428,9 +472,7 @@ if __name__ == "__main__":
         gc.collect()
         torch.cuda.empty_cache()
 
-        ########################
-        # SCORE COMPLETIONS #
-        ########################
+        # Score Completions
 
         # Instantiate evaluator.
         evaluator = AutoModelForCausalLM.from_pretrained(
@@ -462,10 +504,7 @@ if __name__ == "__main__":
             no_token_id,
         )
 
-        #####################
-        # CALCULATE METRICS #
-        #####################
-
+        # Calculate Metrics
         t = nn.Threshold(script_args.threshold, 0, inplace=False)
         classifs = torch.ceil(t(scores))
         rate_hallucination = 1 - torch.mean(classifs)
