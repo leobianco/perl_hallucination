@@ -40,7 +40,7 @@ def main():
         formatting_prompts_func = halomi_formatting_prompts_func
     elif script_args.dataset == "npov":
         response_template = (
-            "\nNeutral point-of-view answer to user query, rewriting provided arguments in natural language:<end_of_turn>\n<start_of_turn>model\n"
+            "Neutral point-of-view answer to user query, rewriting provided arguments in natural language:<end_of_turn>\n<start_of_turn>model\n"
         )
         formatting_prompts_func = npov_formatting_prompts_func
     else:

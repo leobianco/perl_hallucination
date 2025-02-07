@@ -55,15 +55,14 @@ from vllm.lora.request import LoRARequest
 
 @dataclass
 class ScriptArguments:
-    dataset: str = field(
-        metadata={"help": "The dataset to use for evaluation (halomi or npov)."}
-    )
-
     user: str = field(
-        default="leobianco",
         metadata={
             "help": "The user to use for writing and loading to and from HF."
         },
+    )
+
+    dataset: str = field(
+        metadata={"help": "The dataset to use for evaluation (halomi or npov)."}
     )
 
     writer_model_base: str = field(
@@ -305,12 +304,6 @@ if __name__ == "__main__":
         split="train",
     )
 
-    # Load validation dataset, where evaluation will really occur.
-    val_data = load_dataset(
-        f"{script_args.user}/perl_{script_args.dataset}_processed",
-        split="test",
-    )
-
     # Get fewshot examples to aid the evaluator. These come from the dataset
     # with labels.
     if script_args.num_fewshot_examples == 0:
@@ -409,6 +402,12 @@ if __name__ == "__main__":
         )
 
     else:
+        # Load validation dataset, where evaluation will really occur.
+        val_data = load_dataset(
+            f"{script_args.user}/perl_{script_args.dataset}_processed",
+            split="test",
+        )
+
         # Generate Completions
 
         # To evaluate the base model (no LoRA), just re-use the base model path

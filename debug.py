@@ -5,10 +5,10 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
 # Load data
-data = load_dataset("leobianco/perl_halomi_processed", split="train")
+data = load_dataset("leobianco/npov_writer_sft_processed", split="train")
 
-queries = data.select_columns(["input_ids", "attention_mask"])
-query = queries[:5]
+#queries = data.select_columns(["input_ids", "attention_mask"])
+#query = queries[:5]
 
 # Load model + tokenizer
 tokenizer = AutoTokenizer.from_pretrained(
@@ -32,10 +32,10 @@ generation_config = GenerationConfig(
     do_sample=True,
 )
 
-output = model.generate(
-    input_ids=torch.tensor(query["input_ids"]).to(model.device),
-    attention_mask=torch.tensor(query["attention_mask"]).to(model.device),
-    generation_config=generation_config,
-    return_dict_in_generate=True,
-    output_scores=True,
-)
+#output = model.generate(
+#    input_ids=torch.tensor(query["input_ids"]).to(model.device),
+#    attention_mask=torch.tensor(query["attention_mask"]).to(model.device),
+#    generation_config=generation_config,
+#    return_dict_in_generate=True,
+#    output_scores=True,
+#)

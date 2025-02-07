@@ -34,7 +34,7 @@ accelerate launch \
   --push_to_hub True \
   --hub_model_id "$RUN_IDENTIFIER" \
   --seed "$SEED" \
-  --dataset_repo_id "leobianco/writer_sft_${DATASET}_processed" \
+  --dataset_repo_id "leobianco/${DATASET}_writer_sft_processed" \
   --model_repo_id "google/gemma-2-2b-it" \
   --do_train True \
   --bf16 True \
@@ -42,7 +42,7 @@ accelerate launch \
   --num_train_epochs "$NUM_TRAIN_EPOCHS" \
   --learning_rate "$LEARNING_RATE" \
   --weight_decay 0.0 \
-  --max_seq_length 512 \
+  --max_seq_length 768 \
   --dataset_text_field "prompt" \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps 1 \
