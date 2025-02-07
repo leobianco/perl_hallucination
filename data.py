@@ -731,6 +731,7 @@ def main():
             )
 
         npov_rm_processed_data = {}
+        npov_writer_sft_processed = {}
         for split in npov_data_processed.keys():
             npov_rm_processed_data[split] = npov_process_data_for_rm(
                 npov_data_processed[split],
@@ -742,6 +743,15 @@ def main():
 
             npov_rm_processed_data[split].push_to_hub(
                 repo_id=args.rm_processed_repo_id,
+                split=split,
+            )
+
+            npov_writer_sft_processed[split] = npov_process_data_for_sft(
+                npov_data_processed[split]
+            )
+
+            npov_writer_sft_processed[split].push_to_hub(
+                repo_id=args.writer_sft_processed_repo_id,
                 split=split,
             )
 
