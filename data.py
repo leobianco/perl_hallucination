@@ -560,10 +560,8 @@ def npov_process_data_for_sft(npov_data):
 
     writer_sft_processed = npov_data.filter(
         lambda example: (
-            example["has hallucination"] == "No"
-            and example["has synthetic hallucination"] == "No"
-            and example["has coverage issue"] == "No"
-            and example["has synthetic coverage issue"] == "No"
+            example["class_hall"] == "No"
+            and example["class_omit"] == "No"
         )
     )
 
