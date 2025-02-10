@@ -11,7 +11,6 @@ from copy import deepcopy
 from datasets import DatasetDict, concatenate_datasets, load_dataset
 from transformers import AutoTokenizer
 
-
 #####################
 # GENERAL FUNCTIONS #
 #####################
@@ -614,7 +613,9 @@ def npov_formatting_prompts_func(entry):
 # PERL
 
 
-def npov_process_data_for_perl(npov_rm_data, npov_sft_data, tokenizer, max_seq_length=512, seed=12345):
+def npov_process_data_for_perl(
+    npov_rm_data, npov_sft_data, tokenizer, max_seq_length=512, seed=12345
+):
     """
     Processes NPOV data for PERL by creating train and test splits
     from the RM and SFT datasets, ensuring no topic overlap between splits.
@@ -630,7 +631,9 @@ def npov_process_data_for_perl(npov_rm_data, npov_sft_data, tokenizer, max_seq_l
     sft_test = npov_sft_data["test"]
 
     # Combine validation and test splits for both RM and SFT data
-    train_data = concatenate_datasets([rm_validation, rm_test, sft_validation, sft_test])
+    train_data = concatenate_datasets(
+        [rm_validation, rm_test, sft_validation, sft_test]
+    )
     test_data = concatenate_datasets([rm_train, sft_train])
 
     train_data = train_data.shuffle(seed=seed)
@@ -673,10 +676,12 @@ def npov_process_data_for_perl(npov_rm_data, npov_sft_data, tokenizer, max_seq_l
     test_data.set_format("torch")
 
     # Create a DatasetDict with train and test splits
-    npov_perl_data = DatasetDict({
-        "train": train_data,
-        "test": test_data,
-    })
+    npov_perl_data = DatasetDict(
+        {
+            "train": train_data,
+            "test": test_data,
+        }
+    )
 
     return npov_perl_data
 
@@ -801,6 +806,9 @@ def main():
         npov_perl_data = npov_process_data_for_perl(
             npov_rm_data,
             npov_sft_data,
+            tokenizer=tokenizer,
+            max_seq_length=args.max_seq_length,
+            seed=args.seed,
         )
 
         for split in npov_perl_data.keys():
