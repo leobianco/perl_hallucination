@@ -614,7 +614,7 @@ def npov_formatting_prompts_func(entry):
 # PERL
 
 
-def npov_process_data_for_perl(npov_rm_data, npov_sft_data):
+def npov_process_data_for_perl(npov_rm_data, npov_sft_data, tokenizer, max_seq_length=512, seed=12345):
     """
     Processes NPOV data for PERL by creating train and test splits
     from the RM and SFT datasets, ensuring no topic overlap between splits.
@@ -633,6 +633,9 @@ def npov_process_data_for_perl(npov_rm_data, npov_sft_data):
     train_data = concatenate_datasets([rm_validation, rm_test, sft_validation, sft_test])
     test_data = concatenate_datasets([rm_train, sft_train])
 
+    train_data = train_data.shuffle(seed=seed)
+    test_data = test_data.shuffle(seed=seed)
+
     # Get unique topics for train and test splits
     train_topics = set(train_data["topic"])
     test_topics = set(test_data["topic"])
@@ -644,6 +647,30 @@ def npov_process_data_for_perl(npov_rm_data, npov_sft_data):
     # # Filter out overlapping topics from both train and test splits
     # train_data = train_data.filter(lambda example: example["topic"] not in overlapping_topics)
     # test_data = test_data.filter(lambda example: example["topic"] not in overlapping_topics)
+
+    # Create and tokenize prompts for writer
+    train_data = train_data.map(npov_writer_prompt)
+    test_data = test_data.map(npov_writer_prompt)
+
+    train_data = train_data.map(
+        encode,
+        batched=True,
+        fn_kwargs={
+            "tokenizer": tokenizer,
+            "max_seq_length": max_seq_length,
+        },
+    )
+    train_data.set_format("torch")
+
+    test_data = test_data.map(
+        encode,
+        batched=True,
+        fn_kwargs={
+            "tokenizer": tokenizer,
+            "max_seq_length": max_seq_length,
+        },
+    )
+    test_data.set_format("torch")
 
     # Create a DatasetDict with train and test splits
     npov_perl_data = DatasetDict({
