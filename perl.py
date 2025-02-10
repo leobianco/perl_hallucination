@@ -41,14 +41,14 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(
         script_args.model_repo_id,
-        padding_side="right",
+        padding_side="left",
     )
 
-    perl_data_halomi = load_dataset(script_args.dataset_repo_id)
-    perl_data_halomi["train"] = perl_data_halomi["train"].select_columns(
+    perl_data = load_dataset(script_args.dataset_repo_id)
+    perl_data["train"] = perl_data["train"].select_columns(
         ["input_ids", "attention_mask"]
     )
-    perl_data_halomi["test"] = perl_data_halomi["test"].select_columns(
+    perl_data["test"] = perl_data["test"].select_columns(
         ["input_ids", "attention_mask"]
     )
 
@@ -88,8 +88,8 @@ def main():
         ref_policy=ref_policy,
         policy=policy,
         reward_model=reward_model,
-        train_dataset=perl_data_halomi["train"],
-        eval_dataset=perl_data_halomi["test"],
+        train_dataset=perl_data["train"],
+        eval_dataset=perl_data["test"],
     )
 
     if training_args.do_train:
