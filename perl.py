@@ -22,10 +22,6 @@ from utils import CustomLoraConfig, ScriptArguments
 
 
 def main():
-    #########
-    # SETUP #
-    #########
-
     parser = HfArgumentParser(
         (
             ScriptArguments,
@@ -41,8 +37,6 @@ def main():
     ) = parser.parse_args_into_dataclasses()
 
     name_for_saving = training_args.run_name.split("/")[1]
-
-    # Set seed before instantiating the model, for reproducibility.
     set_seed(training_args.seed)
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -50,23 +44,13 @@ def main():
         padding_side="right",
     )
 
-    ########
-    # DATA #
-    ########
-
     perl_data_halomi = load_dataset(script_args.dataset_repo_id)
-
     perl_data_halomi["train"] = perl_data_halomi["train"].select_columns(
         ["input_ids", "attention_mask"]
     )
-
     perl_data_halomi["test"] = perl_data_halomi["test"].select_columns(
         ["input_ids", "attention_mask"]
     )
-
-    ################
-    # REWARD MODEL #
-    ################
 
     id2label = {
         0: "Yes",
@@ -86,10 +70,6 @@ def main():
         attn_implementation="eager",
     )
 
-    #############################
-    # REFERENCE POLICY + POLICY #
-    #############################
-
     ref_policy = AutoModelForCausalLM.from_pretrained(
         training_args.sft_model_path,
         attn_implementation="eager",
@@ -102,10 +82,6 @@ def main():
 
     policy = get_peft_model(policy, peft_args)
 
-    ###########
-    # TRAINER #
-    ###########
-
     trainer = RLOOTrainer(
         config=training_args,
         processing_class=tokenizer,
@@ -115,10 +91,6 @@ def main():
         train_dataset=perl_data_halomi["train"],
         eval_dataset=perl_data_halomi["test"],
     )
-
-    ############
-    # TRAINING #
-    ############
 
     if training_args.do_train:
         trainer.train()

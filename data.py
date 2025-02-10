@@ -8,7 +8,7 @@ with the dataset name as an argument ("halomi" or "npov").
 from argparse import ArgumentParser
 from copy import deepcopy
 
-from datasets import concatenate_datasets, load_dataset
+from datasets import DatasetDict, concatenate_datasets, load_dataset
 from transformers import AutoTokenizer
 
 
@@ -311,17 +311,6 @@ def halomi_formatting_prompts_func(entry):
 # PERL
 
 
-def halomi_format_perl_data(entry, src_lang: str, tgt_lang: str):
-    """Helper function for formatting PERL data, to be mapped over dataset."""
-
-    entry["src_lang"] = src_lang
-    entry["tgt_lang"] = tgt_lang
-    entry["src_text"] = entry[src_lang]
-    entry["mt_text"] = entry[tgt_lang]
-
-    return entry
-
-
 def halomi_process_data_for_perl(
     halomi_perl_data,
     tokenizer,
@@ -334,6 +323,13 @@ def halomi_process_data_for_perl(
     n = halomi_perl_data.num_rows
     first_half = halomi_perl_data.select(range(n // 2))
     second_half = halomi_perl_data.select(range(n // 2, n))
+
+    def halomi_format_perl_data(entry, src_lang: str, tgt_lang: str):
+        entry["src_lang"] = src_lang
+        entry["tgt_lang"] = tgt_lang
+        entry["src_text"] = entry[src_lang]
+        entry["mt_text"] = entry[tgt_lang]
+        return entry
 
     first_half = first_half.map(
         halomi_format_perl_data,
@@ -618,13 +614,44 @@ def npov_formatting_prompts_func(entry):
 # PERL
 
 
-def npov_format_perl_data():
-    """Not sure this function is actually necessary for NPOV."""
-    pass
+def npov_process_data_for_perl(npov_rm_data, npov_sft_data):
+    """
+    Processes NPOV data for PERL by creating train and test splits
+    from the RM and SFT datasets, ensuring no topic overlap between splits.
+    """
 
+    # Extract the splits from the datasets
+    rm_train = npov_rm_data["train"]
+    rm_validation = npov_rm_data["validation"]
+    rm_test = npov_rm_data["test"]
 
-def npov_process_data_for_perl(npov_data):
-    pass
+    sft_train = npov_sft_data["train"]
+    sft_validation = npov_sft_data["validation"]
+    sft_test = npov_sft_data["test"]
+
+    # Combine validation and test splits for both RM and SFT data
+    train_data = concatenate_datasets([rm_validation, rm_test, sft_validation, sft_test])
+    test_data = concatenate_datasets([rm_train, sft_train])
+
+    # Get unique topics for train and test splits
+    train_topics = set(train_data["topic"])
+    test_topics = set(test_data["topic"])
+
+    # Identify overlapping topics
+    overlapping_topics = train_topics.intersection(test_topics)
+    print(f"Overlapping topics: {overlapping_topics}")
+
+    # # Filter out overlapping topics from both train and test splits
+    # train_data = train_data.filter(lambda example: example["topic"] not in overlapping_topics)
+    # test_data = test_data.filter(lambda example: example["topic"] not in overlapping_topics)
+
+    # Create a DatasetDict with train and test splits
+    npov_perl_data = DatasetDict({
+        "train": train_data,
+        "test": test_data,
+    })
+
+    return npov_perl_data
 
 
 def main():
@@ -744,6 +771,16 @@ def main():
             )
 
         # PERL
+        npov_perl_data = npov_process_data_for_perl(
+            npov_rm_data,
+            npov_sft_data,
+        )
+
+        for split in npov_perl_data.keys():
+            npov_perl_data[split].push_to_hub(
+                repo_id=args.perl_processed_repo_id,
+                split=split,
+            )
 
 
 if __name__ == "__main__":

@@ -297,12 +297,27 @@ if __name__ == "__main__":
     script_args = parser.parse_args_into_dataclasses()[0]
     name_for_saving = script_args.writer_model_lora.split("/")[1]
 
-    # Load data, either for evaluating the evaluator or for getting
-    # fewshot examples.
+    # Load data with annotated hallucination labels, either for evaluating the
+    # evaluator or for getting fewshot examples.
     data = load_dataset(
         f"{script_args.user}/{script_args.dataset}_processed",
         split="train",
     )
+
+    if script_args.dataset == "halomi":
+        data = load_dataset(
+            "leobianco/halomi_processed",
+            split="train",
+        )
+        evaluator_prompt = evaluator_prompt_halomi
+    elif script_args.dataset == "npov":
+        data = load_dataset(
+            "leobianco/npov_rm_processed",
+            split="train",
+        )
+        evaluator_prompt = evaluator_prompt_npov
+    else:
+        raise ValueError("Invalid dataset.")
 
     # Get fewshot examples to aid the evaluator. These come from the dataset
     # with labels.
@@ -329,13 +344,6 @@ if __name__ == "__main__":
             torch_dtype=torch.bfloat16,
         )
         evaluator.eval()
-
-        if script_args.dataset == "halomi":
-            evaluator_prompt = evaluator_prompt_halomi
-        elif script_args.dataset == "npov":
-            evaluator_prompt = evaluator_prompt_npov
-        else:
-            raise ValueError("Invalid dataset.")
 
         data = data.map(
             evaluator_prompt,
@@ -404,7 +412,7 @@ if __name__ == "__main__":
     else:
         # Load validation dataset, where evaluation will really occur.
         val_data = load_dataset(
-            f"{script_args.user}/perl_{script_args.dataset}_processed",
+            f"{script_args.user}/{script_args.dataset}_perl_processed",
             split="test",
         )
 
@@ -483,7 +491,7 @@ if __name__ == "__main__":
 
         # Build the evaluator prompts using fewshot examples + generations.
         val_data = val_data.map(
-            evaluator_prompt_halomi,
+            evaluator_prompt,
             fn_kwargs=dict(fewshot_examples=fewshot_examples),
         )
 
