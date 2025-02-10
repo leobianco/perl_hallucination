@@ -23,6 +23,7 @@ accelerate launch \
   --config_file="${DEEPSPEED_CONFIG}" \
   reward_model.py \
   -- \
+  --dataset "$DATASET" \
   --seed "$SEED" \
   --report_to "wandb" \
   --run_name "$RUN_IDENTIFIER" \
