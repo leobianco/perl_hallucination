@@ -1,27 +1,27 @@
 #!/usr/bin/env bash
 
-DATASET="$1"
+TASK="$1"
 USER="leobianco"
 SEED=12345
 TOKENIZER_MODEL="google/gemma-2-2b-it"
 MAX_SEQ_LENGTH=512
-RAW_REPO_ID="${USER}/${DATASET}_raw"
-PROCESSED_REPO_ID="${USER}/${DATASET}_processed"
-RM_PROCESSED_REPO_ID="${USER}/${DATASET}_rm_processed"
+RAW_REPO_ID="${USER}/${TASK}_raw"
+PROCESSED_REPO_ID="${USER}/${TASK}_processed"
+RM_PROCESSED_REPO_ID="${USER}/${TASK}_rm_processed"
 RM_VALIDATION_SIZE=0.2
-WRITER_SFT_PROCESSED_REPO_ID="${USER}/${DATASET}_writer_sft_processed"
+WRITER_SFT_PROCESSED_REPO_ID="${USER}/${TASK}_writer_sft_processed"
 PERL_RAW_REPO_ID="okezieowen/english_to_spanish"
-PERL_PROCESSED_REPO_ID="${USER}/${DATASET}_perl_processed"
+PERL_PROCESSED_REPO_ID="${USER}/${TASK}_perl_processed"
 PERL_TRAIN_SIZE=25000
 PERL_VALIDATION_SIZE=100
 
-if [ "$DATASET" != "halomi" ] && [ "$DATASET" != "npov" ]; then
+if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ]; then
     echo "Invalid dataset name"
     exit 1
 fi
 
 python data.py \
-    --dataset "$DATASET" \
+    --task "$TASK" \
     --seed "$SEED" \
     --tokenizer_model "$TOKENIZER_MODEL" \
     --max_seq_length "$MAX_SEQ_LENGTH" \

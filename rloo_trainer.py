@@ -310,7 +310,7 @@ class RLOOTrainer(Trainer):
                 ref_logprobs = []
                 scores = []
                 sequence_lengths = []
-                with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
+                with unwrap_model_for_generation(model, self.accelerator, is_peft_model=False) as unwrapped_model:  # LEO: had added is_peft_model=True here.
                     query_responses, logitss = batch_generation(
                         unwrapped_model,
                         queries,
@@ -324,6 +324,7 @@ class RLOOTrainer(Trainer):
                     query_response = query_responses[i : i + args.local_rollout_forward_batch_size]
                     response = query_response[:, context_length:]
                     logits = logitss[i : i + args.local_rollout_forward_batch_size]
+                    # logits /= args.temperature + 1e-7  # LEO: I added this line. CHECK IF NEEDED. I think it is not necessary, since batch_generation must already return logits divided by temperature.
                     all_logprob = F.log_softmax(logits, dim=-1)
                     logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
                     del logits, all_logprob
@@ -352,6 +353,9 @@ class RLOOTrainer(Trainer):
                     )
 
                     score_leo = torch.exp(score[:,1]) / (torch.exp(score[:,1]) + torch.exp(score[:,0]) + 1e-7)
+
+                    # if accelerator.local_process_index == 0:
+                    #     print("LEO: generation:", processing_class.decode(postprocessed_response[0]))
 
                     responses.append(response)
                     postprocessed_responses.append(postprocessed_response)
@@ -497,11 +501,7 @@ class RLOOTrainer(Trainer):
             gc.collect()
 
             if args.num_sample_generations > 0 and (update - 1) % self.sample_generations_freq == 0:
-                if accelerator.local_process_index == 0:
-                    print("LEO: inside generate completions conditional")
-                self.generate_completions(sampling=False)  # LEO: changed sampling to False.
-                if accelerator.local_process_index == 0:
-                    print("LEO: leaving generate completions conditional")
+                self.generate_completions(sampling=True)  # LEO: had changed sampling to False.
 
         # HF trainer specifics
         self.control = self.callback_handler.on_train_end(args, self.state, self.control)
@@ -517,16 +517,15 @@ class RLOOTrainer(Trainer):
             temperature=(args.temperature + 1e-7),  
             top_k=0.0,
             top_p=1.0,
-            do_sample=True,  # LEO: I modified this line (was hard coded)
+            do_sample=True,
         )
 
         table = defaultdict(list)
-        with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
+        with unwrap_model_for_generation(self.model, self.accelerator, is_peft_model=False) as unwrapped_model:  # LEO: added is_peft_model=True here.
             for batch in self.eval_dataloader:
                 query = batch["input_ids"]
                 with torch.no_grad():
                     context_length = query.shape[1]
-                    print("Before SECOND batch generation")
                     query_response, _ = batch_generation(
                         unwrapped_model,
                         query,
@@ -534,7 +533,6 @@ class RLOOTrainer(Trainer):
                         processing_class.pad_token_id,
                         generation_config,
                     )
-                    print("After SECOND batch generation")
                     response = query_response[:, context_length:]
                     postprocessed_response = response
                     if args.stop_token_id is not None:  # handle the edge case when stop_token_id exists but is 0

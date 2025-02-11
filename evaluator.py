@@ -52,17 +52,29 @@ from vllm import LLM, SamplingParams
 from vllm.distributed.parallel_state import destroy_model_parallel
 from vllm.lora.request import LoRARequest
 
+from data import npov_writer_prompt
+
 
 @dataclass
 class ScriptArguments:
+    task: str = field(metadata={"help": "Name of the task (NPOV, HalOmi)."})
+
     user: str = field(
         metadata={
             "help": "The user to use for writing and loading to and from HF."
         },
     )
 
-    dataset: str = field(
-        metadata={"help": "The dataset to use for evaluation (halomi or npov)."}
+    dataset_labels: str = field(
+        metadata={
+            "help": "Dataset with hallucination labels, for evaluation of evaluator or for getting few-shot examples. Test split will be used!"
+        }
+    )
+
+    dataset_prompts: str = field(
+        metadata={
+            "help": "Dataset with prompts to be used for generation (not necessarily has hallucination labels). Test split will be used!"
+        }
     )
 
     writer_model_base: str = field(
@@ -132,7 +144,7 @@ def get_fewshot_examples(data, n: int, seed: int):
     return fewshot_examples
 
 
-def evaluator_prompt_halomi(entry, fewshot_examples=None, use_true_label=False):
+def halomi_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False):
     """Function for transforming entries in the HalOmi dataset into prompts for
     the evaluator model.
 
@@ -190,7 +202,7 @@ def evaluator_prompt_halomi(entry, fewshot_examples=None, use_true_label=False):
     return entry
 
 
-def evaluator_prompt_npov(entry, fewshot_examples=None, use_true_label=False):
+def npov_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False):
     """Function for transforming entries in the NPOV dataset into prompts for
     the evaluator model.
 
@@ -297,27 +309,18 @@ if __name__ == "__main__":
     script_args = parser.parse_args_into_dataclasses()[0]
     name_for_saving = script_args.writer_model_lora.split("/")[1]
 
-    # Load data with annotated hallucination labels, either for evaluating the
-    # evaluator or for getting fewshot examples.
+    # Load dataset with hallucination labels (for evaluating the
+    # evaluator, or for getting fewshot examples).
     data = load_dataset(
-        f"{script_args.user}/{script_args.dataset}_processed",
-        split="train",
+        script_args.dataset_labels,
+        split="test",
     )
 
-    if script_args.dataset == "halomi":
-        data = load_dataset(
-            "leobianco/halomi_processed",
-            split="train",
-        )
-        evaluator_prompt = evaluator_prompt_halomi
-    elif script_args.dataset == "npov":
-        data = load_dataset(
-            "leobianco/npov_rm_processed",
-            split="train",
-        )
-        evaluator_prompt = evaluator_prompt_npov
-    else:
-        raise ValueError("Invalid dataset.")
+    evaluator_prompt = (
+        halomi_evaluator_prompt
+        if script_args.task == "halomi"
+        else npov_evaluator_prompt
+    )
 
     # Get fewshot examples to aid the evaluator. These come from the dataset
     # with labels.
@@ -410,9 +413,9 @@ if __name__ == "__main__":
         )
 
     else:
-        # Load validation dataset, where evaluation will really occur.
+        # Load dataset with prompts to generations (not necessarily labeled).
         val_data = load_dataset(
-            f"{script_args.user}/{script_args.dataset}_perl_processed",
+            script_args.dataset_prompts,
             split="test",
         )
 
@@ -446,10 +449,21 @@ if __name__ == "__main__":
             seed=script_args.seed,
             temperature=script_args.temperature,
             top_p=script_args.top_p,
+            min_tokens=10,  # avoid empty generations
             max_tokens=script_args.max_tokens,
         )
 
         prompts = [val_data[i]["prompt"] for i in range(val_data.num_rows)]
+
+        # TODO: once new evaluation set is available, fix this.
+        # CUSTOM RUNS: this is a temporary, _ugly_ solution to run evaluation
+        # on the hc_rm5x_test split. It should be changed once the new eval
+        # set is available. The problem is that the "prompt" column of the RM
+        # dataset contains the answer, and here we want to generate it.
+        # The solution is to call npov_writer_prompt from data.py.
+        if script_args.dataset_prompts == "leobianco/npov_rm_processed":
+            del prompts
+            prompts = val_data.map(npov_writer_prompt)["prompt"]
 
         if enable_lora:
             outputs = llm.generate(
@@ -486,6 +500,7 @@ if __name__ == "__main__":
             script_args.evaluator_model,
             device_map="auto",
             attn_implementation="eager",
+            torch_dtype=torch.bfloat16,
         )
         evaluator.eval()
 

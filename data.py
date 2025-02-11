@@ -584,7 +584,7 @@ def npov_formatting_prompts_func(entry):
         "<start_of_turn>user\n"
         "User query: {user_query}\n"
         "{perspective_1_name} arguments provided: {perspective_1}\n"
-        "{perspective_2_name} arguments provided: {perspective_2}\n"
+        "{perspective_2_name} arguments provided: {perspective_2}"
     )
 
     output_texts = []
@@ -621,39 +621,28 @@ def npov_process_data_for_perl(
     from the RM and SFT datasets, ensuring no topic overlap between splits.
     """
 
-    # Extract the splits from the datasets
-    rm_train = npov_rm_data["train"]
-    rm_validation = npov_rm_data["validation"]
-    rm_test = npov_rm_data["test"]
-
-    sft_train = npov_sft_data["train"]
-    sft_validation = npov_sft_data["validation"]
-    sft_test = npov_sft_data["test"]
-
-    # Combine validation and test splits for both RM and SFT data
-    train_data = concatenate_datasets(
-        [rm_validation, rm_test, sft_validation, sft_test]
-    )
-    test_data = concatenate_datasets([rm_train, sft_train])
+    train_data = npov_rm_data["validation"]
+    test_data = npov_sft_data["test"]
 
     train_data = train_data.shuffle(seed=seed)
     test_data = test_data.shuffle(seed=seed)
 
-    # Get unique topics for train and test splits
-    train_topics = set(train_data["topic"])
-    test_topics = set(test_data["topic"])
-
-    # Identify overlapping topics
-    overlapping_topics = train_topics.intersection(test_topics)
-    print(f"Overlapping topics: {overlapping_topics}")
-
-    # # Filter out overlapping topics from both train and test splits
-    # train_data = train_data.filter(lambda example: example["topic"] not in overlapping_topics)
-    # test_data = test_data.filter(lambda example: example["topic"] not in overlapping_topics)
-
-    # Create and tokenize prompts for writer
     train_data = train_data.map(npov_writer_prompt)
     test_data = test_data.map(npov_writer_prompt)
+
+    # The columns across splits must match.
+    train_data = train_data.select_columns(
+        [
+            "topic",
+            "user_query",
+            "npov_response",
+            "perspective_1",
+            "perspective_1_name",
+            "perspective_2",
+            "perspective_2_name",
+            "prompt",
+        ]
+    )
 
     train_data = train_data.map(
         encode,
@@ -675,7 +664,6 @@ def npov_process_data_for_perl(
     )
     test_data.set_format("torch")
 
-    # Create a DatasetDict with train and test splits
     npov_perl_data = DatasetDict(
         {
             "train": train_data,
@@ -688,7 +676,7 @@ def npov_process_data_for_perl(
 
 def main():
     parser = ArgumentParser()
-    parser.add_argument("--dataset", type=str)
+    parser.add_argument("--task", type=str)
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument(
         "--tokenizer_model", type=str, default="google/gemma-2-2b-it"
@@ -710,7 +698,7 @@ def main():
         padding_side="left",  # Pay attention to this argument!
     )
 
-    if args.dataset == "halomi":
+    if args.task == "halomi":
         halomi_processed_data = halomi_load_and_process_data(args.seed)
 
         halomi_processed_data.push_to_hub(
@@ -759,7 +747,7 @@ def main():
                 split=split,
             )
 
-    elif args.dataset == "npov":
+    elif args.task == "npov":
         # Reward Model
         npov_rm_data = load_dataset(
             "leobianco/npov",

@@ -9,7 +9,7 @@ from peft import LoraConfig
 class ScriptArguments:
     """Arguments common to all scripts (reward model, SFT, PERL)."""
 
-    dataset: str
+    task: str
     dataset_repo_id: str
     model_repo_id: str
 

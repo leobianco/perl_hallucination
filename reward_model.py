@@ -18,12 +18,10 @@ from transformers import (
     set_seed,
 )
 
-from data import *
 from utils import CustomLoraConfig, ScriptArguments
 
 
 def main():
-    
     # SETUP
     parser = HfArgumentParser(
         (ScriptArguments, TrainingArguments, CustomLoraConfig)
@@ -44,7 +42,6 @@ def main():
         padding_side="left",
     )
 
-
     # DATA
     rm_data_halomi = load_dataset(script_args.dataset_repo_id)
 
@@ -57,7 +54,6 @@ def main():
         "Yes": 0,
         "No": 1,
     }
-
 
     # MODEL
     reward_model = AutoModelForSequenceClassification.from_pretrained(
@@ -75,15 +71,14 @@ def main():
 
     reward_model = get_peft_model(reward_model, peft_args)
 
-
     # EVALUATION SETUP
     metric = evaluate.load("roc_auc")
 
     def compute_metrics(eval_preds):
-        """Recall that whereas logits where torch tensors before, now they are 
+        """Recall that whereas logits where torch tensors before, now they are
         numpy arrays.
 
-        logits here are the processed_logits from the process_logits_for_evaluation 
+        logits here are the processed_logits from the process_logits_for_evaluation
         function.
 
         metric is a 'global' function inside the scope of main.
@@ -101,7 +96,6 @@ def main():
         metrics = metric.compute(references=label_ids, prediction_scores=scores)
 
         return metrics
-
 
     # TRAINING
     trainer = Trainer(
@@ -121,7 +115,6 @@ def main():
 
         if training_args.push_to_hub:
             reward_model.push_to_hub(training_args.hub_model_id)
-
 
     # EVALUATION
     if training_args.do_eval:

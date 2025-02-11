@@ -4,10 +4,9 @@ TODO: write proper docstring.
 
 import os
 
+import torch
 from datasets import load_dataset
-from peft import (
-    get_peft_model,
-)
+from peft import PeftModel
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForSequenceClassification,
@@ -17,8 +16,7 @@ from transformers import (
 )
 from trl import RLOOConfig, RLOOTrainer
 
-from data import *
-from utils import CustomLoraConfig, ScriptArguments
+from utils import ScriptArguments
 
 
 def main():
@@ -26,14 +24,12 @@ def main():
         (
             ScriptArguments,
             RLOOConfig,
-            CustomLoraConfig,
         )
     )
 
     (
         script_args,
         training_args,
-        peft_args,
     ) = parser.parse_args_into_dataclasses()
 
     name_for_saving = training_args.run_name.split("/")[1]
@@ -68,19 +64,26 @@ def main():
         id2label=id2label,
         label2id=label2id,
         attn_implementation="eager",
+        torch_dtype=torch.bfloat16,
     )
 
     ref_policy = AutoModelForCausalLM.from_pretrained(
         training_args.sft_model_path,
         attn_implementation="eager",
+        torch_dtype=torch.bfloat16,
     )
 
-    policy = AutoModelForCausalLM.from_pretrained(
-        training_args.sft_model_path,
+    policy_base = AutoModelForCausalLM.from_pretrained(
+        script_args.model_repo_id,
         attn_implementation="eager",
+        torch_dtype=torch.bfloat16,
     )
 
-    policy = get_peft_model(policy, peft_args)
+    policy = PeftModel.from_pretrained(
+        policy_base,
+        training_args.sft_model_path,
+        is_trainable=True,  # loading adapters this way prevents overwriting
+    )
 
     trainer = RLOOTrainer(
         config=training_args,

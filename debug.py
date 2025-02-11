@@ -5,7 +5,7 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
 # Load data
-data = load_dataset("leobianco/npov_writer_sft_processed", split="train")
+data = load_dataset("leobianco/npov_perl_processed", split="test")
 
 #queries = data.select_columns(["input_ids", "attention_mask"])
 #query = queries[:5]
@@ -17,16 +17,17 @@ tokenizer = AutoTokenizer.from_pretrained(
 )
 
 model = AutoModelForCausalLM.from_pretrained(
-    "google/gemma-2-2b-it",
+    "leobianco/npov_SFT_seed_130104_epochs_60_lr_3e-4_lora_8",
     device_map="auto",
     attn_implementation="eager",
+    torch_dtype=torch.bfloat16,
 )
 model.eval()
 
 # Config
 generation_config = GenerationConfig(
-    max_new_tokens=53,
-    temperature=(5e-2 + 1e-7),
+    max_new_tokens=160,
+    temperature=(1e-0 + 1e-7),
     top_k=0.0,
     top_p=1.0,
     do_sample=True,

@@ -5,13 +5,15 @@ if [ $SHLVL -gt 2 ]; then
   :
 else
   # If single-run (copy and paste identifier)
-  DATASET="$1"
+  TASK="$1"
   USER="leobianco"
   SEED=130104
-  RUN_IDENTIFIER="leobianco/npov_SFT_seed_130401_epochs_20_lr_5e-5_lora_8"
+  DATASET_LABELS="leobianco/npov_rm_processed"
+  DATASET_PROMPTS="leobianco/npov_rm_processed"
+  RUN_IDENTIFIER="leobianco/npov_SFT_seed_130104_epochs_60_lr_3e-4_lora_8"
 fi
 
-if [ "$DATASET" != "halomi" ] && [ "$DATASET" != "npov" ]; then
+if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ]; then
     echo "Invalid dataset name"
     exit 1
 fi
@@ -20,13 +22,15 @@ BASE_MODEL="google/gemma-2-2b-it"
 EVALUATOR_MODEL="google/gemma-2-27b-it"
 NUM_FEWSHOT=4
 EVAL_EVALUATOR="False"
-THRESHOLD=0.05
-TEMPERATURE=1
+THRESHOLD=0.1
+TEMPERATURE=5e-2
 
 python3 evaluator.py \
-  --dataset "$DATASET" \
+  --task "$TASK" \
   --user "$USER" \
   --seed "$SEED" \
+  --dataset_labels "$DATASET_LABELS" \
+  --dataset_prompts "$DATASET_PROMPTS" \
   --writer_model_base ${BASE_MODEL} \
   --writer_model_lora "${RUN_IDENTIFIER}" \
   --max_tokens 768 \

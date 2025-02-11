@@ -33,12 +33,12 @@ def main():
     )
 
     # Train on completions only.
-    if script_args.dataset == "halomi":
+    if script_args.task == "halomi":
         response_template = (
             "\nTranslated text:<end_of_turn>\n<start_of_turn>model\n"
         )
         formatting_prompts_func = halomi_formatting_prompts_func
-    elif script_args.dataset == "npov":
+    elif script_args.task == "npov":
         response_template = (
             "Neutral point-of-view answer to user query, rewriting provided arguments in natural language:<end_of_turn>\n<start_of_turn>model\n"
         )
