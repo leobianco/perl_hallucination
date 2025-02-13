@@ -618,7 +618,7 @@ def npov_process_data_for_perl(
 ):
     """
     Processes NPOV data for PERL by creating train and test splits
-    from the RM and SFT datasets, ensuring no topic overlap between splits.
+    from the RM and SFT datasets.
     """
 
     train_data = npov_rm_data["validation"]
