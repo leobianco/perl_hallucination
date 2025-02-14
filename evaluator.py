@@ -307,7 +307,9 @@ def evaluator_score(
 if __name__ == "__main__":
     parser = HfArgumentParser(ScriptArguments)
     script_args = parser.parse_args_into_dataclasses()[0]
-    name_for_saving = script_args.writer_model_lora.split("/")[1]
+    name_for_saving = script_args.writer_model_lora.split(
+        f"{script_args.user}/"
+    )[1]
 
     # Load dataset with hallucination labels (for evaluating the
     # evaluator, or for getting fewshot examples).
@@ -430,11 +432,17 @@ if __name__ == "__main__":
         )
 
         if enable_lora:
-            # Dowload the LoRA adapters and save locally.
-            lora_path = snapshot_download(
-                repo_id=script_args.writer_model_lora,
-                allow_patterns=["*.json", "*.safetensors"],
-            )
+            # Check if the path given is local, and if not, download from HF
+            if os.path.exists(script_args.writer_model_lora):
+                lora_path = script_args.writer_model_lora
+                print("Local LoRA path found:", lora_path)
+            else:
+                # Dowload the LoRA adapters and save locally.
+                lora_path = snapshot_download(
+                    repo_id=script_args.writer_model_lora,
+                    allow_patterns=["*.json", "*.safetensors"],
+                )
+                print("LoRA path (downloaded from remote):", lora_path)
 
         # Instantiate evaluated checkpoint as a vLLM LLM.
         llm = LLM(
@@ -469,7 +477,9 @@ if __name__ == "__main__":
             outputs = llm.generate(
                 prompts,
                 sampling_params,
-                lora_request=LoRARequest("writer_lora_adapter", 1, lora_path),
+                lora_request=LoRARequest(
+                    "writer_lora_adapter", 1, lora_path=lora_path
+                ),
             )
         else:
             outputs = llm.generate(prompts, sampling_params)
