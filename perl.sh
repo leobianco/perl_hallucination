@@ -15,14 +15,16 @@ else
   RESPONSE_LENGTH=140
   NUM_SAMPLE_GENERATIONS=20
   LEARNING_RATE=2e-5
-  KL_COEFF=1e-2
+  KL_COEFF=1e-4
   RLOO_K=2
   NUM_PPO_EPOCHS=4
   NUM_MINIBATCHES=16
   PER_DEVICE_TRAIN_BATCH_SIZE=1
   LOCAL_ROLLOUT_FORWARD_BATCH_SIZE=8
   TEMPERATURE=1e-1
+  SAVE_STEPS=1000
   RUN_IDENTIFIER="leobianco/${TASK}_PERL_seed_${SEED}_episodes_${TOTAL_EPISODES}_lr_${LEARNING_RATE}_klcoeff_${KL_COEFF}_temp_${TEMPERATURE}"
+  SHUTDOWN=true
 fi
 
 if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ]; then
@@ -48,7 +50,7 @@ accelerate launch \
   --stop_token "eos" \
   --do_train True \
   --save_strategy "steps" \
-  --save_steps 150 \
+  --save_steps "$SAVE_STEPS" \
   --total_episodes "$TOTAL_EPISODES" \
   --learning_rate "$LEARNING_RATE" \
   --response_length "$RESPONSE_LENGTH" \
@@ -67,3 +69,9 @@ accelerate launch \
   --missing_eos_penalty 1.0 \
   --temperature "$TEMPERATURE" \
   --num_sample_generations "$NUM_SAMPLE_GENERATIONS"
+
+if [ "$SHUTDOWN" = true ]; then
+  echo "Shutting down the VM..."
+  sudo shutdown -h now
+fi
+
