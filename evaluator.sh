@@ -10,7 +10,7 @@ else
   SEED=130104
   DATASET_LABELS="leobianco/npov_rm_processed"
   DATASET_PROMPTS="leobianco/npov_rm_processed"
-  RUN_IDENTIFIER="leobianco/npov_SFT_seed_130104_epochs_60_lr_3e-4_lora_8"
+  RUN_IDENTIFIER="google/gemma-2-2b-it"
 fi
 
 if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ]; then
