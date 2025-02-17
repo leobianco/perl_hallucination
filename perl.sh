@@ -24,7 +24,7 @@ else
   TEMPERATURE=1e-1
   SAVE_STEPS=1000
   RUN_IDENTIFIER="leobianco/${TASK}_PERL_seed_${SEED}_episodes_${TOTAL_EPISODES}_lr_${LEARNING_RATE}_klcoeff_${KL_COEFF}_temp_${TEMPERATURE}"
-  SHUTDOWN=true
+  SHUTDOWN=false
 fi
 
 if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ]; then

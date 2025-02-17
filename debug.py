@@ -17,7 +17,7 @@ tokenizer = AutoTokenizer.from_pretrained(
 )
 
 model = AutoModelForCausalLM.from_pretrained(
-    "leobianco/PERL_eval",
+    "checkpoints/npov/perl/leobianco/npov_PERL_seed_130104_episodes_50_lr_2e-5_klcoeff_1e-4_temp_1e-1",
     device_map="auto",
     attn_implementation="eager",
     torch_dtype=torch.bfloat16,

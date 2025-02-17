@@ -10,7 +10,7 @@ else
   SEED=130104
   DATASET_LABELS="leobianco/npov_rm_processed"
   DATASET_PROMPTS="leobianco/npov_rm_processed"
-  RUN_IDENTIFIER="leobianco/PERL_eval"
+  RUN_IDENTIFIER="checkpoints/npov/perl/leobianco/npov_PERL_seed_130104_episodes_20000_lr_2e-5_klcoeff_1e-2_temp_1e-1/checkpoint-9490/conversion/"
 fi
 
 if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ]; then

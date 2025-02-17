@@ -97,9 +97,6 @@ def main():
 
     if training_args.do_train:
         trainer.train()
-        policy.save_pretrained(f"checkpoints/{name_for_saving}/")
-        if training_args.push_to_hub:
-            policy.push_to_hub(training_args.hub_model_id)
 
     filepath = f"logs/{name_for_saving}/logs.txt"
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
