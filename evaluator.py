@@ -320,9 +320,12 @@ def evaluator_score(
 if __name__ == "__main__":
     parser = HfArgumentParser(ScriptArguments)
     script_args = parser.parse_args_into_dataclasses()[0]
-    name_for_saving = script_args.writer_model_lora.split(
-        f"{script_args.user}/"
-    )[1]
+    try:
+        name_for_saving = script_args.writer_model_lora.split(
+            f"{script_args.user}/"
+        )[1]
+    except:
+        name_for_saving = script_args.writer_model_lora.split("/")[1]
 
     # Load dataset with hallucination labels (for evaluating the
     # evaluator, or for getting fewshot examples).
