@@ -540,7 +540,7 @@ def npov_process_data_for_sft(npov_data):
     return npov_data
 
 
-def npov_writer_prompt(entry, SFT=False):
+def npov_writer_prompt(entry, SFT=False, fewshot_examples=None):
     """Function for transforming entries in the NPOV dataset into prompts for
     the writer to rewrite.
 
@@ -572,7 +572,36 @@ def npov_writer_prompt(entry, SFT=False):
         npov_response=npov_response,
     )
 
-    entry["prompt"] = formatted_prompt
+    prompt = ""
+
+    if fewshot_examples is not None:
+        preamble = (
+            "<start_of_turn>user\nYour task is to answer an user's query"
+            " by rewriting the provided arguments in natural language. Do not "
+            "generate arguments other than those provided. "
+            f"We provide {fewshot_examples.num_rows} example(s) of what is "
+            "expected, then it is your turn.<end_of_turn>\n"
+        )
+
+        prompt += preamble
+
+        for fewshot_example in fewshot_examples:
+            fewshot_prompt = template.format(
+                user_query=fewshot_example["user_query"],
+                perspective_1_name=fewshot_example["perspective_1_name"],
+                perspective_1=fewshot_example["perspective_1"],
+                perspective_2_name=fewshot_example["perspective_2_name"],
+                perspective_2=fewshot_example["perspective_2"],
+                npov_response=fewshot_example["npov_response"],
+            )
+            prompt += fewshot_prompt + "<end_of_turn>\n"
+
+        prompt += formatted_prompt
+
+    else:
+        prompt += formatted_prompt
+
+    entry["prompt"] = prompt
 
     return entry
 

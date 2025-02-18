@@ -8,7 +8,7 @@ python -m IPython -i evaluator.py \
         --max_tokens 256 \
         --eval_batch_size 4 \
         --evaluator_model "google/gemma-2-27b-it" \
-        --num_fewshot_examples 4 \
+        --evaluator_num_fewshot 4 \
         --evaluate_evaluator False \
         --threshold 0.144
 
@@ -102,10 +102,17 @@ class ScriptArguments:
 
     top_p: float = field(default=1)
 
-    num_fewshot_examples: Optional[int] = field(
+    evaluator_num_fewshot: Optional[int] = field(
         default=0,
         metadata={
-            "help": "The number of fewshot examples to give to the evaluator."
+            "help": "The number of fewshot examples to give to the evaluator. Half will be positive (contain hallucination), half will be negative."
+        },
+    )
+
+    writer_num_fewshot: Optional[int] = field(
+        default=0,
+        metadata={
+            "help": "The number of fewshot examples to give to the writer. Must all be without hallucinations."
         },
     )
 
@@ -122,26 +129,32 @@ class ScriptArguments:
     )
 
 
-def get_fewshot_examples(data, n: int, seed: int):
+def get_fewshot_examples(data, n_yes: int, n_no: int, seed: int):
     """Returns n balanced fewshot examples from data."""
 
-    positive_examples = (
-        data.filter(lambda entry: entry["class_hall"] == "Yes")
-        .shuffle(seed=seed)
-        .select(range(n // 2))
-    )
+    if n_yes == 0 and n_no == 0:
+        fewshot_examples = None
 
-    negative_examples = (
-        data.filter(lambda entry: entry["class_hall"] == "No")
-        .shuffle(seed=seed)
-        .select(range(n // 2))
-    )
+        return fewshot_examples
 
-    fewshot_examples = concatenate_datasets(
-        [positive_examples, negative_examples]
-    ).shuffle(seed=seed)
+    else:
+        positive_examples = (
+            data.filter(lambda entry: entry["class_hall"] == "Yes")
+            .shuffle(seed=seed)
+            .select(range(n_yes))
+        )
 
-    return fewshot_examples
+        negative_examples = (
+            data.filter(lambda entry: entry["class_hall"] == "No")
+            .shuffle(seed=seed)
+            .select(range(n_no))
+        )
+
+        fewshot_examples = concatenate_datasets(
+            [positive_examples, negative_examples]
+        ).shuffle(seed=seed)
+
+        return fewshot_examples
 
 
 def halomi_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False):
@@ -326,12 +339,13 @@ if __name__ == "__main__":
 
     # Get fewshot examples to aid the evaluator. These come from the dataset
     # with labels.
-    if script_args.num_fewshot_examples == 0:
-        fewshot_examples = None
+    if script_args.evaluator_num_fewshot == 0:
+        evaluator_fewshot_examples = None
     else:
-        fewshot_examples = get_fewshot_examples(
+        evaluator_fewshot_examples = get_fewshot_examples(
             data,
-            script_args.num_fewshot_examples,
+            script_args.evaluator_num_fewshot // 2,
+            script_args.evaluator_num_fewshot // 2,
             seed=script_args.seed,
         )
 
@@ -353,7 +367,7 @@ if __name__ == "__main__":
         data = data.map(
             evaluator_prompt,
             fn_kwargs=dict(
-                fewshot_examples=fewshot_examples, use_true_label=True
+                fewshot_examples=evaluator_fewshot_examples, use_true_label=True
             ),
         )
 
@@ -389,7 +403,7 @@ if __name__ == "__main__":
         plt.scatter([fpr[threshold_idx]], [tpr[threshold_idx]], c="r")
         plt.savefig(
             f"logs/{name_for_saving}/"
-            + f"eval_evaluator_auc_curve_{script_args.num_fewshot_examples}_shot"
+            + f"eval_evaluator_auc_curve_{script_args.evaluator_num_fewshot}_shot"
         )
         plt.clf()
 
@@ -411,7 +425,7 @@ if __name__ == "__main__":
         plt.legend()
         plt.savefig(
             f"logs/{name_for_saving}/"
-            + f"eval_evaluator_histogram_{script_args.num_fewshot_examples}_shot"
+            + f"eval_evaluator_histogram_{script_args.evaluator_num_fewshot}_shot"
         )
 
     else:
@@ -471,7 +485,21 @@ if __name__ == "__main__":
         # The solution is to call npov_writer_prompt from data.py.
         if script_args.dataset_prompts == "leobianco/npov_rm_processed":
             del prompts
-            prompts = val_data.map(npov_writer_prompt)["prompt"]
+            train_data = load_dataset(
+                script_args.dataset_prompts,
+                split="train",
+            )
+            writer_fewshot_examples = get_fewshot_examples(
+                train_data,
+                n_yes=0,
+                n_no=script_args.writer_num_fewshot,
+                seed=script_args.seed,
+            )
+            prompts = val_data.map(
+                npov_writer_prompt,
+                fn_kwargs=dict(fewshot_examples=writer_fewshot_examples),
+            )["prompt"]
+            print("LEO: first prompt:", prompts[0])
 
         if enable_lora:
             outputs = llm.generate(
@@ -517,7 +545,7 @@ if __name__ == "__main__":
         # Build the evaluator prompts using fewshot examples + generations.
         val_data = val_data.map(
             evaluator_prompt,
-            fn_kwargs=dict(fewshot_examples=fewshot_examples),
+            fn_kwargs=dict(fewshot_examples=evaluator_fewshot_examples),
         )
 
         filepath = f"logs/{name_for_saving}/evaluator_prompts.txt"

@@ -11,27 +11,27 @@ data = load_dataset("leobianco/npov_rm_processed", split="test")
 #query = queries[:5]
 
 # Load model + tokenizer
-tokenizer = AutoTokenizer.from_pretrained(
-    "google/gemma-2-2b-it",
-    padding_side="left",
-)
+# tokenizer = AutoTokenizer.from_pretrained(
+#     "google/gemma-2-2b-it",
+#     padding_side="left",
+# )
 
-model = AutoModelForCausalLM.from_pretrained(
-    "checkpoints/npov/perl/leobianco/npov_PERL_seed_130104_episodes_50_lr_2e-5_klcoeff_1e-4_temp_1e-1",
-    device_map="auto",
-    attn_implementation="eager",
-    torch_dtype=torch.bfloat16,
-)
-model.eval()
+# model = AutoModelForCausalLM.from_pretrained(
+#     "checkpoints/npov/perl/leobianco/npov_PERL_seed_130104_episodes_50_lr_2e-5_klcoeff_1e-4_temp_1e-1",
+#     device_map="auto",
+#     attn_implementation="eager",
+#     torch_dtype=torch.bfloat16,
+# )
+# model.eval()
 
-# Config
-generation_config = GenerationConfig(
-    max_new_tokens=160,
-    temperature=(1e-1 + 1e-7),
-    top_k=0.0,
-    top_p=1.0,
-    do_sample=True,
-)
+# # Config
+# generation_config = GenerationConfig(
+#     max_new_tokens=160,
+#     temperature=(1e-1 + 1e-7),
+#     top_k=0.0,
+#     top_p=1.0,
+#     do_sample=True,
+# )
 
 #output = model.generate(
 #    input_ids=torch.tensor(query["input_ids"]).to(model.device),

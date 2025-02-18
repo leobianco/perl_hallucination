@@ -10,7 +10,7 @@ else
   SEED=130104
   DATASET_LABELS="leobianco/npov_rm_processed"
   DATASET_PROMPTS="leobianco/npov_rm_processed"
-  RUN_IDENTIFIER="checkpoints/npov/perl/leobianco/npov_PERL_seed_130104_episodes_20000_lr_2e-5_klcoeff_1e-2_temp_1e-1/checkpoint-9490/conversion/"
+  RUN_IDENTIFIER="google/gemma-2-2b-it"
 fi
 
 if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ]; then
@@ -20,7 +20,8 @@ fi
 
 BASE_MODEL="google/gemma-2-2b-it"
 EVALUATOR_MODEL="google/gemma-2-27b-it"
-NUM_FEWSHOT=4
+EVALUATOR_NUM_FEWSHOT=4
+WRITER_NUM_FEWSHOT=1
 EVAL_EVALUATOR="False"
 THRESHOLD=0.1
 TEMPERATURE=1e-1
@@ -35,7 +36,8 @@ python3 evaluator.py \
   --writer_model_lora "${RUN_IDENTIFIER}" \
   --max_tokens 768 \
   --evaluator_model ${EVALUATOR_MODEL} \
-  --num_fewshot_examples $NUM_FEWSHOT \
+  --evaluator_num_fewshot $EVALUATOR_NUM_FEWSHOT \
+  --writer_num_fewshot $WRITER_NUM_FEWSHOT \
   --evaluate_evaluator $EVAL_EVALUATOR \
   --threshold $THRESHOLD \
   --temperature $TEMPERATURE
