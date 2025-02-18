@@ -502,7 +502,6 @@ if __name__ == "__main__":
                 npov_writer_prompt,
                 fn_kwargs=dict(fewshot_examples=writer_fewshot_examples),
             )["prompt"]
-            print("LEO: first prompt:", prompts[0])
 
         if enable_lora:
             outputs = llm.generate(
