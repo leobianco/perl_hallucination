@@ -15,6 +15,7 @@ else
   LEARNING_RATE=3e-4
   LORA_RANK=8
   MAX_SEQ_LENGTH=512
+  NUM_FEWSHOT=1
   RUN_IDENTIFIER="${USER}/${EXPERIMENT_TYPE}_seed_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_lora_${LORA_RANK}"
 fi
 
@@ -44,7 +45,8 @@ accelerate launch \
   --num_train_epochs "$NUM_TRAIN_EPOCHS" \
   --learning_rate "$LEARNING_RATE" \
   --weight_decay 0.0 \
-  --max_seq_length $MAX_SEQ_LENGTH \
+  --max_seq_length "$MAX_SEQ_LENGTH" \
+  --num_fewshot "$NUM_FEWSHOT" \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps 1 \
   --do_eval False \

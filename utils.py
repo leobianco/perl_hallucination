@@ -1,6 +1,7 @@
 """TODO: write docstring."""
 
 from dataclasses import dataclass, field
+from typing import Optional
 
 from peft import LoraConfig
 
@@ -12,6 +13,7 @@ class ScriptArguments:
     task: str
     dataset_repo_id: str
     model_repo_id: str
+    num_fewshot: Optional[int] = None
 
 
 @dataclass

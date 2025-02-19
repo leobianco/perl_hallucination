@@ -1,6 +1,5 @@
 """TODO: write docstring."""
 
-
 from datasets import load_dataset
 from peft import get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
@@ -11,7 +10,11 @@ from trl import (
     TrlParser,
 )
 
-from data import halomi_formatting_prompts_func, npov_formatting_prompts_func
+from data import (
+    halomi_formatting_prompts_func,
+    npov_formatting_prompts_func,
+    npov_formatting_prompts_func_from_fewshot_examples,
+)
 from utils import CustomLoraConfig, ScriptArguments
 
 
@@ -23,26 +26,33 @@ def main():
     name_for_saving = training_args.run_name.split("/")[1]
     set_seed(training_args.seed)
 
-    # Data
     sft_data = load_dataset(script_args.dataset_repo_id, split="train")
 
-    # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
         script_args.model_repo_id,
         padding_side="left",
     )
 
-    # Train on completions only.
+    # For training on completions only.
     if script_args.task == "halomi":
         response_template = (
             "\nTranslated text:<end_of_turn>\n<start_of_turn>model\n"
         )
         formatting_prompts_func = halomi_formatting_prompts_func
     elif script_args.task == "npov":
-        response_template = (
-            "Neutral point-of-view answer to user query, rewriting provided arguments in natural language:<end_of_turn>\n<start_of_turn>model\n"
-        )
-        formatting_prompts_func = npov_formatting_prompts_func
+        response_template = "Neutral point-of-view answer to user query, rewriting provided arguments in natural language:<end_of_turn>\n<start_of_turn>model\n"
+        if script_args.num_fewshot == 0 or script_args.num_fewshot is None:
+            formatting_prompts_func = npov_formatting_prompts_func
+        else:
+            # Get fewshot examples and add to formatting_prompts_func
+            fewshot_examples = sft_data.shuffle(seed=script_args.seed).select(
+                range(script_args.num_fewshot)
+            )
+            formatting_prompts_func = (
+                npov_formatting_prompts_func_from_fewshot_examples(
+                    fewshot_examples=fewshot_examples
+                )
+            )
     else:
         raise ValueError("Invalid dataset.")
 

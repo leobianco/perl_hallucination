@@ -639,6 +639,70 @@ def npov_formatting_prompts_func(entry):
     return output_texts
 
 
+def npov_formatting_prompts_func_from_fewshot_examples(fewshot_examples):
+    """Given a fewshot example, returns a formatting prompts function for writer SFT that includes the given fewshot example in its prompt."""
+
+    preamble = (
+        "<start_of_turn>user\nYour task is to answer an user's query"
+        " by rewriting the provided arguments in natural language. Do not "
+        "generate arguments other than those provided. "
+        f"We provide {fewshot_examples.num_rows} example(s) of what is "
+        "expected, then it is your turn.<end_of_turn>\n"
+    )
+
+    prompt = preamble
+
+    template_fewshot = (
+        "<start_of_turn>user\n"
+        "User query: {user_query}\n"
+        "{perspective_1_name} arguments provided: {perspective_1}\n"
+        "{perspective_2_name} arguments provided: {perspective_2}\n"
+        "Example neutral point-of-view answer to user query, rewriting provided"
+        " arguments in natural language:<end_of_turn>\n"
+        "<start_of_turn>model\n{npov_response}"
+    )
+
+    for fewshot_example in fewshot_examples:
+        fewshot_prompt = template_fewshot.format(
+            user_query=fewshot_example["user_query"],
+            perspective_1_name=fewshot_example["perspective_1_name"],
+            perspective_1=fewshot_example["perspective_1"],
+            perspective_2_name=fewshot_example["perspective_2_name"],
+            perspective_2=fewshot_example["perspective_2"],
+            npov_response=fewshot_example["npov_response"],
+        )
+        prompt += fewshot_prompt + "<end_of_turn>\n"
+
+    def formatting_prompts_func(entry):
+        template = (
+            "<start_of_turn>user\n"
+            "User query: {user_query}\n"
+            "{perspective_1_name} arguments provided: {perspective_1}\n"
+            "{perspective_2_name} arguments provided: {perspective_2}"
+            "\nNeutral point-of-view answer to user query, rewriting provided"
+            " arguments in natural language:<end_of_turn>\n"
+            "<start_of_turn>model\n{npov_response}<end_of_turn><eos>"
+        )
+
+        output_texts = []
+
+        for i in range(len(entry["user_query"])):
+            formatted_prompt = template.format(
+                user_query=entry["user_query"][i],
+                perspective_1_name=entry["perspective_1_name"][i],
+                perspective_1=entry["perspective_1"][i],
+                perspective_2_name=entry["perspective_2_name"][i],
+                perspective_2=entry["perspective_2"][i],
+                npov_response=entry["npov_response"][i],
+            )
+
+            output_texts.append(prompt + formatted_prompt)
+
+        return output_texts
+
+    return formatting_prompts_func
+
+
 # PERL
 
 
