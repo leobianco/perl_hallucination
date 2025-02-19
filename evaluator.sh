@@ -10,7 +10,7 @@ else
   SEED=130104
   DATASET_LABELS="leobianco/npov_rm_processed"
   DATASET_PROMPTS="leobianco/npov_rm_processed"
-  RUN_IDENTIFIER="google/gemma-2-2b-it"
+  RUN_IDENTIFIER="./checkpoints/npov/perl/leobianco/npov_PERL_seed_130104_episodes_20000_lr_8e-6_klcoeff_5e-5_temp_1e-1/checkpoint-7735"
 fi
 
 if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ]; then
@@ -23,7 +23,7 @@ EVALUATOR_MODEL="google/gemma-2-27b-it"
 EVALUATOR_NUM_FEWSHOT=4
 WRITER_NUM_FEWSHOT=0
 EVAL_EVALUATOR="False"
-THRESHOLD=0.1
+THRESHOLD=0.02
 TEMPERATURE=1e-1
 
 python3 evaluator.py \

@@ -576,9 +576,5 @@ if __name__ == "__main__":
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         with open(filepath, "w") as f:
             for idx, score in enumerate(scores):
-                f.write(f"\n{idx}.----------\n" + "{:.3f}".format(score.item()))
-            f.write(
-                f"Rate of hallucination (threshold = {script_args.threshold}):\n"
-                + str(rate_hallucination.item())
-            )
-        print(f"Scores and rate of hallucination saved to {filepath}")
+                f.write("{:.3f}\n".format(score.item()))
+        print(f"Scores saved to {filepath}")
