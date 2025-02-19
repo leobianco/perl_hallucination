@@ -2,6 +2,7 @@
 
 from datasets import load_dataset
 from peft import get_peft_model
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 from trl import (
     DataCollatorForCompletionOnlyLM,
@@ -23,7 +24,6 @@ def main():
     (script_args, training_args, peft_args) = (
         parser.parse_args_into_dataclasses()
     )
-    name_for_saving = training_args.run_name.split("/")[1]
     set_seed(training_args.seed)
 
     sft_data = load_dataset(script_args.dataset_repo_id, split="train")
@@ -45,7 +45,7 @@ def main():
             formatting_prompts_func = npov_formatting_prompts_func
         else:
             # Get fewshot examples and add to formatting_prompts_func
-            fewshot_examples = sft_data.shuffle(seed=script_args.seed).select(
+            fewshot_examples = sft_data.shuffle(seed=training_args.seed).select(
                 range(script_args.num_fewshot)
             )
             formatting_prompts_func = (
@@ -67,6 +67,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         script_args.model_repo_id,
         attn_implementation="eager",
+        torch_dtype=torch.bfloat16,
     )
     model = get_peft_model(model, peft_args)
 
@@ -81,10 +82,6 @@ def main():
 
     if training_args.do_train:
         trainer.train()
-        model.save_pretrained(f"checkpoints/{name_for_saving}/")
-
-        if training_args.push_to_hub:
-            model.push_to_hub(training_args.hub_model_id)
 
 
 if __name__ == "__main__":

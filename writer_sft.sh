@@ -11,16 +11,17 @@ else
   DEEPSPEED_CONFIG="./deepspeed_config.yaml"
   EXPERIMENT_TYPE="${TASK}_SFT"
   SEED=130104
-  NUM_TRAIN_EPOCHS=60
-  LEARNING_RATE=3e-4
+  NUM_TRAIN_EPOCHS=20
+  LEARNING_RATE=3e-1
   LORA_RANK=8
   MAX_SEQ_LENGTH=512
   NUM_FEWSHOT=1
-  RUN_IDENTIFIER="${USER}/${EXPERIMENT_TYPE}_seed_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_lora_${LORA_RANK}"
+  SAVE_STEPS=200
+  RUN_IDENTIFIER="${USER}/${EXPERIMENT_TYPE}_seed_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_lora_${LORA_RANK}_fewshot_${NUM_FEWSHOT}"
 fi
 
 if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ]; then
-    echo "Invalid dataset name"
+    echo "Invalid task name"
     exit 1
 fi
 
@@ -41,7 +42,8 @@ accelerate launch \
   --model_repo_id "${BASE_MODEL_PATH}" \
   --do_train True \
   --bf16 True \
-  --save_strategy "epoch" \
+  --save_strategy "steps" \
+  --save_steps "$SAVE_STEPS" \
   --num_train_epochs "$NUM_TRAIN_EPOCHS" \
   --learning_rate "$LEARNING_RATE" \
   --weight_decay 0.0 \

@@ -47,7 +47,12 @@ from sklearn.metrics import (
 )
 from torch import nn
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    HfArgumentParser,
+    set_seed,
+)
 from vllm import LLM, SamplingParams
 from vllm.distributed.parallel_state import destroy_model_parallel
 from vllm.lora.request import LoRARequest
@@ -320,6 +325,8 @@ def evaluator_score(
 if __name__ == "__main__":
     parser = HfArgumentParser(ScriptArguments)
     script_args = parser.parse_args_into_dataclasses()[0]
+    set_seed(script_args.seed)
+
     try:
         name_for_saving = script_args.writer_model_lora.split(
             f"{script_args.user}/"

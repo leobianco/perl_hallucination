@@ -28,7 +28,7 @@ else
 fi
 
 if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ]; then
-    echo "Invalid dataset name"
+    echo "Invalid task name"
     exit 1
 fi
 
