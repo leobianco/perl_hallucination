@@ -51,6 +51,7 @@ accelerate launch \
   --do_train True \
   --save_strategy "steps" \
   --save_steps "$SAVE_STEPS" \
+  --save_only_model True \
   --total_episodes "$TOTAL_EPISODES" \
   --learning_rate "$LEARNING_RATE" \
   --response_length "$RESPONSE_LENGTH" \
