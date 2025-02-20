@@ -14,6 +14,7 @@ PERL_RAW_REPO_ID="okezieowen/english_to_spanish"
 PERL_PROCESSED_REPO_ID="${USER}/${TASK}_perl_processed"
 PERL_TRAIN_SIZE=25000
 PERL_VALIDATION_SIZE=100
+AUGMENTED_REPO_ID="${USER}/${TASK}_augmented_validation"
 
 if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ]; then
     echo "Invalid dataset name"
@@ -33,4 +34,5 @@ python data.py \
     --perl_raw_repo_id "$PERL_RAW_REPO_ID" \
     --perl_processed_repo_id "$PERL_PROCESSED_REPO_ID" \
     --perl_train_size "$PERL_TRAIN_SIZE" \
-    --perl_validation_size "$PERL_VALIDATION_SIZE"
+    --perl_validation_size "$PERL_VALIDATION_SIZE" \
+    --augmented_repo_id "$AUGMENTED_REPO_ID"

@@ -7,8 +7,9 @@ with the dataset name as an argument ("halomi" or "npov").
 
 from argparse import ArgumentParser
 from copy import deepcopy
+from itertools import combinations
 
-from datasets import DatasetDict, concatenate_datasets, load_dataset
+from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
 from transformers import AutoTokenizer
 
 #####################
@@ -767,6 +768,129 @@ def npov_process_data_for_perl(
     return npov_perl_data
 
 
+# Data augmentation
+
+
+def npov_data_augmentation(data):
+    """
+    Augment NPOV dataset by generating combinations of arguments
+    for different perspectives on each topic.
+
+    Notice that for the moment I have hard coded pairs of arguments.
+    Initially, the different topics do not have the same amount of
+    arguments. The combinatorics of the thing makes some topics appear
+    much more than others.
+    """
+
+    topics = set(data["topic"])
+    p1_name = data[0]["perspective_1_name"]
+    p2_name = data[0]["perspective_2_name"]
+
+    all_topics = []
+    all_user_queries = []
+    all_p1_arguments = []
+    all_p2_arguments = []
+    all_p1_names = []
+    all_p2_names = []
+    result = {}
+
+    def extract_perspective_arguments(
+        topic: str, perspective_col: str, perspective_name: str
+    ):
+        """
+        Extract unique arguments for a given topic and perspective (pro or con).
+        """
+
+        topic_data = data.filter(lambda x: x["topic"] == topic)[perspective_col]
+
+        arguments = {
+            f"{perspective_name}: {arg.strip()}"
+            for text in topic_data
+            for arg in text.split(f"{perspective_name}:")
+            if arg.strip()
+        }
+
+        return arguments
+
+    for topic in topics:
+        user_query = data.filter(lambda x: x["topic"] == topic)["user_query"][0]
+
+        p1_args = extract_perspective_arguments(topic, "perspective_1", p1_name)
+        p2_args = extract_perspective_arguments(topic, "perspective_2", p2_name)
+
+        p1_pairs = list(combinations(p1_args, 2))
+        p2_pairs = list(combinations(p2_args, 2))
+
+        for p1_pair in p1_pairs:
+            for p2_pair in p2_pairs:
+                p1_combined = " ".join(p1_pair)
+                p2_combined = " ".join(p2_pair)
+                all_p1_arguments.append(p1_combined)
+                all_p2_arguments.append(p2_combined)
+                all_p1_names.append(p1_name)
+                all_p2_names.append(p2_name)
+                all_topics.append(topic)
+                all_user_queries.append(user_query)
+
+    result = {
+        "topic": all_topics,
+        "user_query": all_user_queries,
+        "perspective_1": all_p1_arguments,
+        "perspective_1_name": all_p1_names,
+        "perspective_2": all_p2_arguments,
+        "perspective_2_name": all_p2_names,
+    }
+
+    return result
+
+
+# def npov_data_augmentation():
+#     data = load_dataset("leobianco/npov_rm_processed", split="test")
+
+#     # Helper functions
+#     def extract_unique_arguments(
+#         data, perspective_column, perspective_name_column
+#     ):
+#         unique_args = {}
+#         for topic in set(data["topic"]):
+#             splitted_arguments = []
+#             perspective_name = data[perspective_name_column][0]
+
+#             for arguments in data.filter(lambda x: x["topic"] == topic)[
+#                 perspective_column
+#             ]:
+#                 for i in arguments.split(f"{perspective_name}:"):
+#                     if i != "":
+#                         splitted_arguments.append(f"{perspective_name}:{i}")
+
+#             unique_args[topic] = set(splitted_arguments)
+
+#         return unique_args
+
+#     # Extract unique arguments
+#     unique_args_1 = extract_unique_arguments(
+#         data, "perspective_1", "perspective_1_name"
+#     )
+#     unique_args_2 = extract_unique_arguments(
+#         data, "perspective_2", "perspective_2_name"
+#     )
+
+#     # For each topic, extract all possible combinations of 2 arguments
+#     final = {}
+#     for topic in set(data["topic"]):
+#         combs = []
+#         combs1 = list(combinations(unique_args_1[topic], 2))
+#         combs2 = list(combinations(unique_args_2[topic], 2))
+
+#         for comb1 in combs1:
+#             for comb2 in combs2:
+#                 combs.append(combs1 + combs2)
+
+#         final[topic] = combs
+
+#     return final
+
+
 def main():
     parser = ArgumentParser()
     parser.add_argument("--task", type=str)
@@ -784,6 +908,7 @@ def main():
     parser.add_argument("--perl_processed_repo_id", type=str)
     parser.add_argument("--perl_train_size", type=int)
     parser.add_argument("--perl_validation_size", type=int)
+    parser.add_argument("--augmented_repo_id", type=str)
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -897,6 +1022,15 @@ def main():
                 repo_id=args.perl_processed_repo_id,
                 split=split,
             )
+
+        # Data augmentation
+        npov_augmented_data = npov_data_augmentation(npov_rm_data["test"])
+        npov_augmented_data_dict = DatasetDict(
+            {"test": Dataset.from_dict(npov_augmented_data)}
+        )
+        npov_augmented_data_dict.push_to_hub(
+            repo_id=args.augmented_repo_id,
+        )
 
 
 if __name__ == "__main__":
