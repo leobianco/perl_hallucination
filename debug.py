@@ -6,8 +6,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 from data import npov_writer_prompt
 
 # Load data
-data = load_dataset("leobianco/npov_rm_processed", split="test")
-data = data.map(npov_writer_prompt)
+data = load_dataset("leobianco/halomi_rm_processed", split="train")
+data_test = load_dataset("leobianco/halomi_rm_processed", split="test")
+# data = data.map(npov_writer_prompt)
 
 # # Load model + tokenizer
 # tokenizer = AutoTokenizer.from_pretrained(

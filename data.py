@@ -844,53 +844,6 @@ def npov_data_augmentation(data):
     return result
 
 
-# def npov_data_augmentation():
-#     data = load_dataset("leobianco/npov_rm_processed", split="test")
-
-#     # Helper functions
-#     def extract_unique_arguments(
-#         data, perspective_column, perspective_name_column
-#     ):
-#         unique_args = {}
-#         for topic in set(data["topic"]):
-#             splitted_arguments = []
-#             perspective_name = data[perspective_name_column][0]
-
-#             for arguments in data.filter(lambda x: x["topic"] == topic)[
-#                 perspective_column
-#             ]:
-#                 for i in arguments.split(f"{perspective_name}:"):
-#                     if i != "":
-#                         splitted_arguments.append(f"{perspective_name}:{i}")
-
-#             unique_args[topic] = set(splitted_arguments)
-
-#         return unique_args
-
-#     # Extract unique arguments
-#     unique_args_1 = extract_unique_arguments(
-#         data, "perspective_1", "perspective_1_name"
-#     )
-#     unique_args_2 = extract_unique_arguments(
-#         data, "perspective_2", "perspective_2_name"
-#     )
-
-#     # For each topic, extract all possible combinations of 2 arguments
-#     final = {}
-#     for topic in set(data["topic"]):
-#         combs = []
-#         combs1 = list(combinations(unique_args_1[topic], 2))
-#         combs2 = list(combinations(unique_args_2[topic], 2))
-
-#         for comb1 in combs1:
-#             for comb2 in combs2:
-#                 combs.append(combs1 + combs2)
-
-#         final[topic] = combs
-
-#     return final
-
-
 def main():
     parser = ArgumentParser()
     parser.add_argument("--task", type=str)
