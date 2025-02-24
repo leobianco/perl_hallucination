@@ -9,7 +9,6 @@ else
   USER="leobianco"
   BASE_MODEL_PATH="google/gemma-2-2b-it"
   DEEPSPEED_CONFIG="./deepspeed_config.yaml"
-  EXPERIMENT_TYPE="${TASK}_SFT"
   SEED=130104
   NUM_TRAIN_EPOCHS=20
   LEARNING_RATE=3e-1
@@ -17,7 +16,7 @@ else
   MAX_SEQ_LENGTH=512
   NUM_FEWSHOT=1
   SAVE_STEPS=200
-  RUN_IDENTIFIER="${USER}/${EXPERIMENT_TYPE}_seed_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_lora_${LORA_RANK}_fewshot_${NUM_FEWSHOT}"
+  RUN_IDENTIFIER="${USER}/${TASK}_SFT_seed_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_lora_${LORA_RANK}_fewshot_${NUM_FEWSHOT}"
 fi
 
 if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ]; then
