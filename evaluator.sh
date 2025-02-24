@@ -8,9 +8,10 @@ else
   TASK="$1"
   USER="leobianco"
   SEED=130104
-  DATASET_LABELS="leobianco/npov_rm_processed"
-  DATASET_PROMPTS="leobianco/npov_rm_processed"
-  RUN_IDENTIFIER="./checkpoints/npov/writer_sft/leobianco/npov_SFT_seed_130104_epochs_60_lr_3e-4_lora_8_fewshot_1"
+  DATASET_LABELS="leobianco/halomi_processed"
+  DATASET_LABELS_SPLIT="train"
+  DATASET_PROMPTS="leobianco/halomi_perl_processed"
+  RUN_IDENTIFIER="google/gemma-2-2b-it"
 fi
 
 if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ]; then
@@ -23,7 +24,7 @@ EVALUATOR_MODEL="google/gemma-2-27b-it"
 EVALUATOR_NUM_FEWSHOT=4
 WRITER_NUM_FEWSHOT=1
 EVAL_EVALUATOR="False"
-THRESHOLD=0.02
+THRESHOLD=0.05
 TEMPERATURE=1e-1
 
 python3 evaluator.py \
@@ -31,6 +32,7 @@ python3 evaluator.py \
   --user "$USER" \
   --seed "$SEED" \
   --dataset_labels "$DATASET_LABELS" \
+  --dataset_labels_split "$DATASET_LABELS_SPLIT" \
   --dataset_prompts "$DATASET_PROMPTS" \
   --writer_model_base ${BASE_MODEL} \
   --writer_model_lora "${RUN_IDENTIFIER}" \

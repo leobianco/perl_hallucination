@@ -72,7 +72,13 @@ class ScriptArguments:
 
     dataset_labels: str = field(
         metadata={
-            "help": "Dataset with hallucination labels, for evaluation of evaluator or for getting few-shot examples. Test split will be used!"
+            "help": "Dataset with hallucination labels, for evaluation of evaluator or for getting few-shot examples."
+        }
+    )
+
+    dataset_labels_split: str = field(
+        metadata={
+            "help": "What split of the dataset_labels to use."
         }
     )
 
@@ -338,7 +344,7 @@ if __name__ == "__main__":
     # evaluator, or for getting fewshot examples).
     data = load_dataset(
         script_args.dataset_labels,
-        split="test",
+        split=script_args.dataset_labels_split,
     )
 
     evaluator_prompt = (
