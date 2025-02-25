@@ -209,6 +209,17 @@ def halomi_process_data_for_rm(
     # Copy original Halomi data
     halomi_rm_data = deepcopy(halomi_data)
 
+    # Remove undesirable entries listed on "halomi_remove.txt"
+    lines = []
+    with open("halomi_remove.txt", "r") as f:
+        for line in f:
+            line = line.strip()
+            lines.append(line)
+
+    halomi_rm_data = halomi_rm_data.filter(
+        lambda example: example["src_text"] not in lines
+    )
+
     # Create reward model HalOmi prompts
     halomi_rm_data = halomi_rm_data.map(halomi_rm_prompt)
 
