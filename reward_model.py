@@ -43,7 +43,7 @@ def main():
     )
 
     # DATA
-    rm_data_halomi = load_dataset(script_args.dataset_repo_id)
+    rm_data = load_dataset(script_args.dataset_repo_id)
 
     id2label = {
         0: "Yes",
@@ -101,8 +101,8 @@ def main():
     trainer = Trainer(
         model=reward_model,
         args=training_args,
-        train_dataset=rm_data_halomi["train"],
-        eval_dataset=rm_data_halomi["test"],
+        train_dataset=rm_data["train"],
+        eval_dataset=rm_data["test"],
         processing_class=tokenizer,
         compute_metrics=compute_metrics,
     )

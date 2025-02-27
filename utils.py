@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass, field
 from typing import Optional
+import numpy as np
+import matplotlib.pyplot as plt
 
 from peft import LoraConfig
 
@@ -47,6 +49,58 @@ def hallucination_rate_from_score_file(filepath, threshold):
 
         fraction_below_threshold = below_threshold_count / total_count
         return fraction_below_threshold
+
+    except FileNotFoundError:
+        print(f"Error: The file at '{filepath}' was not found.")
+        return None
+
+def average_from_score_file(filepath):
+    """Given a scores.txt file and a threshold, returns its average."""
+
+    total_count = 0
+    total_value = 0
+
+    try:
+        with open(filepath, "r") as file:
+            for line in file:
+                try:
+                    value = float(line.strip())
+                    total_value += value
+                    total_count += 1
+                except ValueError:
+                    continue
+
+        if total_count == 0:
+            return None
+
+        avg = total_value / total_count
+        return avg
+
+    except FileNotFoundError:
+        print(f"Error: The file at '{filepath}' was not found.")
+        return None
+
+def histogram_from_score_file(filepath):
+    """Histogram of scores."""
+    
+    name = filepath.rstrip(".txt")
+    scores = []
+
+    try:
+        with open(filepath, "r") as file:
+            for line in file:
+                try:
+                    value = float(line.strip())
+                    scores.append(value)
+                except ValueError:
+                    continue
+
+        bins = np.linspace(0, 1, 10)
+        plt.hist(scores, bins=bins, density=True, alpha=0.5, label=name)
+        plt.legend()
+        plt.savefig(f"{name}_histogram.png")
+
+        return None
 
     except FileNotFoundError:
         print(f"Error: The file at '{filepath}' was not found.")
