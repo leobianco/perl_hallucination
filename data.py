@@ -6,8 +6,10 @@ with the dataset name as an argument ("halomi" or "npov").
 """
 
 from argparse import ArgumentParser
+import ast
 from copy import deepcopy
 from itertools import combinations
+import random
 
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
 from transformers import AutoTokenizer
@@ -853,6 +855,100 @@ def npov_data_augmentation(data):
     }
 
     return result
+
+
+def owkin_process_data():
+    pass
+
+
+def owkin_load_and_process_data():
+    """Loads and processes Owkin data."""
+
+    data = load_dataset(
+        "owkin/medical_knowledge_from_extracts",
+        data_files={"train": "finetuning_train.csv"},
+        split="train",
+    )
+
+    return data
+
+
+def owkin_synthetic_hallucinations(owkin_data, seed=12345):
+    """Create synthetic hallucinations for the Owkin dataset by switching conditions and/or interventions in the "Answer" column of the dataset.
+    """
+
+    # Initialize seed
+    random.seed(seed)
+
+    # Extract dictionaries in "Answers" column
+    answers = []
+    unique_conditions = []
+    unique_interventions = []
+
+    for ans in owkin_data["Answer"]:
+
+        dict_ans = ast.literal_eval(ans)
+        answers.append(dict_ans)
+
+        # Get unique conditions present in all answers
+        for condition in dict_ans["conditions"].split("|"):
+            if condition not in unique_conditions:
+                unique_conditions.append(condition)
+
+        # Get unique interventions present in all answers
+        for intervention in dict_ans["interventions"].split("|"):
+            if intervention not in unique_interventions:
+                unique_interventions.append(intervention)
+
+    # For each entry, choose a different condition not in its original list
+    hallucinated_answers = deepcopy(answers)
+
+    for hallucinated_answer in hallucinated_answers:
+        # Get this answers' conditions
+        original_conditions = hallucinated_answer["conditions"].split("|")
+        new_conditions = []
+
+        # For each condition, sample a different one (not in the set)
+        for condition in original_conditions:
+            repeated = True
+            while repeated:
+                new_condition = random.sample(unique_conditions, 1)
+                if new_condition not in original_conditions:
+                    repeated = False
+            new_conditions.append(new_condition[0])
+
+        # Join everything back into a single string
+        hallucinated_answer["conditions"] = "|".join(new_conditions)
+
+        # Do the same for interventions
+        original_interventions = hallucinated_answer["interventions"].split("|")
+        new_interventions = []
+
+        # For each intervention, sample a different one (not in the set)
+        for intervention in original_interventions:
+            repeated = True
+            while repeated:
+                new_intervention = random.sample(unique_interventions, 1)
+                if new_intervention not in original_interventions:
+                    repeated = False
+            new_interventions.append(new_intervention[0])
+
+        # Join everything back into a single string
+        hallucinated_answer["interventions"] = "|".join(new_interventions)
+
+    return answers, hallucinated_answers
+
+
+def owkin_rm_prompt():
+    """Function for transforming entries in the Owkin dataset into training
+    prompts for the reward model.
+    """
+
+    pass
+
+
+def owkin_process_data_for_rm():
+    pass
 
 
 def main():
