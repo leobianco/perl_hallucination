@@ -874,8 +874,7 @@ def owkin_load_and_process_data():
 
 
 def owkin_synthetic_hallucinations(owkin_data, seed=12345):
-    """Create synthetic hallucinations for the Owkin dataset by switching conditions and/or interventions in the "Answer" column of the dataset.
-    """
+    """Create synthetic hallucinations for the Owkin dataset by switching conditions and/or interventions in the "Answer" column of the dataset."""
 
     # Initialize seed
     random.seed(seed)
@@ -886,7 +885,6 @@ def owkin_synthetic_hallucinations(owkin_data, seed=12345):
     unique_interventions = []
 
     for ans in owkin_data["Answer"]:
-
         dict_ans = ast.literal_eval(ans)
         answers.append(dict_ans)
 
@@ -936,19 +934,74 @@ def owkin_synthetic_hallucinations(owkin_data, seed=12345):
         # Join everything back into a single string
         hallucinated_answer["interventions"] = "|".join(new_interventions)
 
-    return answers, hallucinated_answers
+    # Put everything on a dataset and return
+    hallucinated_data = deepcopy(owkin_data)
+    hallucinated_data.remove_columns("Answer")
+
+    hallucinated_data = hallucinated_data.map(
+        lambda entry, idx: {
+            "Question": entry["Question"],
+            "Answer": f"{{'conditions': '{hallucinated_answers[idx]['conditions']}', 'interventions': '{hallucinated_answers[idx]['interventions']}'}}",
+        },
+        with_indices=True,
+    )
+
+    return hallucinated_data
 
 
-def owkin_rm_prompt():
+def owkin_rm_prompt(entry):
     """Function for transforming entries in the Owkin dataset into training
     prompts for the reward model.
     """
 
-    pass
+    template = (
+        "<start_of_turn>user\n"
+        "{user_query}\n"
+        "<end_of_turn>\n"
+        "<start_of_turn>model\n{answer}<end_of_turn><eos>"
+    )
+
+    formatted_prompt = template.format(
+        user_query=entry["Question"],
+        answer=entry["Answer"],
+    )
+
+    entry["prompt"] = formatted_prompt
+
+    return entry
 
 
-def owkin_process_data_for_rm():
-    pass
+def owkin_process_data_for_rm(
+    owkin_data,
+    hallucinated_data,
+    tokenizer,
+    max_seq_length=512,
+    seed=12345,
+):
+    # Add label columns correctly
+    owkin_data = owkin_data.map(lambda entry: {**entry, "label": 1})
+    hallucinated_data = hallucinated_data.map(
+        lambda entry: {**entry, "label": 0}
+    )
+
+    # Merge and mix original owkin data and hallucinated data
+    merged_data = concatenate_datasets([owkin_data, hallucinated_data]).shuffle(
+        seed=seed
+    )
+
+    # Map prompt and tokenize
+    merged_data = merged_data.map(owkin_rm_prompt)
+    merged_data = merged_data.map(
+        encode,
+        batched=True,
+        fn_kwargs={
+            "tokenizer": tokenizer,
+            "max_seq_length": max_seq_length,
+        },
+    )
+    merged_data.set_format("torch")
+
+    return merged_data
 
 
 def main():
@@ -1091,6 +1144,26 @@ def main():
         npov_augmented_data_dict.push_to_hub(
             repo_id=args.augmented_repo_id,
         )
+
+    elif args.task == "owkin":
+        data = owkin_load_and_process_data()
+        hallucinated_data = owkin_synthetic_hallucinations(data, seed=args.seed)
+
+        # Reward Model
+        rm_data = owkin_process_data_for_rm(
+            data,
+            hallucinated_data,
+            tokenizer,
+            max_seq_length=args.max_seq_length,
+            seed=args.seed,
+        )
+        rm_data = rm_data.train_test_split(test_size=args.rm_validation_size)
+        
+        for split in rm_data.keys():
+            rm_data[split].push_to_hub(
+                repo_id=args.rm_processed_repo_id,
+                split=split,
+            )
 
 
 if __name__ == "__main__":

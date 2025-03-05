@@ -4,7 +4,7 @@ TASK="$1"
 USER="leobianco"
 SEED=12345
 TOKENIZER_MODEL="google/gemma-2-2b-it"
-MAX_SEQ_LENGTH=512
+MAX_SEQ_LENGTH=1152
 RAW_REPO_ID="${USER}/${TASK}_raw"
 PROCESSED_REPO_ID="${USER}/${TASK}_processed"
 RM_PROCESSED_REPO_ID="${USER}/${TASK}_rm_processed"
@@ -16,7 +16,7 @@ PERL_TRAIN_SIZE=25000
 PERL_VALIDATION_SIZE=500
 AUGMENTED_REPO_ID="${USER}/${TASK}_augmented_validation"
 
-if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ]; then
+if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ] && [ "$TASK" != "owkin" ]; then
     echo "Invalid dataset name"
     exit 1
 fi
