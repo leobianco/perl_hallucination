@@ -276,14 +276,14 @@ def npov_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False):
 def owkin_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False):
     """Transforms entries in the Owkin dataset into prompts for evaluator."""
 
-    preamble = "<start_of_turn>user\nA medical expert identifies when the summarization of a clinical trial into its conditions and treatments is correct or not. The summary is written in a structured JSON format.<end_of_turn>\n"
+    preamble = "<start_of_turn>user\nA medical expert identifies when the summarization of a clinical trial contains additional conditions or interventions that were not present in the original description. The summary is written in a structured JSON format.<end_of_turn>\n"
 
     prompt = preamble
 
     template = (
         "<start_of_turn>user\n"
         "{user_query}{summary}\n"
-        "Medical expert review: the conditions and interventions described in the summary correspond to those present in the original clinical trial description (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
+        "Medical expert review: the summary contains additional conditions or interventions not present in the original clinical trial description (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
     )
 
     # Depending if evaluation of evaluator or of writer checkpoint.
