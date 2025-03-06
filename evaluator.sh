@@ -15,7 +15,7 @@ else
   RUN_IDENTIFIER="google/gemma-2-2b-it"
 fi
 
-if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ]; then
+if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ] && [ "$TASK" != "owkin" ]; then
     echo "Invalid task name"
     exit 1
 fi

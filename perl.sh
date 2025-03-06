@@ -27,7 +27,7 @@ else
   SHUTDOWN=false
 fi
 
-if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ]; then
+if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ] && [ "$TASK" != "owkin" ]; then
     echo "Invalid task name"
     exit 1
 fi

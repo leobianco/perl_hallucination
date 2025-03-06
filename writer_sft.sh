@@ -19,7 +19,7 @@ else
   RUN_IDENTIFIER="${USER}/${TASK}_SFT_seed_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_lora_${LORA_RANK}_fewshot_${NUM_FEWSHOT}"
 fi
 
-if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ]; then
+if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ] && [ "$TASK" != "owkin" ]; then
     echo "Invalid task name"
     exit 1
 fi
