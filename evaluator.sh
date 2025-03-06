@@ -11,6 +11,7 @@ else
   DATASET_LABELS="leobianco/halomi_processed"
   DATASET_LABELS_SPLIT="train"
   DATASET_PROMPTS="leobianco/halomi_perl_processed"
+  DATASET_PROMPTS_SPLIT="test"
   RUN_IDENTIFIER="google/gemma-2-2b-it"
 fi
 
@@ -34,6 +35,7 @@ python3 evaluator.py \
   --dataset_labels "$DATASET_LABELS" \
   --dataset_labels_split "$DATASET_LABELS_SPLIT" \
   --dataset_prompts "$DATASET_PROMPTS" \
+  --dataset_prompts_split "$DATASET_PROMPTS_SPLIT" \
   --writer_model_base ${BASE_MODEL} \
   --writer_model_lora "${RUN_IDENTIFIER}" \
   --max_tokens 768 \

@@ -86,6 +86,10 @@ class ScriptArguments:
         }
     )
 
+    dataset_prompts_split: str = field(
+        metadata={"help": "What split of the dataset_prompts to use."}
+    )
+
     writer_model_base: str = field(
         metadata={"help": "The base model for the writer (name or path)."}
     )
@@ -486,7 +490,7 @@ if __name__ == "__main__":
         # Load dataset with prompts to generations (not necessarily labeled).
         val_data = load_dataset(
             script_args.dataset_prompts,
-            split="test",
+            split=script_args.dataset_prompts_split,
         )
 
         # Generate Completions

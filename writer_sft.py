@@ -15,6 +15,7 @@ from data import (
     halomi_formatting_prompts_func,
     npov_formatting_prompts_func,
     npov_formatting_prompts_func_from_fewshot_examples,
+    owkin_formatting_prompts_func,
 )
 from utils import CustomLoraConfig, ScriptArguments
 
@@ -53,6 +54,9 @@ def main():
                     fewshot_examples=fewshot_examples
                 )
             )
+    elif script_args.task == "owkin":
+        response_template = "Output:<end_of_turn>\n<start_of_turn>model\n"
+        formatting_prompts_func = owkin_formatting_prompts_func
     else:
         raise ValueError("Invalid dataset.")
 

@@ -871,6 +871,9 @@ def owkin_load_and_process_data():
         split="train",
     )
 
+    # Add label
+    data = data.map(lambda entry: {**entry, "label": 1, "class_hall": "No"})
+
     return data
 
 
@@ -937,12 +940,14 @@ def owkin_synthetic_hallucinations(owkin_data, seed=12345):
 
     # Put everything on a dataset and return
     hallucinated_data = deepcopy(owkin_data)
-    hallucinated_data.remove_columns("Answer")
+    # hallucinated_data.remove_columns("Answer")
 
     hallucinated_data = hallucinated_data.map(
         lambda entry, idx: {
             "Question": entry["Question"],
             "Answer": f"{{'conditions': '{hallucinated_answers[idx]['conditions']}', 'interventions': '{hallucinated_answers[idx]['interventions']}'}}",
+            "label": 0,
+            "class_hall": "Yes",
         },
         with_indices=True,
     )
@@ -973,22 +978,16 @@ def owkin_rm_prompt(entry):
 
 
 def owkin_process_data_for_rm(
-    owkin_data,
-    hallucinated_data,
+    data,
     tokenizer,
     max_seq_length=512,
     seed=12345,
 ):
-    # Add label and class_hall columns correctly
-    owkin_data = owkin_data.map(
-        lambda entry: {**entry, "label": 1, "class_hall": "No"}
-    )
-    hallucinated_data = hallucinated_data.map(
-        lambda entry: {**entry, "label": 0, "class_hall": "Yes"}
-    )
+    # Create hallucinated data
+    hallucinated_data = owkin_synthetic_hallucinations(data, seed=seed)
 
     # Merge and mix original owkin data and hallucinated data
-    merged_data = concatenate_datasets([owkin_data, hallucinated_data]).shuffle(
+    merged_data = concatenate_datasets([data, hallucinated_data]).shuffle(
         seed=seed
     )
 
@@ -1005,6 +1004,81 @@ def owkin_process_data_for_rm(
     merged_data.set_format("torch")
 
     return merged_data
+
+
+def owkin_writer_prompt(entry, SFT=False):
+    """Transforms entries in the Owkin dataset into prompts for the writer.
+
+    TODO: perhaps add support for fewshotting later.
+    """
+
+    template = (
+        "<start_of_turn>user\n"
+        "{user_query}<end_of_turn>\n"
+        "<start_of_turn>model\n{summary}"
+    )
+
+    summary = (entry["Answer"] + "<end_of_turn><eos>") if SFT else ""
+
+    formatted_prompt = template.format(
+        user_query=entry["Question"],
+        summary=summary,
+    )
+
+    entry["prompt"] = formatted_prompt
+
+    return entry
+
+
+def owkin_formatting_prompts_func(entry):
+    """Formatting function for SFTTrainer."""
+
+    template = (
+        "<start_of_turn>user\n"
+        "{user_query}<end_of_turn>\n"
+        "<start_of_turn>model\n{summary}<end_of_turn><eos>"
+    )
+
+    output_texts = []
+
+    for i in range(len(entry["Question"])):
+        formatted_prompt = template.format(
+            user_query=entry["Question"][i],
+            summary=entry["Answer"][i],
+        )
+
+        output_texts.append(formatted_prompt)
+
+    return output_texts
+
+
+def owkin_process_data_for_perl(
+    perl_data,
+    tokenizer,
+    max_seq_length=512,
+    seed=12345,
+    train_size=500,
+):
+    # Create and tokenize prompts for writer.
+    perl_data = perl_data.map(owkin_writer_prompt)
+
+    perl_data = perl_data.map(
+        encode,
+        batched=True,
+        fn_kwargs={
+            "tokenizer": tokenizer,
+            "max_seq_length": max_seq_length,
+        },
+    )
+    perl_data.set_format("torch")  # due to using map()
+
+    perl_data = perl_data.train_test_split(
+        seed=seed,
+        train_size=train_size,  # test size will be rest of data
+        shuffle=False,  # to match SFT train data
+    )
+
+    return perl_data
 
 
 def main():
@@ -1150,12 +1224,10 @@ def main():
 
     elif args.task == "owkin":
         data = owkin_load_and_process_data()
-        hallucinated_data = owkin_synthetic_hallucinations(data, seed=args.seed)
 
         # Reward Model
         rm_data = owkin_process_data_for_rm(
-            data,
-            hallucinated_data,
+            data.select(range(400)),
             tokenizer,
             max_seq_length=args.max_seq_length,
             seed=args.seed,
@@ -1165,6 +1237,32 @@ def main():
         for split in rm_data.keys():
             rm_data[split].push_to_hub(
                 repo_id=args.rm_processed_repo_id,
+                split=split,
+            )
+
+        # Writer SFT
+        sft_data = data.select(range(400, 650))
+
+        sft_data.push_to_hub(
+            repo_id=args.writer_sft_processed_repo_id,
+        )
+
+        # PERL
+        # Train is same as SFT, but saved separately for consistency
+        perl_data = data.select(range(650, data.num_rows))
+
+        perl_data_processed = owkin_process_data_for_perl(
+            perl_data,
+            tokenizer,
+            max_seq_length=args.max_seq_length,
+            seed=args.seed,
+            train_size=400,
+        )
+
+        # Save
+        for split in perl_data_processed.keys():
+            perl_data_processed[split].push_to_hub(
+                repo_id=args.perl_processed_repo_id,
                 split=split,
             )
 
