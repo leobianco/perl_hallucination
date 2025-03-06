@@ -857,8 +857,9 @@ def npov_data_augmentation(data):
     return result
 
 
-def owkin_process_data():
-    pass
+##################
+# OWKIN FUNCTIONS #
+##################
 
 
 def owkin_load_and_process_data():
@@ -978,10 +979,12 @@ def owkin_process_data_for_rm(
     max_seq_length=512,
     seed=12345,
 ):
-    # Add label columns correctly
-    owkin_data = owkin_data.map(lambda entry: {**entry, "label": 1})
+    # Add label and class_hall columns correctly
+    owkin_data = owkin_data.map(
+        lambda entry: {**entry, "label": 1, "class_hall": "No"}
+    )
     hallucinated_data = hallucinated_data.map(
-        lambda entry: {**entry, "label": 0}
+        lambda entry: {**entry, "label": 0, "class_hall": "Yes"}
     )
 
     # Merge and mix original owkin data and hallucinated data
@@ -1158,7 +1161,7 @@ def main():
             seed=args.seed,
         )
         rm_data = rm_data.train_test_split(test_size=args.rm_validation_size)
-        
+
         for split in rm_data.keys():
             rm_data[split].push_to_hub(
                 repo_id=args.rm_processed_repo_id,

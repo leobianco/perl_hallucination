@@ -77,9 +77,7 @@ class ScriptArguments:
     )
 
     dataset_labels_split: str = field(
-        metadata={
-            "help": "What split of the dataset_labels to use."
-        }
+        metadata={"help": "What split of the dataset_labels to use."}
     )
 
     dataset_prompts: str = field(
@@ -275,6 +273,45 @@ def npov_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False):
     return entry
 
 
+def owkin_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False):
+    """Transforms entries in the Owkin dataset into prompts for evaluator."""
+
+    preamble = "<start_of_turn>user\nA medical expert identifies when the summarization of a clinical trial into its conditions and treatments is correct or not. The summary is written in a structured JSON format.<end_of_turn>\n"
+
+    prompt = preamble
+
+    template = (
+        "<start_of_turn>user\n"
+        "{user_query}{summary}\n"
+        "Medical expert review: the conditions and interventions described in the summary correspond to those present in the original clinical trial description (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
+    )
+
+    # Depending if evaluation of evaluator or of writer checkpoint.
+    response = entry["Answer"] if use_true_label else entry["completion"]
+
+    formatted_prompt = template.format(
+        user_query=entry["Question"],
+        summary=response,
+        ans="",
+    )
+
+    if fewshot_examples is not None:
+        for fewshot_example in fewshot_examples:
+            fewshot_prompt = template.format(
+                user_query=fewshot_example["Question"],
+                summary=fewshot_example["Answer"],
+                ans=fewshot_example["class_hall"]
+            )
+            prompt += fewshot_prompt + "<end_of_turn>\n"
+        prompt += formatted_prompt
+    else:
+        prompt += formatted_prompt
+
+    entry["evaluator_prompt"] = prompt
+
+    return entry
+
+
 def evaluator_score_batch(
     evaluator, tokenized_prompts, yes_token_id, no_token_id
 ):
@@ -347,11 +384,12 @@ if __name__ == "__main__":
         split=script_args.dataset_labels_split,
     )
 
-    evaluator_prompt = (
-        halomi_evaluator_prompt
-        if script_args.task == "halomi"
-        else npov_evaluator_prompt
-    )
+    if script_args.task == "halomi":
+        evaluator_prompt = halomi_evaluator_prompt
+    elif script_args.task == "npov":
+        evaluator_prompt = npov_evaluator_prompt
+    elif script_args.task == "owkin":
+        evaluator_prompt = owkin_evaluator_prompt
 
     # Get fewshot examples to aid the evaluator. These come from the dataset
     # with labels.
