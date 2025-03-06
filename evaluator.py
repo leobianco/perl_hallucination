@@ -435,7 +435,7 @@ if __name__ == "__main__":
         )
 
         # Calculate Metrics
-        ground_truth = data["class_hall_num"]
+        ground_truth = data["label"]
         auc = roc_auc_score(ground_truth, scores)
         fpr, tpr, thresholds = roc_curve(ground_truth, scores.numpy())
         threshold_idx = np.argmax(tpr - fpr)
