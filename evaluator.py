@@ -294,7 +294,7 @@ def ragtruth_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False
 
     prompt = preamble
 
-    template = "<start_of_turn>user\n{prompt}\n{overview}\nTechnical expert review: the overview contains additional information not present in the original JSON (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
+    template = "<start_of_turn>user\n{prompt}\n{response}\nTechnical expert review: the overview contains additional information not present in the original JSON (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
 
     # Depending if evaluation of evaluator or of writer checkpoint.
     response = entry["response"] if use_true_label else entry["completion"]
