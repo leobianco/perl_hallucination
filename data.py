@@ -1024,7 +1024,8 @@ def main():
             test_size=0.1, shuffle=False
         )
 
-        data2txt_dataset.push_to_hub(args.processed_repo_id)
+        for split in data2txt_dataset_splits.keys():
+            data2txt_dataset_splits[split].push_to_hub(args.processed_repo_id)
 
 
 if __name__ == "__main__":
