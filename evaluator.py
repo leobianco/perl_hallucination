@@ -88,6 +88,12 @@ class ScriptArguments:
         }
     )
 
+    dataset_prompts_split: str = field(
+        metadata={
+            "help": "What split of the dataset_prompts to use."
+        }
+    )
+
     writer_model_base: str = field(
         metadata={"help": "The base model for the writer (name or path)."}
     )
@@ -275,6 +281,48 @@ def npov_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False):
     return entry
 
 
+def ragtruth_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False):
+    """Function for transforming entries in the RAGTruth dataset into prompts 
+    for the evaluator model.
+
+    TO DO (LEO): perhaps split this function into two functions instead of
+    using the use_true_label parameter. Either way you must do something, because
+    it looks really bad.
+    """
+
+    preamble = "<start_of_turn>user\nBelow are examples where a technical expert identifies when the overview of a business written based on a provided JSON contains additional information not present in the original JSON.<end_of_turn>\n"
+
+    prompt = preamble
+
+    template = "<start_of_turn>user\n{prompt}\n{overview}\nTechnical expert review: the overview contains additional information not present in the original JSON (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
+
+    # Depending if evaluation of evaluator or of writer checkpoint.
+    response = entry["response"] if use_true_label else entry["completion"]
+
+    formatted_prompt = template.format(
+        prompt=entry["prompt"],
+        response=response,
+        ans="",
+    )
+
+    if fewshot_examples is not None:
+        for fewshot_example in fewshot_examples:
+            fewshot_prompt = template.format(
+                prompt=fewshot_example["prompt"],
+                response=fewshot_example["response"],
+                ans=fewshot_example["class_hall"],
+            )
+            prompt += fewshot_prompt + "<end_of_turn>\n"
+        prompt += formatted_prompt
+    else:
+        prompt += formatted_prompt
+
+    entry["evaluator_prompt"] = prompt
+
+    return entry
+
+
+
 def evaluator_score_batch(
     evaluator, tokenized_prompts, yes_token_id, no_token_id
 ):
@@ -353,6 +401,13 @@ if __name__ == "__main__":
         else npov_evaluator_prompt
     )
 
+    if script_args.task == "halomi":
+        evaluator_prompt = halomi_evaluator_prompt
+    elif script_args.task == "npov":
+        evaluator_prompt = npov_evaluator_prompt
+    elif script_args.task == "ragtruth":
+        evaluator_prompt = ragtruth_evaluator_prompt
+
     # Get fewshot examples to aid the evaluator. These come from the dataset
     # with labels.
     if script_args.evaluator_num_fewshot == 0:
@@ -397,7 +452,7 @@ if __name__ == "__main__":
         )
 
         # Calculate Metrics
-        ground_truth = data["class_hall_num"]
+        ground_truth = data["label"]
         auc = roc_auc_score(ground_truth, scores)
         fpr, tpr, thresholds = roc_curve(ground_truth, scores.numpy())
         threshold_idx = np.argmax(tpr - fpr)
@@ -448,7 +503,7 @@ if __name__ == "__main__":
         # Load dataset with prompts to generations (not necessarily labeled).
         val_data = load_dataset(
             script_args.dataset_prompts,
-            split="test",
+            split=script_args.dataset_prompts_split,
         )
 
         # Generate Completions
