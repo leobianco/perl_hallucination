@@ -1001,15 +1001,29 @@ def main():
         )
 
         data2txt_sources = data_sources[data_sources["task_type"] == "Data2txt"]
-        data2txt_responses = data_responses[data_responses["source_id"].isin(data2txt_sources["source_id"])]
-        data2txt_unified = pd.merge(data2txt_sources, data2txt_responses, on="source_id", how="left")
-        data2txt_unified = data2txt_unified.drop(["source_info", "task_type", "source", "id"], axis=1)
+        data2txt_responses = data_responses[
+            data_responses["source_id"].isin(data2txt_sources["source_id"])
+        ]
+        data2txt_unified = pd.merge(
+            data2txt_sources, data2txt_responses, on="source_id", how="left"
+        )
+        data2txt_unified = data2txt_unified.drop(
+            ["source_info", "task_type", "source", "id"], axis=1
+        )
         # Numerical hallucination labels
-        data2txt_unified["label"] = data2txt_unified.apply(lambda entry: 1 if len(entry["labels"])==0 else 0, axis=1)
+        data2txt_unified["label"] = data2txt_unified.apply(
+            lambda entry: 1 if len(entry["labels"]) == 0 else 0, axis=1
+        )
         # Textual hallucination labels
-        data2txt_unified["class_hall"] = data2txt_unified.apply(lambda entry: "No" if len(entry["labels"])==0 else "Yes", axis=1)
+        data2txt_unified["class_hall"] = data2txt_unified.apply(
+            lambda entry: "No" if len(entry["labels"]) == 0 else "Yes", axis=1
+        )
 
         data2txt_dataset = Dataset.from_pandas(data2txt_unified)
+        data2txt_dataset_splits = data2txt_dataset.train_test_split(
+            test_size=0.1, shuffle=False
+        )
+
         data2txt_dataset.push_to_hub(args.processed_repo_id)
 
 
