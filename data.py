@@ -1024,8 +1024,19 @@ def main():
             test_size=0.1, shuffle=False
         )
 
+        # On test split, get only unique prompts
+        # This is done in an UGLY way, out of hurry
+        test_pandas = pd.DataFrame(data2txt_dataset_splits["test"])
+        test_pandas = test_pandas.drop_duplicates(subset=["source_id"], keep="first")
+        del data2txt_dataset_splits["test"]
+        test_hf = Dataset.from_pandas(test_pandas)
+        test_hf = test_hf.remove_columns(["__index_level_0__"])
+        data2txt_dataset_splits["test"] = test_hf
+
         for split in data2txt_dataset_splits.keys():
-            data2txt_dataset_splits[split].push_to_hub(args.processed_repo_id)
+            data2txt_dataset_splits[split].push_to_hub(
+                args.processed_repo_id, split=split
+            )
 
 
 if __name__ == "__main__":
