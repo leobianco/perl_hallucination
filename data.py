@@ -9,6 +9,7 @@ from argparse import ArgumentParser
 from copy import deepcopy
 from itertools import combinations
 
+import pandas as pd
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
 from transformers import AutoTokenizer
 
@@ -844,6 +845,11 @@ def npov_data_augmentation(data):
     return result
 
 
+######################
+# RAGTruth FUNCTIONS #
+######################
+
+
 def main():
     parser = ArgumentParser()
     parser.add_argument("--task", type=str)
@@ -984,6 +990,23 @@ def main():
         npov_augmented_data_dict.push_to_hub(
             repo_id=args.augmented_repo_id,
         )
+
+    elif args.task == "ragtruth":
+        # Load data
+        data_sources = pd.read_json(
+            "/home/leo/Downloads/RAGTruth/dataset/source_info.jsonl", lines=True
+        )
+        data_responses = pd.read_json(
+            "/home/leo/Downloads/RAGTruth/dataset/response.jsonl", lines=True
+        )
+
+        data2txt_sources = data_sources[data_sources["task_type"] == "Data2txt"]
+        data2txt_responses = data_responses[data_responses["source_id"].isin(data2txt_sources["source_id"])]
+        data2txt_unified = pd.merge(data2txt_sources, data2txt_responses, on="source_id", how="left")
+        data2txt_unified = data2txt_unified.drop(["source_info", "task_type", "source", "id"], axis=1)
+
+        data2txt_dataset = Dataset.from_pandas(data2txt_unified)
+        data2txt_dataset.push_to_hub(args.processed_repo_id)
 
 
 if __name__ == "__main__":
