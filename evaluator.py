@@ -77,9 +77,7 @@ class ScriptArguments:
     )
 
     dataset_labels_split: str = field(
-        metadata={
-            "help": "What split of the dataset_labels to use."
-        }
+        metadata={"help": "What split of the dataset_labels to use."}
     )
 
     dataset_prompts: str = field(
@@ -89,9 +87,7 @@ class ScriptArguments:
     )
 
     dataset_prompts_split: str = field(
-        metadata={
-            "help": "What split of the dataset_prompts to use."
-        }
+        metadata={"help": "What split of the dataset_prompts to use."}
     )
 
     writer_model_base: str = field(
@@ -281,8 +277,10 @@ def npov_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False):
     return entry
 
 
-def ragtruth_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False):
-    """Function for transforming entries in the RAGTruth dataset into prompts 
+def ragtruth_evaluator_prompt(
+    entry, fewshot_examples=None, use_true_label=False
+):
+    """Function for transforming entries in the RAGTruth dataset into prompts
     for the evaluator model.
 
     TO DO (LEO): perhaps split this function into two functions instead of
@@ -290,17 +288,19 @@ def ragtruth_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False
     it looks really bad.
     """
 
-    preamble = "<start_of_turn>user\nBelow are examples where a technical expert identifies when the overview of a business written based on a provided JSON contains additional information not present in the original JSON.<end_of_turn>\n"
+    prefix_to_remove = "Instruction:\nWrite an objective overview about the following local business based only on the provided structured data in the JSON format. You should include details and cover the information mentioned in the customers' review. The overview should be 100 - 200 words. Don't make up information. "
+
+    preamble = "<start_of_turn>user\nAn expert compares the overview of a business with the JSON provided. The expert's task is to identify when the overview contains information not present in the JSON.<end_of_turn>\n"
 
     prompt = preamble
 
-    template = "<start_of_turn>user\n{prompt}\n{response}\nTechnical expert review: the overview contains additional information not present in the original JSON (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
+    template = "<start_of_turn>user\n{prompt}\n{response}\nExpert's decision on whether the overview contains information not present in the JSON (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
 
     # Depending if evaluation of evaluator or of writer checkpoint.
     response = entry["response"] if use_true_label else entry["completion"]
 
     formatted_prompt = template.format(
-        prompt=entry["prompt"],
+        prompt=entry["prompt"].removeprefix(prefix_to_remove),
         response=response,
         ans="",
     )
@@ -308,7 +308,7 @@ def ragtruth_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False
     if fewshot_examples is not None:
         for fewshot_example in fewshot_examples:
             fewshot_prompt = template.format(
-                prompt=fewshot_example["prompt"],
+                prompt=fewshot_example["prompt"].removeprefix(prefix_to_remove),
                 response=fewshot_example["response"],
                 ans=fewshot_example["class_hall"],
             )
@@ -320,7 +320,6 @@ def ragtruth_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False
     entry["evaluator_prompt"] = prompt
 
     return entry
-
 
 
 def evaluator_score_batch(
@@ -393,12 +392,6 @@ if __name__ == "__main__":
     data = load_dataset(
         script_args.dataset_labels,
         split=script_args.dataset_labels_split,
-    )
-
-    evaluator_prompt = (
-        halomi_evaluator_prompt
-        if script_args.task == "halomi"
-        else npov_evaluator_prompt
     )
 
     if script_args.task == "halomi":
