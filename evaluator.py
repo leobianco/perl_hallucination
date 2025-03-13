@@ -290,13 +290,13 @@ def ragtruth_evaluator_prompt(
 
     prefix_to_remove = "Instruction:\nWrite an objective overview about the following local business based only on the provided structured data in the JSON format. You should include details and cover the information mentioned in the customers' review. The overview should be 100 - 200 words. Don't make up information. "
 
-    preamble = "<start_of_turn>user\nYou are given Structured data about a business in the form of a JSON string. You will also be given an Overview about the business, written in natural language and based on the information given in the Structured data JSON string.\nInstruction: your task is to compare the information in the Overview to the information contained in the JSON string, then answer the following question (answer only with Yes or No): does the Overview state something not supported by the information in the Structured data JSON string?<end_of_turn>"
+    preamble = "<start_of_turn>user\nYou will be given Structured data about a business in the form of a JSON string. You will also be given an Overview about the business, written in natural language and based on the information given in the Structured data JSON string.\nInstruction: your task is to compare the information in the Overview to the information contained in the JSON string, then answer the following question (answer only with Yes or No): does the Overview state something not supported by the information in the Structured data JSON string?<end_of_turn>\n"
 
     prompt = preamble
 
-    template = "\n\n<start_of_turn>user\n{prompt}\n{response}\nQuestion: does the Overview state something not supported by the information in the Structured data JSON string? (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
+    template = "<start_of_turn>user\nYour turn:\n{prompt}\n{response}\nQuestion: does the Overview state something not supported by the information in the Structured data JSON string? (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
 
-    fewshot_template = "\n\nExample:\n\n<start_of_turn>user\n{prompt}\n{response}\nQuestion: does the Overview state something not supported by the information in the Structured data JSON string? (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
+    fewshot_template = "<start_of_turn>user\nExample turn:\n{prompt}\n{response}\nQuestion: does the Overview state something not supported by the information in the Structured data JSON string? (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
 
     # Depending if evaluation of evaluator or of writer checkpoint.
     response = entry["response"] if use_true_label else entry["completion"]
@@ -314,7 +314,7 @@ def ragtruth_evaluator_prompt(
                 response=fewshot_example["response"],
                 ans=fewshot_example["class_hall"],
             )
-            prompt += fewshot_prompt + "<end_of_turn>"
+            prompt += fewshot_prompt + "<end_of_turn>\n"
         prompt += formatted_prompt
     else:
         prompt += formatted_prompt
