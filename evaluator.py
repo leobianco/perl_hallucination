@@ -290,7 +290,7 @@ def ragtruth_evaluator_prompt(
 
     prefix_to_remove = "Instruction:\nWrite an objective overview about the following local business based only on the provided structured data in the JSON format. You should include details and cover the information mentioned in the customers' review. The overview should be 100 - 200 words. Don't make up information. "
 
-    preamble = "<start_of_turn>user\nYou will be given Structured data about a business in the form of a JSON string. You will also be given an Overview about the business, written in natural language and based on the information given in the Structured data JSON string.\nInstruction: your task is to compare the information in the Overview to the information contained in the JSON string, then answer the following question (answer only with Yes or No): does the Overview state something not supported by the information in the Structured data JSON string?<end_of_turn>\n"
+    preamble = "<start_of_turn>user\nYou will be given Structured data about a business in the form of a JSON string. This JSON contains information such as opening hours, amenities, and also some reviews by users. You will also be given an Overview about the business, written in natural language and based on the information provided in the Structured data JSON string.\nInstruction: your task is to compare the information in the Overview to the information contained in the JSON string, then answer the following question (answer only with Yes or No): does the Overview state something not supported by the information in the Structured data JSON string?<end_of_turn>\n"
 
     prompt = preamble
 
