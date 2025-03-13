@@ -294,7 +294,7 @@ def ragtruth_evaluator_prompt(
 
     prompt = preamble
 
-    template = "\n\n<start_of_turn>user\n{prompt}\n{response}\n Question: does the Overview state something not supported by the information in the Structured data JSON string? (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
+    template = "\n\n<start_of_turn>user\n{prompt}\n{response}\nQuestion: does the Overview state something not supported by the information in the Structured data JSON string? (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
 
     fewshot_template = "\n\nExample:\n\n<start_of_turn>user\n{prompt}\n{response}\nQuestion: does the Overview state something not supported by the information in the Structured data JSON string? (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
 
