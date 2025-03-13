@@ -314,7 +314,7 @@ def ragtruth_evaluator_prompt(
                 response=fewshot_example["response"],
                 ans=fewshot_example["class_hall"],
             )
-            prompt += fewshot_prompt + "<end_of_turn><eos>"
+            prompt += fewshot_prompt + "<end_of_turn>"
         prompt += formatted_prompt
     else:
         prompt += formatted_prompt
