@@ -277,10 +277,10 @@ def npov_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False):
     return entry
 
 
-def ragtruth_evaluator_prompt(
+def bosch_evaluator_prompt(
     entry, fewshot_examples=None, use_true_label=False
 ):
-    """Function for transforming entries in the RAGTruth dataset into prompts
+    """Function for transforming entries in the Bosch dataset into prompts
     for the evaluator model.
 
     TO DO (LEO): perhaps split this function into two functions instead of
@@ -288,21 +288,20 @@ def ragtruth_evaluator_prompt(
     it looks really bad.
     """
 
-    prefix_to_remove = "Instruction:\nWrite an objective overview about the following local business based only on the provided structured data in the JSON format. You should include details and cover the information mentioned in the customers' review. The overview should be 100 - 200 words. Don't make up information. "
-
-    preamble = "<start_of_turn>user\nYou will be given Structured data about a business in the form of a JSON string. This JSON contains information such as opening hours, amenities, and also some reviews by users. You will also be given an Overview about the business, written in natural language and based on the information provided in the Structured data JSON string.\nInstruction: your task is to compare the information in the Overview to the information contained in the JSON string, then answer the following question (answer only with Yes or No): does the Overview state something not supported by the information in the Structured data JSON string?<end_of_turn>\n"
+    preamble = "<start_of_turn>user\nAn user asks a question about their car. You will be given a paragraph from this user's car manual of instructions, and you will also be given an answer to the user's question.\nTask: your task is to compare the text provided from the manual and the answer given to the user, then respond to the following question (respond only with Yes or No): does the answer given contain something not supported by the information in the text from the manual?<end_of_turn>\n"
 
     prompt = preamble
 
-    template = "<start_of_turn>user\nYour turn:\n{prompt}\n{response}\nQuestion: does the Overview state something not supported by the information in the Structured data JSON string? (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
+    template = "<start_of_turn>user\nYour turn:\nUser question:{question}\nParagraph taken from manual:{context}\nAnswer given to user:{response}\nDoes the answer given to the user state something not supported by the information in the paragraph taken from the manual? (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
 
-    fewshot_template = "<start_of_turn>user\nExample turn:\n{prompt}\n{response}\nQuestion: does the Overview state something not supported by the information in the Structured data JSON string? (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
+    fewshot_template = "<start_of_turn>user\nExample turn:\nUser question:{question}\nParagraph taken from manual:{context}\nAnswer given to user:{response}\nDoes the answer given to the user state something not supported by the information in the paragraph taken from the manual? (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
 
     # Depending if evaluation of evaluator or of writer checkpoint.
     response = entry["response"] if use_true_label else entry["completion"]
 
     formatted_prompt = template.format(
-        prompt=entry["prompt"].removeprefix(prefix_to_remove),
+        question=entry["Question"],
+        context=entry["Context"],
         response=response,
         ans="",
     )
@@ -310,7 +309,8 @@ def ragtruth_evaluator_prompt(
     if fewshot_examples is not None:
         for fewshot_example in fewshot_examples:
             fewshot_prompt = fewshot_template.format(
-                prompt=fewshot_example["prompt"].removeprefix(prefix_to_remove),
+                question=fewshot_example["Question"],
+                context=fewshot_example["Context"],
                 response=fewshot_example["response"],
                 ans=fewshot_example["class_hall"],
             )
@@ -400,8 +400,8 @@ if __name__ == "__main__":
         evaluator_prompt = halomi_evaluator_prompt
     elif script_args.task == "npov":
         evaluator_prompt = npov_evaluator_prompt
-    elif script_args.task == "ragtruth":
-        evaluator_prompt = ragtruth_evaluator_prompt
+    elif script_args.task == "bosch":
+        evaluator_prompt = bosch_evaluator_prompt
 
     # Get fewshot examples to aid the evaluator. These come from the dataset
     # with labels.

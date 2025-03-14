@@ -16,7 +16,7 @@ PERL_TRAIN_SIZE=25000
 PERL_VALIDATION_SIZE=500
 AUGMENTED_REPO_ID="${USER}/${TASK}_augmented_validation"
 
-if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ] && [ "$TASK" != "ragtruth" ]; then
+if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ]; then
     echo "Invalid dataset name"
     exit 1
 fi

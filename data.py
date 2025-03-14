@@ -845,11 +845,6 @@ def npov_data_augmentation(data):
     return result
 
 
-######################
-# RAGTruth FUNCTIONS #
-######################
-
-
 def main():
     parser = ArgumentParser()
     parser.add_argument("--task", type=str)
@@ -991,52 +986,20 @@ def main():
             repo_id=args.augmented_repo_id,
         )
 
-    elif args.task == "ragtruth":
+    elif args.task == "bosch":
         # Load data
-        data_sources = pd.read_json(
-            "/home/leo/Downloads/RAGTruth/dataset/source_info.jsonl", lines=True
+        data = pd.read_csv(
+            "/home/leo/Downloads/DelucionQA_data/cleaned/train.csv"
         )
-        data_responses = pd.read_json(
-            "/home/leo/Downloads/RAGTruth/dataset/response.jsonl", lines=True
-        )
+        data = data.loc[data["Answerable"]==True]
+        data = data.drop(labels=["Answerable"], axis=1)
+        data = data.rename({'Label': 'class_hall', 'Answer': 'response'}, axis=1)
+        data["class_hall"] = data["class_hall"].apply(lambda x: "Yes" if x=="Hallucinated" else "No")
+        data["label"] = data["class_hall"].apply(lambda x: 1 if x=="No" else 0)
+        data["prompt"] = "<start_of_turn><user>\nYou are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information given.\n" + "User question:\n" + data["Question"] + "\nManual information:\n" + data["Context"] + "\nAnswer to user's question:<end_of_turn>\n<start_of_turn><model>\n"
 
-        data2txt_sources = data_sources[data_sources["task_type"] == "Data2txt"]
-        data2txt_responses = data_responses[
-            data_responses["source_id"].isin(data2txt_sources["source_id"])
-        ]
-        data2txt_unified = pd.merge(
-            data2txt_sources, data2txt_responses, on="source_id", how="left"
-        )
-        data2txt_unified = data2txt_unified.drop(
-            ["source_info", "task_type", "source", "id"], axis=1
-        )
-        # Numerical hallucination labels
-        data2txt_unified["label"] = data2txt_unified.apply(
-            lambda entry: 1 if len(entry["labels"]) == 0 else 0, axis=1
-        )
-        # Textual hallucination labels
-        data2txt_unified["class_hall"] = data2txt_unified.apply(
-            lambda entry: "No" if len(entry["labels"]) == 0 else "Yes", axis=1
-        )
-
-        data2txt_dataset = Dataset.from_pandas(data2txt_unified)
-        data2txt_dataset_splits = data2txt_dataset.train_test_split(
-            test_size=0.1, shuffle=False
-        )
-
-        # On test split, get only unique prompts
-        # This is done in an UGLY way, out of hurry
-        test_pandas = pd.DataFrame(data2txt_dataset_splits["test"])
-        test_pandas = test_pandas.drop_duplicates(subset=["source_id"], keep="first")
-        del data2txt_dataset_splits["test"]
-        test_hf = Dataset.from_pandas(test_pandas)
-        test_hf = test_hf.remove_columns(["__index_level_0__"])
-        data2txt_dataset_splits["test"] = test_hf
-
-        for split in data2txt_dataset_splits.keys():
-            data2txt_dataset_splits[split].push_to_hub(
-                args.processed_repo_id, split=split
-            )
+        dataset = Dataset.from_pandas(data, split="train")
+        dataset.push_to_hub("leobianco/bosch")
 
 
 if __name__ == "__main__":
