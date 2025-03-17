@@ -288,13 +288,22 @@ def bosch_evaluator_prompt(
     it looks really bad.
     """
 
-    preamble = "<start_of_turn>user\nAn user asks a question about their car. You will be given a paragraph from this user's car manual of instructions, and you will also be given an answer to the user's question.\nTask: your task is to compare the text provided from the manual and the answer given to the user, then respond to the following question (respond only with Yes or No): does the answer given contain something not supported by the information in the text from the manual?<end_of_turn>\n"
+    # preamble = "<start_of_turn>user\nAn user asks a question about their car. You will be given a paragraph from this user's car manual of instructions, and you will also be given an answer to the user's question.\nTask: your task is to compare the text provided from the manual and the answer given to the user, then respond to the following question (respond only with Yes or No): does the answer given contain something not supported by the information in the text from the manual?<end_of_turn>\n"
+
+    # prompt = preamble
+
+    # template = "<start_of_turn>user\nYour turn:\nUser question:{question}\nParagraph taken from manual:{context}\nAnswer given to user:{response}\nDoes the answer given to the user state something not supported by the information in the paragraph taken from the manual? (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
+
+    # fewshot_template = "<start_of_turn>user\nExample turn:\nUser question:{question}\nParagraph taken from manual:{context}\nAnswer given to user:{response}\nDoes the answer given to the user state something not supported by the information in the paragraph taken from the manual? (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
+
+    preamble = "<start_of_turn>user\nYou are a sentence classifier. Given a source text and a generated text as input, your task is classify into Yes or No whether the generated text contains information not present in the source text.<end_of_turn>\n"
 
     prompt = preamble
 
-    template = "<start_of_turn>user\nYour turn:\nUser question:{question}\nParagraph taken from manual:{context}\nAnswer given to user:{response}\nDoes the answer given to the user state something not supported by the information in the paragraph taken from the manual? (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
+    template = "<start_of_turn>user\nNow, classify the following:\nSource text:{context}\nGenerated text:{response}\nAdditional information (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
 
-    fewshot_template = "<start_of_turn>user\nExample turn:\nUser question:{question}\nParagraph taken from manual:{context}\nAnswer given to user:{response}\nDoes the answer given to the user state something not supported by the information in the paragraph taken from the manual? (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
+    fewshot_template = "<start_of_turn>user\nFor example:\nSource text:{context}\nGenerated text:{response}\nAdditional information (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
+
 
     # Depending if evaluation of evaluator or of writer checkpoint.
     response = entry["response"] if use_true_label else entry["completion"]
