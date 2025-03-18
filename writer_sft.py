@@ -15,6 +15,7 @@ from data import (
     halomi_formatting_prompts_func,
     npov_formatting_prompts_func,
     npov_formatting_prompts_func_from_fewshot_examples,
+    bosch_formatting_prompts_func,
 )
 from utils import CustomLoraConfig, ScriptArguments
 
@@ -55,7 +56,7 @@ def main():
             )
     elif script_args.task == "bosch":
         response_template = "\nAnswer to user's question:<end_of_turn><start_of_turn><model>"
-        formatting_prompts_func = 
+        formatting_prompts_func = bosch_formatting_prompts_func
     else:
         raise ValueError("Invalid dataset.")
 
