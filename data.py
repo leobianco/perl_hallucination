@@ -873,6 +873,52 @@ def bosch_process_data_for_rm(
     return rm_data
 
 
+def bosch_formatting_prompts_func(entry):
+    """Formatting function for SFTTrainer. Imported in writer_sft.py."""
+
+    template = (
+        "<start_of_turn><user>\nYou are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information given.\n"
+        "User question:\n{question}"
+        "\nManual information:\n{context}"
+        "\nAnswer to user's question:<end_of_turn>\n<start_of_turn><model>\n"
+    )
+
+    output_texts = []
+
+    for i in range(len(entry["user_query"])):
+        formatted_prompt = template.format(
+            question=entry["Question"],
+            context =entry["Context"],
+        )
+
+        output_texts.append(formatted_prompt)
+
+    return output_texts
+
+
+def bosch_process_data_for_perl(
+    data,
+    tokenizer,
+    max_seq_length=1340,
+    seed=12345,
+):
+    perl_data = deepcopy(data)
+
+    perl_data = perl_data.map(
+        encode,
+        batched=True,
+        fn_kwargs={
+            "tokenizer": tokenizer,
+            "max_seq_length": max_seq_length,
+        },
+    )
+    perl_data.set_format("torch")  # due to using map()
+
+    return perl_data
+    
+
+
+
 def main():
     parser = ArgumentParser()
     parser.add_argument("--task", type=str)
@@ -1042,6 +1088,10 @@ def main():
         dataset = Dataset.from_pandas(data, split="train")
         dataset.push_to_hub(args.processed_repo_id)
 
+        # SFT
+        sft_data = dataset.filter(lambda entry: entry["class_hall"]=="No")
+        sft_data.push_to_hub(args.writer_sft_processed_repo_id)
+
         # Reward Model
         rm_data = bosch_process_data_for_rm(
             dataset.select(range(600)),
@@ -1051,6 +1101,16 @@ def main():
         )
 
         rm_data.push_to_hub(args.rm_processed_repo_id)
+
+        # PERL
+        perl_data = bosch_process_data_for_perl(
+            dataset.select(range(600, dataset.num_rows)),
+            tokenizer,
+            seed=args.seed,
+            max_seq_length=args.max_seq_length,
+        )
+
+        perl_data.push_to_hub(args.perl_processed_repo_id)
 
 
 if __name__ == "__main__":

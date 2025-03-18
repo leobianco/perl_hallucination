@@ -53,6 +53,9 @@ def main():
                     fewshot_examples=fewshot_examples
                 )
             )
+    elif script_args.task == "bosch":
+        response_template = "\nAnswer to user's question:<end_of_turn><start_of_turn><model>"
+        formatting_prompts_func = 
     else:
         raise ValueError("Invalid dataset.")
 
