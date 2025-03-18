@@ -887,8 +887,8 @@ def bosch_formatting_prompts_func(entry):
 
     for i in range(len(entry["Question"])):
         formatted_prompt = template.format(
-            question=entry["Question"],
-            context =entry["Context"],
+            question=entry["Question"][i],
+            context =entry["Context"][i],
         )
 
         output_texts.append(formatted_prompt)
@@ -901,6 +901,7 @@ def bosch_process_data_for_perl(
     tokenizer,
     max_seq_length=1340,
     seed=12345,
+    validation_size=50,
 ):
     perl_data = deepcopy(data)
 
@@ -913,6 +914,11 @@ def bosch_process_data_for_perl(
         },
     )
     perl_data.set_format("torch")  # due to using map()
+
+    perl_data = perl_data.train_test_split(
+        seed=seed,
+        test_size=validation_size,
+    )
 
     return perl_data
     
@@ -1110,7 +1116,11 @@ def main():
             max_seq_length=args.max_seq_length,
         )
 
-        perl_data.push_to_hub(args.perl_processed_repo_id)
+        for split in perl_data.keys():
+            perl_data[split].push_to_hub(
+                repo_id=args.perl_processed_repo_id,
+                split=split,
+            )
 
 
 if __name__ == "__main__":
