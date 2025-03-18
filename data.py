@@ -885,7 +885,7 @@ def bosch_formatting_prompts_func(entry):
 
     output_texts = []
 
-    for i in range(len(entry["user_query"])):
+    for i in range(len(entry["Question"])):
         formatted_prompt = template.format(
             question=entry["Question"],
             context =entry["Context"],
