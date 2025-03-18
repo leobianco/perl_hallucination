@@ -845,6 +845,34 @@ def npov_data_augmentation(data):
     return result
 
 
+def bosch_rm_prompt(entry):
+    """The dataset already contains a prompt column, which is an instruction for the writer. We just append the generation."""
+
+    entry["prompt"] += entry["response"] + "<end_of_turn><eos>"
+
+    return entry
+
+
+def bosch_process_data_for_rm(
+    data, tokenizer, seed=12345, max_seq_length=1340, validation_size=0.2
+):
+    rm_data = deepcopy(data)
+
+    rm_data = rm_data.map(bosch_rm_prompt)
+    rm_data = rm_data.map(
+        encode,
+        batched=True,
+        fn_kwargs={
+            "tokenizer": tokenizer,
+            "max_seq_length": max_seq_length,
+        },
+    )
+    rm_data.set_format("torch")  # due to using map()
+    rm_data = rm_data.train_test_split(seed=seed, test_size=validation_size)
+
+    return rm_data
+
+
 def main():
     parser = ArgumentParser()
     parser.add_argument("--task", type=str)
@@ -991,15 +1019,38 @@ def main():
         data = pd.read_csv(
             "/home/leo/Downloads/DelucionQA_data/cleaned/train.csv"
         )
-        data = data.loc[data["Answerable"]==True]
+        data = data.loc[data["Answerable"] == True]
         data = data.drop(labels=["Answerable"], axis=1)
-        data = data.rename({'Label': 'class_hall', 'Answer': 'response'}, axis=1)
-        data["class_hall"] = data["class_hall"].apply(lambda x: "Yes" if x=="Hallucinated" else "No")
-        data["label"] = data["class_hall"].apply(lambda x: 1 if x=="No" else 0)
-        data["prompt"] = "<start_of_turn><user>\nYou are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information given.\n" + "User question:\n" + data["Question"] + "\nManual information:\n" + data["Context"] + "\nAnswer to user's question:<end_of_turn>\n<start_of_turn><model>\n"
+        data = data.rename(
+            {"Label": "class_hall", "Answer": "response"}, axis=1
+        )
+        data["class_hall"] = data["class_hall"].apply(
+            lambda x: "Yes" if x == "Hallucinated" else "No"
+        )
+        data["label"] = data["class_hall"].apply(
+            lambda x: 1 if x == "No" else 0
+        )
+        data["prompt"] = (
+            "<start_of_turn><user>\nYou are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information given.\n"
+            + "User question:\n"
+            + data["Question"]
+            + "\nManual information:\n"
+            + data["Context"]
+            + "\nAnswer to user's question:<end_of_turn>\n<start_of_turn><model>\n"
+        )
 
         dataset = Dataset.from_pandas(data, split="train")
-        dataset.push_to_hub("leobianco/bosch")
+        dataset.push_to_hub(args.processed_repo_id)
+
+        # Reward Model
+        rm_data = bosch_process_data_for_rm(
+            dataset.select(range(600)),
+            tokenizer,
+            seed=args.seed,
+            max_seq_length=args.max_seq_length,
+        )
+
+        rm_data.push_to_hub(args.rm_processed_repo_id)
 
 
 if __name__ == "__main__":
