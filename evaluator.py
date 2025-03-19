@@ -277,9 +277,7 @@ def npov_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False):
     return entry
 
 
-def bosch_evaluator_prompt(
-    entry, fewshot_examples=None, use_true_label=False
-):
+def bosch_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False):
     """Function for transforming entries in the Bosch dataset into prompts
     for the evaluator model.
 
@@ -288,13 +286,46 @@ def bosch_evaluator_prompt(
     it looks really bad.
     """
 
-    preamble = "<start_of_turn>user\nAn user asks a question about their car. You will be given a paragraph from this user's car manual of instructions, and you will also be given an answer to the user's question.\nTask: your task is to compare the text provided from the manual and the answer given to the user, then respond to the following question (respond only with Yes or No): does the answer given contain something not supported by the information in the text from the manual?<end_of_turn>\n"
+    preamble = """<start_of_turn>user
+You are an expert linguist and fact-checker responsible for determining when an answer contains information not supported by a source text. 
+
+In this task:
+1. A user asks a question about their car
+2. You receive an excerpt from the car's manual
+3. You examine a proposed answer to the user's question
+
+Your ONLY job is to determine: Does the proposed answer contain ANY statements, claims, instructions, or implications that are NOT explicitly supported by the manual excerpt?
+
+Important evaluation criteria:
+- If the answer makes ANY claim not directly supported by the manual, respond with "Yes"
+- If the answer rephrases information from the manual without adding new claims, respond with "No"
+- If the answer draws reasonable inferences that follow directly from the manual, respond with "No"
+- Ignore differences in tone, style, or level of detail if the underlying information is supported
+- Focus solely on factual accuracy, not helpfulness or completeness
+
+Provide ONLY "Yes" or "No" as your final answer.
+<end_of_turn>
+"""
 
     prompt = preamble
 
-    template = "<start_of_turn>user\nYour turn:\nUser question:{question}\nParagraph taken from manual:{context}\nAnswer given to user:{response}\nDoes the answer given to the user state something not supported by the information in the paragraph taken from the manual? (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
+    template = """<start_of_turn>user
+Question: {question}
 
-    fewshot_template = "<start_of_turn>user\nExample turn:\nUser question:{question}\nParagraph taken from manual:{context}\nAnswer given to user:{response}\nDoes the answer given to the user state something not supported by the information in the paragraph taken from the manual? (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
+Manual excerpt: {context}
+
+Proposed answer: {response}
+
+Analysis:
+1. Compare each statement in the proposed answer to the manual excerpt
+2. Identify any claims in the answer not explicitly supported by the manual
+3. Consider whether the answer introduces new information not present in the manual
+
+Does the proposed answer state anything not supported by the information in the manual? (Yes/No): 
+<end_of_turn>
+<start_of_turn>model
+{ans}
+"""
 
     # Depending if evaluation of evaluator or of writer checkpoint.
     response = entry["response"] if use_true_label else entry["completion"]
@@ -308,7 +339,7 @@ def bosch_evaluator_prompt(
 
     if fewshot_examples is not None:
         for fewshot_example in fewshot_examples:
-            fewshot_prompt = fewshot_template.format(
+            fewshot_prompt = template.format(
                 question=fewshot_example["Question"],
                 context=fewshot_example["Context"],
                 response=fewshot_example["response"],
