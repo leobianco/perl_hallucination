@@ -1071,6 +1071,10 @@ def main():
         data = pd.read_csv(
             "/home/leo/Downloads/DelucionQA_data/cleaned/train.csv"
         )
+        data_to_exclude = pd.read_csv(
+            "/home/leo/Downloads/DelucionQA_data/cleaned_leo/leo_bad_train.csv"
+        )
+        data = data[~data["sample_id"].isin(data_to_exclude["sample_id"])]
         data = data.loc[data["Answerable"] == True]
         data = data.drop(labels=["Answerable"], axis=1)
         data = data.rename(
