@@ -888,7 +888,7 @@ def bosch_formatting_prompts_func(entry):
     for i in range(len(entry["Question"])):
         formatted_prompt = template.format(
             question=entry["Question"][i],
-            context =entry["Context"][i],
+            context=entry["Context"][i],
         )
 
         output_texts.append(formatted_prompt)
@@ -921,8 +921,6 @@ def bosch_process_data_for_perl(
     )
 
     return perl_data
-    
-
 
 
 def main():
@@ -1087,7 +1085,7 @@ def main():
             lambda x: 1 if x == "No" else 0
         )
         data["prompt"] = (
-            "<start_of_turn><user>\nYou are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information given.\n"
+            "<start_of_turn><user>\nYou are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information giver. Do not add to your answer any information other than those present in the manual excerpt.\n"
             + "User question:\n"
             + data["Question"]
             + "\nManual information:\n"
@@ -1099,12 +1097,24 @@ def main():
         dataset.push_to_hub(args.processed_repo_id)
 
         # SFT
-        sft_data = dataset.filter(lambda entry: entry["class_hall"]=="No")
+        sft_data = dataset.filter(lambda entry: entry["class_hall"] == "No")
         sft_data.push_to_hub(args.writer_sft_processed_repo_id)
 
         # Reward Model
+        hallucinations_data = dataset.filter(lambda entry: entry["Yes"])
+        non_hallucinated_data = dataset.filter(lambda entry: entry["No"])
+
+        rm_data = concatenate_datasets(
+            [
+                hallucinations_data,
+                non_hallucinated_data.select(
+                    range((600 - hallucinations_data.num_rows))
+                ),
+            ]
+        )
+
         rm_data = bosch_process_data_for_rm(
-            dataset.select(range(600)),
+            rm_data,
             tokenizer,
             seed=args.seed,
             max_seq_length=args.max_seq_length,
@@ -1114,7 +1124,12 @@ def main():
 
         # PERL
         perl_data = bosch_process_data_for_perl(
-            dataset.select(range(600, dataset.num_rows)),
+            non_hallucinated_data.select(
+                range(
+                    (600 - hallucinations_data.num_rows),
+                    non_hallucinated_data.num_rows,
+                )
+            ),
             tokenizer,
             seed=args.seed,
             max_seq_length=args.max_seq_length,
