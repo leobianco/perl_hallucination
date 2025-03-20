@@ -1101,8 +1101,8 @@ def main():
         sft_data.push_to_hub(args.writer_sft_processed_repo_id)
 
         # Reward Model
-        hallucinations_data = dataset.filter(lambda entry: entry["Yes"])
-        non_hallucinated_data = dataset.filter(lambda entry: entry["No"])
+        hallucinations_data = dataset.filter(lambda entry: entry["class_hall"] == "Yes")
+        non_hallucinated_data = dataset.filter(lambda entry: entry["class_hall"] == "No")
 
         rm_data = concatenate_datasets(
             [
