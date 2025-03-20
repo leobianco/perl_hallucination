@@ -298,15 +298,17 @@ Your ONLY job is to determine: Does the proposed answer contain ANY statements, 
 
 Important evaluation criteria:
 - If the answer makes ANY claim not directly supported by the manual, respond with "Yes"
-- If the excerpt is unrelated to the user's question, answer "Yes".
-- If the answer rephrases information from the manual without adding new claims, respond with "No"
-- If the answer draws reasonable inferences that follow directly from the manual, respond with "No"
+- If the answer only rephrases information from the manual without adding new claims, respond with "No"
+- If the answer is FULLY supported by the manual, but truncated at the last sentence (due to word limit), answer "No"
 - Ignore differences in tone, style, or level of detail if the underlying information is supported
 - Focus solely on factual accuracy, not helpfulness or completeness
 
 Provide ONLY "Yes" or "No" as your final answer.
 <end_of_turn>
 """
+
+    # Previously included:
+    # - If the answer draws reasonable inferences that follow directly from the manual, respond with "No"
 
     prompt = preamble
 
