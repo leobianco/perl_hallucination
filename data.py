@@ -901,7 +901,7 @@ def bosch_process_data_for_perl(
     tokenizer,
     max_seq_length=1340,
     seed=12345,
-    validation_size=50,
+    validation_size=100,
 ):
     perl_data = deepcopy(data)
 
@@ -1069,10 +1069,30 @@ def main():
         data = pd.read_csv(
             "/home/leo/Downloads/DelucionQA_data/cleaned/train.csv"
         )
-        data_to_exclude = pd.read_csv(
-            "/home/leo/Downloads/DelucionQA_data/cleaned_leo/leo_bad_train.csv"
+        data_to_flip_train = pd.read_csv(
+            "/home/leo/Downloads/DelucionQA_data/cleaned_leo/leo_flip_train.csv"
         )
-        data = data[~data["sample_id"].isin(data_to_exclude["sample_id"])]
+        data_test = pd.read_csv(
+            "/home/leo/Downloads/DelucionQA_data/cleaned/test.csv"
+        )
+        data_to_flip_test = pd.read_csv(
+            "/home/leo/Downloads/DelucionQA_data/cleaned_leo/leo_flip_test.csv"
+        )
+        data_dev = pd.read_csv(
+            "/home/leo/Downloads/DelucionQA_data/cleaned/dev.csv"
+        )
+        data_to_flip_dev = pd.read_csv(
+            "/home/leo/Downloads/DelucionQA_data/cleaned_leo/leo_flip_dev.csv"
+        )
+
+        # Merge the two
+        data = pd.concat([data, data_test, data_dev])
+        data_to_flip = pd.concat([data_to_flip_train, data_to_flip_test, data_to_flip_dev])
+
+        # To exclude bad data
+        # data = data[~data["sample_id"].isin(data_to_exclude["sample_id"])]
+        # To flip the label for the bad data
+        data.loc[data["sample_id"].isin(data_to_flip["sample_id"]), "Label"] = "Not Hallucinated"
         data = data.loc[data["Answerable"] == True]
         data = data.drop(labels=["Answerable"], axis=1)
         data = data.rename(
@@ -1133,6 +1153,7 @@ def main():
             tokenizer,
             seed=args.seed,
             max_seq_length=args.max_seq_length,
+            validation_size=100,
         )
 
         for split in perl_data.keys():
