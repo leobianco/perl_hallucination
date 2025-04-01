@@ -725,3 +725,11 @@ if __name__ == "__main__":
             for idx, score in enumerate(scores):
                 f.write("{:.5f}\n".format(score.item()))
         print(f"Scores saved to {filepath}")
+
+        filepath = f"logs/{name_for_saving}/classifs.txt"
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(filepath, "w") as f:
+            for idx, classif in enumerate(classifs):
+                f.write("{:.5f}\n".format(classif.item()))
+        print(f"Classifs saved to {filepath}")
+        print(f"Classif mean: {torch.mean(classifs)}")
