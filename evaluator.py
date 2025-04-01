@@ -691,7 +691,8 @@ if __name__ == "__main__":
                 )
 
                 scores.append(gemini_score(response))
-                scores = torch.tensor(scores)
+
+            scores = torch.tensor(scores)
 
         else:
             evaluator = AutoModelForCausalLM.from_pretrained(
