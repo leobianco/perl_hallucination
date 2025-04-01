@@ -676,6 +676,7 @@ if __name__ == "__main__":
             model = "gemini-2.0-flash-001"
             schema = {"type": "STRING", "enum":['No','Yes']}
             scores = []
+            print("Calling the Gemini API...")
 
             for query in val_data["evaluator_prompt"]:
                 response = client.models.generate_content(
@@ -722,5 +723,5 @@ if __name__ == "__main__":
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         with open(filepath, "w") as f:
             for idx, score in enumerate(scores):
-                f.write("{:.3f}\n".format(score.item()))
+                f.write("{:.5f}\n".format(score.item()))
         print(f"Scores saved to {filepath}")
