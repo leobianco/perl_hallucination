@@ -37,6 +37,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from datasets import concatenate_datasets, load_dataset
+from google import genai
+from google.genai import types
 from huggingface_hub import snapshot_download
 from sklearn.metrics import (
     RocCurveDisplay,
@@ -103,6 +105,15 @@ class ScriptArguments:
         metadata={
             "help": "The model name or path to the model to use as evaluator."
         },
+    )
+
+    use_gemini: bool = field(
+        default=True,
+        metadata={"help": "Using the latest Gemini model as evaluator"},
+    )
+
+    gemini_api_key: Optional[str] = field(
+        default="", metadata={"help": "API key for calling Gemini"}
     )
 
     seed: int = field(default=12345)
@@ -287,7 +298,7 @@ def bosch_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False):
     """
 
     preamble = """<start_of_turn>user
-You are an expert linguist and fact-checker responsible for determining when an answer contains information not supported by a source text. 
+You are an expert linguist and fact-checker responsible for determining when an answer contains information not supported by a source text.
 
 In this task:
 1. A user asks a question about their car
@@ -298,10 +309,12 @@ Your ONLY job is to determine: Does the proposed answer contain ANY statements, 
 
 Important evaluation criteria:
 - If the answer makes ANY claim not directly supported by the manual, respond with "Yes"
+- If the answer contains any logical implication not explicitly appearing in the manual excerpt, valid or not, respond with "Yes"
 - If the answer only rephrases information from the manual without adding new claims, respond with "No"
 - If the answer is FULLY supported by the manual, but truncated at the last sentence (due to word limit), answer "No"
+- Introduction sentences such as "Follow these steps:" and conclusions such as "I hope these helps!" are allowed. If all other sentences are supported by the context, answer "No"
 - Ignore differences in tone, style, or level of detail if the underlying information is supported
-- Focus solely on factual accuracy, not helpfulness or completeness
+- Focus solely on faithfulness to the source, not helpfulness or completeness
 
 Provide ONLY "Yes" or "No" as your final answer.
 <end_of_turn>
@@ -324,7 +337,7 @@ Analysis:
 2. Identify any claims in the answer not explicitly supported by the manual
 3. Consider whether the answer introduces new information not present in the manual
 
-Does the proposed answer state anything not supported by the information in the manual? (Yes/No): 
+Does the proposed answer state anything not supported by the information in the manual? (Yes/No):
 <end_of_turn>
 <start_of_turn>model
 {ans}
@@ -409,6 +422,17 @@ def evaluator_score(
         del tokenized_prompts
 
     return scores
+
+
+def gemini_score(response):
+  if response.candidates[0].avg_logprobs is None:
+    return 0
+  if response.text=="No":
+    return np.exp(response.candidates[0].avg_logprobs)
+  elif response.text=="Yes":
+    return 1-np.exp(response.candidates[0].avg_logprobs)
+  else:
+    raise Exception("Invalid response")
 
 
 if __name__ == "__main__":
@@ -611,8 +635,15 @@ if __name__ == "__main__":
         else:
             outputs = llm.generate(prompts, sampling_params)
 
-        generations = [output.outputs[0].text for output in outputs]
+        # Free vLLM memory to free up space for evaluator.
+        destroy_model_parallel()
+        del llm.llm_engine.model_executor.driver_worker
+        del llm
+        gc.collect()
+        torch.cuda.empty_cache()
 
+        # Save generations
+        generations = [output.outputs[0].text for output in outputs]
         filepath = f"logs/{name_for_saving}/generations.txt"
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         with open(filepath, "w") as f:
@@ -623,30 +654,13 @@ if __name__ == "__main__":
         # Add generations to the val_data under a column named "completion".
         val_data = val_data.add_column("completion", generations)
 
-        # Free vLLM memory to free up space for evaluator.
-        destroy_model_parallel()
-        del llm.llm_engine.model_executor.driver_worker
-        del llm
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        # Score Completions
-
-        # Instantiate evaluator.
-        evaluator = AutoModelForCausalLM.from_pretrained(
-            script_args.evaluator_model,
-            device_map="auto",
-            attn_implementation="eager",
-            torch_dtype=torch.bfloat16,
-        )
-        evaluator.eval()
-
         # Build the evaluator prompts using fewshot examples + generations.
         val_data = val_data.map(
             evaluator_prompt,
             fn_kwargs=dict(fewshot_examples=evaluator_fewshot_examples),
         )
 
+        # Save evaluator prompts
         filepath = f"logs/{name_for_saving}/evaluator_prompts.txt"
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         with open(filepath, "w") as f:
@@ -654,14 +668,48 @@ if __name__ == "__main__":
                 f.write(f"\n{idx}. ----------\n" + prompt)
         print(f"Evaluator prompts saved to {filepath}")
 
-        scores = evaluator_score(
-            val_data,
-            script_args,
-            tokenizer,
-            evaluator,
-            yes_token_id,
-            no_token_id,
-        )
+        # Score Completions
+
+        # Instantiate evaluator.
+        if script_args.use_gemini:
+            client = genai.Client(api_key=script_args.gemini_api_key)
+            model = "gemini-2.0-flash-001"
+            schema = {"type": "STRING", "enum":['No','Yes']}
+            scores = []
+
+            for query in val_data["evaluator_prompt"]:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=query,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="text/x.enum",
+                        response_schema=schema,
+                        temperature=script_args.temperature,
+                        max_output_tokens=1,
+                        seed=script_args.seed,
+                    )
+                )
+
+                scores.append(gemini_score(response))
+                scores = torch.tensor(scores)
+
+        else:
+            evaluator = AutoModelForCausalLM.from_pretrained(
+                script_args.evaluator_model,
+                device_map="auto",
+                attn_implementation="eager",
+                torch_dtype=torch.bfloat16,
+            )
+            evaluator.eval()
+
+            scores = evaluator_score(
+                val_data,
+                script_args,
+                tokenizer,
+                evaluator,
+                yes_token_id,
+                no_token_id,
+            )
 
         # Calculate Metrics
         t = nn.Threshold(script_args.threshold, 0, inplace=False)

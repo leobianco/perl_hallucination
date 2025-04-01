@@ -22,6 +22,8 @@ fi
 
 BASE_MODEL="google/gemma-2-2b-it"
 EVALUATOR_MODEL="google/gemma-2-27b-it"
+USE_GEMINI="True"
+GEMINI_API_KEY="AIzaSyCIPXhApp0pcu7TruZ8EyuW086VJ1wzrhk"
 EVALUATOR_NUM_FEWSHOT=2
 WRITER_NUM_FEWSHOT=0
 EVAL_EVALUATOR="True"
@@ -40,6 +42,8 @@ python3 evaluator.py \
   --writer_model_lora "${RUN_IDENTIFIER}" \
   --max_tokens 768 \
   --evaluator_model ${EVALUATOR_MODEL} \
+  --use_gemini $USE_GEMINI \
+  --gemini_api_key ${GEMINI_API_KEY} \
   --evaluator_num_fewshot $EVALUATOR_NUM_FEWSHOT \
   --writer_num_fewshot $WRITER_NUM_FEWSHOT \
   --evaluate_evaluator $EVAL_EVALUATOR \
