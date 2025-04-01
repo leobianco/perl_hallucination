@@ -424,7 +424,7 @@ def evaluator_score(
     return scores
 
 
-def gemini_score(response):
+def gemini_score_response(response):
   if response.candidates[0].avg_logprobs is None:
     return 0
   if response.text=="No":
@@ -433,6 +433,39 @@ def gemini_score(response):
     return 1-np.exp(response.candidates[0].avg_logprobs)
   else:
     raise Exception("Invalid response")
+
+
+def gemini_score_dataset(client, dataset, script_args):
+    """Score a whole dataset with Gemini API.
+    
+    Args:
+        client: Initialized Gemini API client
+        dataset: Dataset containing evaluator_prompt column
+        script_args: Script arguments containing seed
+        
+    Returns:
+        torch.tensor: Tensor of scores
+    """
+    model = "gemini-2.0-flash-001"
+    schema = {"type": "STRING", "enum":['No','Yes']}
+    scores = []
+    print("Calling the Gemini API...")
+
+    for query in dataset["evaluator_prompt"]:
+        response = client.models.generate_content(
+            model=model,
+            contents=query,
+            config=types.GenerateContentConfig(
+                response_mime_type="text/x.enum",
+                response_schema=schema,
+                temperature=0,
+                max_output_tokens=1,
+                seed=script_args.seed,
+            )
+        )
+        scores.append(gemini_score_response(response))
+
+    return torch.tensor(scores)
 
 
 if __name__ == "__main__":
@@ -480,14 +513,6 @@ if __name__ == "__main__":
     no_token_id = tokenizer.convert_tokens_to_ids("No")
 
     if script_args.evaluate_evaluator:
-        evaluator = AutoModelForCausalLM.from_pretrained(
-            script_args.evaluator_model,
-            device_map="auto",
-            attn_implementation="eager",
-            torch_dtype=torch.bfloat16,
-        )
-        evaluator.eval()
-
         data = data.map(
             evaluator_prompt,
             fn_kwargs=dict(
@@ -495,14 +520,28 @@ if __name__ == "__main__":
             ),
         )
 
-        scores = evaluator_score(
-            data,
-            script_args,
-            tokenizer,
-            evaluator,
-            yes_token_id,
-            no_token_id,
-        )
+        # Repetitive code, encapsulate in a function 
+        if script_args.use_gemini:
+            client = genai.Client(api_key=script_args.gemini_api_key)
+            scores = gemini_score_dataset(client, data, script_args)
+
+        else:
+            evaluator = AutoModelForCausalLM.from_pretrained(
+                script_args.evaluator_model,
+                device_map="auto",
+                attn_implementation="eager",
+                torch_dtype=torch.bfloat16,
+            )
+            evaluator.eval()
+
+            scores = evaluator_score(
+                data,
+                script_args,
+                tokenizer,
+                evaluator,
+                yes_token_id,
+                no_token_id,
+            )
 
         # Calculate Metrics
         ground_truth = data["label"]
@@ -673,27 +712,7 @@ if __name__ == "__main__":
         # Instantiate evaluator.
         if script_args.use_gemini:
             client = genai.Client(api_key=script_args.gemini_api_key)
-            model = "gemini-2.0-flash-001"
-            schema = {"type": "STRING", "enum":['No','Yes']}
-            scores = []
-            print("Calling the Gemini API...")
-
-            for query in val_data["evaluator_prompt"]:
-                response = client.models.generate_content(
-                    model=model,
-                    contents=query,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="text/x.enum",
-                        response_schema=schema,
-                        temperature=0,
-                        max_output_tokens=1,
-                        seed=script_args.seed,
-                    )
-                )
-
-                scores.append(gemini_score(response))
-
-            scores = torch.tensor(scores)
+            scores = gemini_score_dataset(client, val_data, script_args)
 
         else:
             evaluator = AutoModelForCausalLM.from_pretrained(
