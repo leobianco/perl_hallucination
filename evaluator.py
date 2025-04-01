@@ -715,7 +715,7 @@ if __name__ == "__main__":
 
         # Calculate Metrics
         t = nn.Threshold(script_args.threshold, 0, inplace=False)
-        classifs = torch.ceil(t(scores))
+        classifs = torch.ceil(t(scores)).clamp(0, 1)
         rate_hallucination = 1 - torch.mean(classifs)
         print("Rate of hallucination:", rate_hallucination.item())
 
