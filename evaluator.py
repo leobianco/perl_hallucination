@@ -684,7 +684,7 @@ if __name__ == "__main__":
                     config=types.GenerateContentConfig(
                         response_mime_type="text/x.enum",
                         response_schema=schema,
-                        temperature=script_args.temperature,
+                        temperature=0,
                         max_output_tokens=1,
                         seed=script_args.seed,
                     )
