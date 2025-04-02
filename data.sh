@@ -35,4 +35,5 @@ python data.py \
     --perl_processed_repo_id "$PERL_PROCESSED_REPO_ID" \
     --perl_train_size "$PERL_TRAIN_SIZE" \
     --perl_validation_size "$PERL_VALIDATION_SIZE" \
-    --augmented_repo_id "$AUGMENTED_REPO_ID"
+    --augmented_repo_id "$AUGMENTED_REPO_ID" \
+    --gemini_api_key "AIzaSyCIPXhApp0pcu7TruZ8EyuW086VJ1wzrhk"

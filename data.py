@@ -11,6 +11,8 @@ from itertools import combinations
 
 import pandas as pd
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
+from google import genai
+from google.genai import types
 from transformers import AutoTokenizer
 
 #####################
@@ -923,6 +925,64 @@ def bosch_process_data_for_perl(
     return perl_data
 
 
+rm_synthetic_hall_llm_prompt = """
+Objective:
+Generate a modified version of a given answer that includes plausible-sounding synthetic hallucinations (information not present in the provided context).
+
+Task:
+You are given a Question, a Context used to answer it, and an Original Grounded Answer derived solely from that Context. Your task is to rewrite the Original Grounded Answer to create a Modified Answer.
+
+Requirements for the Modified Answer:
+1. Address the Question: It must still fundamentally answer the original Question.
+2. Incorporate Hallucinations: It must include 1 or 2 specific pieces of information that are explicitly NOT found in the provided Context.
+3. Plausibility: The added information (the hallucinations) should sound plausible and relevant to the Question and the general topic, even though it lacks support in the Context.
+4. Integration: Weave the hallucinated information naturally into the text. Do not simply append it awkwardly. It should blend smoothly with the information retained from the Original Grounded Answer.
+5. Minimal Other Changes: Preserve the core information and structure of the Original Grounded Answer as much as possible, only augmenting it with the hallucinations.
+6. Output: Provide only the text of the Modified Answer.
+
+Input Information:
+
+--- START CONTEXT ---
+{context}
+--- END CONTEXT ---
+
+--- START QUESTION ---
+{question}
+--- END QUESTION ---
+
+--- START ORIGINAL GROUNDED ANSWER ---
+{original_answer}
+--- END ORIGINAL GROUNDED ANSWER ---
+
+Instruction:
+Please generate the Modified Answer based on the requirements above.
+
+Modified Answer:
+"""
+
+
+def bosch_function_to_map_synthetic_halls_llm(
+    entry, client, gemini_model, generation_config
+):
+    prompt_to_send = rm_synthetic_hall_llm_prompt.format(
+        context=entry["Context"],
+        question=entry["Question"],
+        original_answer=entry["response"],
+    )
+
+    response = client.models.generate_content(
+        model=gemini_model,
+        contents=prompt_to_send,
+        config=generation_config,
+    )
+
+    return {
+        "response": response.text,
+        "class_hall": "Yes",
+        "label": 0,
+    }
+
+
 def main():
     parser = ArgumentParser()
     parser.add_argument("--task", type=str)
@@ -941,6 +1001,7 @@ def main():
     parser.add_argument("--perl_train_size", type=int)
     parser.add_argument("--perl_validation_size", type=int)
     parser.add_argument("--augmented_repo_id", type=str)
+    parser.add_argument("--gemini_api_key", type=str)
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -1065,7 +1126,7 @@ def main():
         )
 
     elif args.task == "bosch":
-        # Load data
+        # GLOBAL DATA
         data = pd.read_csv(
             "/home/leo/Downloads/DelucionQA_data/cleaned/train.csv"
         )
@@ -1087,14 +1148,23 @@ def main():
 
         # Merge the two
         data = pd.concat([data, data_test, data_dev])
-        data_to_flip = pd.concat([data_to_flip_train, data_to_flip_test, data_to_flip_dev])
+        data_to_flip = pd.concat(
+            [data_to_flip_train, data_to_flip_test, data_to_flip_dev]
+        )
 
         # To exclude bad data
         # data = data[~data["sample_id"].isin(data_to_exclude["sample_id"])]
+
         # To flip the label for the bad data
-        data.loc[data["sample_id"].isin(data_to_flip["sample_id"]), "Label"] = "Not Hallucinated"
+        data.loc[data["sample_id"].isin(data_to_flip["sample_id"]), "Label"] = (
+            "Not Hallucinated"
+        )
+
+        # Filter to keep only context relating to the question
         data = data.loc[data["Answerable"] == True]
         data = data.drop(labels=["Answerable"], axis=1)
+
+        # Create or rename columns
         data = data.rename(
             {"Label": "class_hall", "Answer": "response"}, axis=1
         )
@@ -1121,16 +1191,21 @@ def main():
         sft_data.push_to_hub(args.writer_sft_processed_repo_id)
 
         # Reward Model
-        hallucinations_data = dataset.filter(lambda entry: entry["class_hall"] == "Yes")
-        non_hallucinated_data = dataset.filter(lambda entry: entry["class_hall"] == "No")
+        hallucinations_data = dataset.filter(
+            lambda entry: entry["class_hall"] == "Yes"
+        )
+        non_hallucinated_data = dataset.filter(
+            lambda entry: entry["class_hall"] == "No"
+        )
+        # We don't want to use all of the non-hallucinated data.
+        # Some of it goes to PERL, etc
+        subset_non_hallucinated_data = non_hallucinated_data.select(
+            range((600 - hallucinations_data.num_rows))
+        )
 
+        # RM dataset with organic hallucinations
         rm_data = concatenate_datasets(
-            [
-                hallucinations_data,
-                non_hallucinated_data.select(
-                    range((600 - hallucinations_data.num_rows))
-                ),
-            ]
+            [hallucinations_data, subset_non_hallucinated_data]
         )
 
         rm_data = bosch_process_data_for_rm(
@@ -1141,6 +1216,46 @@ def main():
         )
 
         rm_data.push_to_hub(args.rm_processed_repo_id)
+
+        # RM dataset with Synthetic Hallucinations - LLM generated
+        client = genai.Client(api_key=args.gemini_api_key)
+        gemini_model = "gemini-2.0-flash-001"
+        generation_config = types.GenerateContentConfig(
+            temperature=0.7,
+            seed=args.seed,
+        )
+
+        print("Calling Gemini's API...")
+
+        # Get the same non-hallucinated samples as in the organic case,
+        # but now generate hallucinated versions for them.
+        synthetic_hallucinations_llm = subset_non_hallucinated_data.map(
+            bosch_function_to_map_synthetic_halls_llm,
+            fn_kwargs=dict(
+                client=client,
+                gemini_model=gemini_model,
+                generation_config=generation_config,
+            ),
+        )
+
+        synthetic_hallucinations_llm_data = concatenate_datasets(
+            [subset_non_hallucinated_data, synthetic_hallucinations_llm]
+        )
+        synthetic_hallucinations_llm_data = (
+            synthetic_hallucinations_llm_data.shuffle(seed=args.seed)
+        )
+
+        # You need to rewrite the prompts, re-tokenize, re-split, etc...
+        synthetic_hallucinations_llm_data = bosch_process_data_for_rm(
+            synthetic_hallucinations_llm_data,
+            tokenizer,
+            seed=args.seed,
+            max_seq_length=args.max_seq_length,
+        )
+
+        synthetic_hallucinations_llm_data.push_to_hub(
+            args.rm_processed_repo_id + "_synthetic_llm"
+        )
 
         # PERL
         perl_data = bosch_process_data_for_perl(
