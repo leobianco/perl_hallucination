@@ -856,7 +856,12 @@ def bosch_rm_prompt(entry):
 
 
 def bosch_process_data_for_rm(
-    data, tokenizer, seed=12345, max_seq_length=1340, validation_size=0.2
+    data,
+    tokenizer,
+    seed=12345,
+    max_seq_length=1340,
+    split_data=True,
+    validation_size=0.2,
 ):
     rm_data = deepcopy(data)
 
@@ -870,7 +875,9 @@ def bosch_process_data_for_rm(
         },
     )
     rm_data.set_format("torch")  # due to using map()
-    rm_data = rm_data.train_test_split(seed=seed, test_size=validation_size)
+
+    if split_data:
+        rm_data = rm_data.train_test_split(seed=seed, test_size=validation_size)
 
     return rm_data
 
@@ -1199,8 +1206,9 @@ def main():
         )
         # We don't want to use all of the non-hallucinated data.
         # Some of it goes to PERL, etc
+        rm_data_cap = 600
         subset_non_hallucinated_data = non_hallucinated_data.select(
-            range((600 - hallucinations_data.num_rows))
+            range((rm_data_cap - hallucinations_data.num_rows))
         )
 
         # RM dataset with organic hallucinations
@@ -1238,37 +1246,72 @@ def main():
             ),
         )
 
-        synthetic_hallucinations_llm_data = concatenate_datasets(
+        synthetic_hallucinations_llm_train_data = concatenate_datasets(
             [subset_non_hallucinated_data, synthetic_hallucinations_llm]
         )
-        synthetic_hallucinations_llm_data = (
-            synthetic_hallucinations_llm_data.shuffle(seed=args.seed)
+        synthetic_hallucinations_llm_train_data = (
+            synthetic_hallucinations_llm_train_data.shuffle(seed=args.seed)
         )
 
-        # You need to rewrite the prompts, re-tokenize, re-split, etc...
-        synthetic_hallucinations_llm_data = bosch_process_data_for_rm(
-            synthetic_hallucinations_llm_data,
+        # You need to rewrite the prompts, re-tokenize... but don't re-split!
+        # This will be the train split of the final Dataset.
+        # The test set will be composed of organic hallucinations + some
+        # non-hallucinated samples from the PERL training set.
+        synthetic_hallucinations_llm_train_data = bosch_process_data_for_rm(
+            synthetic_hallucinations_llm_train_data,
             tokenizer,
             seed=args.seed,
+            split_data=False,
             max_seq_length=args.max_seq_length,
         )
 
+        # Building the test split
+
+        # Get the necessary non-hallucinated examples.
+        # You had taken rm_data_cap - |hallucinations| examples already.
+        # So start from there and get
+        start_idx_test = rm_data_cap - hallucinations_data.num_rows
+        end_idx_test = start_idx_test + hallucinations_data.num_rows
+        non_hallucinated_data_for_test = non_hallucinated_data.select(
+            range(start_idx_test, end_idx_test)
+        )
+
+        synthetic_hallucinations_llm_test_data = concatenate_datasets(
+            [hallucinations_data, non_hallucinated_data_for_test]
+        ).shuffle(seed=args.seed)
+
+        synthetic_hallucinations_llm_test_data = bosch_process_data_for_rm(
+            synthetic_hallucinations_llm_test_data,
+            tokenizer,
+            seed=args.seed,
+            split_data=False,
+            max_seq_length=args.max_seq_length,
+        )
+
+        # Merge the two in the appropriate splits
+        synthetic_hallucinations_llm_data = DatasetDict(
+            {
+                "train": synthetic_hallucinations_llm_train_data,
+                "test": synthetic_hallucinations_llm_test_data,
+            }
+        )
+
         synthetic_hallucinations_llm_data.push_to_hub(
-            args.rm_processed_repo_id + "_synthetic_llm"
+            repo_id=args.rm_processed_repo_id + "_synthetic_llm"
         )
 
         # PERL
         perl_data = bosch_process_data_for_perl(
             non_hallucinated_data.select(
                 range(
-                    (600 - hallucinations_data.num_rows),
+                    (rm_data_cap - hallucinations_data.num_rows),
                     non_hallucinated_data.num_rows,
                 )
             ),
             tokenizer,
             seed=args.seed,
             max_seq_length=args.max_seq_length,
-            validation_size=100,
+            validation_size=args.perl_validation_size,
         )
 
         for split in perl_data.keys():

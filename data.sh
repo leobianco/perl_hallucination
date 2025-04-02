@@ -13,7 +13,7 @@ WRITER_SFT_PROCESSED_REPO_ID="${USER}/${TASK}_writer_sft_processed"
 PERL_RAW_REPO_ID="okezieowen/english_to_spanish"
 PERL_PROCESSED_REPO_ID="${USER}/${TASK}_perl_processed"
 PERL_TRAIN_SIZE=25000
-PERL_VALIDATION_SIZE=500
+PERL_VALIDATION_SIZE=800
 AUGMENTED_REPO_ID="${USER}/${TASK}_augmented_validation"
 
 if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ]; then
