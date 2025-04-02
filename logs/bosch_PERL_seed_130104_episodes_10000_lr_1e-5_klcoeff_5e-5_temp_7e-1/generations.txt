@@ -1,0 +1,328 @@
+
+0. ----------
+The touchscreen X button to disable the display of the TrailCam view is made available ONLY when the vehicle is not in REVERSE. 
+
+1. ----------
+The Gross Trailer Weight (GTW) is the weight of the trailer plus the weight of all cargo, consumables and equipment (permanent or temporary) loaded in or on the trailer in its "loaded and ready for operation" condition.  The recommended way to measure GTW is to put your fully loaded trailer on a vehicle scale.  The entire weight of the trailer must be supported by the scale.  
+
+2. ----------
+The tool kit is located in the center console. 
+
+3. ----------
+Use intermittent wipers when weather conditions make a single wiping cycle, with a variable pause between cycles, desirable. 
+
+4. ----------
+The Hazard Warning Flashers button is located on the instrument panel below the climate controls.  Push the button to turn on the Hazard Warning Flashers.  When the button is activated, all directional turn signals will flash on and off to warn oncoming traffic of an emergency.  Push the button a second time to turn off the Hazard Warning Flashers. 
+
+5. ----------
+To replace the battery in the key fob, remove the back cover of the key fob by inserting a flat-blade screwdriver into the slot on the bottom of the fob. Apply light pressure until the cover unsnaps being careful not to damage the seal. Proceed counterclockwise (in the order shown in the following image) to loosen the remaining snaps until the battery cover can be removed.  Insert a small flat-blade screwdriver into the battery removal slot and slide the battery forward and upward being careful not to damage the electronic board underneath.  Install the new battery into the key fob, making sure the positive (+) side is facing up.  Slide the battery until it is seated securely below the tabs.  Reassemble the back cover making sure it is properly aligned before snapping it back in place. 
+
+6. ----------
+Care must be taken to avoid scratching the plastic.  Clean with a wet soft cloth.  A mild soap solution may be used, but do not use high alcohol content or abrasive cleaners.  If soap is used, wipe clean with a clean damp cloth.  Dry with a soft cloth. 
+
+7. ----------
+The OBD II system may not be ready if your vehicle was recently serviced, recently had a depleted battery or a battery replacement.  If your vehicle's obd ii system should be determined not ready for the I/M test, your vehicle may fail the test.  A recheck with the previously mentioned test routine may then indicate that the system is now ready.  Cycle the ignition switch to the ON position, but do not crank or start the engine.  If you crank or start the engine, you will have to start this test over. 
+
+8. ----------
+No. 
+You should not add fuel when the engine is running.  WARNING: Do not open the high pressure fuel system with the engine running.  Engine operation causes high fuel pressure.  High pressure fuel spray can cause serious injury or death. 
+
+9. ----------
+Sling type equipment should not be used when towing. 
+
+10. ----------
+The Autostop Mode can be activated after driving the vehicle forward at a speed greater than 5 mph (8 km/h). 
+
+11. ----------
+This manual excerpt does not contain information about interrupting a voice response. 
+
+12. ----------
+If the temperature is below 41°F (5°C) do not attempt to put the top down or roll the rear or side curtains. 
+
+13. ----------
+The Driver Assist menu displays the status of the ACC system. 
+
+14. ----------
+The Vehicle Security Warning Light will flash at a fast rate for approximately 15 seconds when the vehicle security system is arming, and then will flash slowly until the vehicle is disarmed. 
+
+15. ----------
+Get out of the vehicle and determine the cause of the hangup.  You can jack up the vehicle, place rocks under the tires, or try rocking or winching the vehicle off the object. Be careful to avoid damaging the undercarriage.  
+
+16. ----------
+To erase old channels, place the ignition switch into the ON/RUN position. Push and hold the two outside HomeLink® buttons (I and III) for up to 20 seconds, or until the HomeLink® indicator light flashes. 
+
+17. ----------
+If the light stays on after the bulb check, it indicates that the vehicle should be serviced promptly. 
+
+18. ----------
+To adjust the ambient light level, rotate the dimmer control on the left side of the instrument panel while the parking lights or headlights are on. 
+
+19. ----------
+The perception of pressure on the ears is described as wind buffeting. 
+
+20. ----------
+The voltmeter may show a gauge fluctuation at various engine temperatures. 
+
+21. ----------
+The ACC buttons:
+- **Distance Increase button:** Increases the following distance setting by one bar (longer).
+- **Distance Decrease button:** Decreases the following distance setting by one bar (shorter). 
+
+22. ----------
+You should press the Hazard Warning button in the following situations: 
+
+* When your vehicle is disabled 
+* When creating a safety hazard warning for other motorists 
+* When you must leave the vehicle to seek assistance 
+
+23. ----------
+To turn on parking lights, rotate the headlight switch clockwise to the first detent.  To turn on instrument panel lights, rotate the headlight switch clockwise to the first detent. 
+
+24. ----------
+The ParkView Rear Back Up Camera allows you to see an on-screen image of the rear surroundings of your vehicle whenever the gear selector is in REVERSE.  The image will be displayed in the touchscreen display along with a caution note to “Check Entire Surroundings” across the top of the screen.  After five seconds this note will disappear. 
+
+25. ----------
+Without pushing the brake pedal, place the ignition in the ON/RUN position (do not start the engine).  Fully press the accelerator pedal, slowly, three times within ten seconds.  Without pushing the brake pedal, place the ignition in OFF position.  Stop the vehicle.  Shift the transmission into PARK, if possible.  If not, shift the transmission to NEUTRAL.  Push and hold the ENGINE START/STOP button until the engine turns off.  Wait approximately 30 seconds.  Restart the engine.  Shift into the desired gear range. 
+
+26. ----------
+The Locking Storage Bin can be accessed by folding the rear seat bottom upward into the Stadium Position. 
+
+27. ----------
+The power door lock switch on the front door panel unlocks the doors when pushed forward and locks them when pushed rearward. 
+
+28. ----------
+The manual states that HSA will work in REVERSE gear and all forward gears.  It will not activate if the transmission is in PARK or NEUTRAL. 
+
+29. ----------
+The Air Bag Warning Light will turn on for four to eight seconds as a bulb check when the ignition switch is first placed in the ON/RUN position. 
+
+30. ----------
+When securing the vehicle to a flatbed truck, do not attach to front or rear suspension components. 
+Damage to your vehicle may result from improper towing.  
+Use only tow bars and other equipment designed for this purpose, following equipment manufacturer’s instructions.  
+Use of safety chains is mandatory. 
+Attach a tow bar or other towing device to main structural members of the vehicle, not to fascia/bumpers or associated brackets. 
+State and local laws regarding vehicles under tow must be observed.  
+If you must use the accessories (wipers, defrosters, etc.)  while being towed, the ignition must be in the ON/RUN position, not the ACC position.  
+If the vehicle's battery is discharged, instructions on shifting the automatic transmission out of PARK (P) in order to move the vehicle CAUTION: Do not use sling type equipment when towing.  Vehicle damage may occur. 
+
+31. ----------
+The N position refers to disengaging both the front and rear driveshafts from the powertrain and is used for flat towing behind another vehicle. 
+
+32. ----------
+A long break-in period is not required for the engine and drivetrain (transmission and axle) in your vehicle. A new engine may consume some oil during its first few thousand miles (kilometers) of operation. This should be considered a normal part of the break-in and not interpreted as a problem. 
+
+33. ----------
+The MIL light can illuminate due to a loose or missing gas cap, poor quality fuel, or other conditions after the engine starts.  It will flash to alert serious conditions leading to immediate loss of power or severe catalytic converter damage.  
+
+34. ----------
+The electronic disconnecting stabilizer/sway bar allows greater front suspension travel in off-road situations. 
+
+35. ----------
+The engine will not stop if the driver’s seat belt is not buckled, the driver’s door is not closed, battery charge is low, the vehicle is on a steep grade, cabin heating or cooling is in process, the HVAC is set to full defrost mode at a high blower speed, the engine has not reached normal operating temperature, engine or exhaust temperature is too high, the transmission is not in a forward gear, the hood is open, the transfer case is in 4L or N (neutral), the brake pedal is not pressed with sufficient pressure, or the accelerator pedal input is present. 
+
+36. ----------
+To turn on the heated steering wheel, press the heated steering wheel button once. 
+
+37. ----------
+The Gross Axle Weight Rating (GAWR) is the maximum permissible load on the front and rear axles. 
+
+38. ----------
+You have 10 seconds after pushing the SOS Call button to cancel the call.  To cancel the call, either push the SOS Call button again, or press the Cancel button on the in-vehicle touchscreen. 
+
+39. ----------
+The Tongue Weight (TW) is the downward force exerted on the hitch ball by the trailer. 
+
+40. ----------
+If the ESC indicator light remains on after several ignition cycles and you have driven several miles at speeds greater than 30 mph, see an authorized dealer as soon as possible. 
+
+41. ----------
+Using E-15 may result in starting and drivability problems, damage critical fuel system components, cause emissions to exceed the applicable standard, and/or cause the Malfunction Indicator Light to illuminate. 
+
+42. ----------
+The provided text does not contain information about the potential for overheating in the steering wheel. 
+
+43. ----------
+When washing your car, use car wash soap and water. Do not use harsh chemicals or a stiff brush, as they can damage the wheel's protective coating.  Use a soft cloth or sponge and mild soap to wipe away promptly.  Remember to avoid acidic solutions or strong alkaline additives or harsh brushes. 
+
+44. ----------
+The Owner's Manuals have been prepared with the assistance of service and engineering specialists to acquaint you with specific FCA vehicles. To access your owner's information online, visit www.mopar.com/om (us) or www.owners.mopar.ca (canada).  Or call tech authority toll free at: 1-800-890-4038 (us) 
+
+45. ----------
+You should not start or run the engine if the MIL is illuminated. 
+
+46. ----------
+The mirror should be adjusted to center on the view through the rear window.  Headlight glare from vehicles behind you can be reduced by moving the small control under the mirror to the night position (toward the rear of the vehicle).  The mirror should be adjusted while set in the day position (toward the windshield). 
+
+47. ----------
+Yes, Android Auto™ is a feature of your Uconnect system, and your Android™ 6.0 or higher powered smartphone with a data plan allows you to project your smartphone and a number of its apps onto the touchscreen radio display. 
+
+48. ----------
+Yes, you should check the straps frequently. 
+
+49. ----------
+To use Android Auto™, download the Android Auto™ app from the Google Play store on your Android™-powered smartphone. Then, connect your Android™-powered smartphone to one of the media USB ports in your vehicle. Once the device is connected and recognized, the Phone icon on the drag & drop menu bar changes to the Android Auto™ icon. 
+
+50. ----------
+A telescoping link is a type of trailer sway control that can be installed between the hitch receiver and the trailer tongue. 
+
+51. ----------
+A telescoping link. 
+ 
+**Note:** This information is provided directly from the manual and should not be considered a comprehensive answer on trailer sway control. 
+
+52. ----------
+The dimmer control can adjust the brightness of the instrument panel lights, as well as the interior and ambient light levels (e.g., courtesy lights in the footwell, illuminated cupholders, and front door handles). 
+
+53. ----------
+To use the mid position, open the tailgate and lower it to near mid position.  Secure the tailgate in this position by looping the tailgate straps behind the circular retainer on both sides. 
+
+54. ----------
+The engine oil installed in the engine at the factory is a high-quality energy conserving type lubricant.  Oil changes should be consistent with anticipated climate conditions under which vehicle operations will occur.  For recommended viscosity and quality grades NON-DETERGENT OR STRAIGHT MINERAL OILS MUST NEVER BE USED. 
+
+55. ----------
+You have 10 seconds after pushing the SOS Call button to cancel the call.  To cancel the call, either push the SOS Call button again, or press the Cancel button on the in-vehicle touchscreen. 
+
+56. ----------
+4H stands for Four-Wheel Drive.  This range provides low speed four-wheel drive. 
+
+57. ----------
+Yes, a tool kit is provided with your vehicle located in the center console. 
+
+58. ----------
+To stop the window from going all the way down during the Auto-Down operation, pull up on the switch briefly. 
+
+59. ----------
+The manual states that if the temperature is below 72°F (24°C) and/or the top has been folded down for a period of time, the top may appear to have shrunk when raised. This is caused by a natural contraction of the vinyl or acrylic materials of the fabric top. 
+
+60. ----------
+The instrument cluster display will activate when the ignition is in the OFF mode and a door is opened or closed.  It will also display the total miles (kilometers) in the odometer. 
+
+61. ----------
+To carry cargo on the roof rack, securely tie down the load before driving.  The load must not exceed 100 lb (45 kg) and should be evenly distributed.  Long loads should be secured to both the front and rear of the vehicle. Place a blanket or other protection between the surface of the roof and the load.  Travel at reduced speeds and turn corners carefully when carrying large or heavy loads on the roof rack. 
+
+62. ----------
+ACC will not react to stationary objects or vehicles.  It will consider a stopped vehicle a stationary object if it did not previously detect movement from it. 
+
+63. ----------
+Yes, the Vehicle Security system monitors the vehicle doors for unauthorized entry. 
+
+64. ----------
+If a diesel engine runs out of fuel, air is pulled into the fuel system. 
+
+65. ----------
+Using leaded gasoline can impair engine performance and damage the emissions control system.  An out-of-tune engine, certain fuel or ignition malfunctions can cause the catalytic converter to overheat.  The use of fuel additives, which are now being sold as octane enhancers, is not recommended.  Most of these products contain high concentrations of methanol.  Fuel system damage or vehicle performance problems resulting from the use of such fuels or additives is not the responsibility of The manufacturer and may void or not be covered under the New Vehicle Limited Warranty. 
+
+66. ----------
+The Screen Setup feature allows you to change what information is displayed in the instrument cluster as well as the location in which that information is displayed. 
+
+67. ----------
+The manual refers to the soft top as a "fabric top". 
+
+68. ----------
+The recommended way to measure the full weight of a trailer is to put your fully loaded trailer on a vehicle scale.  The entire weight of the trailer must be supported by the scale. 
+
+69. ----------
+With extended use the Hazard Warning Flashers may wear down your battery. 
+
+70. ----------
+The parking brake should always be applied when the driver is not in the vehicle.  Especially on an incline. 
+
+71. ----------
+Yes, outside parking can significantly affect the paint and metal of your car.  It will be affected by airborne contaminants, road surfaces, extreme hot or cold weather and other extreme conditions. 
+
+72. ----------
+No. 
+It is not recommended.  Children should never ride in the front passenger seat. 
+
+73. ----------
+A portable battery booster pack can be used for jump starting. 
+
+74. ----------
+The 4WD Low Indicator Light will be turned on if the vehicle is in the 4WD Low mode. 
+
+75. ----------
+If the temperature is below 72°F (24°C) and/or the top has been folded down for a period of time, the top will appear to have shrunk when you raise it, making it difficult to put up.  Place the vehicle in a warm area.  Pull steadily on the top fabric.  The vinyl will stretch back to its original size and the top can then be installed.  If the temperature is 41°F (5°C) or below, do not attempt to put the top down or roll the rear or side curtains.  
+
+76. ----------
+If your vehicle has a discharged battery, it can be jump started using a set of jumper cables and a battery in another vehicle, or by using a portable battery booster pack.  
+
+77. ----------
+Please refer to your provided radio supplement for complete information. 
+
+78. ----------
+Yes, you can press the accelerator to pass. 
+
+79. ----------
+Designated TOP TIER Detergent Gasoline contains a higher level of detergents to further aide in minimizing engine and fuel system deposits. 
+
+80. ----------
+Push and release the Remote Start button on the key fob twice within five seconds.  The vehicle doors and tailgate will lock, the turn signals will flash twice, and the horn will chirp twice. 
+
+81. ----------
+To remove the door frame, use a #T40 Torx head driver and ratchet to loosen the Torx head fasteners located on the underside of each door hinge.  Pull the fasteners downward to remove them.  Lift the frame upward to remove it from the vehicle.  Store the fasteners in a secure location.  
+
+82. ----------
+The "POWER STEERING HOT" message and an icon indicate that extreme steering maneuvers may have occurred, causing an over temperature condition in the power steering system. 
+
+83. ----------
+The following may affect the performance of the transmission:
+
+* Using a transmission fluid other than manufacturer’s recommended fluid may cause deterioration in transmission shift quality and/or torque converter shudder
+* Continuous driving with the Transmission Temperature Warning Light illuminated will eventually cause severe transmission damage or transmission failure.
+* Using a lower gear while operating the vehicle under heavy loading conditions, will improve performance and extend transmission life by reducing excessive shifting and heat build-up. 
+* Racing the engine or spinning the wheels may lead to transmission overheating and failure. 
+* Towing the vehicle, coasting, or driving for any other reason with the transmission in NEUTRAL can cause severe transmission damage. 
+* Frequent transmission shifting occurs (such as when operating the vehicle under heavy loading conditions, in hilly terrain, traveling into strong head winds, or while towing a heavy trailer), use the AutoStick shift control to select a lower gear 
+*  Allowing the engine to idle with the transmission in NEUTRAL (N) for at least one minute after every five rocking-motion cycles.
+* Revving the engine or spinning the wheels too fast may lead to transmission overheating and failure. 
+*  Do not spin the wheels above 30 mph (48 km/h) while in gear (no transmission shifting occurring).
+* During cold weather, you may experience increased effort in shifting until the transmission fluid warms up.  
+
+84. ----------
+If a non-OAT engine coolant (antifreeze) is introduced into the cooling system in an emergency, the cooling system will need to be drained, flushed, and refilled with fresh OAT coolant (conforming to MS.90032), by an authorized dealer as soon as possible. 
+
+85. ----------
+Yes, HomeLink can work with the Vehicle Security system. 
+
+86. ----------
+To read the speedometer, push and release the up or down arrow button until the speedometer menu icon is displayed in the instrument cluster display. Push and release the ok button to toggle between mph and km/h. 
+
+87. ----------
+The VR button is used to activate/deactivate your voice recognition system. 
+
+88. ----------
+A tire marked C may have poor traction performance. 
+
+89. ----------
+The Screen Setup feature allows you to change what information is displayed in the instrument cluster as well as the location in which that information is displayed. 
+
+90. ----------
+Yes, you can hear a list of suggested voice commands by saying “help”. 
+
+91. ----------
+The TrailCam view can be activated using the FWD Camera button, the Forward Facing Camera button, the TrailCam button on the Off Road Pages, and the Off Road+ button when Auto Launch Off Road+ (if equipped) has been selected under camera settings.  The TrailCam view can also be activated by pressing the icon on the back up camera view and the back up camera view can also be activated by pressing the icon on the trailcam view. 
+
+92. ----------
+Make sure hands and fingers are clear of all pinch points when installing and removing the soft top.  The lift assist mechanism and side bows may cause serious injury if fingers or hands get caught in between. 
+
+93. ----------
+The Lumbar Support Control knob is used to adjust the amount of lumbar support provided by the driver's seat. Rotate it forward to increase support and rearward to decrease it. 
+
+94. ----------
+Diagnostic Procedure Manuals are filled with diagrams, charts and detailed illustrations.  They show exactly how to find and correct problems, using step-by-step troubleshooting and drivability procedures, proven diagnostic tests and a complete list of all tools and equipment.  To order a hard copy of your service or diagnostic procedure manuals, visit: www.techauthority.com (us and canada). 
+
+95. ----------
+When having to change a tire in a trip, it is recommended to replace the two front tires or two rear tires as a pair.  Failure to use equivalent replacement tires may adversely affect the safety, handling, and ride of your vehicle.  You should never use a tire with a smaller load index or capacity than what was originally equipped on your vehicle.  Using a tire with a smaller load index could result in tire overloading and failure.  You could lose control and have a collision. 
+
+96. ----------
+To order the Owner's Manuals you may use either the website or the phone numbers listed below. 
+
+97. ----------
+The instrument cluster displays Fuel System Messages. 
+
+98. ----------
+Number 1 ULSD Fuel should only be used where extended arctic conditions 0°F (-18°C) exist. 
+
+99. ----------
+To lock the storage compartment, you need to use the two keyed locks on the front of the bin and use the same key as the glove compartment and center console. 

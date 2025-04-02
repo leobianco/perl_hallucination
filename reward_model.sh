@@ -23,6 +23,7 @@ fi
 
 if [ "$SYN_HALL_LLM" = true ]; then
   DATASET_REPO_ID=$DATASET_REPO_ID"_synthetic_llm"
+  echo "Using dataset ${DATASET_REPO_ID}"
 fi
 
 accelerate launch \
@@ -38,7 +39,7 @@ accelerate launch \
   --overwrite_output_dir True \
   --push_to_hub True \
   --hub_model_id "$RUN_IDENTIFIER" \
-  --dataset_repo_id "leobianco/${TASK}_rm_processed" \
+  --dataset_repo_id "${DATASET_REPO_ID}" \
   --model_repo_id "google/gemma-2-2b-it" \
   --do_train True \
   --bf16 True \

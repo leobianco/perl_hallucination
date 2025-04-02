@@ -10,16 +10,16 @@ else
   BASE_MODEL_PATH="google/gemma-2-2b-it"
   DEEPSPEED_CONFIG="./deepspeed_config.yaml"
   SEED=130104
-  NUM_TRAIN_EPOCHS=20
-  LEARNING_RATE=3e-1
+  NUM_TRAIN_EPOCHS=0.01
+  LEARNING_RATE=3e-3
   LORA_RANK=8
   MAX_SEQ_LENGTH=512
-  NUM_FEWSHOT=1
+  NUM_FEWSHOT=0
   SAVE_STEPS=200
   RUN_IDENTIFIER="${USER}/${TASK}_SFT_seed_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_lora_${LORA_RANK}_fewshot_${NUM_FEWSHOT}"
 fi
 
-if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ]; then
+if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ]; then
     echo "Invalid task name"
     exit 1
 fi

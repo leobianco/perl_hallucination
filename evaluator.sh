@@ -7,12 +7,12 @@ else
   # If single-run (copy and paste identifier)
   TASK="$1"
   USER="leobianco"
-  SEED=130104
-  DATASET_LABELS="leobianco/ragtruth_processed"
+  SEED=12345
+  DATASET_LABELS="leobianco/bosch_rm_processed"
   DATASET_LABELS_SPLIT="train"
-  DATASET_PROMPTS="leobianco/ragtruth_processed"
-  DATASET_PROMPTS_SPLIT="train"
-  RUN_IDENTIFIER="google/gemma-2-2b-it"
+  DATASET_PROMPTS="leobianco/bosch_perl_processed"
+  DATASET_PROMPTS_SPLIT="test"
+  RUN_IDENTIFIER="leobianco/bosch_PERL_seed_130104_episodes_20000_lr_2e-5_klcoeff_1e-4_temp_7e-1"
 fi
 
 if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ]; then
@@ -24,11 +24,11 @@ BASE_MODEL="google/gemma-2-2b-it"
 EVALUATOR_MODEL="google/gemma-2-27b-it"
 USE_GEMINI="True"
 GEMINI_API_KEY="AIzaSyCIPXhApp0pcu7TruZ8EyuW086VJ1wzrhk"
-EVALUATOR_NUM_FEWSHOT=2
+EVALUATOR_NUM_FEWSHOT=4
 WRITER_NUM_FEWSHOT=0
-EVAL_EVALUATOR="True"
-THRESHOLD=0.2
-TEMPERATURE=1e-1
+EVAL_EVALUATOR="False"
+THRESHOLD=0.9998
+TEMPERATURE=7e-1
 
 python3 evaluator.py \
   --task "$TASK" \

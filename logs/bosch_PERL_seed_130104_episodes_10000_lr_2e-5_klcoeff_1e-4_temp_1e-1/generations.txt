@@ -1,0 +1,319 @@
+
+0. ----------
+Number 2 Ultra Low Sulfur diesel fuel or Number 2 Ultra Low Sulfur climatized diesel fuels. 
+
+1. ----------
+The vehicle is equipped with dual hydraulic brake systems.  If either of the two hydraulic systems lose normal capability, the remaining system will still function.  However, there will be some loss of overall braking effectiveness.  You may notice increased pedal travel during application, greater pedal force required to slow or stop, and potential activation of the Brake Warning Light. 
+
+2. ----------
+Yes, if equipped, the Windshield Wiper De-Icer will activate automatically when Remote Start is active and the outside ambient temperature is less than 33°F (0.6°C). 
+
+3. ----------
+The lock button on the key fob can lock all the doors. 
+
+4. ----------
+To use a fast charger while the battery is in the vehicle, disconnect both vehicle battery cables before connecting the charger to the battery. 
+
+5. ----------
+The manual does not specify the maximum permissible load on the rear axles. 
+
+6. ----------
+You should be familiar with the terrain and area before proceeding.  Every surface has a different effect on your vehicle's steering, handling and traction.  Controlling your vehicle is one of the keys to successful off-road driving, so always keep a firm grip on the steering wheel and maintain a good driving posture.  Avoid sudden accelerations, turns or braking.  In most cases, there are no road signs, posted speed limits or signal lights.  Therefore, you will need to use your own good judgment on what is safe and what is not.  When on a trail, you should always be looking ahead for surface obstacles and changes in terrain.  The key is to plan your future driving route while remembering what you are currently driving over. 
+
+7. ----------
+If the engine fails to start, wait at least two minutes for the starter to cool before repeating the start procedure.  If the Water in Fuel Indicator Light remains on, DO NOT START the engine before you drain the water from the fuel filters to avoid engine damage.  Install a battery charger or jumper cables to the battery to ensure a full battery charge during the crank cycle.  Press and hold the brake pedal while pushing the ENGINE START/STOP button once.  If the engine fails to start within 10 seconds, place the ignition in the OFF position, wait 10 to 15 seconds to allow the starter to cool, then repeat the “Extended Park Starting” procedure.  If the engine fails to start after eight attempts, allow the starter to cool for at least 10 minutes, then repeat the procedure.  Always apply the parking brake. 
+
+8. ----------
+Certain conditions, such as a loose or missing gas cap, poor quality fuel, etc., may illuminate the light after engine start.  The vehicle should be serviced if the light stays on through several typical driving styles. 
+
+9. ----------
+The voltmeter needle may show a gauge fluctuation at various engine temperatures. This is caused by the glow plug heating system.  The number of cycles and the length of the cycling operation is controlled by the engine control module.  Once the heater operation is complete the voltmeter needle will stabilize. 
+
+10. ----------
+Stack the boards and place them into the formation in the side wall of the pickup box. The corners of the bottom board will need to be chamfered to fit. 
+
+11. ----------
+Push upward on the wiper lever to activate a single wipe to clear off-road mist or spray from a passing vehicle.  
+
+12. ----------
+To remove a door frame, use a #T40 Torx head driver and ratchet to loosen the Torx head fasteners located on the underside of each door hinge.  Remove the fasteners by pulling downward.  Lift the frame upward to remove it from the vehicle.  Store the fasteners in a secure location.  To install a door frame, first install the front door frame, ensuring the windshield is in the “up” position.  Carefully place the frame in the rubber seal at the top of the windshield, and line up the holes for the Torx head fasteners.  Insert the fasteners from underneath and tighten with the #T40 Torx head driver until they are snug.  Refer to the table for the appropriate torque specifications for the door frame fasteners. 
+
+13. ----------
+The manual does not contain information about driving in snow. 
+
+14. ----------
+1. Press and hold the power button for 2-3 seconds to turn the Jeep® wireless speaker on.
+2. Turn “on” Bluetooth® for the device you desire to be connected to the Jeep® wireless speaker.
+3. When powered on, the Jeep® wireless speaker will automatically enter pairing mode.
+4. Press and hold the Bluetooth® button for 2-3 seconds, until an audio cue is heard.
+5. Go to the devices’ Bluetooth® settings and select “Jeep® Speaker” from the list. 
+
+15. ----------
+To defrost the mirrors, activate the rear window defroster (if equipped) and the heated mirrors will activate. 
+
+16. ----------
+It may be possible that vehicle systems, including safety related systems, could be impaired or a loss of vehicle control could occur that may result in an accident involving serious injury or death. 
+
+17. ----------
+Reduce background noise.  Wind noise and passenger conversations are examples of noise that may impact recognition.  Speak clearly at a normal pace and volume while facing straight ahead. 
+
+18. ----------
+The RES button is used to resume a set speed. 
+
+19. ----------
+It may be possible that vehicle systems, including safety related systems, could be impaired or a loss of vehicle control could occur that may result in an accident involving serious injury or death.  Access, or allow others to access, information stored in your vehicle systems, including personal information.  When the ACC system is resumed, the driver must ensure that there are no pedestrians, vehicles or objects in the path of the vehicle.  Failure to follow these warnings can result in a collision and death or serious personal injury. 
+
+20. ----------
+Push upward on the wiper lever to activate a single wipe to clear off-road mist or spray from a passing vehicle.  
+
+21. ----------
+The tailgate is designed with a dampening mechanism to provide a slower, more controlled lowering. 
+
+22. ----------
+Helpful hints for using Voice Recognition: Reduce background noise. Speak clearly at a normal pace and volume while facing straight ahead. 
+
+23. ----------
+The manual states that occupant restraint systems are important safety features in the vehicle. 
+
+24. ----------
+The portable battery booster pack should not have a system voltage greater than 12 Volts. 
+
+25. ----------
+Push and release the Remote Start button on the key fob twice within five seconds.  The vehicle doors and tailgate will lock, the turn signals will flash twice, and the horn will chirp twice (if equipped). 
+
+26. ----------
+The Stop/Start telltale will illuminate indicating you are in Autostop. 
+
+27. ----------
+The overhead console can provide onboard assistance features designed to enhance your driving experience if you should ever need assistance or support. 
+
+28. ----------
+To enable Autostop, the system must be in STOP/START READY state. A STOP/START READY message will be displayed in the instrument cluster display within the Stop/Start section. The vehicle must be completely stopped. The gear selector must be in a forward gear and the brake pedal pressed. 
+
+29. ----------
+You can use the following voice commands with Amazon Alexa:
+
+* "alexa, ask <vehicle brand> to start my <vehicle name> with your voice code."
+* "alexa, ask <vehicle brand> to lock my <vehicle name> with your voice code."
+* "alexa, ask <vehicle brand> to send 1000 chrysler drive, auburn hills, michigan to my <vehicle name>."
+* "alexa, ask <vehicle brand> what is the fuel level of my <vehicle name>." 
+
+
+You can also use voice commands to control your car's radio, such as "tune to ninety-five-point-five fm" or "tune to satellite channel hits 1". 
+
+30. ----------
+Yes, the Vehicle Security system monitors the vehicle doors for unauthorized entry and the ignition switch for unauthorized operation.  The system provides audible and visible signals if something triggers the alarm.  The Sentry Key Immobilizer system also prevents unauthorized vehicle operation. 
+
+31. ----------
+If either light remains on and does not flash, or there is a very fast flash rate, check for a defective outside light bulb. 
+
+32. ----------
+The TrailCam view can be activated via the following methods: Press the FWD Camera button on the controls screen.  Press the Forward Facing Camera button on the apps menu.  Press the TrailCam button on the Off Road Pages.  Press the Off Road+ button when Auto Launch Off Road+ (if equipped) has been selected under camera settings.  The trailcam view can also be activated by pressing the icon on the back up camera view.  The back up camera view can also be activated by pressing the icon on the trailcam view. 
+
+33. ----------
+Before a long trip, you should check the engine oil level, windshield washer fluid level, tire pressures, and look for unusual wear or damage.  Check the fluid levels of the coolant reservoir, brake master cylinder, and power steering, and fill as needed.  Check function of all interior and exterior lights. 
+
+34. ----------
+Use the intermittent wiper when weather conditions make a single wiping cycle, with a variable pause between cycles, desirable. 
+
+35. ----------
+When starting a cold engine, bring the engine up to operating speed slowly to allow the oil pressure to stabilize. If temperatures are below 32°F (0°C), operate the engine at moderate speeds for five minutes before full loads are applied. 
+
+36. ----------
+To reset the oil life, place the ignition in the ON/RUN mode, navigate to "Oil Life" submenu in "Vehicle Info" in the instrument cluster display, and push and hold the ok button until the gauge resets to 100%. 
+
+37. ----------
+The engine temperature gauge may fluctuate due to the glow plug heating system.  This is caused by the engine control module controlling the number of cycles and the length of the cycling operation. 
+
+38. ----------
+You should take your vehicle to an authorized dealer for service. 
+
+39. ----------
+Yes, the Vehicle Security system will remain armed until it's disarmed. 
+
+40. ----------
+To start the engine while in autostop mode, while in a forward gear, the engine will start when the brake pedal is released or the throttle pedal is pressed. The transmission will automatically re-engage upon engine restart. 
+
+41. ----------
+Yes, the manual states "Make sure hands and fingers are clear of all pinch points when installing and removing the soft top. The lift assist mechanism and side bows may cause serious injury if fingers or hands get caught in between." 
+
+42. ----------
+To adjust the seat height, pull upward on the ratcheting handle located on the outboard side of the seat to raise it, and push downward on the handle to lower it. Several strokes may be necessary to achieve the desired position. 
+
+43. ----------
+4H stands for four-wheel drive. 
+
+44. ----------
+The TrailCam view can be activated by pressing the TrailCam button on the Off Road Pages. 
+
+45. ----------
+There are two nuts connecting to the body side and one bolt connecting to the underbody on each attachment bracket. 
+
+46. ----------
+Yes, the engine will be turned on when the remote start button is activated. 
+
+47. ----------
+To minimize the drain on your vehicle's battery when storing it for more than 3 weeks, disconnect the negative cable from the battery. If your vehicle is equipped with a Stop/Start system, disconnect both the main and supplemental negative battery cables.  If you are storing your vehicle for two weeks or more, run the air conditioning system at idle for about five minutes in the fresh air and high blower setting. 
+
+48. ----------
+If the Low Oil Pressure Warning Light turns on while driving, stop the vehicle and shut down the engine as soon as possible.  After the vehicle is safely stopped, restart the engine and monitor the lamp.  If the lamp is still illuminated, shut the engine off, contact an authorized dealer, and do not operate the vehicle until the cause is corrected.  If the lamp is no longer illuminated, the engine can be operated, but should be taken to an authorized dealer as soon as possible for further inspection. 
+
+49. ----------
+The GVWR is the total allowable weight of your vehicle.  This includes driver, passengers, cargo and tongue weight.  The total load must be limited so that you do not exceed the gvwr "⇨vehicle loading" . 
+
+50. ----------
+No. 
+You should not add fuel while the engine is running. 
+
+51. ----------
+The Redundant Air Bag Warning Light will illuminate on the instrument panel.  A single chime will sound to alert you that the Redundant Air Bag Warning Light has come on and a fault has been detected. 
+
+52. ----------
+The SYNC button toggles the Sync feature on/off.  It synchronizes the passenger temperature setting with the driver temperature setting. 
+
+53. ----------
+The instrument cluster displays fuel system messages. 
+
+54. ----------
+You may call the vehicle safety hotline toll free at 1-888-327-4236 (tty: 1-800-424-9153); or go to http://www.safercar.gov ; or write to: administrator, nhtsa, 1200 new jersey avenue, se., west building, washington, d.c.20590. 
+
+55. ----------
+The TrailCam image is activated whenever the vehicle speed is greater than or equal to 8 mph (13 km/h) and through Manual Activation Methods. 
+
+56. ----------
+To lower the windshield, you must first remove the protective caps over the windshield wiper hex bolts. Then, using a 15 mm socket, remove the two hex bolts and remove the wiper arms.  Move to the inside of the vehicle and lower both sun visors. Using a #T40 Torx head driver, remove the four Torx head fasteners located along the interior of the windshield (two on each side of the header trim). Lower the windshield gently until it contacts the tie-down bumpers (if equipped).  Secure the windshield by passing a cinch strap through the tie-down bumper on either side of the hood and on the windshield frame.  Tighten the strap to secure the windshield in place. 
+
+57. ----------
+To reinstall a head restraint, put the head restraint posts into the holes and push downward.  Then adjust it to the appropriate height. 
+
+58. ----------
+If either light remains on and does not flash, or there is a very fast flash rate, check for a defective outside light bulb. 
+
+59. ----------
+The manual does not provide the full name of the OBD II system. 
+
+60. ----------
+If the "SERVICE POWER STEERING" message and a flashing icon are displayed on the instrument cluster screen, it indicates that the vehicle needs to be taken to an authorized dealer for service. 
+
+61. ----------
+To start the car in extreme cold weather, use an externally powered electric engine block heater (available from an authorized dealer). 
+
+62. ----------
+The Air Bag Warning Light should turn on for four to eight seconds when the ignition switch is first placed in the ON/RUN position. If it does not come on during this initial check, or stays on after starting the vehicle, or comes on while driving, have the system inspected at an authorized dealer as soon as possible. 
+
+63. ----------
+The instrument cluster display will show information about your vehicle's systems and features, including warnings when a system needs your attention.  It will also display the total miles (kilometers) in the odometer.  The display may show messages related to the Off Road+ feature, depending on the Four-Wheel Drive mode in use.  Additionally, the display may show messages related to maintenance required on your vehicle or engine. 
+
+64. ----------
+To activate Autostop Mode, the system must be in STOP/START READY state.  A STOP/START READY message will be displayed in the instrument cluster. Vehicle speed must be less than 2 mph (3 km/h). The gear selector must be in the NEUTRAL position and the clutch pedal must be fully released. 
+
+65. ----------
+The manual states that Number 1 ULSD fuel should only be used in extended arctic conditions of 0°F (-18°C). 
+
+66. ----------
+The front door panel provides a power door lock switch to unlock and lock the doors.  There is also a pouch to store hard top edge protectors.  The Interior Courtesy Lights will turn on when the front doors are opened. 
+
+67. ----------
+Yes, the Vehicle Security system will remain armed until it is disarmed. 
+
+68. ----------
+Android Auto™ allows you to use your voice to interact with its best-in-class speech technology through your vehicle’s voice recognition system, and use your smartphone’s data plan to project your Android™-powered smartphone and a number of its apps onto your Uconnect touchscreen. 
+
+69. ----------
+Yes, the Vehicle Security system will remain armed until it is disarmed. 
+
+70. ----------
+When shifting the transfer case out of N (neutral), the engine should remain off to avoid gear clash. 
+
+71. ----------
+No. You cannot change the desired speed while the Cruise Control is on. 
+
+72. ----------
+10 seconds 
+ 
+**Note:**  Do not crank continuously for more than 10 seconds at a time.  Wait 10 to 15 seconds before trying again. 
+
+73. ----------
+To activate Android Auto™, press the new Android Auto™ icon that replaces your Phone icon on the main menu bar.  Push and hold the vr button on the steering wheel, or press and hold the microphone icon within android auto™, to activate its vr, which recognizes natural voice commands. 
+
+74. ----------
+The procedure to program HomeLink® to a miscellaneous device is the same as programming to a garage door opener.  Determine if the device has a rolling code or non-rolling code before beginning the programming process. 
+
+75. ----------
+To loosen the Torx head fasteners, use the provided #T40 Torx head driver and ratchet.  Loosen the fasteners by pulling downward. 
+
+76. ----------
+If the LED key fob light no longer illuminates from key fob button pushes, then the key fob battery requires replacement. 
+
+77. ----------
+Tire damage or failure can be caused by spinning tires at speeds above 30 mph (48 km/h) for longer than 30 seconds continuously. 
+
+78. ----------
+Children should be warned not to touch the parking brake, brake pedal or the gear selector. 
+
+79. ----------
+If the engine fails to start, you should have your vehicle serviced before going to the I/M station. 
+
+80. ----------
+The remote start function may become unusable if there are obstructions between the vehicle and the key fob. 
+
+81. ----------
+Lay the bag for the panels down so the loops and hooks are facing upward.  Unzip the bag and fold back the outer flap.  Insert the left side hard top panel into the bag with the latches facing upward.  Unfold the black panel divider (ensure the divider is lying flat).  Insert the right side Freedom Top panel into the bag with the latches facing downward.  Note: ensure the front panel latch is closed prior to inserting the panel into the bag.  Unfold the outer flap and zip the hard top bag closed. 
+
+82. ----------
+Yes, if equipped, the Windshield Wiper De-Icer will activate automatically when Remote Start is active and the outside ambient temperature is less than 33°F (0.6°C). 
+
+83. ----------
+Yes, you can press the accelerator to pass. 
+
+84. ----------
+Do not “top off” the fuel tank after filling.  Always place fuel containers on the ground while filling. 
+
+85. ----------
+The Fastener Bin is located behind the rear seat storage bin.  The Fastener Bin contains foam inserts for each of the fasteners; they are removable.  To remove the Fastener Bin: Remove the lid and foam inserts from the Fastener Bin.  Remove the three nuts from the bottom of the Fastener Bin. 
+
+86. ----------
+The heated seat control buttons are located on the center instrument panel below the touchscreen and also in the Climate Control touchscreen menu.  Press the heated seat button once to turn the HI setting on.  Press the heated seat button a second time to turn the MED setting on.  Press the heated seat button a third time to turn the LO setting on.  Press the heated seat button a fourth time to turn the heating elements off. 
+
+87. ----------
+If your Air Conditioner (A/C) is on, turn it off.  The A/C system adds heat to the engine cooling system and turning the A/C off can help remove this heat. 
+
+88. ----------
+The recommended way to measure the full weight of a trailer is to put your fully loaded trailer on a vehicle scale.  The entire weight of the trailer must be supported by the scale. 
+
+89. ----------
+No. The HomeLink® unit is disabled when the vehicle security system is active. 
+
+90. ----------
+The manual does not provide the specific maximum permissible loads for the front and rear axles. 
+
+91. ----------
+Drivetrain Menu 2WD/4WD Drivetrain 
+
+92. ----------
+Climatized ULSD fuel is a blend of Number 2 ULSD fuel and Number 1 ULSD fuel which reduces the temperature at which wax crystals form in fuel. 
+
+93. ----------
+To manually activate the rear view camera, go to the Controls screen by pressing the Controls button located on the bottom of the Uconnect display, and then press Back Up Camera.  Press the Back Up Camera button to turn the Rear View Camera system on. 
+
+94. ----------
+1. Install the front door frame first.
+2. Ensure the windshield is in the “up” position.
+3. Carefully place the front door frame in the rubber seal at the top of the windshield, and line up the holes for the Torx head fasteners (two for each door).
+4. Swing the frame bracket around the side of the door frame, and insert the fasteners from underneath.
+5. Tighten with the #T40 Torx head driver until they are snug, being careful not to cross-thread the fasteners or overtighten. 
+
+95. ----------
+You should press the Hazard Warning button when your vehicle is disabled or creating a safety hazard warning for other motorists.  You should also use it when you must leave the vehicle to seek assistance. 
+
+96. ----------
+Yes, the vehicle is equipped with certain security features to reduce the risk of unauthorized and unlawful access to vehicle systems and wireless communications. 
+
+97. ----------
+Cruise Control will keep your vehicle at a constant preset speed. 
+
+98. ----------
+Daytime Running Lights (DRLs) are in a dedicated position below the headlight assembly. They are active when the low beams are not on while the vehicle is in any position (automatic transmission), or when the vehicle begins to move (manual transmission). 
+
+99. ----------
+To automatically restart the vehicle, release the brake pedal or press the accelerator pedal. 
