@@ -1206,10 +1206,11 @@ def main():
         )
         # We don't want to use all of the non-hallucinated data.
         # Some of it goes to PERL, etc
-        rm_data_cap = 600
-        subset_non_hallucinated_data = non_hallucinated_data.select(
-            range((rm_data_cap - hallucinations_data.num_rows))
-        )
+        rm_data_cap = 1000
+        size_subset = rm_data_cap - hallucinations_data.num_rows
+        subset_non_hallucinated_data = non_hallucinated_data.shuffle(
+            seed=args.seed
+        ).select(range(size_subset))
 
         # RM dataset with organic hallucinations
         rm_data = concatenate_datasets(
@@ -1235,9 +1236,19 @@ def main():
 
         print("Calling Gemini's API...")
 
-        # Get the same non-hallucinated samples as in the organic case,
-        # but now generate hallucinated versions for them.
-        synthetic_hallucinations_llm = subset_non_hallucinated_data.map(
+        # You don't want exact pairing, because the model then overfits.
+        # Instead, shuffle the subset, then take a new subset of it to
+        # be the one out of which synthetic hallucinations will be created.
+        # Do not use the base non-hallucinated samples to train the RM,
+        # use only the hallucinated version and put the original in the
+        # PERL test split.
+        # Confusing, I know!
+        # subset_2 are the non-hallucinated data that will become hallucinated
+        size_subset_2 = int(size_subset / 4)
+        subset_2_end_idx = size_subset_2  # because it starts from zero
+        subset_2 = subset_non_hallucinated_data.select(range(size_subset_2))
+
+        synthetic_hallucinations_llm = subset_2.map(
             bosch_function_to_map_synthetic_halls_llm,
             fn_kwargs=dict(
                 client=client,
@@ -1246,12 +1257,32 @@ def main():
             ),
         )
 
+        # subset_3 are the non-hallucinated samples that will also be used to
+        # train the RM
+        size_subset_3 = 2 * size_subset_2
+        subset_3_end_idx = subset_2_end_idx + size_subset_3
+        subset_3 = subset_non_hallucinated_data.select(
+            range(subset_2_end_idx, subset_3_end_idx)
+        )
+
+        # Finally, subset_4 are the non-hallucinated samples that go to the
+        # test split of the RM
+        subset_4 = subset_non_hallucinated_data.select(
+            range(subset_3_end_idx, size_subset)
+        )
+
+        # All of them are subsets of subset_non_hallucinated_data
+
+        # Now we create the RM training data
         synthetic_hallucinations_llm_train_data = concatenate_datasets(
-            [subset_non_hallucinated_data, synthetic_hallucinations_llm]
+            [synthetic_hallucinations_llm, subset_3]
         )
         synthetic_hallucinations_llm_train_data = (
             synthetic_hallucinations_llm_train_data.shuffle(seed=args.seed)
         )
+
+        # TO DO: put the original version of the first third of
+        # subset_non_hallucinated_data in the PERL test set
 
         # You need to rewrite the prompts, re-tokenize... but don't re-split!
         # This will be the train split of the final Dataset.
@@ -1266,18 +1297,8 @@ def main():
         )
 
         # Building the test split
-
-        # Get the necessary non-hallucinated examples.
-        # You had taken rm_data_cap - |hallucinations| examples already.
-        # So start from there and get
-        start_idx_test = rm_data_cap - hallucinations_data.num_rows
-        end_idx_test = start_idx_test + hallucinations_data.num_rows
-        non_hallucinated_data_for_test = non_hallucinated_data.select(
-            range(start_idx_test, end_idx_test)
-        )
-
         synthetic_hallucinations_llm_test_data = concatenate_datasets(
-            [hallucinations_data, non_hallucinated_data_for_test]
+            [hallucinations_data, subset_4]
         ).shuffle(seed=args.seed)
 
         synthetic_hallucinations_llm_test_data = bosch_process_data_for_rm(
