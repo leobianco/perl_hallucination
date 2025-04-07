@@ -457,7 +457,7 @@ def gemini_score_dataset(client, dataset, script_args):
     query_count = 0
     start_time = time.time()
 
-    for query in dataset["evaluator_prompt"]:
+    for query in tqdm(dataset["evaluator_prompt"], desc="Scoring with Gemini API"):
         # Check if we are approaching the rate limit
         elapsed_time = time.time() - start_time
         if query_count == (queries_per_minute - 1):
