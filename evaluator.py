@@ -30,6 +30,7 @@ The writer checkpoint will be loaded as a vLLM LLM.
 
 import gc
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -425,33 +426,50 @@ def evaluator_score(
 
 
 def gemini_score_response(response):
-  if response.candidates[0].avg_logprobs is None:
-    return 0
-  if response.text=="No":
-    return np.exp(response.candidates[0].avg_logprobs)
-  elif response.text=="Yes":
-    return 1-np.exp(response.candidates[0].avg_logprobs)
-  else:
-    raise Exception("Invalid response")
+    if response.candidates[0].avg_logprobs is None:
+        return 0
+    if response.text == "No":
+        return np.exp(response.candidates[0].avg_logprobs)
+    elif response.text == "Yes":
+        return 1 - np.exp(response.candidates[0].avg_logprobs)
+    else:
+        raise Exception("Invalid response")
 
 
 def gemini_score_dataset(client, dataset, script_args):
     """Score a whole dataset with Gemini API.
-    
+
     Args:
         client: Initialized Gemini API client
         dataset: Dataset containing evaluator_prompt column
         script_args: Script arguments containing seed
-        
+
     Returns:
         torch.tensor: Tensor of scores
     """
     model = "gemini-2.0-flash-001"
-    schema = {"type": "STRING", "enum":['No','Yes']}
+    schema = {"type": "STRING", "enum": ["No", "Yes"]}
     scores = []
     print("Calling the Gemini API...")
 
+    queries_per_minute = 2000
+    time_window = 60
+    query_count = 0
+    start_time = time.time()
+
     for query in dataset["evaluator_prompt"]:
+        # Check if we are approaching the rate limit
+        elapsed_time = time.time() - start_time
+        if query_count == (queries_per_minute - 1):
+            if elapsed_time < time_window:
+                wait_time = time_window - elapsed_time
+                print(
+                    f"Wait {wait_time:.2f} seconds to avoid API rate limit..."
+                )
+                time.sleep(wait_time + 1)
+            query_count = 0
+            start_time = time.time()
+
         response = client.models.generate_content(
             model=model,
             contents=query,
@@ -461,9 +479,10 @@ def gemini_score_dataset(client, dataset, script_args):
                 temperature=0,
                 max_output_tokens=1,
                 seed=script_args.seed,
-            )
+            ),
         )
         scores.append(gemini_score_response(response))
+        query_count += 1
 
     return torch.tensor(scores)
 
@@ -520,7 +539,7 @@ if __name__ == "__main__":
             ),
         )
 
-        # Repetitive code, encapsulate in a function 
+        # Repetitive code, encapsulate in a function
         if script_args.use_gemini:
             client = genai.Client(api_key=script_args.gemini_api_key)
             scores = gemini_score_dataset(client, data, script_args)
@@ -641,19 +660,22 @@ if __name__ == "__main__":
         prompts = [val_data[i]["prompt"] for i in range(val_data.num_rows)]
 
         # TODO: once new evaluation set is available, fix this.
-        # CUSTOM RUNS: this is a temporary, _ugly_ solution to run evaluation
+        # CUSTOM RUNS: this is a temporary, *ugly* solution to run evaluation
         # on the hc_rm5x_test split. It should be changed once the new eval
         # set is available. The problem is that the "prompt" column of the RM
         # dataset contains the answer, and here we want to generate it.
         # The solution is to call npov_writer_prompt from data.py.
         if script_args.dataset_prompts == "leobianco/npov_rm_processed":
-            del prompts
-            train_data = load_dataset(
+            data = load_dataset(
                 script_args.dataset_prompts,
                 split="train",
             )
+
+        # Pass fewshot examples to writer by remapping npov_writer_prompt
+        if (script_args.dataset_prompts == "leobianco/npov_rm_processed") or (script_args.dataset_prompts == "leobianco/npov_augmented_validation"):
+            del prompts
             writer_fewshot_examples = get_fewshot_examples(
-                train_data,
+                data,
                 n_yes=0,
                 n_no=script_args.writer_num_fewshot,
                 seed=script_args.seed,

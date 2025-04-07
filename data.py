@@ -932,50 +932,121 @@ def bosch_process_data_for_perl(
     return perl_data
 
 
-rm_synthetic_hall_llm_prompt = """
-Objective:
-Generate a modified version of a given answer that includes plausible-sounding synthetic hallucinations (information not present in the provided context).
+# PREVIOUS (FIRST) PROMPT
+# rm_synthetic_hall_llm_prompt = """
+# Objective:
+# Generate a modified version of a given answer that includes plausible-sounding synthetic hallucinations (information not present in the provided context).
 
-Task:
-You are given a Question, a Context used to answer it, and an Original Grounded Answer derived solely from that Context. Your task is to rewrite the Original Grounded Answer to create a Modified Answer.
+# Task:
+# You are given a Question, a Context used to answer it, and an Original Grounded Answer derived solely from that Context. Your task is to rewrite the Original Grounded Answer to create a Modified Answer.
 
-Requirements for the Modified Answer:
-1. Address the Question: It must still fundamentally answer the original Question.
-2. Incorporate Hallucinations: It must include 1 or 2 specific pieces of information that are explicitly NOT found in the provided Context.
-3. Plausibility: The added information (the hallucinations) should sound plausible and relevant to the Question and the general topic, even though it lacks support in the Context.
-4. Integration: Weave the hallucinated information naturally into the text. Do not simply append it awkwardly. It should blend smoothly with the information retained from the Original Grounded Answer.
-5. Minimal Other Changes: Preserve the core information and structure of the Original Grounded Answer as much as possible, only augmenting it with the hallucinations.
-6. Output: Provide only the text of the Modified Answer.
+# Requirements for the Modified Answer:
+# 1. Address the Question: It must still fundamentally answer the original Question.
+# 2. Incorporate Hallucinations: It must include 1 or 2 specific pieces of information that are explicitly NOT found in the provided Context.
+# 3. Plausibility: The added information (the hallucinations) should sound plausible and relevant to the Question and the general topic, even though it lacks support in the Context.
+# 4. Integration: Weave the hallucinated information naturally into the text. Do not simply append it awkwardly. It should blend smoothly with the information retained from the Original Grounded Answer.
+# 5. Minimal Other Changes: Preserve the core information and structure of the Original Grounded Answer as much as possible, only augmenting it with the hallucinations.
+# 6. Output: Provide only the text of the Modified Answer.
 
-Input Information:
+# Input Information:
 
---- START CONTEXT ---
-{context}
---- END CONTEXT ---
+# --- START CONTEXT ---
+# {context}
+# --- END CONTEXT ---
 
---- START QUESTION ---
-{question}
---- END QUESTION ---
+# --- START QUESTION ---
+# {question}
+# --- END QUESTION ---
 
---- START ORIGINAL GROUNDED ANSWER ---
-{original_answer}
---- END ORIGINAL GROUNDED ANSWER ---
+# --- START ORIGINAL GROUNDED ANSWER ---
+# {original_answer}
+# --- END ORIGINAL GROUNDED ANSWER ---
 
-Instruction:
-Please generate the Modified Answer based on the requirements above.
+# Instruction:
+# Please generate the Modified Answer based on the requirements above.
 
-Modified Answer:
+# Modified Answer:
+# """
+
+
+def rm_synthetic_hall_llm(entry, fewshot_examples=None):
+    preamble = """
+    Objective:
+    Generate a modified version of a given answer that includes subtle, natural-sounding synthetic hallucinations (information plausible but not directly supported by the provided context), mimicking the kinds of errors LLMs sometimes make organically.
+
+    Goal Context:
+    We are creating training data for a hallucination detection model. Previous attempts generated hallucinations that were too obvious, causing the model to overfit. The goal now is to generate *subtle* hallucinations that resemble real-world LLM errors, making the synthetic data more realistic and improving the detector's generalization.
+
+    What Makes a Good Subtle Hallucination (for this task):
+    - It often feels like a minor factual inaccuracy, a slight misinterpretation, or a plausible detail/reason/consequence that *could* be true but isn't mentioned.
+    - It blends seamlessly with the surrounding text derived from the context.
+    - It's not easily identifiable as completely fabricated or drastically contradicting the context.
+    - It avoids being the main point of the answer; it's usually a supporting detail.
+    """
+
+    prompt = preamble
+
+    if fewshot_examples is not None:
+        prompt += """
+        
+        --- START FEW-SHOT EXAMPLES OF DESIRED OUTPUT ---
+
+        """
+
+        for fewshot in fewshot_examples:
+            prompt += f"""Example:
+            
+            [QUESTION] {fewshot["Question"]}
+
+            [CONTEXT] {fewshot["Context"]}
+
+            [ANSWER WITH HALLUCINATION] {fewshot["response"]}
+
+            """
+
+        prompt += """
+        --- END FEW-SHOT EXAMPLES ---
+
+        """
+
+    prompt += f"""Task:
+    You are given a Question, a Context used to answer it, and an Original Grounded Answer derived solely from that Context. Your task is to rewrite the Original Grounded Answer to create a Modified Answer containing subtle hallucinations.
+
+    Requirements for the Modified Answer:
+    1.  Address the Question: It must still fundamentally answer the original Question.
+    2.  Incorporate Subtle Hallucinations: Include 1 or 2 specific pieces of information that are plausible and relevant BUT NOT DIRECTLY SUPPORTED by the provided Context. Aim for the kind of subtlety shown in the examples.
+    3.  Plausibility & Consistency: The added information should sound highly plausible within the domain, be consistent with the overall tone and information in the context, and not be easily flagged as fake. Avoid contradictions.
+    4.  Natural Integration: Weave the hallucinated information smoothly into the text. Do not make it stand out awkwardly. It should blend seamlessly with the grounded information.
+    5.  Minimal Other Changes: Preserve the core grounded information and structure of the Original Grounded Answer as much as possible, augmenting it *only* with the subtle hallucinations.
+    6.  Output: Provide only the text of the Modified Answer.
+
+    Input Information:
+
+    --- START QUESTION ---
+    {entry["Question"]}
+    --- END QUESTION ---
+
+    --- START CONTEXT ---
+    {entry["Context"]}
+    --- END CONTEXT ---
+
+    --- START ORIGINAL GROUNDED ANSWER ---
+    {entry["response"]}
+    --- END ORIGINAL GROUNDED ANSWER ---
+
+    Instruction:
+    Please generate the Modified Answer based on the requirements and examples above.
+
+    Modified Answer:
 """
+
+    return prompt
 
 
 def bosch_function_to_map_synthetic_halls_llm(
-    entry, client, gemini_model, generation_config
+    entry, fewshot_examples, client, gemini_model, generation_config
 ):
-    prompt_to_send = rm_synthetic_hall_llm_prompt.format(
-        context=entry["Context"],
-        question=entry["Question"],
-        original_answer=entry["response"],
-    )
+    prompt_to_send = rm_synthetic_hall_llm(entry, fewshot_examples)
 
     response = client.models.generate_content(
         model=gemini_model,
@@ -1076,6 +1147,27 @@ def main():
             },
         )
 
+        # To train on synthetic hallucinations only and evaluate on organic,
+        # drop the organic ones from the training set, and the synthetic ones
+        # from the validation set. Do not mix splits, as this would mix topics.
+        # Do not pass the test set into the validation one, because it will be
+        # the test set for PERL later on and we agreed that we cannot test
+        # both the RM and PERL on the same examples.
+
+        npov_rm_data["train"] = npov_rm_data["train"].filter(
+            lambda x: not (
+                x["has hallucination"] == "YES"
+                and x["has synthetic hallucination"] == "NO"
+            )
+        )
+
+        npov_rm_data["validation"] = npov_rm_data["validation"].filter(
+            lambda x: not (
+                x["has hallucination"] == "YES"
+                and x["has synthetic hallucination"] == "YES"
+            )
+        )
+
         for split in npov_rm_data.keys():
             npov_rm_data[split] = npov_process_data_for_rm(
                 npov_rm_data[split],
@@ -1127,6 +1219,9 @@ def main():
         npov_augmented_data = npov_data_augmentation(npov_rm_data["test"])
         npov_augmented_data_dict = DatasetDict(
             {"test": Dataset.from_dict(npov_augmented_data)}
+        )
+        npov_augmented_data_dict["test"] = npov_augmented_data_dict["test"].map(
+            npov_writer_prompt
         )
         npov_augmented_data_dict.push_to_hub(
             repo_id=args.augmented_repo_id,
@@ -1227,6 +1322,14 @@ def main():
         rm_data.push_to_hub(args.rm_processed_repo_id)
 
         # RM dataset with Synthetic Hallucinations - LLM generated
+
+        # Fewshot examples of organic hallucinations
+        n_fewshot_examples_synth_llm = 4
+        fewshot_examples_synth_llm = hallucinations_data.select(
+            range(n_fewshot_examples_synth_llm)
+        )
+
+        # API config
         client = genai.Client(api_key=args.gemini_api_key)
         gemini_model = "gemini-2.0-flash-001"
         generation_config = types.GenerateContentConfig(
@@ -1251,6 +1354,7 @@ def main():
         synthetic_hallucinations_llm = subset_2.map(
             bosch_function_to_map_synthetic_halls_llm,
             fn_kwargs=dict(
+                fewshot_examples=fewshot_examples_synth_llm,
                 client=client,
                 gemini_model=gemini_model,
                 generation_config=generation_config,
