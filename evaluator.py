@@ -575,12 +575,12 @@ if __name__ == "__main__":
         ]
 
         # Display Metrics and Save Plots
-        print("AUC:", auc)
-        print("Threshold:", threshold)
-        print("TPR (recall):", tpr[threshold_idx])
-        print("FPR:", fpr[threshold_idx])
-        print("Accuracy:", accuracy_score(ground_truth, classif_at_threshold))
-        print("Precision:", precision_score(ground_truth, classif_at_threshold))
+        print("AUC: {:.5f}".format(auc))
+        print("Threshold: {:.5f}".format(threshold))
+        print("TPR (recall): {:.5f}".format(tpr[threshold_idx]))
+        print("FPR: {:.5f}".format(fpr[threshold_idx]))
+        print("Accuracy: {:.5f}".format(accuracy_score(ground_truth, classif_at_threshold)))
+        print("Precision: {:.5f}".format(precision_score(ground_truth, classif_at_threshold)))
 
         # ROC-AUC plot
         RocCurveDisplay.from_predictions(ground_truth, scores)
