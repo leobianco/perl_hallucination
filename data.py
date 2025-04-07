@@ -1147,6 +1147,27 @@ def main():
             },
         )
 
+        npov_autorater_data = concatenate_datasets(
+            [
+                npov_rm_data["train"],
+                npov_rm_data["validation"],
+                npov_rm_data["test"],
+            ]
+        )
+        npov_autorater_data = npov_autorater_data.filter(
+            lambda x: x["has synthetic hallucination"] == "NO"
+        )
+        npov_autorater_data = npov_process_data_for_rm(
+            npov_autorater_data, tokenizer, max_seq_length=args.max_seq_length
+        )
+        npov_autorater_data.push_to_hub(
+            repo_id="npov_autorater_data",
+            split="test",
+        )
+
+        # Before filtering out the data for training on synthetic only,
+        # create the data for evaluating the autorater
+
         # To train on synthetic hallucinations only and evaluate on organic,
         # drop the organic ones from the training set, and the synthetic ones
         # from the validation set. Do not mix splits, as this would mix topics.

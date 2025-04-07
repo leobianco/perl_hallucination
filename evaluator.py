@@ -457,7 +457,9 @@ def gemini_score_dataset(client, dataset, script_args):
     query_count = 0
     start_time = time.time()
 
-    for query in tqdm(dataset["evaluator_prompt"], desc="Scoring with Gemini API"):
+    for query in tqdm(
+        dataset["evaluator_prompt"], desc="Scoring with Gemini API"
+    ):
         # Check if we are approaching the rate limit
         elapsed_time = time.time() - start_time
         if query_count == (queries_per_minute - 1):
@@ -582,7 +584,9 @@ if __name__ == "__main__":
 
         # ROC-AUC plot
         RocCurveDisplay.from_predictions(ground_truth, scores)
+        plt.legend([f"Threshold: {threshold:.5f}"])
         plt.scatter([fpr[threshold_idx]], [tpr[threshold_idx]], c="r")
+        os.makedirs(f"logs/{name_for_saving}/", exist_ok=True)
         plt.savefig(
             f"logs/{name_for_saving}/"
             + f"eval_evaluator_auc_curve_{script_args.evaluator_num_fewshot}_shot"
@@ -672,7 +676,9 @@ if __name__ == "__main__":
             )
 
         # Pass fewshot examples to writer by remapping npov_writer_prompt
-        if (script_args.dataset_prompts == "leobianco/npov_rm_processed") or (script_args.dataset_prompts == "leobianco/npov_augmented_validation"):
+        if (script_args.dataset_prompts == "leobianco/npov_rm_processed") or (
+            script_args.dataset_prompts == "leobianco/npov_augmented_validation"
+        ):
             del prompts
             writer_fewshot_examples = get_fewshot_examples(
                 data,
