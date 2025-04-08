@@ -6,13 +6,13 @@ if [ $SHLVL -gt 2 ]; then
 else
   # If single-run (copy and paste identifier)
   TASK="$1"
-  USER="leobianco"
   SEED=12345
-  DATASET_LABELS="leobianco/bosch_rm_processed"
+  USER="leobianco"
+  DATASET_LABELS="bosch_rm_processed"
   DATASET_LABELS_SPLIT="train"
-  DATASET_PROMPTS="leobianco/bosch_perl_processed"
+  DATASET_PROMPTS="bosch_perl_processed"
   DATASET_PROMPTS_SPLIT="test"
-  RUN_IDENTIFIER="leobianco/bosch_PERL_seed_130104_episodes_20000_lr_2e-5_klcoeff_1e-4_temp_7e-1"
+  RUN_IDENTIFIER="$USER/bosch_PERL_seed_130104_episodes_20000_lr_2e-5_klcoeff_1e-4_temp_7e-1"
 fi
 
 if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ]; then
@@ -34,9 +34,9 @@ python3 evaluator.py \
   --task "$TASK" \
   --user "$USER" \
   --seed "$SEED" \
-  --dataset_labels "$DATASET_LABELS" \
+  --dataset_labels "$USER/$DATASET_LABELS" \
   --dataset_labels_split "$DATASET_LABELS_SPLIT" \
-  --dataset_prompts "$DATASET_PROMPTS" \
+  --dataset_prompts "$USER/$DATASET_PROMPTS" \
   --dataset_prompts_split "$DATASET_PROMPTS_SPLIT" \
   --writer_model_base ${BASE_MODEL} \
   --writer_model_lora "${RUN_IDENTIFIER}" \
