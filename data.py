@@ -1154,14 +1154,23 @@ def main():
                 npov_rm_data["test"],
             ]
         )
-        npov_autorater_data = npov_autorater_data.filter(
-            lambda x: x["has synthetic hallucination"] == "NO"
-        )
+
         npov_autorater_data = npov_process_data_for_rm(
             npov_autorater_data, tokenizer, max_seq_length=args.max_seq_length
         )
+
+        # Save a version with the whole dataset (organic + synthetic hallus.)
         npov_autorater_data.push_to_hub(
-            repo_id="npov_autorater_data",
+            repo_id="npov_autorater_data_organic_and_synthetic",
+            split="test",
+        )
+
+        # Create a version with organic hallucinations only
+        npov_autorater_data = npov_autorater_data.filter(
+            lambda x: x["has synthetic hallucination"] == "NO"
+        )
+        npov_autorater_data.push_to_hub(
+            repo_id="npov_autorater_data_organic_only",
             split="test",
         )
 

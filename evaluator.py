@@ -494,13 +494,6 @@ if __name__ == "__main__":
     script_args = parser.parse_args_into_dataclasses()[0]
     set_seed(script_args.seed)
 
-    try:
-        name_for_saving = script_args.writer_model_lora.split(
-            f"{script_args.user}/"
-        )[1]
-    except:
-        name_for_saving = script_args.writer_model_lora.split("/")[1]
-
     # Load dataset with hallucination labels (for evaluating the
     # evaluator, or for getting fewshot examples).
     data = load_dataset(
@@ -564,8 +557,28 @@ if __name__ == "__main__":
                 no_token_id,
             )
 
+        # Save results
+        name_for_saving = f"eval_autorater_{script_args.evaluator_model}" + f"autorater_num_fewshot_{script_args.evaluator_num_fewshot}" + f"data_{script_args.dataset_labels}" + f"seed_{script_args.seed}"
+
         # Calculate Metrics
         ground_truth = data["label"]
+
+        # Save ground_truth labels to a file
+        filepath = f"logs/{name_for_saving}/eval_autorater_ground_truth.txt"
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(filepath, "w") as f:
+            for label in ground_truth:
+            f.write(f"{label}\n")
+        print(f"Ground truth labels saved to {filepath}")
+
+        # Save scores to a file
+        filepath = f"logs/{name_for_saving}/eval_autorater_scores.txt"
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(filepath, "w") as f:
+            for score in scores:
+            f.write(f"{score.item():.5f}\n")
+        print(f"Scores saved to {filepath}")
+
         auc = roc_auc_score(ground_truth, scores)
         fpr, tpr, thresholds = roc_curve(ground_truth, scores.numpy())
         threshold_idx = np.argmax(tpr - fpr)
@@ -575,6 +588,17 @@ if __name__ == "__main__":
         ]
 
         # Display Metrics and Save Plots
+        metrics_filepath = f"logs/{name_for_saving}/eval_autorater_metrics.txt"
+        os.makedirs(os.path.dirname(metrics_filepath), exist_ok=True)
+        with open(metrics_filepath, "w") as f:
+            f.write("AUC: {:.5f}\n".format(auc))
+            f.write("Threshold: {:.5f}\n".format(threshold))
+            f.write("TPR (recall): {:.5f}\n".format(tpr[threshold_idx]))
+            f.write("FPR: {:.5f}\n".format(fpr[threshold_idx]))
+            f.write("Accuracy: {:.5f}\n".format(accuracy_score(ground_truth, classif_at_threshold)))
+            f.write("Precision: {:.5f}\n".format(precision_score(ground_truth, classif_at_threshold)))
+        print(f"Metrics saved to {metrics_filepath}")
+
         print("AUC: {:.5f}".format(auc))
         print("Threshold: {:.5f}".format(threshold))
         print("TPR (recall): {:.5f}".format(tpr[threshold_idx]))
@@ -589,11 +613,11 @@ if __name__ == "__main__":
         os.makedirs(f"logs/{name_for_saving}/", exist_ok=True)
         plt.savefig(
             f"logs/{name_for_saving}/"
-            + f"eval_evaluator_auc_curve_{script_args.evaluator_num_fewshot}_shot"
+            + f"eval_autorater_auc_curve_{script_args.evaluator_num_fewshot}_shot"
         )
         plt.clf()
 
-        # Histogram
+        # Histogram of scores
         bins = np.arange(0, 1, 0.05)
         scores_no = [
             score.item()
@@ -611,7 +635,7 @@ if __name__ == "__main__":
         plt.legend()
         plt.savefig(
             f"logs/{name_for_saving}/"
-            + f"eval_evaluator_histogram_{script_args.evaluator_num_fewshot}_shot"
+            + f"eval_autorater_{script_args.evaluator_num_fewshot}_shot"
         )
 
     else:
@@ -710,6 +734,13 @@ if __name__ == "__main__":
         torch.cuda.empty_cache()
 
         # Save generations
+        try:
+            name_for_saving = "eval" + script_args.writer_model_lora.split(
+                f"{script_args.user}/"
+            )[1]
+        except:
+            name_for_saving = "eval" + script_args.writer_model_lora.split("/")[1]
+
         generations = [output.outputs[0].text for output in outputs]
         filepath = f"logs/{name_for_saving}/generations.txt"
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
