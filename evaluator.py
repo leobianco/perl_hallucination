@@ -765,12 +765,12 @@ if __name__ == "__main__":
         # Save generations
         try:
             name_for_saving = (
-                "eval"
+                "eval_"
                 + script_args.writer_model_lora.split(f"{script_args.user}/")[1]
             )
         except:
             name_for_saving = (
-                "eval" + script_args.writer_model_lora.split("/")[1]
+                "eval_" + script_args.writer_model_lora.split("/")[1]
             )
 
         generations = [output.outputs[0].text for output in outputs]
