@@ -629,7 +629,7 @@ if __name__ == "__main__":
 
         # ROC-AUC plot
         RocCurveDisplay.from_predictions(ground_truth, scores)
-        plt.legend([f"Threshold: {threshold:.5f}"])
+        plt.title(f"ROC Curve (Threshold: {threshold:.5f})")
         plt.scatter([fpr[threshold_idx]], [tpr[threshold_idx]], c="r")
         os.makedirs(f"logs/{name_for_saving}/", exist_ok=True)
         plt.savefig(
