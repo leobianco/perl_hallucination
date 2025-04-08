@@ -520,12 +520,6 @@ if __name__ == "__main__":
             seed=script_args.seed,
         )
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        script_args.evaluator_model,
-    )
-    yes_token_id = tokenizer.convert_tokens_to_ids("Yes")
-    no_token_id = tokenizer.convert_tokens_to_ids("No")
-
     if script_args.evaluate_evaluator:
         data = data.map(
             evaluator_prompt,
@@ -540,6 +534,12 @@ if __name__ == "__main__":
             scores = gemini_score_dataset(client, data, script_args)
 
         else:
+            tokenizer = AutoTokenizer.from_pretrained(
+                script_args.evaluator_model,
+            )
+            yes_token_id = tokenizer.convert_tokens_to_ids("Yes")
+            no_token_id = tokenizer.convert_tokens_to_ids("No")
+
             evaluator = AutoModelForCausalLM.from_pretrained(
                 script_args.evaluator_model,
                 device_map="auto",
@@ -798,6 +798,12 @@ if __name__ == "__main__":
             scores = gemini_score_dataset(client, val_data, script_args)
 
         else:
+            tokenizer = AutoTokenizer.from_pretrained(
+                script_args.evaluator_model,
+            )
+            yes_token_id = tokenizer.convert_tokens_to_ids("Yes")
+            no_token_id = tokenizer.convert_tokens_to_ids("No")
+
             evaluator = AutoModelForCausalLM.from_pretrained(
                 script_args.evaluator_model,
                 device_map="auto",
