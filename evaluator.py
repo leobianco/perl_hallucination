@@ -568,6 +568,14 @@ if __name__ == "__main__":
         # Calculate Metrics
         ground_truth = data["label"]
 
+        # Save evaluator prompts
+        filepath = f"logs/{name_for_saving}/eval_autorater_evaluator_prompts.txt"
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(filepath, "w") as f:
+            for idx, prompt in enumerate(data["evaluator_prompt"]):
+                f.write(f"\n{idx}. ----------\n" + prompt)
+        print(f"Evaluator prompts saved to {filepath}")
+
         # Save ground_truth labels to a file
         filepath = f"logs/{name_for_saving}/eval_autorater_ground_truth.txt"
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
