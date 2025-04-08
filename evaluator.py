@@ -559,9 +559,9 @@ if __name__ == "__main__":
 
         # Save results
         name_for_saving = (
-            f"eval_autorater_{script_args.evaluator_model}"
+            f"eval_autorater_{script_args.evaluator_model.split('/')[-1]}"
             + f"_autorater_num_fewshot_{script_args.evaluator_num_fewshot}"
-            + f"_data_{script_args.dataset_labels}"
+            + f"_data_{script_args.dataset_labels.split('/')[-1]}"
             + f"_seed_{script_args.seed}"
         )
 
