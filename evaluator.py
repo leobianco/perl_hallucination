@@ -558,7 +558,12 @@ if __name__ == "__main__":
             )
 
         # Save results
-        name_for_saving = f"eval_autorater_{script_args.evaluator_model}" + f"autorater_num_fewshot_{script_args.evaluator_num_fewshot}" + f"data_{script_args.dataset_labels}" + f"seed_{script_args.seed}"
+        name_for_saving = (
+            f"eval_autorater_{script_args.evaluator_model}"
+            + f"autorater_num_fewshot_{script_args.evaluator_num_fewshot}"
+            + f"data_{script_args.dataset_labels}"
+            + f"seed_{script_args.seed}"
+        )
 
         # Calculate Metrics
         ground_truth = data["label"]
@@ -568,7 +573,7 @@ if __name__ == "__main__":
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         with open(filepath, "w") as f:
             for label in ground_truth:
-            f.write(f"{label}\n")
+                f.write(f"{label}\n")
         print(f"Ground truth labels saved to {filepath}")
 
         # Save scores to a file
@@ -576,7 +581,7 @@ if __name__ == "__main__":
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         with open(filepath, "w") as f:
             for score in scores:
-            f.write(f"{score.item():.5f}\n")
+                f.write(f"{score.item():.5f}\n")
         print(f"Scores saved to {filepath}")
 
         auc = roc_auc_score(ground_truth, scores)
@@ -595,16 +600,32 @@ if __name__ == "__main__":
             f.write("Threshold: {:.5f}\n".format(threshold))
             f.write("TPR (recall): {:.5f}\n".format(tpr[threshold_idx]))
             f.write("FPR: {:.5f}\n".format(fpr[threshold_idx]))
-            f.write("Accuracy: {:.5f}\n".format(accuracy_score(ground_truth, classif_at_threshold)))
-            f.write("Precision: {:.5f}\n".format(precision_score(ground_truth, classif_at_threshold)))
+            f.write(
+                "Accuracy: {:.5f}\n".format(
+                    accuracy_score(ground_truth, classif_at_threshold)
+                )
+            )
+            f.write(
+                "Precision: {:.5f}\n".format(
+                    precision_score(ground_truth, classif_at_threshold)
+                )
+            )
         print(f"Metrics saved to {metrics_filepath}")
 
         print("AUC: {:.5f}".format(auc))
         print("Threshold: {:.5f}".format(threshold))
         print("TPR (recall): {:.5f}".format(tpr[threshold_idx]))
         print("FPR: {:.5f}".format(fpr[threshold_idx]))
-        print("Accuracy: {:.5f}".format(accuracy_score(ground_truth, classif_at_threshold)))
-        print("Precision: {:.5f}".format(precision_score(ground_truth, classif_at_threshold)))
+        print(
+            "Accuracy: {:.5f}".format(
+                accuracy_score(ground_truth, classif_at_threshold)
+            )
+        )
+        print(
+            "Precision: {:.5f}".format(
+                precision_score(ground_truth, classif_at_threshold)
+            )
+        )
 
         # ROC-AUC plot
         RocCurveDisplay.from_predictions(ground_truth, scores)
@@ -735,11 +756,14 @@ if __name__ == "__main__":
 
         # Save generations
         try:
-            name_for_saving = "eval" + script_args.writer_model_lora.split(
-                f"{script_args.user}/"
-            )[1]
+            name_for_saving = (
+                "eval"
+                + script_args.writer_model_lora.split(f"{script_args.user}/")[1]
+            )
         except:
-            name_for_saving = "eval" + script_args.writer_model_lora.split("/")[1]
+            name_for_saving = (
+                "eval" + script_args.writer_model_lora.split("/")[1]
+            )
 
         generations = [output.outputs[0].text for output in outputs]
         filepath = f"logs/{name_for_saving}/generations.txt"
