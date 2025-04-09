@@ -1616,6 +1616,7 @@ def main():
             lambda entry: "No" if len(entry["labels"]) == 0 else "Yes", axis=1
         )
         unified = unified[unified["quality"] == "good"]
+        unified = unified.rename(columns={"labels": "explanation"})
 
         train_data = unified[unified["split"] == "train"]
         test_data = unified[unified["split"] == "test"]
