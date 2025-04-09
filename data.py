@@ -1529,6 +1529,11 @@ def main():
                 bosch_rm_synthetic_hall_structured, fn_kwargs=dict(data=dataset)
             )
 
+            # Add some non-hallucinated examples and shuffle!
+            synthetic_hallucinations_struct_train_data = concatenate_datasets(
+                [synthetic_hallucinations_struct_train_data, subset_3]
+            ).shuffle(seed=args.seed)
+
             # Reconstuct prompts and retokenize
             synthetic_hallucinations_struct_train_data = (
                 bosch_process_data_for_rm(
@@ -1539,11 +1544,6 @@ def main():
                     max_seq_length=args.max_seq_length,
                 )
             )
-
-            # Add some non-hallucinated examples and shuffle!
-            synthetic_hallucinations_struct_train_data = concatenate_datasets(
-                [synthetic_hallucinations_struct_train_data, subset_3]
-            ).shuffle(seed=args.seed)
 
             # Create test split with organic hallucinations
             synthetic_hallucinations_struct_test_data = concatenate_datasets(
