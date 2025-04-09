@@ -8,25 +8,26 @@ else
   TASK="$1"
   SEED=12345
   USER="leobianco"
-  DATASET_LABELS="leobianco/bosch_rm_processed"
-  DATASET_LABELS_SPLIT="train"
+  DATASET_LABELS="leobianco/ragtruth_autorater_data"
+  DATASET_LABELS_SPLIT="test"
   DATASET_PROMPTS="leobianco/bosch_perl_processed"
   DATASET_PROMPTS_SPLIT="test"
   RUN_IDENTIFIER="$USER/bosch_PERL_seed_130104_episodes_20000_lr_2e-5_klcoeff_1e-4_temp_7e-1"
 fi
 
-if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ]; then
-    echo "Invalid task name"
+if [ "$TASK" != "ragtruth" ] && [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ]; then
+    echo "Invalid task name" 
+    echo "$TASK"
     exit 1
 fi
 
 BASE_MODEL="google/gemma-2-2b-it"
-EVALUATOR_MODEL="google/gemma-2-27b-it"
+EVALUATOR_MODEL="gemini-2.0-flash"
 USE_GEMINI="True"
 GEMINI_API_KEY="AIzaSyCIPXhApp0pcu7TruZ8EyuW086VJ1wzrhk"
-EVALUATOR_NUM_FEWSHOT=4
+EVALUATOR_NUM_FEWSHOT=2
 WRITER_NUM_FEWSHOT=0
-EVAL_EVALUATOR="False"
+EVAL_EVALUATOR="True"
 THRESHOLD=0.9998
 TEMPERATURE=7e-1
 
