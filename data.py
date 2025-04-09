@@ -1618,6 +1618,12 @@ def main():
         unified = unified[unified["quality"] == "good"]
         unified = unified.rename(columns={"labels": "explanation"})
 
+        # This unified data will be used to evaluate the autorater
+        unified_dataset = Dataset.from_pandas(unified)
+        unified_dataset.push_to_hub(
+            repo_id="leobianco/ragtruth_autorater_data", split="test"
+        )
+
         train_data = unified[unified["split"] == "train"]
         test_data = unified[unified["split"] == "test"]
 

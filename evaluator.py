@@ -372,6 +372,78 @@ Does the proposed answer state anything not supported by the information in the 
     return entry
 
 
+def ragtruth_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False):
+    """Function for transforming entries in the RAGTruth dataset into prompts
+    for the evaluator model.
+
+    TO DO (LEO): perhaps split this function into two functions instead of
+    using the use_true_label parameter. Either way you must do something, because
+    it looks really bad.
+    """
+
+    preamble = """<start_of_turn>user
+You are an expert evaluator specializing in detecting hallucinations in text summarization. Your task is to determine whether a summary contains any information not present in the original text.
+
+In this evaluation:
+1. You will be given an original text that was meant to be summarized
+2. You will examine a summary generated from that text
+3. You must determine if the summary contains ANY information, statements, claims, or implications that are NOT supported by the original text
+
+Evaluation guidelines:
+- A hallucination occurs when the summary includes facts, details, or conclusions absent from the original text
+- Reasonable paraphrasing and reorganization of information is acceptable
+- Focus only on factual accuracy, not on style, tone, or format
+- Be vigilant about subtle additions that might seem plausible but aren't in the source
+
+Your response must be ONLY "Yes" (hallucination detected) or "No" (no hallucination detected).
+<end_of_turn>
+"""
+
+    prompt = preamble
+
+    template = """<start_of_turn>user
+Original text to be summarized: {prompt}
+{response}
+
+Evaluation process:
+1. Read the original text carefully
+2. Examine each claim or statement in the summary (output)
+3. Verify that every piece of information in the summary (output) is supported by the original text
+4. Check for subtle additions, expansions, or assumptions not justified by the original
+
+Does the summary (output) contain ANY information not present in or directly inferable from the original text? (Yes/No):
+<end_of_turn>
+<start_of_turn>model
+{ans}
+"""
+
+    # Depending if evaluation of evaluator or of writer checkpoint.
+    response = entry["response"] if use_true_label else entry["completion"]
+
+    formatted_prompt = template.format(
+        prompt=entry["prompt"],
+        response=response,
+        ans="",
+    )
+
+    if fewshot_examples is not None:
+        for fewshot_example in fewshot_examples:
+            fewshot_prompt = template.format(
+                prompt=fewshot_example["prompt"],
+                response=fewshot_example["response"],
+                ans=fewshot_example["class_hall"],
+            )
+            prompt += fewshot_prompt + "<end_of_turn>\n"
+        prompt += formatted_prompt
+    else:
+        prompt += formatted_prompt
+
+    entry["evaluator_prompt"] = prompt
+
+    return entry
+
+
+
 def evaluator_score_batch(
     evaluator, tokenized_prompts, yes_token_id, no_token_id
 ):
@@ -501,8 +573,8 @@ if __name__ == "__main__":
         split=script_args.dataset_labels_split,
     )
 
-    if script_args.task == "halomi":
-        evaluator_prompt = halomi_evaluator_prompt
+    if script_args.task == "ragtruth":
+        evaluator_prompt = ragtruth_evaluator_prompt
     elif script_args.task == "npov":
         evaluator_prompt = npov_evaluator_prompt
     elif script_args.task == "bosch":
