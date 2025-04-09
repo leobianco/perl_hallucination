@@ -5,11 +5,15 @@ and NPOV to Hugging Face Hub. Call this script via the shell script data.sh
 with the dataset name as an argument ("halomi" or "npov").
 """
 
+import random
 from argparse import ArgumentParser
 from copy import deepcopy
 from itertools import combinations
 
+import nltk
 import pandas as pd
+
+nltk.download("punkt_tab")
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
 from google import genai
 from google.genai import types
@@ -969,7 +973,7 @@ def bosch_process_data_for_perl(
 # """
 
 
-def rm_synthetic_hall_llm(entry, fewshot_examples=None):
+def bosch_rm_synthetic_hall_llm(entry, fewshot_examples=None):
     preamble = """
     Objective:
     Generate a modified version of a given answer that includes subtle, natural-sounding synthetic hallucinations (information plausible but not directly supported by the provided context), mimicking the kinds of errors LLMs sometimes make organically.
@@ -1043,10 +1047,46 @@ def rm_synthetic_hall_llm(entry, fewshot_examples=None):
     return prompt
 
 
+def bosch_rm_synthetic_hall_structured(entry, data):
+    """Given an entry and the rest of the data, select a random sentence of
+    the response in the entry, a random different entry in the data and a
+    random sentence in it, and swap the first by the second.
+    TO DO: I am not particularly worried with seeds here.
+    """
+
+    # Break response into sentences and filter out small ones
+    tok = nltk.sent_tokenize(entry["response"])
+    tok_filt = [i for i in tok if len(i) > 5]
+
+    # Choose a random different entry and do the same
+    entry2 = data.shuffle()[0]
+    tok2 = nltk.sent_tokenize(entry2["response"])
+    tok_filt2 = [i for i in tok2 if len(i) > 5]
+
+    # Randomly select sentences in both entries
+    rand = random.choice(tok_filt)
+    rand_idx = tok.index(rand)
+    rand2 = random.choice(tok_filt2)
+    rand_idx2 = tok2.index(rand2)
+
+    # Switch sentence and join
+    tok[rand_idx] = tok2[rand_idx2]
+    new_response = " ".join(tok)
+
+    # Update response and labels
+    entry["response"] = new_response
+    entry["class_hall"] = "Yes"
+    entry["label"] = 0
+
+    # Important: you need to retokenize these!
+
+    return entry
+
+
 def bosch_function_to_map_synthetic_halls_llm(
     entry, fewshot_examples, client, gemini_model, generation_config
 ):
-    prompt_to_send = rm_synthetic_hall_llm(entry, fewshot_examples)
+    prompt_to_send = bosch_rm_synthetic_hall_llm(entry, fewshot_examples)
 
     response = client.models.generate_content(
         model=gemini_model,
@@ -1073,6 +1113,16 @@ def main():
     parser.add_argument("--processed_repo_id", type=str)
     parser.add_argument("--rm_processed_repo_id", type=str)
     parser.add_argument("--rm_validation_size", type=float, default=0.2)
+    parser.add_argument(
+        "--create_synthetic_hallus_llm",
+        default=False,
+        type=lambda x: (str(x).lower() == "true"),
+    )
+    parser.add_argument(
+        "--create_synthetic_hallus_struct",
+        default=False,
+        type=lambda x: (str(x).lower() == "true"),
+    )
     parser.add_argument("--writer_sft_processed_repo_id", type=str)
     parser.add_argument("--perl_raw_repo_id", type=str)
     parser.add_argument("--perl_processed_repo_id", type=str)
@@ -1166,7 +1216,9 @@ def main():
             npov_autorater_data, tokenizer, max_seq_length=args.max_seq_length
         )
         npov_autorater_data_organic_only = npov_process_data_for_rm(
-            npov_autorater_data_organic_only, tokenizer, max_seq_length=args.max_seq_length
+            npov_autorater_data_organic_only,
+            tokenizer,
+            max_seq_length=args.max_seq_length,
         )
 
         # Save both versions
@@ -1356,23 +1408,9 @@ def main():
 
         rm_data.push_to_hub(args.rm_processed_repo_id)
 
-        # RM dataset with Synthetic Hallucinations - LLM generated
-
-        # Fewshot examples of organic hallucinations
-        n_fewshot_examples_synth_llm = 4
-        fewshot_examples_synth_llm = hallucinations_data.select(
-            range(n_fewshot_examples_synth_llm)
-        )
-
-        # API config
-        client = genai.Client(api_key=args.gemini_api_key)
-        gemini_model = "gemini-2.0-flash-001"
-        generation_config = types.GenerateContentConfig(
-            temperature=0.7,
-            seed=args.seed,
-        )
-
-        print("Calling Gemini's API...")
+        #
+        # DATA ORGANIZATION FOR SYNTHETIC HALLUCINATIONS
+        #
 
         # You don't want exact pairing, because the model then overfits.
         # Instead, shuffle the subset, then take a new subset of it to
@@ -1381,20 +1419,11 @@ def main():
         # use only the hallucinated version and put the original in the
         # PERL test split.
         # Confusing, I know!
+
         # subset_2 are the non-hallucinated data that will become hallucinated
         size_subset_2 = int(size_subset / 4)
         subset_2_end_idx = size_subset_2  # because it starts from zero
         subset_2 = subset_non_hallucinated_data.select(range(size_subset_2))
-
-        synthetic_hallucinations_llm = subset_2.map(
-            bosch_function_to_map_synthetic_halls_llm,
-            fn_kwargs=dict(
-                fewshot_examples=fewshot_examples_synth_llm,
-                client=client,
-                gemini_model=gemini_model,
-                generation_config=generation_config,
-            ),
-        )
 
         # subset_3 are the non-hallucinated samples that will also be used to
         # train the RM
@@ -1412,53 +1441,136 @@ def main():
 
         # All of them are subsets of subset_non_hallucinated_data
 
-        # Now we create the RM training data
-        synthetic_hallucinations_llm_train_data = concatenate_datasets(
-            [synthetic_hallucinations_llm, subset_3]
-        )
-        synthetic_hallucinations_llm_train_data = (
-            synthetic_hallucinations_llm_train_data.shuffle(seed=args.seed)
-        )
+        #
+        # RM SYNTHETIC HALLUCINATIONS - LLM GENERATED
+        #
 
-        # TO DO: put the original version of the first third of
-        # subset_non_hallucinated_data in the PERL test set
+        if args.create_synthetic_hallus_llm:
+            # Fewshot examples of organic hallucinations
+            n_fewshot_examples_synth_llm = 4
+            fewshot_examples_synth_llm = hallucinations_data.select(
+                range(n_fewshot_examples_synth_llm)
+            )
 
-        # You need to rewrite the prompts, re-tokenize... but don't re-split!
-        # This will be the train split of the final Dataset.
-        # The test set will be composed of organic hallucinations + some
-        # non-hallucinated samples from the PERL training set.
-        synthetic_hallucinations_llm_train_data = bosch_process_data_for_rm(
-            synthetic_hallucinations_llm_train_data,
-            tokenizer,
-            seed=args.seed,
-            split_data=False,
-            max_seq_length=args.max_seq_length,
-        )
+            # API config
+            client = genai.Client(api_key=args.gemini_api_key)
+            gemini_model = "gemini-2.0-flash-001"
+            generation_config = types.GenerateContentConfig(
+                temperature=0.7,
+                seed=args.seed,
+            )
 
-        # Building the test split
-        synthetic_hallucinations_llm_test_data = concatenate_datasets(
-            [hallucinations_data, subset_4]
-        ).shuffle(seed=args.seed)
+            print("Calling Gemini's API...")
 
-        synthetic_hallucinations_llm_test_data = bosch_process_data_for_rm(
-            synthetic_hallucinations_llm_test_data,
-            tokenizer,
-            seed=args.seed,
-            split_data=False,
-            max_seq_length=args.max_seq_length,
-        )
+            synthetic_hallucinations_llm = subset_2.map(
+                bosch_function_to_map_synthetic_halls_llm,
+                fn_kwargs=dict(
+                    fewshot_examples=fewshot_examples_synth_llm,
+                    client=client,
+                    gemini_model=gemini_model,
+                    generation_config=generation_config,
+                ),
+            )
 
-        # Merge the two in the appropriate splits
-        synthetic_hallucinations_llm_data = DatasetDict(
-            {
-                "train": synthetic_hallucinations_llm_train_data,
-                "test": synthetic_hallucinations_llm_test_data,
-            }
-        )
+            # Now we create the RM training data
+            synthetic_hallucinations_llm_train_data = concatenate_datasets(
+                [synthetic_hallucinations_llm, subset_3]
+            )
+            synthetic_hallucinations_llm_train_data = (
+                synthetic_hallucinations_llm_train_data.shuffle(seed=args.seed)
+            )
 
-        synthetic_hallucinations_llm_data.push_to_hub(
-            repo_id=args.rm_processed_repo_id + "_synthetic_llm"
-        )
+            # TO DO: put the original version of the first third of
+            # subset_non_hallucinated_data in the PERL test set
+
+            # You need to rewrite the prompts, re-tokenize... but don't re-split!
+            # This will be the train split of the final Dataset.
+            # The test set will be composed of organic hallucinations + some
+            # non-hallucinated samples from the PERL training set.
+            synthetic_hallucinations_llm_train_data = bosch_process_data_for_rm(
+                synthetic_hallucinations_llm_train_data,
+                tokenizer,
+                seed=args.seed,
+                split_data=False,
+                max_seq_length=args.max_seq_length,
+            )
+
+            # Building the test split
+            synthetic_hallucinations_llm_test_data = concatenate_datasets(
+                [hallucinations_data, subset_4]
+            ).shuffle(seed=args.seed)
+
+            synthetic_hallucinations_llm_test_data = bosch_process_data_for_rm(
+                synthetic_hallucinations_llm_test_data,
+                tokenizer,
+                seed=args.seed,
+                split_data=False,
+                max_seq_length=args.max_seq_length,
+            )
+
+            # Merge the two in the appropriate splits
+            synthetic_hallucinations_llm_data = DatasetDict(
+                {
+                    "train": synthetic_hallucinations_llm_train_data,
+                    "test": synthetic_hallucinations_llm_test_data,
+                }
+            )
+
+            synthetic_hallucinations_llm_data.push_to_hub(
+                repo_id=args.rm_processed_repo_id + "_synthetic_llm"
+            )
+
+        #
+        # RM SYNTHETIC HALLUCINATIONS - STRUCTURED
+        #
+        elif args.create_synthetic_hallus_struct:
+            # Apply the map that switches sentences to subset_2
+            synthetic_hallucinations_struct_train_data = subset_2.map(
+                bosch_rm_synthetic_hall_structured, fn_kwargs=dict(data=dataset)
+            )
+
+            # Reconstuct prompts and retokenize
+            synthetic_hallucinations_struct_train_data = (
+                bosch_process_data_for_rm(
+                    synthetic_hallucinations_struct_train_data,
+                    tokenizer,
+                    seed=args.seed,
+                    split_data=False,
+                    max_seq_length=args.max_seq_length,
+                )
+            )
+
+            # Add some non-hallucinated examples and shuffle!
+            synthetic_hallucinations_struct_train_data = concatenate_datasets(
+                [synthetic_hallucinations_struct_train_data, subset_3]
+            ).shuffle(seed=args.seed)
+
+            # Create test split with organic hallucinations
+            synthetic_hallucinations_struct_test_data = concatenate_datasets(
+                [hallucinations_data, subset_4]
+            ).shuffle(seed=args.seed)
+
+            synthetic_hallucinations_struct_test_data = (
+                bosch_process_data_for_rm(
+                    synthetic_hallucinations_struct_test_data,
+                    tokenizer,
+                    seed=args.seed,
+                    split_data=False,
+                    max_seq_length=args.max_seq_length,
+                )
+            )
+
+            # Merge the two in the appropriate splits
+            synthetic_hallucinations_struct_data = DatasetDict(
+                {
+                    "train": synthetic_hallucinations_struct_train_data,
+                    "test": synthetic_hallucinations_struct_test_data,
+                }
+            )
+
+            synthetic_hallucinations_struct_data.push_to_hub(
+                repo_id=args.rm_processed_repo_id + "_synthetic_struct"
+            )
 
         # PERL
         perl_data = bosch_process_data_for_perl(

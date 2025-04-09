@@ -6,14 +6,15 @@ if [ $SHLVL -gt 2 ]; then
 else
   # If single-run, set variables here.
   TASK="$1"
-  SYN_HALL_LLM=true
+  SYN_HALL_LLM=false
+  SYN_HALL_STRUCT=true
   DATASET_REPO_ID="leobianco/${TASK}_rm_processed"
   DEEPSPEED_CONFIG="./deepspeed_config.yaml"
   SEED=130104
   NUM_TRAIN_EPOCHS=3
   LEARNING_RATE=1e-3
   LORA_RANK=8
-  RUN_IDENTIFIER="leobianco/${TASK}_RM_seed_${SEED}_SYN_HALL_LLM_${SYN_HALL_LLM}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_lora_${LORA_RANK}"
+  RUN_IDENTIFIER="leobianco/${TASK}_RM_seed_${SEED}_SYN_LLM_${SYN_HALL_LLM}_SYN_STRUCT_${SYN_HALL_STRUCT}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_lora_${LORA_RANK}"
 fi
 
 if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ]; then
@@ -23,6 +24,11 @@ fi
 
 if [ "$SYN_HALL_LLM" = true ]; then
   DATASET_REPO_ID=$DATASET_REPO_ID"_synthetic_llm"
+  echo "Using dataset ${DATASET_REPO_ID}"
+fi
+
+if [ "$SYN_HALL_STRUCT" = true ]; then
+  DATASET_REPO_ID=$DATASET_REPO_ID"_synthetic_struct"
   echo "Using dataset ${DATASET_REPO_ID}"
 fi
 
