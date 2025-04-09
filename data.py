@@ -11,6 +11,7 @@ from copy import deepcopy
 from itertools import combinations
 
 import nltk
+import numpy as np
 import pandas as pd
 
 nltk.download("punkt_tab")
@@ -1600,46 +1601,113 @@ def main():
         data_responses = pd.read_json(
             "/home/leo/Downloads/RAGTruth/dataset/response.jsonl", lines=True
         )
-
-        data2txt_sources = data_sources[data_sources["task_type"] == "Data2txt"]
-        data2txt_responses = data_responses[
-            data_responses["source_id"].isin(data2txt_sources["source_id"])
+        sources = data_sources[data_sources["task_type"] == "Summary"]
+        responses = data_responses[
+            data_responses["source_id"].isin(sources["source_id"])
         ]
-        data2txt_unified = pd.merge(
-            data2txt_sources, data2txt_responses, on="source_id", how="left"
-        )
-        data2txt_unified = data2txt_unified.drop(
+        unified = pd.merge(sources, responses, on="source_id", how="left")
+        unified = unified.drop(
             ["source_info", "task_type", "source", "id"], axis=1
         )
-        # Numerical hallucination labels
-        data2txt_unified["label"] = data2txt_unified.apply(
+        unified["label"] = unified.apply(
             lambda entry: 1 if len(entry["labels"]) == 0 else 0, axis=1
         )
-        # Textual hallucination labels
-        data2txt_unified["class_hall"] = data2txt_unified.apply(
+        unified["class_hall"] = unified.apply(
             lambda entry: "No" if len(entry["labels"]) == 0 else "Yes", axis=1
         )
+        unified = unified[unified["quality"] == "good"]
 
-        data2txt_dataset = Dataset.from_pandas(data2txt_unified)
-        data2txt_dataset_splits = data2txt_dataset.train_test_split(
-            test_size=0.1, shuffle=False
+        train_data = unified[unified["split"] == "train"]
+        test_data = unified[unified["split"] == "test"]
+
+        #
+        # STAGE ONE: testing the idea
+        #
+
+        # The train data will be used to train the reward model.
+        # However, the prompt must be modified to include the
+        # response and some control characters.
+        train_data["prompt"] = (
+            "<start_of_turn>user\n"
+            + train_data["prompt"]
+            + "<end_of_turn>\n<start_of_turn><model>\n"
+            + train_data["response"]
+            + "<end_of_turn><eos>"
         )
 
-        # On test split, get only unique prompts
-        # This is done in an UGLY way, out of hurry
-        test_pandas = pd.DataFrame(data2txt_dataset_splits["test"])
-        test_pandas = test_pandas.drop_duplicates(
-            subset=["source_id"], keep="first"
-        )
-        del data2txt_dataset_splits["test"]
-        test_hf = Dataset.from_pandas(test_pandas)
-        test_hf = test_hf.remove_columns(["__index_level_0__"])
-        data2txt_dataset_splits["test"] = test_hf
+        # The same must be done to the test samples that will be used to
+        # validate the RM
 
-        for split in data2txt_dataset_splits.keys():
-            data2txt_dataset_splits[split].push_to_hub(
-                args.processed_repo_id, split=split
-            )
+        # First, we grab 100 unique prompts to be used for PERL
+        unique_prompts_for_perl = np.random.choice(
+            test_data["prompt"].unique(), size=100
+        )
+        perl_data = test_data[test_data["prompt"].isin(unique_prompts_for_perl)]
+        perl_data["prompt"] = (
+            "<start_of_turn>user\n"
+            + perl_data["prompt"]
+            + "<end_of_turn>\n<start_of_turn><model>\n"
+        )
+
+        # The rest of the entries in the test set (even with repeated prompts)
+        # serve to validate the RM.
+        test_RM = test_data[~test_data["prompt"].isin(unique_prompts_for_perl)]
+        test_RM["prompt"] = (
+            "<start_of_turn>user\n"
+            + test_RM["prompt"]
+            + "<end_of_turn>\n<start_of_turn><model>\n"
+            + test_RM["response"]
+            + "<end_of_turn><eos>"
+        )
+
+        # Convert RM data to HF Dataset
+        train_RM_dataset = Dataset.from_pandas(train_data)
+        test_RM_dataset = Dataset.from_pandas(test_RM)
+
+        # Tokenize the RM data
+        train_RM_dataset = train_RM_dataset.map(
+            encode,
+            batched=True,
+            fn_kwargs={
+                "tokenizer": tokenizer,
+                "max_seq_length": args.max_seq_length,
+            },
+        )
+        train_RM_dataset.set_format("torch")  # due to using map()
+
+        test_RM_dataset = test_RM_dataset.map(
+            encode,
+            batched=True,
+            fn_kwargs={
+                "tokenizer": tokenizer,
+                "max_seq_length": args.max_seq_length,
+            },
+        )
+        test_RM_dataset.set_format("torch")  # due to using map()
+
+        # Save to HF Hub
+        RM_dataset = DatasetDict(
+            {"train": train_RM_dataset, "test": test_RM_dataset}
+        )
+        RM_dataset.push_to_hub("leobianco/ragtruth_rm_processed")
+
+        # Convert the PERL data and save to HF Hub
+        perl_dataset = Dataset.from_pandas(perl_data)
+
+        # Tokenize the PERL data
+        perl_dataset = perl_dataset.map(
+            encode,
+            batched=True,
+            fn_kwargs={
+                "tokenizer": tokenizer,
+                "max_seq_length": args.max_seq_length,
+            },
+        )
+        perl_dataset.set_format("torch")  # due to using map()
+
+        # PERL requires some test split
+        perl_dataset_dict = perl_dataset.train_test_split(test_size=10)
+        perl_dataset_dict.push_to_hub("leobianco/ragtruth_perl_processed")
 
 
 if __name__ == "__main__":

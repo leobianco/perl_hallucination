@@ -10,7 +10,7 @@ PROCESSED_REPO_ID="${USER}/${TASK}_processed"
 RM_PROCESSED_REPO_ID="${USER}/${TASK}_rm_processed"
 RM_VALIDATION_SIZE=0.2
 CREATE_SYNTH_HALL_LLM="False"
-CREATE_SYNTH_HALL_STRUCT="True"
+CREATE_SYNTH_HALL_STRUCT="False"
 WRITER_SFT_PROCESSED_REPO_ID="${USER}/${TASK}_writer_sft_processed"
 PERL_RAW_REPO_ID="okezieowen/english_to_spanish"
 PERL_PROCESSED_REPO_ID="${USER}/${TASK}_perl_processed"
@@ -18,7 +18,7 @@ PERL_TRAIN_SIZE=25000
 PERL_VALIDATION_SIZE=800
 AUGMENTED_REPO_ID="${USER}/${TASK}_augmented_validation"
 
-if [ "$TASK" != "halomi" ] && [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ]; then
+if [ "$TASK" != "ragtruth" ] && [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ]; then
     echo "Invalid dataset name"
     exit 1
 fi
