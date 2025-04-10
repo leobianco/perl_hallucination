@@ -6,6 +6,7 @@ with the dataset name as an argument ("halomi" or "npov").
 """
 
 import random
+import re
 from argparse import ArgumentParser
 from copy import deepcopy
 from itertools import combinations
@@ -1129,6 +1130,56 @@ def bosch_function_to_map_synthetic_halls_llm(
     }
 
 
+def ragtruth_rm_synthetic_hall_llm(entry):
+    prompt = f"""Task: Generate a modified summary that includes controlled hallucinations
+
+Source Text:
+{entry["user_query"]}
+
+Grounded Summary:
+{entry["response"]}
+
+Instructions:
+1. Create a modified version of the grounded summary that includes 1-2 subtle pieces of information that are NOT present in the source text.
+2. These synthetic hallucinations should:
+   - Be plausible and contextually relevant to the topic
+   - Blend naturally with the factual information
+   - Be specific rather than vague (e.g., details, statistics, claims, or implications)
+   - Change or extend the meaning in a meaningful but subtle way
+
+3. The hallucinated content should:
+   - Not be marked or highlighted in any way
+   - Appear to be a natural part of the summary
+   - Be difficult to detect without comparing to the source text
+
+4. Maintain the same overall structure, tone, and approximate length as the original summary.
+5. The majority of the summary should remain faithful to the source text.
+6. The modified summary should still read as a coherent, well-formed summary.
+
+Modified Summary with Subtle Hallucinations:
+"""
+
+    return prompt
+
+
+def ragtruth_function_to_map_synthetic_halls_llm(
+    entry, client, gemini_model, generation_config
+):
+    prompt_to_send = ragtruth_rm_synthetic_hall_llm(entry)
+
+    response = client.models.generate_content(
+        model=gemini_model,
+        contents=prompt_to_send,
+        config=generation_config,
+    )
+
+    return {
+        "response": response.text,
+        "class_hall": "Yes",
+        "label": 0,
+    }
+
+
 def main():
     parser = ArgumentParser()
     parser.add_argument("--task", type=str)
@@ -1724,12 +1775,16 @@ def main():
         # STAGE ONE: testing the idea
         #
 
+        # Rename the original prompt column to a "user_query" column
+        train_data = train_data.rename_column("prompt", "user_query")
+        test_data = test_data.rename_column("prompt", "user_query")
+
         # The train data will be used to train the reward model.
         # However, the prompt must be modified to include the
         # response and some control characters.
         train_data["prompt"] = (
             "<start_of_turn>user\n"
-            + train_data["prompt"]
+            + train_data["user_query"]
             + "<end_of_turn>\n<start_of_turn><model>\n"
             + train_data["response"]
             + "<end_of_turn><eos>"
@@ -1738,34 +1793,36 @@ def main():
         # The same must be done to the test samples that will be used to
         # validate the RM
 
-        # First, we grab 100 unique prompts to be used for PERL
+        # First, we grab 100 unique user_query to be used for PERL
         unique_prompts_for_perl = np.random.choice(
-            test_data["prompt"].unique(), size=100
+            test_data["user_query"].unique(), size=100
         )
-        perl_data = test_data[test_data["prompt"].isin(unique_prompts_for_perl)]
+        perl_data = test_data[test_data["user_query"].isin(unique_prompts_for_perl)]
+
+        # In the case of PERL, prompt = user_query
         perl_data["prompt"] = (
             "<start_of_turn>user\n"
-            + perl_data["prompt"]
+            + perl_data["user_query"]
             + "<end_of_turn>\n<start_of_turn><model>\n"
         )
 
         # The rest of the entries in the test set (even with repeated prompts)
         # serve to validate the RM.
-        test_RM = test_data[~test_data["prompt"].isin(unique_prompts_for_perl)]
+        test_RM = test_data[~test_data["user_query"].isin(unique_prompts_for_perl)]
         test_RM["prompt"] = (
             "<start_of_turn>user\n"
-            + test_RM["prompt"]
+            + test_RM["user_query"]
             + "<end_of_turn>\n<start_of_turn><model>\n"
             + test_RM["response"]
             + "<end_of_turn><eos>"
         )
 
-        # Convert RM data to HF Dataset
-        train_RM_dataset = Dataset.from_pandas(train_data)
-        test_RM_dataset = Dataset.from_pandas(test_RM)
+        # # Convert RM data to HF Dataset
+        # train_RM_dataset = Dataset.from_pandas(train_data)
+        # test_RM_dataset = Dataset.from_pandas(test_RM)
 
         # Tokenize the RM data
-        train_RM_dataset = train_RM_dataset.map(
+        train_data = train_data.map(
             encode,
             batched=True,
             fn_kwargs={
@@ -1773,9 +1830,9 @@ def main():
                 "max_seq_length": args.max_seq_length,
             },
         )
-        train_RM_dataset.set_format("torch")  # due to using map()
+        train_data.set_format("torch")  # due to using map()
 
-        test_RM_dataset = test_RM_dataset.map(
+        test_RM = test_RM.map(
             encode,
             batched=True,
             fn_kwargs={
@@ -1783,13 +1840,82 @@ def main():
                 "max_seq_length": args.max_seq_length,
             },
         )
-        test_RM_dataset.set_format("torch")  # due to using map()
+        test_RM.set_format("torch")  # due to using map()
 
         # Save to HF Hub
         RM_dataset = DatasetDict(
-            {"train": train_RM_dataset, "test": test_RM_dataset}
+            {"train": train_data, "test": test_RM}
         )
         RM_dataset.push_to_hub("leobianco/ragtruth_rm_processed")
+
+        #
+        # SYNTHETIC HALLUCINATIONS - LLM GENERATED
+        #
+
+        if args.synthetic_hallus_llm:
+            # Filter out non-hallucinations from the RM train dataset
+            train_RM_non_hallus = train_data.filter(
+                lambda x: x["class_hall"] == "No"
+            )
+
+            # Some (~1000) of them will be used as base for synthetic
+            train_RM_synth_llm = train_RM_non_hallus.select(range(1000))
+            train_RM_non_hallus = train_RM_non_hallus.select(
+                range(1000, train_RM_non_hallus.num_rows)
+            )
+
+            # API config
+            client = genai.Client(api_key=args.gemini_api_key)
+            gemini_model = "gemini-2.0-flash-001"
+            generation_config = types.GenerateContentConfig(
+                temperature=0.7,
+                seed=args.seed,
+            )
+
+            print("Calling Gemini's API...")
+
+            synthetic_hallucinations_llm = train_RM_synth_llm.map(
+                ragtruth_function_to_map_synthetic_halls_llm,
+                fn_kwargs=dict(
+                    client=client,
+                    gemini_model=gemini_model,
+                    generation_config=generation_config,
+                ),
+            )
+
+            # Since the response changed, you need to rewrite the
+            # prompt, and retokenize
+            synthetic_hallucinations_llm = synthetic_hallucinations_llm.map(lambda x: {"prompt": "<start_of_turn>user\n" + x["user_query"] + "<end_of_turn>\n<start_of_turn><model>\n" + x["response"] + "<end_of_turn><eos>"})
+
+            synthetic_hallucinations_llm = synthetic_hallucinations_llm.map(
+                encode,
+                batched=True,
+                fn_kwargs={
+                    "tokenizer": tokenizer,
+                    "max_seq_length": args.max_seq_length,
+                },
+            )
+            synthetic_hallucinations_llm.set_format("torch")
+            
+            # Now we create the RM training data
+            synthetic_hallucinations_llm_train_data = concatenate_datasets(
+                [synthetic_hallucinations_llm, train_RM_non_hallus]
+            ).shuffle(seed=args.seed)
+
+            # Merge the two in the appropriate splits
+            synthetic_hallucinations_llm_data = DatasetDict(
+                {
+                    "train": synthetic_hallucinations_llm_train_data,
+                    "test": test_RM,
+                }
+            )
+
+            # Save
+            for split in synthetic_hallucinations_llm_data.keys():
+                synthetic_hallucinations_llm_data[split].push_to_hub(
+                    repo_id=args.rm_processed_repo_id + "_synthetic_llm",
+                    split=split,
+                )
 
         # Convert the PERL data and save to HF Hub
         perl_dataset = Dataset.from_pandas(perl_data)
