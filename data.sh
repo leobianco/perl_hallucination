@@ -4,13 +4,13 @@ TASK="$1"
 USER="leobianco"
 SEED=12345
 TOKENIZER_MODEL="google/gemma-2-2b-it"
-MAX_SEQ_LENGTH=2048
+MAX_SEQ_LENGTH=512
 RAW_REPO_ID="${USER}/${TASK}_raw"
 PROCESSED_REPO_ID="${USER}/${TASK}_processed"
+SYNTH_LLM="True"
+SYNTH_STRUCT="False"
 RM_PROCESSED_REPO_ID="${USER}/${TASK}_rm_processed"
 RM_VALIDATION_SIZE=0.2
-CREATE_SYNTH_HALL_LLM="False"
-CREATE_SYNTH_HALL_STRUCT="False"
 WRITER_SFT_PROCESSED_REPO_ID="${USER}/${TASK}_writer_sft_processed"
 PERL_RAW_REPO_ID="okezieowen/english_to_spanish"
 PERL_PROCESSED_REPO_ID="${USER}/${TASK}_perl_processed"
@@ -32,8 +32,8 @@ python data.py \
     --processed_repo_id "$PROCESSED_REPO_ID" \
     --rm_processed_repo_id "$RM_PROCESSED_REPO_ID" \
     --rm_validation_size "$RM_VALIDATION_SIZE" \
-    --create_synthetic_hallus_llm $CREATE_SYNTH_HALL_LLM \
-    --create_synthetic_hallus_struct $CREATE_SYNTH_HALL_STRUCT \
+    --synthetic_hallus_llm $SYNTH_LLM \
+    --synthetic_hallus_struct $SYNTH_STRUCT \
     --writer_sft_processed_repo_id "$WRITER_SFT_PROCESSED_REPO_ID" \
     --perl_raw_repo_id "$PERL_RAW_REPO_ID" \
     --perl_processed_repo_id "$PERL_PROCESSED_REPO_ID" \

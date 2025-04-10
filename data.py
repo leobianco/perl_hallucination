@@ -387,7 +387,7 @@ def npov_hallucination_labels_to_numerical(entry):
     """Data processing utility function which replaces the hallucination labels by
     a numerical version."""
 
-    entry["class_hall_num"] = 0 if entry["has hallucination"] == "Yes" else 1
+    entry["class_hall_num"] = 0 if entry["class_hall"] == "Yes" else 1
 
     return entry
 
@@ -396,7 +396,7 @@ def npov_omission_labels_to_numerical(entry):
     """Data processing utility function which replaces the omission labels by
     a numerical version."""
 
-    entry["class_omit_num"] = 0 if entry["has coverage issue"] == "Yes" else 1
+    entry["class_omit_num"] = 0 if entry["class_omit"] == "Yes" else 1
 
     return entry
 
@@ -408,12 +408,12 @@ def npov_change_hallucination_labels(entry):
 
     class_hallucination_to_label = {
         "NO": "No",
+        "No": "No",
         "YES": "Yes",
+        "Yes": "Yes",
     }
 
-    entry["has hallucination"] = class_hallucination_to_label[
-        entry["has hallucination"]
-    ]
+    entry["class_hall"] = class_hallucination_to_label[entry["class_hall"]]
 
     entry["has synthetic hallucination"] = class_hallucination_to_label[
         entry["has synthetic hallucination"]
@@ -429,12 +429,12 @@ def npov_change_omission_labels(entry):
 
     class_omission_to_label = {
         "NO": "No",
+        "No": "No",
         "YES": "Yes",
+        "Yes": "Yes",
     }
 
-    entry["has coverage issue"] = class_omission_to_label[
-        entry["has coverage issue"]
-    ]
+    entry["class_omit"] = class_omission_to_label[entry["class_omit"]]
 
     entry["has synthetic coverage issue"] = class_omission_to_label[
         entry["has synthetic coverage issue"]
@@ -483,7 +483,15 @@ def npov_process_data_for_rm(
     # Copy original NPOV data
     npov_rm_data = deepcopy(npov_data)
 
-    # Select relevant subset of columns
+    if "has hallucination" in npov_rm_data.column_names:
+        npov_rm_data = npov_rm_data.rename_column(
+            "has hallucination", "class_hall"
+        )
+    if "has coverage issue" in npov_rm_data.column_names:
+        npov_rm_data = npov_rm_data.rename_column(
+            "has coverage issue", "class_omit"
+        )
+
     npov_rm_data = npov_rm_data.select_columns(
         [
             "topic",
@@ -493,21 +501,16 @@ def npov_process_data_for_rm(
             "perspective_1_name",
             "perspective_2",
             "perspective_2_name",
-            "has hallucination",
+            "class_hall",
             "has synthetic hallucination",
-            "has coverage issue",
+            "class_omit",
             "has synthetic coverage issue",
         ]
     )
-
     npov_rm_data = npov_rm_data.map(npov_change_hallucination_labels)
     npov_rm_data = npov_rm_data.map(npov_change_omission_labels)
     npov_rm_data = npov_rm_data.map(npov_hallucination_labels_to_numerical)
     npov_rm_data = npov_rm_data.map(npov_omission_labels_to_numerical)
-    npov_rm_data = npov_rm_data.rename_column("has hallucination", "class_hall")
-    npov_rm_data = npov_rm_data.rename_column(
-        "has coverage issue", "class_omit"
-    )
     npov_rm_data = npov_rm_data.map(npov_rm_prompt)
     npov_rm_data = npov_rm_data.map(
         encode,
@@ -852,6 +855,67 @@ def npov_data_augmentation(data):
     return result
 
 
+# Synthetic Hallucinations
+def npov_rm_synthetic_hall_llm(entry):
+    prompt = f"""
+Task: Generate a modified answer that includes controlled hallucinations
+
+Question: {entry["user_query"]}
+
+Context:
+{entry["perspective_1_name"]} arguments:
+{entry["perspective_1"]}
+
+{entry["perspective_2_name"]} arguments:
+{entry["perspective_2"]}
+
+Neutral Point of View Answer:
+{entry["npov_response"]}
+
+Instructions:
+1. Create a modified version of the neutral answer that does ONE of the following:
+   a. Adds one entirely new argument (either pro or con) that is NOT present in the context
+   b. Distorts one or two existing arguments to change their meaning or implications
+
+2. If adding a new argument:
+   - Make it plausible and thematically consistent with the topic
+   - Ensure it appears to be a natural extension of the discussion
+   - Integrate it seamlessly without calling attention to it
+
+3. If distorting existing arguments:
+   - Subtly change key details, statistics, or conclusions
+   - Maintain enough of the original argument to make it recognizable
+   - Ensure the distortion meaningfully alters the argument's strength or implications
+
+4. The hallucinated content should not be marked or highlighted in any way
+5. Maintain the overall balanced structure, tone, and appearance of neutrality
+6. The rest of the answer should remain faithful to the original arguments
+
+Modified Answer with Synthetic Hallucinations:
+"""
+
+    return prompt
+
+
+def npov_function_to_map_synthetic_halls_llm(
+    entry, client, gemini_model, generation_config
+):
+    prompt_to_send = npov_rm_synthetic_hall_llm(entry)
+
+    response = client.models.generate_content(
+        model=gemini_model,
+        contents=prompt_to_send,
+        config=generation_config,
+    )
+
+    return {
+        "npov_response": response.text,
+        "class_hall": "Yes",
+        "label": 0,
+        "has synthetic hallucination": "Yes",
+    }
+
+
 def bosch_rm_prompt(entry):
     """The dataset already contains a prompt column, which is an instruction for the writer. We just append the generation."""
 
@@ -937,41 +1001,40 @@ def bosch_process_data_for_perl(
     return perl_data
 
 
-# PREVIOUS (FIRST) PROMPT
-# rm_synthetic_hall_llm_prompt = """
-# Objective:
-# Generate a modified version of a given answer that includes plausible-sounding synthetic hallucinations (information not present in the provided context).
+def bosch_rm_synthetic_hall_structured(entry, data):
+    """Given an entry and the rest of the data, select a random sentence of
+    the response in the entry, a random different entry in the data and a
+    random sentence in it, and swap the first by the second.
+    TO DO: I am not particularly worried with seeds here.
+    """
 
-# Task:
-# You are given a Question, a Context used to answer it, and an Original Grounded Answer derived solely from that Context. Your task is to rewrite the Original Grounded Answer to create a Modified Answer.
+    # Break response into sentences and filter out small ones
+    tok = nltk.sent_tokenize(entry["response"])
+    tok_filt = [i for i in tok if len(i) > 5]
 
-# Requirements for the Modified Answer:
-# 1. Address the Question: It must still fundamentally answer the original Question.
-# 2. Incorporate Hallucinations: It must include 1 or 2 specific pieces of information that are explicitly NOT found in the provided Context.
-# 3. Plausibility: The added information (the hallucinations) should sound plausible and relevant to the Question and the general topic, even though it lacks support in the Context.
-# 4. Integration: Weave the hallucinated information naturally into the text. Do not simply append it awkwardly. It should blend smoothly with the information retained from the Original Grounded Answer.
-# 5. Minimal Other Changes: Preserve the core information and structure of the Original Grounded Answer as much as possible, only augmenting it with the hallucinations.
-# 6. Output: Provide only the text of the Modified Answer.
+    # Choose a random different entry and do the same
+    entry2 = data.shuffle()[0]
+    tok2 = nltk.sent_tokenize(entry2["response"])
+    tok_filt2 = [i for i in tok2 if len(i) > 5]
 
-# Input Information:
+    # Randomly select sentences in both entries
+    rand = random.choice(tok_filt)
+    rand_idx = tok.index(rand)
+    rand2 = random.choice(tok_filt2)
+    rand_idx2 = tok2.index(rand2)
 
-# --- START CONTEXT ---
-# {context}
-# --- END CONTEXT ---
+    # Switch sentence and join
+    tok[rand_idx] = tok2[rand_idx2]
+    new_response = " ".join(tok)
 
-# --- START QUESTION ---
-# {question}
-# --- END QUESTION ---
+    # Update response and labels
+    entry["response"] = new_response
+    entry["class_hall"] = "Yes"
+    entry["label"] = 0
 
-# --- START ORIGINAL GROUNDED ANSWER ---
-# {original_answer}
-# --- END ORIGINAL GROUNDED ANSWER ---
+    # Important: you need to retokenize these!
 
-# Instruction:
-# Please generate the Modified Answer based on the requirements above.
-
-# Modified Answer:
-# """
+    return entry
 
 
 def bosch_rm_synthetic_hall_llm(entry, fewshot_examples=None):
@@ -1048,42 +1111,6 @@ def bosch_rm_synthetic_hall_llm(entry, fewshot_examples=None):
     return prompt
 
 
-def bosch_rm_synthetic_hall_structured(entry, data):
-    """Given an entry and the rest of the data, select a random sentence of
-    the response in the entry, a random different entry in the data and a
-    random sentence in it, and swap the first by the second.
-    TO DO: I am not particularly worried with seeds here.
-    """
-
-    # Break response into sentences and filter out small ones
-    tok = nltk.sent_tokenize(entry["response"])
-    tok_filt = [i for i in tok if len(i) > 5]
-
-    # Choose a random different entry and do the same
-    entry2 = data.shuffle()[0]
-    tok2 = nltk.sent_tokenize(entry2["response"])
-    tok_filt2 = [i for i in tok2 if len(i) > 5]
-
-    # Randomly select sentences in both entries
-    rand = random.choice(tok_filt)
-    rand_idx = tok.index(rand)
-    rand2 = random.choice(tok_filt2)
-    rand_idx2 = tok2.index(rand2)
-
-    # Switch sentence and join
-    tok[rand_idx] = tok2[rand_idx2]
-    new_response = " ".join(tok)
-
-    # Update response and labels
-    entry["response"] = new_response
-    entry["class_hall"] = "Yes"
-    entry["label"] = 0
-
-    # Important: you need to retokenize these!
-
-    return entry
-
-
 def bosch_function_to_map_synthetic_halls_llm(
     entry, fewshot_examples, client, gemini_model, generation_config
 ):
@@ -1115,12 +1142,12 @@ def main():
     parser.add_argument("--rm_processed_repo_id", type=str)
     parser.add_argument("--rm_validation_size", type=float, default=0.2)
     parser.add_argument(
-        "--create_synthetic_hallus_llm",
+        "--synthetic_hallus_llm",
         default=False,
         type=lambda x: (str(x).lower() == "true"),
     )
     parser.add_argument(
-        "--create_synthetic_hallus_struct",
+        "--synthetic_hallus_struct",
         default=False,
         type=lambda x: (str(x).lower() == "true"),
     )
@@ -1198,6 +1225,17 @@ def main():
             },
         )
 
+        for split in npov_rm_data.keys():
+            npov_rm_data[split] = npov_process_data_for_rm(
+                npov_rm_data[split],
+                tokenizer,
+                max_seq_length=args.max_seq_length,
+            )
+
+        #
+        # AUTORATER
+        #
+
         # Version with all data
         npov_autorater_data = concatenate_datasets(
             [
@@ -1209,17 +1247,7 @@ def main():
 
         # Version with organic hallucinations only
         npov_autorater_data_organic_only = npov_autorater_data.filter(
-            lambda x: x["has synthetic hallucination"] == "NO"
-        )
-
-        # Tokenize both versions
-        npov_autorater_data = npov_process_data_for_rm(
-            npov_autorater_data, tokenizer, max_seq_length=args.max_seq_length
-        )
-        npov_autorater_data_organic_only = npov_process_data_for_rm(
-            npov_autorater_data_organic_only,
-            tokenizer,
-            max_seq_length=args.max_seq_length,
+            lambda x: x["has synthetic hallucination"] == "No"
         )
 
         # Save both versions
@@ -1232,8 +1260,19 @@ def main():
             split="test",
         )
 
-        # Before filtering out the data for training on synthetic only,
-        # create the data for evaluating the autorater
+        #
+        # SYNTHETIC HALLUCINATIONS
+        #
+
+        # In any case, we want to evaluate the RM on organic hallucinations only
+        npov_rm_data["validation"] = npov_rm_data["validation"].filter(
+            lambda x: not (
+                x["class_hall"] == "Yes"
+                and x["has synthetic hallucination"] == "Yes"
+            )
+        )
+
+        # STRUCTURED CASE
 
         # To train on synthetic hallucinations only and evaluate on organic,
         # drop the organic ones from the training set, and the synthetic ones
@@ -1242,31 +1281,88 @@ def main():
         # the test set for PERL later on and we agreed that we cannot test
         # both the RM and PERL on the same examples.
 
-        npov_rm_data["train"] = npov_rm_data["train"].filter(
-            lambda x: not (
-                x["has hallucination"] == "YES"
-                and x["has synthetic hallucination"] == "NO"
-            )
-        )
-
-        npov_rm_data["validation"] = npov_rm_data["validation"].filter(
-            lambda x: not (
-                x["has hallucination"] == "YES"
-                and x["has synthetic hallucination"] == "YES"
-            )
-        )
-
-        for split in npov_rm_data.keys():
-            npov_rm_data[split] = npov_process_data_for_rm(
-                npov_rm_data[split],
-                tokenizer,
-                max_seq_length=args.max_seq_length,
+        if args.synthetic_hallus_struct:
+            npov_rm_train_non_and_structured = npov_rm_data["train"].filter(
+                lambda x: not (
+                    x["class_hall"] == "Yes"
+                    and x["has synthetic hallucination"] == "No"
+                )
             )
 
-            npov_rm_data[split].push_to_hub(
-                repo_id=args.rm_processed_repo_id,
-                split=split,
+            npov_rm_non_and_structured = DatasetDict(
+                {
+                    "train": npov_rm_train_non_and_structured,
+                    "test": npov_rm_data["validation"],
+                }
             )
+
+            for split in npov_rm_non_and_structured.keys():
+                npov_rm_non_and_structured[split].push_to_hub(
+                    repo_id=args.rm_processed_repo_id + "_synthetic_struct",
+                    split=split,
+                )
+
+        #
+        # LLM-GENERATED SYNTHETIC HALLUCINATIONS
+        #
+        elif args.synthetic_hallus_llm:
+            npov_rm_train_non = npov_rm_data["train"].filter(
+                lambda x: x["class_hall"] == "No"
+            )
+
+            # We use some non-hallus. to generate synthetic hallus.
+            npov_rm_train_synth_llm = npov_rm_train_non.select(range(100))
+            npov_rm_train_non = npov_rm_train_non.select(
+                range(100, npov_rm_train_non.num_rows)
+            )
+
+            # API config
+            client = genai.Client(api_key=args.gemini_api_key)
+            gemini_model = "gemini-2.0-flash-001"
+            generation_config = types.GenerateContentConfig(
+                temperature=0.7,
+                seed=args.seed,
+            )
+
+            print("Calling Gemini's API...")
+
+            synthetic_hallucinations_llm = npov_rm_train_synth_llm.map(
+                npov_function_to_map_synthetic_halls_llm,
+                fn_kwargs=dict(
+                    client=client,
+                    gemini_model=gemini_model,
+                    generation_config=generation_config,
+                ),
+            )
+
+            # Now we create the RM training data
+            synthetic_hallucinations_llm_train_data = concatenate_datasets(
+                [synthetic_hallucinations_llm, npov_rm_train_non]
+            ).shuffle(seed=args.seed)
+
+            # Merge the two in the appropriate splits
+            synthetic_hallucinations_llm_data = DatasetDict(
+                {
+                    "train": synthetic_hallucinations_llm_train_data,
+                    "test": npov_rm_data["validation"],
+                }
+            )
+
+            # Since the response changed, you need to rewrite the
+            # prompt and retokenize
+            for split in synthetic_hallucinations_llm_data.keys():
+                synthetic_hallucinations_llm_data[split] = (
+                    npov_process_data_for_rm(
+                        synthetic_hallucinations_llm_data[split],
+                        tokenizer,
+                        max_seq_length=args.max_seq_length,
+                    )
+                )
+
+                synthetic_hallucinations_llm_data[split].push_to_hub(
+                    repo_id=args.rm_processed_repo_id + "_synthetic_llm",
+                    split=split,
+                )
 
         # Writer SFT
         npov_sft_data = load_dataset(
@@ -1446,7 +1542,7 @@ def main():
         # RM SYNTHETIC HALLUCINATIONS - LLM GENERATED
         #
 
-        if args.create_synthetic_hallus_llm:
+        if args.synthetic_hallus_llm:
             # Fewshot examples of organic hallucinations
             n_fewshot_examples_synth_llm = 4
             fewshot_examples_synth_llm = hallucinations_data.select(
@@ -1476,10 +1572,7 @@ def main():
             # Now we create the RM training data
             synthetic_hallucinations_llm_train_data = concatenate_datasets(
                 [synthetic_hallucinations_llm, subset_3]
-            )
-            synthetic_hallucinations_llm_train_data = (
-                synthetic_hallucinations_llm_train_data.shuffle(seed=args.seed)
-            )
+            ).shuffle(seed=args.seed)
 
             # TO DO: put the original version of the first third of
             # subset_non_hallucinated_data in the PERL test set
@@ -1524,7 +1617,7 @@ def main():
         #
         # RM SYNTHETIC HALLUCINATIONS - STRUCTURED
         #
-        elif args.create_synthetic_hallus_struct:
+        elif args.synthetic_hallus_struct:
             # Apply the map that switches sentences to subset_2
             synthetic_hallucinations_struct_train_data = subset_2.map(
                 bosch_rm_synthetic_hall_structured, fn_kwargs=dict(data=dataset)
