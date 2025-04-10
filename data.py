@@ -1849,21 +1849,26 @@ def main():
         RM_dataset.push_to_hub("leobianco/ragtruth_rm_processed")
 
         #
-        # SYNTHETIC HALLUCINATIONS - LLM GENERATED
+        # SYNTHETIC HALLUCINATIONS
+        #
+
+        # Filter out non-hallucinations from the RM train dataset
+        train_RM_non_hallus = train_data.filter(
+            lambda x: x["class_hall"] == "No"
+        )
+
+        # Some (~1000) of them will be used as base for synthetic
+        train_RM_synth_llm = train_RM_non_hallus.select(range(1000))
+        # The rest will be non-hallus. training samples
+        train_RM_non_hallus = train_RM_non_hallus.select(
+            range(1000, train_RM_non_hallus.num_rows)
+        )
+
+        #
+        # LLM GENERATED
         #
 
         if args.synthetic_hallus_llm:
-            # Filter out non-hallucinations from the RM train dataset
-            train_RM_non_hallus = train_data.filter(
-                lambda x: x["class_hall"] == "No"
-            )
-
-            # Some (~1000) of them will be used as base for synthetic
-            train_RM_synth_llm = train_RM_non_hallus.select(range(1000))
-            train_RM_non_hallus = train_RM_non_hallus.select(
-                range(1000, train_RM_non_hallus.num_rows)
-            )
-
             # API config
             client = genai.Client(api_key=args.gemini_api_key)
             gemini_model = "gemini-2.0-flash-001"
@@ -1916,6 +1921,49 @@ def main():
                     repo_id=args.rm_processed_repo_id + "_synthetic_llm",
                     split=split,
                 )
+
+        #
+        # STRUCTURED
+        #
+        elif args.synthetic_hallus_struct:
+            # Tbh, you can use the same bosch_rm_synthetic_hall_structured
+            # function that was used for Bosch, and then retokenize.
+            synthetic_hallucinations_struct = train_RM_synth_llm.map(
+                bosch_rm_synthetic_hall_structured,
+                fn_kwargs=dict(data=train_data)
+            )
+
+            # Reconstruct prompts and retokenize
+            synthetic_hallucinations_struct = synthetic_hallucinations_struct.map(lambda x: {"prompt": "<start_of_turn>user\n" + x["user_query"] + "<end_of_turn>\n<start_of_turn><model>\n" + x["response"] + "<end_of_turn><eos>"})
+
+            synthetic_hallucinations_struct = synthetic_hallucinations_struct.map(
+                encode,
+                batched=True,
+                fn_kwargs={
+                    "tokenizer": tokenizer,
+                    "max_seq_length": args.max_seq_length,
+                },
+            )
+            synthetic_hallucinations_struct.set_format("torch")
+
+            # Add the non-hallucinated samples and shuffle
+            synthetic_hallucinations_struct_train_data = concatenate_datasets(
+                [synthetic_hallucinations_struct, train_RM_non_hallus]
+            ).shuffle(seed=args.seed)
+
+            # Put together with test split
+            synthetic_hallucinations_struct_data = DatasetDict({
+                "train": synthetic_hallucinations_struct_train_data,
+                "test": test_RM,
+            })
+
+            # Save
+            for split in synthetic_hallucinations_struct_data.keys():
+                synthetic_hallucinations_struct_data[split].push_to_hub(
+                    repo_id=args.rm_processed_repo_id + "_synthetic_struct",
+                    split=split,
+                )
+            
 
         # Convert the PERL data and save to HF Hub
         perl_dataset = Dataset.from_pandas(perl_data)
