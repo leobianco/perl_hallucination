@@ -785,8 +785,10 @@ def npov_process_data_for_perl(
 
 def npov_data_augmentation(data):
     """
-    Augment NPOV dataset by generating combinations of arguments
-    for different perspectives on each topic.
+    Augment NPOV dataset by
+    (1) Adding more unique perspectives to some topics.
+    (2) Generating combinations of arguments for different perspectives
+    on each topic.
 
     Notice that for the moment I have hard coded pairs of arguments.
     Initially, the different topics do not have the same amount of
@@ -824,12 +826,38 @@ def npov_data_augmentation(data):
 
         return arguments
 
+    # Load new perspectives from CSV
+    # hard coded the file name due to hurry -> ugly, fix later
+    new_perspectives = pd.read_csv("npov_new_perspectives.csv")
+
     for topic in topics:
         user_query = data.filter(lambda x: x["topic"] == topic)["user_query"][0]
 
         p1_args = extract_perspective_arguments(topic, "perspective_1", p1_name)
         p2_args = extract_perspective_arguments(topic, "perspective_2", p2_name)
 
+        # Filter new perspectives for the current topic
+        new_perspectives_for_topic = new_perspectives[
+            new_perspectives["topic"] == topic
+        ]
+
+        # Extract new pro and con arguments
+        new_p1_args = set(
+            new_perspectives_for_topic[
+                new_perspectives_for_topic["perspective"] == "pro"
+            ]["argument"]
+        )
+        new_p2_args = set(
+            new_perspectives_for_topic[
+                new_perspectives_for_topic["perspective"] == "con"
+            ]["argument"]
+        )
+
+        # Add new arguments to the existing ones
+        p1_args.update(new_p1_args)
+        p2_args.update(new_p2_args)
+
+        # Create combinations of perspectives
         p1_pairs = list(combinations(p1_args, 2))
         p2_pairs = list(combinations(p2_args, 2))
 
@@ -1776,8 +1804,8 @@ def main():
         #
 
         # Rename the original prompt column to a "user_query" column
-        train_data = train_data.rename_column("prompt", "user_query")
-        test_data = test_data.rename_column("prompt", "user_query")
+        train_data = train_data.rename(columns={"prompt": "user_query"})
+        test_data = test_data.rename(columns={"prompt": "user_query"})
 
         # The train data will be used to train the reward model.
         # However, the prompt must be modified to include the
@@ -1797,7 +1825,9 @@ def main():
         unique_prompts_for_perl = np.random.choice(
             test_data["user_query"].unique(), size=100
         )
-        perl_data = test_data[test_data["user_query"].isin(unique_prompts_for_perl)]
+        perl_data = test_data[
+            test_data["user_query"].isin(unique_prompts_for_perl)
+        ]
 
         # In the case of PERL, prompt = user_query
         perl_data["prompt"] = (
@@ -1808,7 +1838,9 @@ def main():
 
         # The rest of the entries in the test set (even with repeated prompts)
         # serve to validate the RM.
-        test_RM = test_data[~test_data["user_query"].isin(unique_prompts_for_perl)]
+        test_RM = test_data[
+            ~test_data["user_query"].isin(unique_prompts_for_perl)
+        ]
         test_RM["prompt"] = (
             "<start_of_turn>user\n"
             + test_RM["user_query"]
@@ -1817,12 +1849,12 @@ def main():
             + "<end_of_turn><eos>"
         )
 
-        # # Convert RM data to HF Dataset
-        # train_RM_dataset = Dataset.from_pandas(train_data)
-        # test_RM_dataset = Dataset.from_pandas(test_RM)
+        # Convert RM data to HF Dataset
+        train_RM_dataset = Dataset.from_pandas(train_data)
+        test_RM_dataset = Dataset.from_pandas(test_RM)
 
         # Tokenize the RM data
-        train_data = train_data.map(
+        train_RM_dataset = train_RM_dataset.map(
             encode,
             batched=True,
             fn_kwargs={
@@ -1830,9 +1862,9 @@ def main():
                 "max_seq_length": args.max_seq_length,
             },
         )
-        train_data.set_format("torch")  # due to using map()
+        train_RM_dataset.set_format("torch")  # due to using map()
 
-        test_RM = test_RM.map(
+        test_RM_dataset = test_RM_dataset.map(
             encode,
             batched=True,
             fn_kwargs={
@@ -1840,11 +1872,11 @@ def main():
                 "max_seq_length": args.max_seq_length,
             },
         )
-        test_RM.set_format("torch")  # due to using map()
+        test_RM_dataset.set_format("torch")  # due to using map()
 
         # Save to HF Hub
         RM_dataset = DatasetDict(
-            {"train": train_data, "test": test_RM}
+            {"train": train_RM_dataset, "test": test_RM_dataset}
         )
         RM_dataset.push_to_hub("leobianco/ragtruth_rm_processed")
 
@@ -1853,7 +1885,7 @@ def main():
         #
 
         # Filter out non-hallucinations from the RM train dataset
-        train_RM_non_hallus = train_data.filter(
+        train_RM_non_hallus = train_RM_dataset.filter(
             lambda x: x["class_hall"] == "No"
         )
 
@@ -1890,7 +1922,15 @@ def main():
 
             # Since the response changed, you need to rewrite the
             # prompt, and retokenize
-            synthetic_hallucinations_llm = synthetic_hallucinations_llm.map(lambda x: {"prompt": "<start_of_turn>user\n" + x["user_query"] + "<end_of_turn>\n<start_of_turn><model>\n" + x["response"] + "<end_of_turn><eos>"})
+            synthetic_hallucinations_llm = synthetic_hallucinations_llm.map(
+                lambda x: {
+                    "prompt": "<start_of_turn>user\n"
+                    + x["user_query"]
+                    + "<end_of_turn>\n<start_of_turn><model>\n"
+                    + x["response"]
+                    + "<end_of_turn><eos>"
+                }
+            )
 
             synthetic_hallucinations_llm = synthetic_hallucinations_llm.map(
                 encode,
@@ -1901,7 +1941,7 @@ def main():
                 },
             )
             synthetic_hallucinations_llm.set_format("torch")
-            
+
             # Now we create the RM training data
             synthetic_hallucinations_llm_train_data = concatenate_datasets(
                 [synthetic_hallucinations_llm, train_RM_non_hallus]
@@ -1911,7 +1951,7 @@ def main():
             synthetic_hallucinations_llm_data = DatasetDict(
                 {
                     "train": synthetic_hallucinations_llm_train_data,
-                    "test": test_RM,
+                    "test": test_RM_dataset,
                 }
             )
 
@@ -1930,19 +1970,31 @@ def main():
             # function that was used for Bosch, and then retokenize.
             synthetic_hallucinations_struct = train_RM_synth_llm.map(
                 bosch_rm_synthetic_hall_structured,
-                fn_kwargs=dict(data=train_data)
+                fn_kwargs=dict(data=train_RM_dataset),
             )
 
             # Reconstruct prompts and retokenize
-            synthetic_hallucinations_struct = synthetic_hallucinations_struct.map(lambda x: {"prompt": "<start_of_turn>user\n" + x["user_query"] + "<end_of_turn>\n<start_of_turn><model>\n" + x["response"] + "<end_of_turn><eos>"})
+            synthetic_hallucinations_struct = (
+                synthetic_hallucinations_struct.map(
+                    lambda x: {
+                        "prompt": "<start_of_turn>user\n"
+                        + x["user_query"]
+                        + "<end_of_turn>\n<start_of_turn><model>\n"
+                        + x["response"]
+                        + "<end_of_turn><eos>"
+                    }
+                )
+            )
 
-            synthetic_hallucinations_struct = synthetic_hallucinations_struct.map(
-                encode,
-                batched=True,
-                fn_kwargs={
-                    "tokenizer": tokenizer,
-                    "max_seq_length": args.max_seq_length,
-                },
+            synthetic_hallucinations_struct = (
+                synthetic_hallucinations_struct.map(
+                    encode,
+                    batched=True,
+                    fn_kwargs={
+                        "tokenizer": tokenizer,
+                        "max_seq_length": args.max_seq_length,
+                    },
+                )
             )
             synthetic_hallucinations_struct.set_format("torch")
 
@@ -1952,10 +2004,12 @@ def main():
             ).shuffle(seed=args.seed)
 
             # Put together with test split
-            synthetic_hallucinations_struct_data = DatasetDict({
-                "train": synthetic_hallucinations_struct_train_data,
-                "test": test_RM,
-            })
+            synthetic_hallucinations_struct_data = DatasetDict(
+                {
+                    "train": synthetic_hallucinations_struct_train_data,
+                    "test": test_RM_dataset,
+                }
+            )
 
             # Save
             for split in synthetic_hallucinations_struct_data.keys():
@@ -1963,7 +2017,6 @@ def main():
                     repo_id=args.rm_processed_repo_id + "_synthetic_struct",
                     split=split,
                 )
-            
 
         # Convert the PERL data and save to HF Hub
         perl_dataset = Dataset.from_pandas(perl_data)
