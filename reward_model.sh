@@ -10,10 +10,16 @@ else
   SYN_HALL_STRUCT=true
   DATASET_REPO_ID="leobianco/${TASK}_rm_processed"
   DEEPSPEED_CONFIG="./deepspeed_config.yaml"
-  SEED=130104
-  NUM_TRAIN_EPOCHS=3
-  LEARNING_RATE=1e-3
+  SEED=12345
+  NUM_TRAIN_EPOCHS=2
+  BATCH_SIZE=2
+  LEARNING_RATE=5e-5
+  LR_SCHEDULER_TYPE="cosine"
+  WARMUP_RATIO=0.15
   LORA_RANK=8
+  LORA_ALPHA=8
+  LORA_DROPOUT=0.1
+  WEIGHT_DECAY=5e-4
   RUN_IDENTIFIER="leobianco/${TASK}_RM_seed_${SEED}_SYN_LLM_${SYN_HALL_LLM}_SYN_STRUCT_${SYN_HALL_STRUCT}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_lora_${LORA_RANK}"
 fi
 
@@ -52,14 +58,18 @@ accelerate launch \
   --save_strategy "epoch" \
   --num_train_epochs "$NUM_TRAIN_EPOCHS" \
   --learning_rate "$LEARNING_RATE" \
-  --weight_decay 0.0 \
-  --per_device_train_batch_size 1 \
+  --lr_scheduler_type "$LR_SCHEDULER_TYPE" \
+  --warmup_ratio "$WARMUP_RATIO" \
+  --weight_decay "$WEIGHT_DECAY" \
+  --per_device_train_batch_size "$BATCH_SIZE" \
   --gradient_accumulation_steps 1 \
   --do_eval True \
   --eval_on_start True \
   --eval_strategy "steps" \
   --eval_steps 20 \
-  --per_device_eval_batch_size 1 \
+  --per_device_eval_batch_size "$BATCH_SIZE" \
   --eval_accumulation_steps 1 \
   --task_type "SEQ_CLS" \
-  --r "$LORA_RANK"
+  --r "$LORA_RANK" \
+  --lora_alpha "$LORA_ALPHA" \
+  --lora_dropout "$LORA_DROPOUT" 
