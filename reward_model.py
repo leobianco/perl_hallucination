@@ -43,6 +43,10 @@ def main():
         script_args.model_repo_id,
         padding_side="left",
     )
+    NEED_TO_RESIZE_VOCAB=False
+    if 'pad_token' not in tokenizer.special_tokens_map.keys():
+        tokenizer.add_special_tokens({'pad_token': '<pad>'})
+        NEED_TO_RESIZE_VOCAB=True
 
     def encode(examples):
         return tokenizer(
@@ -90,6 +94,9 @@ def main():
         torch_dtype=torch_dtype,
         attn_implementation="eager",
     )
+
+    if NEED_TO_RESIZE_VOCAB:
+        reward_model.resize_token_embeddings(len(tokenizer))
 
     reward_model = get_peft_model(reward_model, peft_args)
 
