@@ -80,6 +80,7 @@ def main():
         label2id=label2id,
         torch_dtype=torch_dtype,
         attn_implementation="eager",
+        use_cache=False,
     )
 
     reward_model = get_peft_model(reward_model, peft_args)

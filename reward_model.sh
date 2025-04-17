@@ -7,14 +7,14 @@ else
   # If single-run, set variables here.
   TASK="$1"
   SYN_HALL_LLM=false
-  SYN_HALL_STRUCT=true
+  SYN_HALL_STRUCT=false
   DATASET_REPO_ID="leobianco/${TASK}_rm_processed"
   DEEPSPEED_CONFIG="./deepspeed_config.yaml"
-  MODEL_REPO_ID="google/gemma-2-2b-it"
+  MODEL_REPO_ID="mistralai/Mistral-7B-Instruct-v0.3"
   SEED=12345
   PRECISION="BF16"  # BF16 for Gemma, Mistral, Qwen
   NUM_TRAIN_EPOCHS=2
-  BATCH_SIZE=2
+  BATCH_SIZE=1
   LEARNING_RATE=5e-5
   LR_SCHEDULER_TYPE="cosine"
   WARMUP_RATIO=0.15
