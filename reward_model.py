@@ -5,6 +5,7 @@ TODO: clean imports.
 
 import os
 
+import torch
 import evaluate
 import numpy as np
 from datasets import load_dataset
@@ -42,6 +43,13 @@ def main():
         padding_side="left",
     )
 
+    if script_args.fp16:
+        torch_dtype=torch.float16
+    elif script_args.bf16:
+        torch_dtype=torch.bfloat16
+    else:
+        raise Exception("Not training in mixed precision!")
+
     # DATA
     rm_data = load_dataset(script_args.dataset_repo_id)
 
@@ -61,13 +69,9 @@ def main():
         num_labels=2,
         id2label=id2label,
         label2id=label2id,
+        torch_dtype=torch_dtype,
         attn_implementation="eager",
     )
-
-    if training_args.resume_from_checkpoint is not None:
-        reward_model = PeftModel.from_pretrained(
-            reward_model, training_args.resume_from_checkpoint
-        )
 
     reward_model = get_peft_model(reward_model, peft_args)
 

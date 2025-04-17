@@ -10,7 +10,9 @@ else
   SYN_HALL_STRUCT=true
   DATASET_REPO_ID="leobianco/${TASK}_rm_processed"
   DEEPSPEED_CONFIG="./deepspeed_config.yaml"
+  MODEL_REPO_ID="google/gemma-2-2b-it"
   SEED=12345
+  PRECISION="BF16"  # BF16 for Gemma, FP16 for Mistral
   NUM_TRAIN_EPOCHS=2
   BATCH_SIZE=2
   LEARNING_RATE=5e-5
@@ -20,7 +22,19 @@ else
   LORA_ALPHA=8
   LORA_DROPOUT=0.1
   WEIGHT_DECAY=5e-4
-  RUN_IDENTIFIER="leobianco/${TASK}_RM_seed_${SEED}_SYN_LLM_${SYN_HALL_LLM}_SYN_STRUCT_${SYN_HALL_STRUCT}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_lora_${LORA_RANK}"
+  MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $2}')
+  RUN_IDENTIFIER="leobianco/${TASK}_RM_model_${MODEL_NAME}_seed_${SEED}_SYN_LLM_${SYN_HALL_LLM}_SYN_STRUCT_${SYN_HALL_STRUCT}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_lora_${LORA_RANK}"
+fi
+
+if [ "$PRECISION" = "FP16" ]; then
+  FP16="True"
+  BF16="False"
+elif [ "$PRECISION" = "BF16" ]; then
+  FP16="False"
+  BF16="True"
+else
+  echo "Invalid PRECISION value. Must be 'FP16' or 'BF16'."
+  exit 1
 fi
 
 if [ "$TASK" != "ragtruth" ] && [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ]; then
@@ -52,9 +66,10 @@ accelerate launch \
   --push_to_hub True \
   --hub_model_id "$RUN_IDENTIFIER" \
   --dataset_repo_id "${DATASET_REPO_ID}" \
-  --model_repo_id "google/gemma-2-2b-it" \
+  --model_repo_id "${MODEL_REPO_ID}" \
   --do_train True \
-  --bf16 True \
+  --fp16 "$FP16" \
+  --bf16 "$BF16" \
   --save_strategy "epoch" \
   --num_train_epochs "$NUM_TRAIN_EPOCHS" \
   --learning_rate "$LEARNING_RATE" \
@@ -70,6 +85,7 @@ accelerate launch \
   --per_device_eval_batch_size "$BATCH_SIZE" \
   --eval_accumulation_steps 1 \
   --task_type "SEQ_CLS" \
+  --peft_type "LORA" \
   --r "$LORA_RANK" \
   --lora_alpha "$LORA_ALPHA" \
   --lora_dropout "$LORA_DROPOUT" 
