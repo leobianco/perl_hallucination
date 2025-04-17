@@ -42,11 +42,20 @@ def main():
         script_args.model_repo_id,
         padding_side="left",
     )
+    # Make special tokens (pad, end of sequence) common to all models
+    tokenizer.add_special_tokens(
+        {
+            "pad_token": "<pad>",
+            "bos_token": "<bos>",
+            "eos_token": "<eos>",
+            "unk_token": "<unk>",
+        }
+    )
 
     if training_args.fp16:
-        torch_dtype=torch.float16
+        torch_dtype = torch.float16
     elif training_args.bf16:
-        torch_dtype=torch.bfloat16
+        torch_dtype = torch.bfloat16
     else:
         raise Exception("Not training in mixed precision!")
 
