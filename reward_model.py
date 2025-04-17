@@ -43,6 +43,8 @@ def main():
         script_args.model_repo_id,
         padding_side="left",
     )
+    
+    # Some models (e.g. Mistral) don't have a pad token, so we add it.
     NEED_TO_RESIZE_VOCAB=False
     if 'pad_token' not in tokenizer.special_tokens_map.keys():
         tokenizer.add_special_tokens({'pad_token': '<pad>'})
@@ -51,7 +53,6 @@ def main():
     def encode(examples):
         return tokenizer(
             examples["prompt"],
-            padding=True,
             truncation=True,
             return_tensors="pt",  # using map() => set_format("torch") later
         )
@@ -95,6 +96,7 @@ def main():
         attn_implementation="eager",
     )
 
+    # If pad token was added, need to resize embeddings.
     if NEED_TO_RESIZE_VOCAB:
         reward_model.resize_token_embeddings(len(tokenizer))
 
