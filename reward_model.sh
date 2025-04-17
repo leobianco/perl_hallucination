@@ -12,7 +12,7 @@ else
   DEEPSPEED_CONFIG="./deepspeed_config.yaml"
   MODEL_REPO_ID="google/gemma-2-2b-it"
   SEED=12345
-  PRECISION="BF16"  # BF16 for Gemma, FP16 for Mistral
+  PRECISION="BF16"  # BF16 for Gemma, Mistral, Qwen
   NUM_TRAIN_EPOCHS=2
   BATCH_SIZE=2
   LEARNING_RATE=5e-5

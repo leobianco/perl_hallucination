@@ -43,9 +43,9 @@ def main():
         padding_side="left",
     )
 
-    if script_args.fp16:
+    if training_args.fp16:
         torch_dtype=torch.float16
-    elif script_args.bf16:
+    elif training_args.bf16:
         torch_dtype=torch.bfloat16
     else:
         raise Exception("Not training in mixed precision!")
