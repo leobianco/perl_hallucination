@@ -22,7 +22,7 @@ else
   LORA_ALPHA=8
   LORA_DROPOUT=0.1
   WEIGHT_DECAY=5e-4
-  MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $2}')
+  MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
   RUN_IDENTIFIER="leobianco/${TASK}_RM_model_${MODEL_NAME}_seed_${SEED}_SYN_LLM_${SYN_HALL_LLM}_SYN_STRUCT_${SYN_HALL_STRUCT}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_lora_${LORA_RANK}"
 fi
 
