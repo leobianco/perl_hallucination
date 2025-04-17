@@ -6,6 +6,7 @@ if [ $SHLVL -gt 2 ]; then
 else
   # If single-run, set variables here.
   TASK="$1"
+  ORGANIC=true
   SYN_HALL_LLM=false
   SYN_HALL_STRUCT=false
   DATASET_REPO_ID="leobianco/${TASK}_rm_processed"
@@ -40,6 +41,11 @@ fi
 if [ "$TASK" != "ragtruth" ] && [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ]; then
     echo "Invalid task name"
     exit 1
+fi
+
+if [ "$ORGANIC" = true ]; then
+  DATASET_REPO_ID=$DATASET_REPO_ID"_organic"
+  echo "Using dataset ${DATASET_REPO_ID}"
 fi
 
 if [ "$SYN_HALL_LLM" = true ]; then

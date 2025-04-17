@@ -12,6 +12,7 @@ from datasets import load_dataset
 from peft import PeftModel, get_peft_model
 from transformers import (
     AutoModelForSequenceClassification,
+    DataCollatorWithPadding,
     AutoTokenizer,
     HfArgumentParser,
     Trainer,
@@ -42,15 +43,16 @@ def main():
         script_args.model_repo_id,
         padding_side="left",
     )
-    # Make special tokens (pad, end of sequence) common to all models
-    tokenizer.add_special_tokens(
-        {
-            "pad_token": "<pad>",
-            "bos_token": "<bos>",
-            "eos_token": "<eos>",
-            "unk_token": "<unk>",
-        }
-    )
+
+    def encode(examples):
+        return tokenizer(
+            examples["prompt"],
+            padding=True,
+            truncation=True,
+            return_tensors="pt",  # using map() => set_format("torch") later
+        )
+
+    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
     if training_args.fp16:
         torch_dtype = torch.float16
@@ -58,9 +60,6 @@ def main():
         torch_dtype = torch.bfloat16
     else:
         raise Exception("Not training in mixed precision!")
-
-    # DATA
-    rm_data = load_dataset(script_args.dataset_repo_id)
 
     id2label = {
         0: "Yes",
@@ -72,6 +71,16 @@ def main():
         "No": 1,
     }
 
+    # DATA
+    rm_data = load_dataset(script_args.dataset_repo_id)
+
+    for split in rm_data.keys():
+        rm_data[split] = rm_data[split].map(
+            encode,
+            batched=True,
+        )
+        rm_data[split].set_format("torch")  # due to using map()
+
     # MODEL
     reward_model = AutoModelForSequenceClassification.from_pretrained(
         script_args.model_repo_id,
@@ -80,7 +89,6 @@ def main():
         label2id=label2id,
         torch_dtype=torch_dtype,
         attn_implementation="eager",
-        use_cache=False,
     )
 
     reward_model = get_peft_model(reward_model, peft_args)
@@ -118,6 +126,7 @@ def main():
         train_dataset=rm_data["train"],
         eval_dataset=rm_data["test"],
         processing_class=tokenizer,
+        data_collator=data_collator,
         compute_metrics=compute_metrics,
     )
 

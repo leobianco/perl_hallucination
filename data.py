@@ -478,8 +478,6 @@ def npov_rm_prompt(entry):
 
 def npov_process_data_for_rm(
     npov_data,
-    tokenizer,
-    max_seq_length=512,
 ):
     # Copy original NPOV data
     npov_rm_data = deepcopy(npov_data)
@@ -513,15 +511,6 @@ def npov_process_data_for_rm(
     npov_rm_data = npov_rm_data.map(npov_hallucination_labels_to_numerical)
     npov_rm_data = npov_rm_data.map(npov_omission_labels_to_numerical)
     npov_rm_data = npov_rm_data.map(npov_rm_prompt)
-    npov_rm_data = npov_rm_data.map(
-        encode,
-        batched=True,
-        fn_kwargs={
-            "tokenizer": tokenizer,
-            "max_seq_length": max_seq_length,
-        },
-    )
-    npov_rm_data.set_format("torch")  # due to using map()
     npov_rm_data = npov_rm_data.rename_column("class_hall_num", "label")
 
     return npov_rm_data
@@ -1307,8 +1296,6 @@ def main():
         for split in npov_rm_data.keys():
             npov_rm_data[split] = npov_process_data_for_rm(
                 npov_rm_data[split],
-                tokenizer,
-                max_seq_length=args.max_seq_length,
             )
 
         #
@@ -1340,16 +1327,49 @@ def main():
         )
 
         #
-        # SYNTHETIC HALLUCINATIONS
+        # ORGANIC HALLUCINATIONS
         #
 
-        # In any case, we want to evaluate the RM on organic hallucinations only
-        npov_rm_data["validation"] = npov_rm_data["validation"].filter(
+        # Copy data
+        npov_rm_data_organic = deepcopy(npov_rm_data)
+
+        # Filter out synthetic hallucinations from train set
+        npov_rm_data_organic["train"] = npov_rm_data_organic["train"].filter(
             lambda x: not (
                 x["class_hall"] == "Yes"
                 and x["has synthetic hallucination"] == "Yes"
             )
         )
+
+        # Filter out synthetic hallucinations from validation set
+        npov_rm_data_organic["validation"] = npov_rm_data_organic[
+            "validation"
+        ].filter(
+            lambda x: not (
+                x["class_hall"] == "Yes"
+                and x["has synthetic hallucination"] == "Yes"
+            )
+        )
+
+        # Put in splits and save
+        npov_rm_data_organic_dataset = DatasetDict(
+            {
+                "train": npov_rm_data_organic["train"],
+                "test": npov_rm_data_organic["validation"],
+            }
+        )
+
+        npov_rm_data_organic_dataset.push_to_hub(
+            repo_id=args.rm_processed_repo_id+"_organic"
+        )
+
+        # Release memory
+        del npov_rm_data_organic_dataset
+        del npov_rm_data_organic
+
+        #
+        # SYNTHETIC HALLUCINATIONS
+        #
 
         # STRUCTURED CASE
 
@@ -1361,45 +1381,77 @@ def main():
         # both the RM and PERL on the same examples.
 
         if args.synthetic_hallus_struct:
-            npov_rm_train_non_and_structured = npov_rm_data["train"].filter(
+            # Copy data
+            npov_rm_data_synth_struct = deepcopy(npov_rm_data)
+
+            # Filter out organic hallucinations from train set
+            npov_rm_data_synth_struct["train"] = npov_rm_data_synth_struct["train"].filter(
                 lambda x: not (
                     x["class_hall"] == "Yes"
                     and x["has synthetic hallucination"] == "No"
                 )
             )
 
-            npov_rm_non_and_structured = DatasetDict(
+            # Filter out synthetic hallucinations from validation set
+            npov_rm_data_synth_struct["validation"] = npov_rm_data_synth_struct[
+                "validation"
+            ].filter(
+                lambda x: not (
+                    x["class_hall"] == "Yes"
+                    and x["has synthetic hallucination"] == "Yes"
+                )
+            )
+
+            # Put in splits and save
+            npov_rm_data_synth_struct_dataset = DatasetDict(
                 {
-                    "train": npov_rm_train_non_and_structured,
-                    "test": npov_rm_data["validation"],
+                    "train": npov_rm_data_synth_struct["train"],
+                    "test": npov_rm_data_synth_struct["validation"],
                 }
             )
 
-            for split in npov_rm_non_and_structured.keys():
-                npov_rm_non_and_structured[split].push_to_hub(
-                    repo_id=args.rm_processed_repo_id + "_synthetic_struct",
-                    split=split,
-                )
+            npov_rm_data_synth_struct_dataset.push_to_hub(
+                repo_id=args.rm_processed_repo_id+"_synthetic_struct"
+            )
+
+            # Release memory
+            del npov_rm_data_synth_struct_dataset
+            del npov_rm_data_synth_struct
 
         #
         # LLM-GENERATED SYNTHETIC HALLUCINATIONS
         #
-        elif args.synthetic_hallus_llm:
-            npov_rm_train_non = npov_rm_data["train"].filter(
-                lambda x: x["class_hall"] == "No"
+        if args.synthetic_hallus_llm:
+            # Copy data
+            npov_rm_data_synth_llm = deepcopy(npov_rm_data)
+
+            # Filter out synthetic hallucinations from validation set
+            npov_rm_data_synth_llm["validation"] = npov_rm_data_synth_llm[
+                "validation"
+            ].filter(
+                lambda x: not (
+                    x["class_hall"] == "Yes"
+                    and x["has synthetic hallucination"] == "Yes"
+                )
             )
 
+            # Get non-hallucinations
+            npov_rm_train_non = npov_rm_data_synth_llm["train"].filter(
+                lambda x: x["class_hall"] == "No"
+            ).shuffle(seed=args.seed)
+
             # We use some non-hallus. to generate synthetic hallus.
-            npov_rm_train_synth_llm = npov_rm_train_non.select(range(100))
+            quantity_synth_llm = 100  # TODO: move to script arguments
+            npov_rm_train_synth_llm = npov_rm_train_non.select(range(quantity_synth_llm))
             npov_rm_train_non = npov_rm_train_non.select(
-                range(100, npov_rm_train_non.num_rows)
+                range(quantity_synth_llm, npov_rm_train_non.num_rows)
             )
 
             # API config
             client = genai.Client(api_key=args.gemini_api_key)
             gemini_model = "gemini-2.0-flash-001"
             generation_config = types.GenerateContentConfig(
-                temperature=0.7,
+                temperature=0.7,  # TODO: move to script arguments
                 seed=args.seed,
             )
 
@@ -1423,18 +1475,16 @@ def main():
             synthetic_hallucinations_llm_data = DatasetDict(
                 {
                     "train": synthetic_hallucinations_llm_train_data,
-                    "test": npov_rm_data["validation"],
+                    "test": npov_rm_data_synth_llm["validation"],
                 }
             )
 
             # Since the response changed, you need to rewrite the
-            # prompt and retokenize
+            # prompt
             for split in synthetic_hallucinations_llm_data.keys():
                 synthetic_hallucinations_llm_data[split] = (
                     npov_process_data_for_rm(
                         synthetic_hallucinations_llm_data[split],
-                        tokenizer,
-                        max_seq_length=args.max_seq_length,
                     )
                 )
 
