@@ -53,6 +53,7 @@ def main():
     def encode(examples):
         return tokenizer(
             examples["prompt"],
+            padding=True,
             truncation=True,
             return_tensors="pt",  # using map() => set_format("torch") later
         )
