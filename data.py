@@ -21,360 +21,6 @@ from google import genai
 from google.genai import types
 from transformers import AutoTokenizer
 
-#####################
-# GENERAL FUNCTIONS #
-#####################
-
-
-def encode(batch, tokenizer=None, max_seq_length=512):
-    return tokenizer(
-        batch["prompt"],
-        padding="max_length",
-        truncation=True,
-        max_length=max_seq_length,
-        return_tensors="pt",  # though using map() => set_format("torch") later
-    )
-
-
-####################
-# HALOMI FUNCTIONS #
-####################
-
-
-# Preprocessing
-
-
-def halomi_hallucination_labels_to_numerical(entry):
-    """Data processing utility function which replaces the hallucination labels by
-    a numerical version."""
-
-    entry["class_hall_num"] = 0 if entry["class_hall"] == "Yes" else 1
-
-    return entry
-
-
-def halomi_omission_labels_to_numerical(entry):
-    """Data processing utility function which replaces the omission labels by
-    a numerical version."""
-
-    entry["class_omit_num"] = 0 if entry["class_omit"] == "Yes" else 1
-
-    return entry
-
-
-def halomi_change_language_labels(entry):
-    """Data processing utility function which replaces the language labels by the
-    natural language correspondent version.
-    """
-
-    lang_to_natural_lang = {
-        "eng_Latn": "English",
-        "kas_Deva": "Kashmiri",
-        "spa_Latn": "Spanish",
-        "mni_Beng": "Manipuri",
-        "yor_Latn": "Yoruba",
-        "deu_Latn": "German",
-        "zho_Hans": "Mandarin",
-        "arb_Arab": "Modern Standard Arab",
-        "rus_Cyrl": "Russian",
-    }
-
-    entry["src_lang"] = lang_to_natural_lang[entry["src_lang"]]
-    entry["tgt_lang"] = lang_to_natural_lang[entry["tgt_lang"]]
-
-    return entry
-
-
-def halomi_change_hallucination_labels(entry):
-    """Data processing utility function which replaces the hallucination labels by
-    a simplified version.
-    """
-
-    class_hallucination_to_label = {
-        "1_No_hallucination": "No",
-        "2_Small_hallucination": "Yes",
-        "3_Partial_hallucination": "Yes",
-        "4_Full_hallucination": "Yes",
-    }
-
-    entry["class_hall"] = class_hallucination_to_label[entry["class_hall"]]
-
-    return entry
-
-
-def halomi_change_omission_labels(entry):
-    """Data processing utility function which replaces the omission labels by
-    a simplified version.
-    """
-
-    class_omit_to_label = {
-        "1_No_omission": "No",
-        "2_Small_omission": "Yes",
-        "3_Partial_omission": "Yes",
-        "4_Full_omission": "Yes",
-    }
-
-    entry["class_omit"] = class_omit_to_label[entry["class_omit"]]
-
-    return entry
-
-
-def halomi_process_data(data_halomi, seed: int = 12345):
-    """Preprocesses the HalOmi dataset."""
-
-    # Select relevant subset of columns
-    data_halomi = data_halomi.select_columns(
-        [
-            "src_lang",
-            "tgt_lang",
-            "src_text",
-            "mt_text",
-            "class_hall",
-            "class_omit",
-        ]
-    )
-
-    # Restrict ourselves only to English <-> Spanish examples
-    included_langs = ["eng_Latn", "spa_Latn"]
-
-    data_halomi = data_halomi.filter(
-        lambda example: (
-            example["src_lang"] in included_langs
-            and example["tgt_lang"] in included_langs
-        )
-    )
-
-    # Change language labels to natural language
-    data_halomi = data_halomi.map(halomi_change_language_labels)
-
-    # Change hallucination labels to 'Yes' or 'No'
-    data_halomi = data_halomi.map(halomi_change_hallucination_labels)
-
-    # Add numerical version of hallucination
-    data_halomi = data_halomi.map(halomi_hallucination_labels_to_numerical)
-
-    # Change omission labels to 'Yes' or 'No'
-    data_halomi = data_halomi.map(halomi_change_omission_labels)
-
-    # Add numerical version of omission
-    data_halomi = data_halomi.map(halomi_omission_labels_to_numerical)
-
-    # Shuffle rows to mix languages and examples
-    data_halomi = data_halomi.shuffle(seed=seed)
-
-    return data_halomi
-
-
-def halomi_load_and_process_data(seed: int = 12345):
-    """Loads HalOmi data that is saved in my HF Hub."""
-
-    data_halomi = load_dataset(
-        "leobianco/halomi",
-        data_files={"train": "halomi_full.tsv"},
-        sep="\t",
-        split="train",
-    )
-
-    data_halomi = halomi_process_data(data_halomi, seed)
-
-    return data_halomi
-
-
-# Reward Model
-
-
-def halomi_rm_prompt(entry):
-    """Function for transforming entries in the HalOmi dataset into training
-    prompts for the reward model.
-    """
-
-    template = (
-        "<start_of_turn>user\n"
-        "Translate a text originally written in {src_lang} into {tgt_lang}. "
-        "Generate only the translated text, and nothing else."
-        "\nOriginal text: {src_text}"
-        "\nTranslated text:<end_of_turn>\n<start_of_turn>model\n{mt_text}<end_of_turn><eos>"
-    )
-
-    formatted_prompt = template.format(
-        src_lang=entry["src_lang"],
-        tgt_lang=entry["tgt_lang"],
-        src_text=entry["src_text"],
-        mt_text=entry["mt_text"],
-    )
-
-    entry["prompt"] = formatted_prompt
-
-    return entry
-
-
-def halomi_process_data_for_rm(
-    halomi_data,
-    tokenizer,
-    max_seq_length=512,
-    validation_size=0.25,
-    seed=12345,
-):
-    # Copy original Halomi data
-    halomi_rm_data = deepcopy(halomi_data)
-
-    # Create reward model HalOmi prompts
-    halomi_rm_data = halomi_rm_data.map(halomi_rm_prompt)
-
-    # Tokenize reward model prompts
-    halomi_rm_data = halomi_rm_data.map(
-        encode,
-        batched=True,
-        fn_kwargs={
-            "tokenizer": tokenizer,
-            "max_seq_length": max_seq_length,
-        },
-    )
-    halomi_rm_data.set_format("torch")  # due to using map()
-
-    # Rename hallucination class to label
-    halomi_rm_data = halomi_rm_data.rename_column("class_hall_num", "label")
-
-    # Split the dataset
-    halomi_rm_data = halomi_rm_data.train_test_split(
-        seed=seed, test_size=validation_size
-    )
-
-    return halomi_rm_data
-
-
-# Writer SFT
-
-
-def halomi_process_data_for_sft(halomi_processed_data):
-    """Data processing utility function which filters the HalOmi dataset to only
-    include examples that are not hallucinations or omissions.
-    """
-
-    writer_sft_processed = halomi_processed_data.filter(
-        lambda example: (
-            example["class_hall"] == "No" and example["class_omit"] == "No"
-        )
-    )
-
-    return writer_sft_processed
-
-
-def halomi_writer_prompt(entry, SFT=False):
-    """Function for transforming entries in the HalOmi dataset into prompts for
-    the writer to translate.
-
-    Previously used for SFT, but now used as prompt for generation during PERL.
-    The SFT now uses the "halomi_formatting_prompts_func" function, which has
-    the same prompt as this one, but is used by the SFTTrainer differently.
-    """
-
-    template = (
-        "<start_of_turn>user\n"
-        "Translate a text originally written in {src_lang} into {tgt_lang}. "
-        "Generate only the translated text, and nothing else."
-        "\nOriginal text: {src_text}"
-        "\nTranslated text:<end_of_turn>\n<start_of_turn>model\n{ans}"
-    )
-
-    ans = (entry["mt_text"] + "<end_of_turn><eos>") if SFT else ""
-
-    formatted_prompt = template.format(
-        src_lang=entry["src_lang"],
-        tgt_lang=entry["tgt_lang"],
-        src_text=entry["src_text"],
-        ans=ans,
-    )
-
-    entry["prompt"] = formatted_prompt
-
-    return entry
-
-
-def halomi_formatting_prompts_func(entry):
-    """Formatting function for SFTTrainer. Imported in writer_sft.py."""
-
-    template = (
-        "<start_of_turn>user\n"
-        "Translate a text originally written in {src_lang} into {tgt_lang}. "
-        "Generate only the translated text, and nothing else."
-        "\nOriginal text: {src_text}"
-    )
-
-    output_texts = []
-
-    for i in range(len(entry["src_text"])):
-        formatted_prompt = template.format(
-            src_lang=entry["src_lang"][i],
-            tgt_lang=entry["tgt_lang"][i],
-            src_text=entry["src_text"][i],
-        )
-
-        text = f"{formatted_prompt}\nTranslated text:<end_of_turn>\n<start_of_turn>model\n{entry['mt_text'][i]}<end_of_turn><eos>"
-
-        output_texts.append(text)
-
-    return output_texts
-
-
-# PERL
-
-
-def halomi_process_data_for_perl(
-    halomi_perl_data,
-    tokenizer,
-    max_seq_length=512,
-    seed=12345,
-    perl_train_size=1000,
-    perl_validation_size=500,
-):
-    # Half of it will be English -> Spanish, the other half Spanish -> English.
-    n = halomi_perl_data.num_rows
-    first_half = halomi_perl_data.select(range(n // 2))
-    second_half = halomi_perl_data.select(range(n // 2, n))
-
-    def halomi_format_perl_data(entry, src_lang: str, tgt_lang: str):
-        entry["src_lang"] = src_lang
-        entry["tgt_lang"] = tgt_lang
-        entry["src_text"] = entry[src_lang]
-        entry["mt_text"] = entry[tgt_lang]
-        return entry
-
-    first_half = first_half.map(
-        halomi_format_perl_data,
-        fn_kwargs=dict(src_lang="English", tgt_lang="Spanish"),
-    )
-
-    second_half = second_half.map(
-        halomi_format_perl_data,
-        fn_kwargs=dict(src_lang="Spanish", tgt_lang="English"),
-    )
-
-    halomi_perl_data = concatenate_datasets([first_half, second_half])
-    halomi_perl_data = halomi_perl_data.shuffle(seed=seed)
-
-    # Create and tokenize prompts for writer.
-    halomi_perl_data = halomi_perl_data.map(halomi_writer_prompt)
-
-    halomi_perl_data = halomi_perl_data.map(
-        encode,
-        batched=True,
-        fn_kwargs={
-            "tokenizer": tokenizer,
-            "max_seq_length": max_seq_length,
-        },
-    )
-    halomi_perl_data.set_format("torch")  # due to using map()
-
-    # Split into training, validation, and test splits.
-    halomi_perl_data = halomi_perl_data.train_test_split(
-        seed=seed,
-        train_size=perl_train_size,
-        test_size=perl_validation_size,
-    )
-
-    return halomi_perl_data
-
 
 ##################
 # NPOV FUNCTIONS #
@@ -709,7 +355,9 @@ def npov_formatting_prompts_func_from_fewshot_examples(fewshot_examples):
 
 
 def npov_process_data_for_perl(
-    npov_rm_data, npov_sft_data, tokenizer, max_seq_length=512, seed=12345
+    npov_rm_data,
+    npov_sft_data,
+    seed=12345,
 ):
     """
     Processes NPOV data for PERL by creating train and test splits
@@ -738,26 +386,6 @@ def npov_process_data_for_perl(
             "prompt",
         ]
     )
-
-    train_data = train_data.map(
-        encode,
-        batched=True,
-        fn_kwargs={
-            "tokenizer": tokenizer,
-            "max_seq_length": max_seq_length,
-        },
-    )
-    train_data.set_format("torch")
-
-    test_data = test_data.map(
-        encode,
-        batched=True,
-        fn_kwargs={
-            "tokenizer": tokenizer,
-            "max_seq_length": max_seq_length,
-        },
-    )
-    test_data.set_format("torch")
 
     npov_perl_data = DatasetDict(
         {
@@ -934,39 +562,46 @@ def npov_function_to_map_synthetic_halls_llm(
     }
 
 
+def bosch_load_and_process_data(data_path, flip_path):
+    # Load
+    data = pd.read_csv(data_path)
+    data_to_flip = pd.read_csv(flip_path)
+
+    # Filter unanswerable samples.
+    data = data.loc[data["Answerable"] == True].drop(
+        labels=["Answerable"], axis=1
+    )
+
+    # Flip labels of mis-annotated samples.
+    data.loc[
+        data["sample_id"].isin(data_to_flip["sample_id"]),
+        "Label",
+    ] = "Not Hallucinated"
+
+    # Rename and create necessary columns
+    data = data.rename({"Label": "class_hall", "Answer": "response"}, axis=1)
+    data["class_hall"] = data["class_hall"].apply(
+        lambda x: "Yes" if x == "Hallucinated" else "No"
+    )
+    data["label"] = data["class_hall"].apply(lambda x: 1 if x == "No" else 0)
+    data["prompt"] = (
+        "<start_of_turn><user>\nYou are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information giver. Do not add to your answer any information other than those present in the manual excerpt.\n"
+        + "User question:\n"
+        + data["Question"]
+        + "\nManual information:\n"
+        + data["Context"]
+        + "\nAnswer to user's question:<end_of_turn>\n<start_of_turn><model>\n"
+    )
+
+    return data
+
+
 def bosch_rm_prompt(entry):
     """The dataset already contains a prompt column, which is an instruction for the writer. We just append the generation."""
 
     entry["prompt"] += entry["response"] + "<end_of_turn><eos>"
 
     return entry
-
-
-def bosch_process_data_for_rm(
-    data,
-    tokenizer,
-    seed=12345,
-    max_seq_length=1340,
-    split_data=True,
-    validation_size=0.2,
-):
-    rm_data = deepcopy(data)
-
-    rm_data = rm_data.map(bosch_rm_prompt)
-    rm_data = rm_data.map(
-        encode,
-        batched=True,
-        fn_kwargs={
-            "tokenizer": tokenizer,
-            "max_seq_length": max_seq_length,
-        },
-    )
-    rm_data.set_format("torch")  # due to using map()
-
-    if split_data:
-        rm_data = rm_data.train_test_split(seed=seed, test_size=validation_size)
-
-    return rm_data
 
 
 def bosch_formatting_prompts_func(entry):
@@ -990,33 +625,6 @@ def bosch_formatting_prompts_func(entry):
         output_texts.append(formatted_prompt)
 
     return output_texts
-
-
-def bosch_process_data_for_perl(
-    data,
-    tokenizer,
-    max_seq_length=1340,
-    seed=12345,
-    validation_size=100,
-):
-    perl_data = deepcopy(data)
-
-    perl_data = perl_data.map(
-        encode,
-        batched=True,
-        fn_kwargs={
-            "tokenizer": tokenizer,
-            "max_seq_length": max_seq_length,
-        },
-    )
-    perl_data.set_format("torch")  # due to using map()
-
-    perl_data = perl_data.train_test_split(
-        seed=seed,
-        test_size=validation_size,
-    )
-
-    return perl_data
 
 
 def bosch_rm_synthetic_hall_structured(entry, data):
@@ -1202,14 +810,6 @@ def main():
     parser.add_argument("--task", type=str)
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument(
-        "--tokenizer_model", type=str, default="google/gemma-2-2b-it"
-    )
-    parser.add_argument("--max_seq_length", type=int, default=512)
-    parser.add_argument("--raw_repo_id", type=str)
-    parser.add_argument("--processed_repo_id", type=str)
-    parser.add_argument("--rm_processed_repo_id", type=str)
-    parser.add_argument("--rm_validation_size", type=float, default=0.2)
-    parser.add_argument(
         "--synthetic_hallus_llm",
         default=False,
         type=lambda x: (str(x).lower() == "true"),
@@ -1219,71 +819,14 @@ def main():
         default=False,
         type=lambda x: (str(x).lower() == "true"),
     )
-    parser.add_argument("--writer_sft_processed_repo_id", type=str)
-    parser.add_argument("--perl_raw_repo_id", type=str)
-    parser.add_argument("--perl_processed_repo_id", type=str)
-    parser.add_argument("--perl_train_size", type=int)
-    parser.add_argument("--perl_validation_size", type=int)
-    parser.add_argument("--augmented_repo_id", type=str)
+    parser.add_argument("--num_synth_hallus", type=int, default=0)
     parser.add_argument("--gemini_api_key", type=str)
+    parser.add_argument("--synth_llm_temperature", type=float, default=0.7)
+    parser.add_argument("--synth_llm_num_fewshot", type=int, default=2) 
     args = parser.parse_args()
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.tokenizer_model,
-        padding_side="left",  # Pay attention to this argument!
-    )
-
-    if args.task == "halomi":
-        halomi_processed_data = halomi_load_and_process_data(args.seed)
-
-        halomi_processed_data.push_to_hub(
-            repo_id=args.processed_repo_id,
-        )
-
-        halomi_rm_processed_data = halomi_process_data_for_rm(
-            halomi_processed_data,
-            tokenizer,
-            max_seq_length=args.max_seq_length,
-            validation_size=args.rm_validation_size,
-            seed=args.seed,
-        )
-
-        for split in halomi_rm_processed_data.keys():
-            halomi_rm_processed_data[split].push_to_hub(
-                repo_id=args.rm_processed_repo_id,
-                split=split,
-            )
-
-        halomi_writer_sft_processed = halomi_process_data_for_sft(
-            halomi_processed_data
-        )
-
-        halomi_writer_sft_processed.push_to_hub(
-            repo_id=args.writer_sft_processed_repo_id,
-        )
-
-        halomi_perl_data = load_dataset(
-            args.perl_raw_repo_id,
-            split="train",
-        )
-
-        halomi_perl_data_processed = halomi_process_data_for_perl(
-            halomi_perl_data,
-            tokenizer,
-            max_seq_length=args.max_seq_length,
-            seed=args.seed,
-            perl_train_size=args.perl_train_size,
-            perl_validation_size=args.perl_validation_size,
-        )
-
-        for split in halomi_perl_data_processed.keys():
-            halomi_perl_data_processed[split].push_to_hub(
-                repo_id=args.perl_processed_repo_id,
-                split=split,
-            )
-
-    elif args.task == "npov":
-        # Reward Model
+    if args.task == "npov":
+        # GENERAL DATA PROCESSING
         npov_rm_data = load_dataset(
             "leobianco/npov",
             data_files={
@@ -1297,12 +840,9 @@ def main():
             npov_rm_data[split] = npov_process_data_for_rm(
                 npov_rm_data[split],
             )
+            npov_rm_data[split].push_to_hub(repo_id=args.task + "_processed")
 
-        #
         # AUTORATER
-        #
-
-        # Version with all data
         npov_autorater_data = concatenate_datasets(
             [
                 npov_rm_data["train"],
@@ -1310,27 +850,17 @@ def main():
                 npov_rm_data["test"],
             ]
         )
-
-        # Version with organic hallucinations only
-        npov_autorater_data_organic_only = npov_autorater_data.filter(
+        # Keep organic hallucinations only
+        npov_autorater_data = npov_autorater_data.filter(
             lambda x: x["has synthetic hallucination"] == "No"
         )
-
-        # Save both versions
+        # Save
         npov_autorater_data.push_to_hub(
-            repo_id="npov_autorater_data_organic_and_synthetic",
-            split="test",
-        )
-        npov_autorater_data_organic_only.push_to_hub(
-            repo_id="npov_autorater_data_organic_only",
+            repo_id=args.task + "_autorater",
             split="test",
         )
 
-        #
         # ORGANIC HALLUCINATIONS
-        #
-
-        # Copy data
         npov_rm_data_organic = deepcopy(npov_rm_data)
 
         # Filter out synthetic hallucinations from train set
@@ -1360,67 +890,16 @@ def main():
         )
 
         npov_rm_data_organic_dataset.push_to_hub(
-            repo_id=args.rm_processed_repo_id+"_organic"
+            repo_id=args.task + "_rm_organic"
         )
 
         # Release memory
         del npov_rm_data_organic_dataset
         del npov_rm_data_organic
 
-        #
         # SYNTHETIC HALLUCINATIONS
-        #
 
-        # STRUCTURED CASE
-
-        # To train on synthetic hallucinations only and evaluate on organic,
-        # drop the organic ones from the training set, and the synthetic ones
-        # from the validation set. Do not mix splits, as this would mix topics.
-        # Do not pass the test set into the validation one, because it will be
-        # the test set for PERL later on and we agreed that we cannot test
-        # both the RM and PERL on the same examples.
-
-        if args.synthetic_hallus_struct:
-            # Copy data
-            npov_rm_data_synth_struct = deepcopy(npov_rm_data)
-
-            # Filter out organic hallucinations from train set
-            npov_rm_data_synth_struct["train"] = npov_rm_data_synth_struct["train"].filter(
-                lambda x: not (
-                    x["class_hall"] == "Yes"
-                    and x["has synthetic hallucination"] == "No"
-                )
-            )
-
-            # Filter out synthetic hallucinations from validation set
-            npov_rm_data_synth_struct["validation"] = npov_rm_data_synth_struct[
-                "validation"
-            ].filter(
-                lambda x: not (
-                    x["class_hall"] == "Yes"
-                    and x["has synthetic hallucination"] == "Yes"
-                )
-            )
-
-            # Put in splits and save
-            npov_rm_data_synth_struct_dataset = DatasetDict(
-                {
-                    "train": npov_rm_data_synth_struct["train"],
-                    "test": npov_rm_data_synth_struct["validation"],
-                }
-            )
-
-            npov_rm_data_synth_struct_dataset.push_to_hub(
-                repo_id=args.rm_processed_repo_id+"_synthetic_struct"
-            )
-
-            # Release memory
-            del npov_rm_data_synth_struct_dataset
-            del npov_rm_data_synth_struct
-
-        #
-        # LLM-GENERATED SYNTHETIC HALLUCINATIONS
-        #
+        # LLM-GENERATED
         if args.synthetic_hallus_llm:
             # Copy data
             npov_rm_data_synth_llm = deepcopy(npov_rm_data)
@@ -1436,22 +915,25 @@ def main():
             )
 
             # Get non-hallucinations
-            npov_rm_train_non = npov_rm_data_synth_llm["train"].filter(
-                lambda x: x["class_hall"] == "No"
-            ).shuffle(seed=args.seed)
+            npov_rm_train_non = (
+                npov_rm_data_synth_llm["train"]
+                .filter(lambda x: x["class_hall"] == "No")
+                .shuffle(seed=args.seed)
+            )
 
             # We use some non-hallus. to generate synthetic hallus.
-            quantity_synth_llm = 100  # TODO: move to script arguments
-            npov_rm_train_synth_llm = npov_rm_train_non.select(range(quantity_synth_llm))
-            npov_rm_train_non = npov_rm_train_non.select(
-                range(quantity_synth_llm, npov_rm_train_non.num_rows)
+            npov_rm_train_synth_llm = npov_rm_train_non.shuffle(
+                seed=args.seed
+            ).select(range(args.num_synth_hallus))
+            npov_rm_train_non = npov_rm_train_non.filter(
+                lambda x: x not in npov_rm_train_synth_llm
             )
 
             # API config
             client = genai.Client(api_key=args.gemini_api_key)
             gemini_model = "gemini-2.0-flash-001"
             generation_config = types.GenerateContentConfig(
-                temperature=0.7,  # TODO: move to script arguments
+                temperature=args.synth_llm_temperature,
                 seed=args.seed,
             )
 
@@ -1489,11 +971,57 @@ def main():
                 )
 
                 synthetic_hallucinations_llm_data[split].push_to_hub(
-                    repo_id=args.rm_processed_repo_id + "_synthetic_llm",
+                    repo_id=args.task + "_rm_synthetic_llm",
                     split=split,
                 )
 
-        # Writer SFT
+        # STRUCTURED
+        if args.synthetic_hallus_struct:
+            # Copy data
+            npov_rm_data_synth_struct = deepcopy(npov_rm_data)
+
+            # To train on synthetic hallucinations only and evaluate on organic,
+            # drop the organic ones from the training set, and the synthetic
+            # ones from the validation set. Do not mix splits, as this would
+            # mix topics. Do not pass the test set into the validation one,
+            # because it will be the test set for PERL later on and we agreed
+            # that we cannot test both the RM and PERL on the same examples.
+            npov_rm_data_synth_struct["train"] = npov_rm_data_synth_struct[
+                "train"
+            ].filter(
+                lambda x: not (
+                    x["class_hall"] == "Yes"
+                    and x["has synthetic hallucination"] == "No"
+                )
+            )
+
+            # Filter out synthetic hallucinations from validation set
+            npov_rm_data_synth_struct["validation"] = npov_rm_data_synth_struct[
+                "validation"
+            ].filter(
+                lambda x: not (
+                    x["class_hall"] == "Yes"
+                    and x["has synthetic hallucination"] == "Yes"
+                )
+            )
+
+            # Put in splits and save
+            npov_rm_data_synth_struct_dataset = DatasetDict(
+                {
+                    "train": npov_rm_data_synth_struct["train"],
+                    "test": npov_rm_data_synth_struct["validation"],
+                }
+            )
+
+            npov_rm_data_synth_struct_dataset.push_to_hub(
+                repo_id=args.task + "_rm_synthetic_struct"
+            )
+
+            # Release memory
+            del npov_rm_data_synth_struct_dataset
+            del npov_rm_data_synth_struct
+
+        # SFT
         npov_sft_data = load_dataset(
             "leobianco/npov",
             data_files={
@@ -1509,7 +1037,7 @@ def main():
             )
 
             npov_sft_data[split].push_to_hub(
-                repo_id=args.writer_sft_processed_repo_id,
+                repo_id=args.task + "_sft",
                 split=split,
             )
 
@@ -1517,18 +1045,16 @@ def main():
         npov_perl_data = npov_process_data_for_perl(
             npov_rm_data,
             npov_sft_data,
-            tokenizer=tokenizer,
-            max_seq_length=args.max_seq_length,
             seed=args.seed,
         )
 
         for split in npov_perl_data.keys():
             npov_perl_data[split].push_to_hub(
-                repo_id=args.perl_processed_repo_id,
+                repo_id=args.task + "_perl",
                 split=split,
             )
 
-        # Data augmentation
+        # FINAL TEST SET
         npov_augmented_data = npov_data_augmentation(npov_rm_data["test"])
         npov_augmented_data_dict = DatasetDict(
             {"test": Dataset.from_dict(npov_augmented_data)}
@@ -1537,158 +1063,112 @@ def main():
             npov_writer_prompt
         )
         npov_augmented_data_dict.push_to_hub(
-            repo_id=args.augmented_repo_id,
+            repo_id=args.task + "_final_test_set",
         )
 
     elif args.task == "bosch":
-        # GLOBAL DATA
-        data = pd.read_csv(
-            "/home/leo/Downloads/DelucionQA_data/cleaned/train.csv"
+        # GENERAL DATA PROCESSING
+        # TODO: put these files on a HF repo.
+        data_train = bosch_load_and_process_data(
+            "/home/leo/Downloads/DelucionQA_data/cleaned/train.csv",
+            "/home/leo/Downloads/DelucionQA_data/cleaned_leo/leo_flip_train.csv",
         )
-        data_to_flip_train = pd.read_csv(
-            "/home/leo/Downloads/DelucionQA_data/cleaned_leo/leo_flip_train.csv"
+        data_val = bosch_load_and_process_data(
+            "/home/leo/Downloads/DelucionQA_data/cleaned/dev.csv",
+            "/home/leo/Downloads/DelucionQA_data/cleaned_leo/leo_flip_dev.csv",
         )
-        data_test = pd.read_csv(
-            "/home/leo/Downloads/DelucionQA_data/cleaned/test.csv"
-        )
-        data_to_flip_test = pd.read_csv(
-            "/home/leo/Downloads/DelucionQA_data/cleaned_leo/leo_flip_test.csv"
-        )
-        data_dev = pd.read_csv(
-            "/home/leo/Downloads/DelucionQA_data/cleaned/dev.csv"
-        )
-        data_to_flip_dev = pd.read_csv(
-            "/home/leo/Downloads/DelucionQA_data/cleaned_leo/leo_flip_dev.csv"
+        data_test = bosch_load_and_process_data(
+            "/home/leo/Downloads/DelucionQA_data/cleaned/test.csv",
+            "/home/leo/Downloads/DelucionQA_data/cleaned_leo/leo_flip_test.csv",
         )
 
-        # Merge the two
-        data = pd.concat([data, data_test, data_dev])
-        data_to_flip = pd.concat(
-            [data_to_flip_train, data_to_flip_test, data_to_flip_dev]
+        # Convert to Hugging Face Dataset and push to hub
+        dataset_train = Dataset.from_pandas(data_train, split="train")
+        dataset_val = Dataset.from_pandas(data_val, split="validation")
+        dataset_test = Dataset.from_pandas(data_test, split="test")
+
+        # IMPORTANT: notice how we switch the original train and test splits.
+        # This is because we need enough test samples to measure hallucination
+        # rate decrease in the end.
+        dataset = DatasetDict(
+            {
+                "train": dataset_train,
+                "validation": dataset_val,
+                "test": dataset_test,
+            }
+        )
+        dataset.push_to_hub(args.task + "_processed")
+
+        # AUTORATER
+        # For the autorater, we want to measure its ability on all samples, so
+        # we just merge all of them and save as a single test split.
+        autorater_dataset = concatenate_datasets(
+            [dataset_train, dataset_val, dataset_test]
+        )
+        autorater_dataset.push_to_hub(
+            repo_id=args.task + "_autorater", split="test"
         )
 
-        # To exclude bad data
-        # data = data[~data["sample_id"].isin(data_to_exclude["sample_id"])]
+        #
+        # SFT: TODO: check if it is really ok to SFT on the RM train set.
+        #
+        sft_data = dataset_val.filter(lambda entry: entry["class_hall"] == "No")
+        sft_data.push_to_hub(repo_id=args.task + "_sft")
 
-        # To flip the label for the bad data
-        data.loc[data["sample_id"].isin(data_to_flip["sample_id"]), "Label"] = (
-            "Not Hallucinated"
+        # REWARD MODEL
+        # ORGANIC HALLUCINATIONS
+        # train -> validation, test -> test
+        bosch_rm_organic = DatasetDict(
+            {"train": dataset_val, "test": dataset_test}
         )
+        # RM prompt
+        for split in bosch_rm_organic.keys():
+            bosch_rm_organic[split] = bosch_rm_organic[split].map(
+                bosch_rm_prompt
+            )
+        # Save
+        bosch_rm_organic.push_to_hub(repo_id=args.task + "_rm_organic")
 
-        # Filter to keep only context relating to the question
-        data = data.loc[data["Answerable"] == True]
-        data = data.drop(labels=["Answerable"], axis=1)
+        # SYNTHETIC HALLUCINATIONS
 
-        # Create or rename columns
-        data = data.rename(
-            {"Label": "class_hall", "Answer": "response"}, axis=1
-        )
-        data["class_hall"] = data["class_hall"].apply(
-            lambda x: "Yes" if x == "Hallucinated" else "No"
-        )
-        data["label"] = data["class_hall"].apply(
-            lambda x: 1 if x == "No" else 0
-        )
-        data["prompt"] = (
-            "<start_of_turn><user>\nYou are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information giver. Do not add to your answer any information other than those present in the manual excerpt.\n"
-            + "User question:\n"
-            + data["Question"]
-            + "\nManual information:\n"
-            + data["Context"]
-            + "\nAnswer to user's question:<end_of_turn>\n<start_of_turn><model>\n"
-        )
-
-        dataset = Dataset.from_pandas(data, split="train")
-        dataset.push_to_hub(args.processed_repo_id)
-
-        # SFT
-        sft_data = dataset.filter(lambda entry: entry["class_hall"] == "No")
-        sft_data.push_to_hub(args.writer_sft_processed_repo_id)
-
-        # Reward Model
-        hallucinations_data = dataset.filter(
-            lambda entry: entry["class_hall"] == "Yes"
-        )
-        non_hallucinated_data = dataset.filter(
+        # GENERAL ORGANIZATION
+        # train -> validation | non-hallucinated (some -> hall.), test -> test
+        non_hallucinated_data = dataset_val.filter(
             lambda entry: entry["class_hall"] == "No"
         )
-        # We don't want to use all of the non-hallucinated data.
-        # Some of it goes to PERL, etc
-        rm_data_cap = 1000
-        size_subset = rm_data_cap - hallucinations_data.num_rows
-        subset_non_hallucinated_data = non_hallucinated_data.shuffle(
-            seed=args.seed
-        ).select(range(size_subset))
-
-        # RM dataset with organic hallucinations
-        rm_data = concatenate_datasets(
-            [hallucinations_data, subset_non_hallucinated_data]
+        hallucinated_data = dataset_val.filter(
+            lambda entry: entry["class_hall"] == "Yes"
         )
-
-        rm_data = bosch_process_data_for_rm(
-            rm_data,
-            tokenizer,
-            seed=args.seed,
-            max_seq_length=args.max_seq_length,
+        # Get some random non-hallucinations to become hallucinations
+        to_become_hallus = non_hallucinated_data.shuffle(seed=args.seed).select(
+            range(args.num_synth_hallus)
         )
-
-        rm_data.push_to_hub(args.rm_processed_repo_id)
-
-        #
-        # DATA ORGANIZATION FOR SYNTHETIC HALLUCINATIONS
-        #
-
-        # You don't want exact pairing, because the model then overfits.
-        # Instead, shuffle the subset, then take a new subset of it to
-        # be the one out of which synthetic hallucinations will be created.
-        # Do not use the base non-hallucinated samples to train the RM,
-        # use only the hallucinated version and put the original in the
-        # PERL test split.
-        # Confusing, I know!
-
-        # subset_2 are the non-hallucinated data that will become hallucinated
-        size_subset_2 = int(size_subset / 4)
-        subset_2_end_idx = size_subset_2  # because it starts from zero
-        subset_2 = subset_non_hallucinated_data.select(range(size_subset_2))
-
-        # subset_3 are the non-hallucinated samples that will also be used to
-        # train the RM
-        size_subset_3 = 2 * size_subset_2
-        subset_3_end_idx = subset_2_end_idx + size_subset_3
-        subset_3 = subset_non_hallucinated_data.select(
-            range(subset_2_end_idx, subset_3_end_idx)
+        # Remove them from the rest
+        non_hallucinated_data = non_hallucinated_data.filter(
+            lambda x: x not in to_become_hallus
         )
+        # Build RM prompts for the non_hallucinated_data
+        non_hallucinated_data = non_hallucinated_data.map(bosch_rm_prompt)
 
-        # Finally, subset_4 are the non-hallucinated samples that go to the
-        # test split of the RM
-        subset_4 = subset_non_hallucinated_data.select(
-            range(subset_3_end_idx, size_subset)
-        )
-
-        # All of them are subsets of subset_non_hallucinated_data
-
-        #
-        # RM SYNTHETIC HALLUCINATIONS - LLM GENERATED
-        #
-
+        # LLM-GENERATED
         if args.synthetic_hallus_llm:
-            # Fewshot examples of organic hallucinations
-            n_fewshot_examples_synth_llm = 4
-            fewshot_examples_synth_llm = hallucinations_data.select(
-                range(n_fewshot_examples_synth_llm)
-            )
+            # Fewshot examples of organic hallucinations to help LLM
+            n_fewshot_examples_synth_llm = args.synth_llm_num_fewshot
+            fewshot_examples_synth_llm = hallucinated_data.shuffle(
+                seed=args.seed
+            ).select(range(n_fewshot_examples_synth_llm))
 
             # API config
             client = genai.Client(api_key=args.gemini_api_key)
             gemini_model = "gemini-2.0-flash-001"
             generation_config = types.GenerateContentConfig(
-                temperature=0.7,
+                temperature=args.synth_llm_temperature,
                 seed=args.seed,
             )
 
             print("Calling Gemini's API...")
 
-            synthetic_hallucinations_llm = subset_2.map(
+            synthetic_hallucinations_llm = to_become_hallus.map(
                 bosch_function_to_map_synthetic_halls_llm,
                 fn_kwargs=dict(
                     fewshot_examples=fewshot_examples_synth_llm,
@@ -1698,122 +1178,70 @@ def main():
                 ),
             )
 
-            # Now we create the RM training data
+            # Write the RM prompts.
+            synthetic_hallucinations_llm = synthetic_hallucinations_llm.map(
+                bosch_rm_prompt
+            )
+
+            # Now we create the RM training data by joining and shuffling
             synthetic_hallucinations_llm_train_data = concatenate_datasets(
-                [synthetic_hallucinations_llm, subset_3]
+                [synthetic_hallucinations_llm, non_hallucinated_data]
             ).shuffle(seed=args.seed)
 
-            # TO DO: put the original version of the first third of
-            # subset_non_hallucinated_data in the PERL test set
-
-            # You need to rewrite the prompts, re-tokenize... but don't re-split!
-            # This will be the train split of the final Dataset.
-            # The test set will be composed of organic hallucinations + some
-            # non-hallucinated samples from the PERL training set.
-            synthetic_hallucinations_llm_train_data = bosch_process_data_for_rm(
-                synthetic_hallucinations_llm_train_data,
-                tokenizer,
-                seed=args.seed,
-                split_data=False,
-                max_seq_length=args.max_seq_length,
-            )
-
-            # Building the test split
-            synthetic_hallucinations_llm_test_data = concatenate_datasets(
-                [hallucinations_data, subset_4]
-            ).shuffle(seed=args.seed)
-
-            synthetic_hallucinations_llm_test_data = bosch_process_data_for_rm(
-                synthetic_hallucinations_llm_test_data,
-                tokenizer,
-                seed=args.seed,
-                split_data=False,
-                max_seq_length=args.max_seq_length,
-            )
-
-            # Merge the two in the appropriate splits
+            # Create dataset with same test split as before
             synthetic_hallucinations_llm_data = DatasetDict(
                 {
                     "train": synthetic_hallucinations_llm_train_data,
-                    "test": synthetic_hallucinations_llm_test_data,
+                    "test": bosch_rm_organic["test"],
                 }
             )
 
             synthetic_hallucinations_llm_data.push_to_hub(
-                repo_id=args.rm_processed_repo_id + "_synthetic_llm"
+                repo_id=args.task + "_rm_synthetic_llm"
             )
 
-        #
-        # RM SYNTHETIC HALLUCINATIONS - STRUCTURED
-        #
-        elif args.synthetic_hallus_struct:
-            # Apply the map that switches sentences to subset_2
-            synthetic_hallucinations_struct_train_data = subset_2.map(
-                bosch_rm_synthetic_hall_structured, fn_kwargs=dict(data=dataset)
+        # STRUCTURED
+        if args.synthetic_hallus_struct:
+            # Apply the map that switches sentences
+            synthetic_hallucinations_struct = to_become_hallus.map(
+                bosch_rm_synthetic_hall_structured,
+                fn_kwargs=dict(data=dataset_val),
+            )
+
+            # Write the RM prompts with the new response.
+            synthetic_hallucinations_struct = (
+                synthetic_hallucinations_struct.map(bosch_rm_prompt)
             )
 
             # Add some non-hallucinated examples and shuffle!
             synthetic_hallucinations_struct_train_data = concatenate_datasets(
-                [synthetic_hallucinations_struct_train_data, subset_3]
+                [synthetic_hallucinations_struct, non_hallucinated_data]
             ).shuffle(seed=args.seed)
 
-            # Reconstuct prompts and retokenize
-            synthetic_hallucinations_struct_train_data = (
-                bosch_process_data_for_rm(
-                    synthetic_hallucinations_struct_train_data,
-                    tokenizer,
-                    seed=args.seed,
-                    split_data=False,
-                    max_seq_length=args.max_seq_length,
-                )
-            )
-
-            # Create test split with organic hallucinations
-            synthetic_hallucinations_struct_test_data = concatenate_datasets(
-                [hallucinations_data, subset_4]
-            ).shuffle(seed=args.seed)
-
-            synthetic_hallucinations_struct_test_data = (
-                bosch_process_data_for_rm(
-                    synthetic_hallucinations_struct_test_data,
-                    tokenizer,
-                    seed=args.seed,
-                    split_data=False,
-                    max_seq_length=args.max_seq_length,
-                )
-            )
-
-            # Merge the two in the appropriate splits
+            # Create dataset with same test split as before
             synthetic_hallucinations_struct_data = DatasetDict(
                 {
                     "train": synthetic_hallucinations_struct_train_data,
-                    "test": synthetic_hallucinations_struct_test_data,
+                    "test": bosch_rm_organic["test"],
                 }
             )
 
             synthetic_hallucinations_struct_data.push_to_hub(
-                repo_id=args.rm_processed_repo_id + "_synthetic_struct"
+                repo_id=args.task + "_rm_synthetic_struct"
             )
 
         # PERL
-        perl_data = bosch_process_data_for_perl(
-            non_hallucinated_data.select(
-                range(
-                    (rm_data_cap - hallucinations_data.num_rows),
-                    non_hallucinated_data.num_rows,
-                )
-            ),
-            tokenizer,
-            seed=args.seed,
-            max_seq_length=args.max_seq_length,
-            validation_size=args.perl_validation_size,
+        # train -> test, test -> a few random samples (not the final test set).
+        perl_data = DatasetDict(
+            {"train": dataset_test, "test": dataset_val.select(range(10))}
         )
 
-        for split in perl_data.keys():
-            perl_data[split].push_to_hub(
-                repo_id=args.perl_processed_repo_id,
-                split=split,
-            )
+        perl_data.push_to_hub(repo_id=args.task + "_perl")
+
+        # FINAL TEST SET
+        dataset_train.push_to_hub(
+            repo_id=args.task + "_final_test_set", split="test"
+        )
 
     elif args.task == "ragtruth":
         # Load data
@@ -2008,7 +1436,7 @@ def main():
             # Save
             for split in synthetic_hallucinations_llm_data.keys():
                 synthetic_hallucinations_llm_data[split].push_to_hub(
-                    repo_id=args.rm_processed_repo_id + "_synthetic_llm",
+                    repo_id=args.task + "_rm_synthetic_llm",
                     split=split,
                 )
 
@@ -2064,7 +1492,7 @@ def main():
             # Save
             for split in synthetic_hallucinations_struct_data.keys():
                 synthetic_hallucinations_struct_data[split].push_to_hub(
-                    repo_id=args.rm_processed_repo_id + "_synthetic_struct",
+                    repo_id=args.task + "_rm_synthetic_struct",
                     split=split,
                 )
 
