@@ -7,7 +7,8 @@ else
   # If single-run, set variables here.
   TASK="$1"
   SEED=130104
-  BASE_MODEL_PATH="google/gemma-2-2b-it"
+  MODEL_REPO_ID="google/gemma-2-2b-it"
+  MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
   REWARD_MODEL_PATH="leobianco/bosch_RM_seed_130104_SYN_HALL_LLM_true_epochs_3_lr_1e-3_lora_8"
   SFT_MODEL_PATH="leobianco/bosch_SFT_seed_130104_epochs_0.01_lr_3e-3_lora_8_fewshot_0"
   DEEPSPEED_CONFIG="./deepspeed_config.yaml"
@@ -19,11 +20,11 @@ else
   RLOO_K=2
   NUM_PPO_EPOCHS=1
   NUM_MINIBATCHES=16
-  PER_DEVICE_TRAIN_BATCH_SIZE=1
+  PER_DEVICE_BATCH_SIZE=4
   LOCAL_ROLLOUT_FORWARD_BATCH_SIZE=8
   TEMPERATURE=7e-1
   SAVE_STEPS=1000
-  RUN_IDENTIFIER="leobianco/${TASK}_PERL_seed_${SEED}_episodes_${TOTAL_EPISODES}_lr_${LEARNING_RATE}_klcoeff_${KL_COEFF}_temp_${TEMPERATURE}"
+  RUN_IDENTIFIER="leobianco/${TASK}_PERL_model_${MODEL_NAME}_seed_${SEED}_episodes_${TOTAL_EPISODES}_lr_${LEARNING_RATE}_klcoeff_${KL_COEFF}"
   SHUTDOWN=false
 fi
 
@@ -40,13 +41,13 @@ accelerate launch \
   --seed "$SEED" \
   --report_to "wandb" \
   --run_name "$RUN_IDENTIFIER" \
-  --logging_steps 10 \
+  --logging_steps 5 \
   --output_dir "./checkpoints/${TASK}/perl/${RUN_IDENTIFIER}" \
   --overwrite_output_dir True \
   --push_to_hub True \
   --hub_model_id "$RUN_IDENTIFIER" \
-  --dataset_repo_id "leobianco/${TASK}_perl_processed" \
-  --model_repo_id "${BASE_MODEL_PATH}" \
+  --dataset_repo_id "leobianco/${TASK}_perl" \
+  --model_repo_id "${MODEL_REPO_ID}" \
   --stop_token "eos" \
   --do_train True \
   --save_strategy "steps" \
@@ -57,7 +58,7 @@ accelerate launch \
   --response_length "$RESPONSE_LENGTH" \
   --weight_decay 0.0 \
   --gradient_accumulation_steps 1 \
-  --per_device_eval_batch_size 1 \
+  --per_device_eval_batch_size "$PER_DEVICE_BATCH_SIZE" \
   --eval_accumulation_steps 1 \
   --reward_model_path "${REWARD_MODEL_PATH}" \
   --sft_model_path "${SFT_MODEL_PATH}" \
@@ -65,7 +66,7 @@ accelerate launch \
   --rloo_k "$RLOO_K" \
   --num_ppo_epochs "$NUM_PPO_EPOCHS" \
   --num_mini_batches "$NUM_MINIBATCHES" \
-  --per_device_train_batch_size "$PER_DEVICE_TRAIN_BATCH_SIZE" \
+  --per_device_train_batch_size "$PER_DEVICE_BATCH_SIZE" \
   --local_rollout_forward_batch_size "$LOCAL_ROLLOUT_FORWARD_BATCH_SIZE" \
   --missing_eos_penalty 1.0 \
   --temperature "$TEMPERATURE" \

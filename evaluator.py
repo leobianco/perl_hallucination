@@ -372,7 +372,9 @@ Does the proposed answer state anything not supported by the information in the 
     return entry
 
 
-def ragtruth_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False):
+def ragtruth_evaluator_prompt(
+    entry, fewshot_examples=None, use_true_label=False
+):
     """Function for transforming entries in the RAGTruth dataset into prompts
     for the evaluator model.
 
@@ -381,8 +383,7 @@ def ragtruth_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False
     it looks really bad.
     """
 
-    preamble = """<start_of_turn>user
-You are an expert evaluator specializing in detecting hallucinations in text summarization. Your task is to determine whether a summary contains any information not present in the original text.
+    preamble = """You are an expert evaluator specializing in detecting hallucinations in text summarization. Your task is to determine whether a summary contains any information not present in the original text.
 
 In this evaluation:
 1. You will be given an original text that was meant to be summarized
@@ -396,13 +397,13 @@ Evaluation guidelines:
 - Be vigilant about subtle additions that might seem plausible but aren't in the source
 
 Your response must be ONLY "Yes" (hallucination detected) or "No" (no hallucination detected).
-<end_of_turn>
 """
 
     prompt = preamble
 
-    template = """<start_of_turn>user
-Original text to be summarized: {prompt}
+    template = """
+
+Original text to be summarized: {user_query}
 {response}
 
 Evaluation process:
@@ -411,17 +412,14 @@ Evaluation process:
 3. Verify that every piece of information in the summary (output) is supported by the original text
 4. Check for subtle additions, expansions, or assumptions not justified by the original
 
-Does the summary (output) contain ANY information not present in or directly inferable from the original text? (Yes/No):
-<end_of_turn>
-<start_of_turn>model
-{ans}
+Does the summary (output) contain ANY information not present in or directly inferable from the original text? (Yes/No):{ans}
 """
 
     # Depending if evaluation of evaluator or of writer checkpoint.
     response = entry["response"] if use_true_label else entry["completion"]
 
     formatted_prompt = template.format(
-        prompt=entry["prompt"],
+        user_query=entry["user_query"],
         response=response,
         ans="",
     )
@@ -429,11 +427,11 @@ Does the summary (output) contain ANY information not present in or directly inf
     if fewshot_examples is not None:
         for fewshot_example in fewshot_examples:
             fewshot_prompt = template.format(
-                prompt=fewshot_example["prompt"],
+                user_query=fewshot_example["user_query"],
                 response=fewshot_example["response"],
                 ans=fewshot_example["class_hall"],
             )
-            prompt += fewshot_prompt + "<end_of_turn>\n"
+            prompt += fewshot_prompt
         prompt += formatted_prompt
     else:
         prompt += formatted_prompt
@@ -441,7 +439,6 @@ Does the summary (output) contain ANY information not present in or directly inf
     entry["evaluator_prompt"] = prompt
 
     return entry
-
 
 
 def evaluator_score_batch(
@@ -641,7 +638,9 @@ if __name__ == "__main__":
         ground_truth = data["label"]
 
         # Save evaluator prompts
-        filepath = f"logs/{name_for_saving}/eval_autorater_evaluator_prompts.txt"
+        filepath = (
+            f"logs/{name_for_saving}/eval_autorater_evaluator_prompts.txt"
+        )
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         with open(filepath, "w") as f:
             for idx, prompt in enumerate(data["evaluator_prompt"]):
@@ -774,7 +773,7 @@ if __name__ == "__main__":
             model=script_args.writer_model_base,
             enable_lora=enable_lora,
             max_lora_rank=64,  # currently maximum available in vLLM.
-            dtype="bfloat16",  # important for Gemma.
+            dtype="bfloat16",
         )
 
         # Generate completions with writer.
@@ -787,34 +786,6 @@ if __name__ == "__main__":
         )
 
         prompts = [val_data[i]["prompt"] for i in range(val_data.num_rows)]
-
-        # TODO: once new evaluation set is available, fix this.
-        # CUSTOM RUNS: this is a temporary, *ugly* solution to run evaluation
-        # on the hc_rm5x_test split. It should be changed once the new eval
-        # set is available. The problem is that the "prompt" column of the RM
-        # dataset contains the answer, and here we want to generate it.
-        # The solution is to call npov_writer_prompt from data.py.
-        if script_args.dataset_prompts == "leobianco/npov_rm_processed":
-            data = load_dataset(
-                script_args.dataset_prompts,
-                split="train",
-            )
-
-        # Pass fewshot examples to writer by remapping npov_writer_prompt
-        if (script_args.dataset_prompts == "leobianco/npov_rm_processed") or (
-            script_args.dataset_prompts == "leobianco/npov_augmented_validation"
-        ):
-            del prompts
-            writer_fewshot_examples = get_fewshot_examples(
-                data,
-                n_yes=0,
-                n_no=script_args.writer_num_fewshot,
-                seed=script_args.seed,
-            )
-            prompts = val_data.map(
-                npov_writer_prompt,
-                fn_kwargs=dict(fewshot_examples=writer_fewshot_examples),
-            )["prompt"]
 
         if enable_lora:
             outputs = llm.generate(
@@ -840,7 +811,7 @@ if __name__ == "__main__":
                 "eval_"
                 + script_args.writer_model_lora.split(f"{script_args.user}/")[1]
             )
-        except:
+        except Exception:
             name_for_saving = (
                 "eval_" + script_args.writer_model_lora.split("/")[1]
             )

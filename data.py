@@ -755,6 +755,14 @@ def bosch_function_to_map_synthetic_halls_llm(
     }
 
 
+def ragtruth_rm_prompt(entry):
+    """The dataset already contains a prompt column, which is an instruction for the writer. We just append the generation."""
+
+    entry["prompt"] = entry["user_query"] + "\n" + entry["response"]
+
+    return entry
+
+
 def ragtruth_rm_synthetic_hall_llm(entry):
     prompt = f"""Task: Generate a modified summary that includes controlled hallucinations
 
@@ -805,6 +813,26 @@ def ragtruth_function_to_map_synthetic_halls_llm(
     }
 
 
+def ragtruth_formatting_prompts_func(entry):
+    """Formatting function for SFTTrainer. Imported in writer_sft.py."""
+
+    template = (
+        "{user_query}" + "\n" + "{response}"
+    )
+
+    output_texts = []
+
+    for i in range(len(entry["user_query"])):
+        formatted_prompt = template.format(
+            user_query=entry["user_query"][i],
+            response=entry["response"][i],
+        )
+
+        output_texts.append(formatted_prompt)
+
+    return output_texts
+
+
 def main():
     parser = ArgumentParser()
     parser.add_argument("--task", type=str)
@@ -822,7 +850,7 @@ def main():
     parser.add_argument("--num_synth_hallus", type=int, default=0)
     parser.add_argument("--gemini_api_key", type=str)
     parser.add_argument("--synth_llm_temperature", type=float, default=0.7)
-    parser.add_argument("--synth_llm_num_fewshot", type=int, default=2) 
+    parser.add_argument("--synth_llm_num_fewshot", type=int, default=2)
     args = parser.parse_args()
 
     if args.task == "npov":
@@ -1109,9 +1137,7 @@ def main():
             repo_id=args.task + "_autorater", split="test"
         )
 
-        #
-        # SFT: TODO: check if it is really ok to SFT on the RM train set.
-        #
+        # SFT
         sft_data = dataset_val.filter(lambda entry: entry["class_hall"] == "No")
         sft_data.push_to_hub(repo_id=args.task + "_sft")
 
@@ -1244,13 +1270,15 @@ def main():
         )
 
     elif args.task == "ragtruth":
-        # Load data
+        # GENERAL DATA PROCESSING
+        # TODO: put these files on huggingface.
         data_sources = pd.read_json(
             "/home/leo/Downloads/RAGTruth/dataset/source_info.jsonl", lines=True
         )
         data_responses = pd.read_json(
             "/home/leo/Downloads/RAGTruth/dataset/response.jsonl", lines=True
         )
+        # Filter only summarization entries and unify the two data files.
         sources = data_sources[data_sources["task_type"] == "Summary"]
         responses = data_responses[
             data_responses["source_id"].isin(sources["source_id"])
@@ -1259,137 +1287,98 @@ def main():
         unified = unified.drop(
             ["source_info", "task_type", "source", "id"], axis=1
         )
+        # Define necessary columns.
         unified["label"] = unified.apply(
             lambda entry: 1 if len(entry["labels"]) == 0 else 0, axis=1
         )
         unified["class_hall"] = unified.apply(
             lambda entry: "No" if len(entry["labels"]) == 0 else "Yes", axis=1
         )
+        # Filter only good-quality entries, and rename some columns.
         unified = unified[unified["quality"] == "good"]
-        unified = unified.rename(columns={"labels": "explanation"})
-
-        # This unified data will be used to evaluate the autorater
-        unified_dataset = Dataset.from_pandas(unified)
-        unified_dataset.push_to_hub(
-            repo_id="leobianco/ragtruth_autorater_data", split="test"
+        unified = unified.rename(
+            columns={"labels": "explanation", "prompt": "user_query"}
         )
-
+        # Separate data splits.
         train_data = unified[unified["split"] == "train"]
         test_data = unified[unified["split"] == "test"]
+        # Create a validation split by taking the samples corresponding to
+        # the first 150 unique queries in the train set
+        val_source_ids = train_data["source_id"].drop_duplicates().iloc[:150]
+        val_data = train_data[
+            train_data["source_id"].isin(val_source_ids)
+        ].copy()
+        train_data = train_data[
+            ~train_data["source_id"].isin(val_source_ids)
+        ].copy()
+        # Convert to dataset format
+        train_dataset = Dataset.from_pandas(train_data)
+        val_dataset = Dataset.from_pandas(val_data)
+        test_dataset = Dataset.from_pandas(test_data)
 
-        #
-        # STAGE ONE: testing the idea
-        #
-
-        # Rename the original prompt column to a "user_query" column
-        train_data = train_data.rename(columns={"prompt": "user_query"})
-        test_data = test_data.rename(columns={"prompt": "user_query"})
-
-        # The train data will be used to train the reward model.
-        # However, the prompt must be modified to include the
-        # response and some control characters.
-        train_data["prompt"] = (
-            "<start_of_turn>user\n"
-            + train_data["user_query"]
-            + "<end_of_turn>\n<start_of_turn><model>\n"
-            + train_data["response"]
-            + "<end_of_turn><eos>"
+        # AUTORATER
+        # This unified data will be used to evaluate the autorater.
+        unified_dataset = concatenate_datasets(
+            [train_dataset, val_dataset, test_dataset]
+        )
+        unified_dataset.push_to_hub(
+            repo_id=args.task + "_autorater", split="test"
         )
 
-        # The same must be done to the test samples that will be used to
-        # validate the RM
-
-        # First, we grab 100 unique user_query to be used for PERL
-        unique_prompts_for_perl = np.random.choice(
-            test_data["user_query"].unique(), size=100
+        # SFT data
+        # We use the non-hallucinated samples in the validation split for SFT.
+        sft_data = test_dataset.filter(
+            lambda entry: entry["class_hall"] == "No"
         )
-        perl_data = test_data[
-            test_data["user_query"].isin(unique_prompts_for_perl)
-        ]
+        sft_data.push_to_hub(repo_id=args.task + "_sft")
 
-        # In the case of PERL, prompt = user_query
-        perl_data["prompt"] = (
-            "<start_of_turn>user\n"
-            + perl_data["user_query"]
-            + "<end_of_turn>\n<start_of_turn><model>\n"
+        # REWARD MODEL
+        # ORGANIC HALLUCINATIONS
+        # train -> validation, test -> test
+        ragtruth_rm_organic = DatasetDict(
+            {"train": test_dataset, "test": val_dataset}
         )
+        # RM prompt
+        for split in ragtruth_rm_organic.keys():
+            ragtruth_rm_organic[split] = ragtruth_rm_organic[split].map(
+                ragtruth_rm_prompt
+            )
+        # Save
+        ragtruth_rm_organic.push_to_hub(repo_id=args.task + "_rm_organic")
 
-        # The rest of the entries in the test set (even with repeated prompts)
-        # serve to validate the RM.
-        test_RM = test_data[
-            ~test_data["user_query"].isin(unique_prompts_for_perl)
-        ]
-        test_RM["prompt"] = (
-            "<start_of_turn>user\n"
-            + test_RM["user_query"]
-            + "<end_of_turn>\n<start_of_turn><model>\n"
-            + test_RM["response"]
-            + "<end_of_turn><eos>"
-        )
-
-        # Convert RM data to HF Dataset
-        train_RM_dataset = Dataset.from_pandas(train_data)
-        test_RM_dataset = Dataset.from_pandas(test_RM)
-
-        # Tokenize the RM data
-        train_RM_dataset = train_RM_dataset.map(
-            encode,
-            batched=True,
-            fn_kwargs={
-                "tokenizer": tokenizer,
-                "max_seq_length": args.max_seq_length,
-            },
-        )
-        train_RM_dataset.set_format("torch")  # due to using map()
-
-        test_RM_dataset = test_RM_dataset.map(
-            encode,
-            batched=True,
-            fn_kwargs={
-                "tokenizer": tokenizer,
-                "max_seq_length": args.max_seq_length,
-            },
-        )
-        test_RM_dataset.set_format("torch")  # due to using map()
-
-        # Save to HF Hub
-        RM_dataset = DatasetDict(
-            {"train": train_RM_dataset, "test": test_RM_dataset}
-        )
-        RM_dataset.push_to_hub("leobianco/ragtruth_rm_processed")
-
-        #
         # SYNTHETIC HALLUCINATIONS
-        #
 
-        # Filter out non-hallucinations from the RM train dataset
-        train_RM_non_hallus = train_RM_dataset.filter(
-            lambda x: x["class_hall"] == "No"
+        # GENERAL ORGANIZATION
+        non_hallucinated_data = test_dataset.filter(
+            lambda entry: entry["class_hall"] == "No"
         )
-
-        # Some (~1000) of them will be used as base for synthetic
-        train_RM_synth_llm = train_RM_non_hallus.select(range(1000))
-        # The rest will be non-hallus. training samples
-        train_RM_non_hallus = train_RM_non_hallus.select(
-            range(1000, train_RM_non_hallus.num_rows)
+        hallucinated_data = test_dataset.filter(
+            lambda entry: entry["class_hall"] == "Yes"
         )
+        # Get some random non-hallucinations to become hallucinations
+        to_become_hallus = non_hallucinated_data.shuffle(seed=args.seed).select(
+            range(args.num_synth_hallus)
+        )
+        # Remove them from the rest
+        non_hallucinated_data = non_hallucinated_data.filter(
+            lambda x: x not in to_become_hallus
+        )
+        # Build RM prompts for the non_hallucinated_data
+        non_hallucinated_data = non_hallucinated_data.map(ragtruth_rm_prompt)
 
-        #
         # LLM GENERATED
-        #
-
         if args.synthetic_hallus_llm:
             # API config
             client = genai.Client(api_key=args.gemini_api_key)
             gemini_model = "gemini-2.0-flash-001"
             generation_config = types.GenerateContentConfig(
-                temperature=0.7,
+                temperature=args.synth_llm_temperature,
                 seed=args.seed,
             )
 
             print("Calling Gemini's API...")
 
-            synthetic_hallucinations_llm = train_RM_synth_llm.map(
+            synthetic_hallucinations_llm = to_become_hallus.map(
                 ragtruth_function_to_map_synthetic_halls_llm,
                 fn_kwargs=dict(
                     client=client,
@@ -1398,121 +1387,75 @@ def main():
                 ),
             )
 
-            # Since the response changed, you need to rewrite the
-            # prompt, and retokenize
+            # Write the RM prompts
             synthetic_hallucinations_llm = synthetic_hallucinations_llm.map(
-                lambda x: {
-                    "prompt": "<start_of_turn>user\n"
-                    + x["user_query"]
-                    + "<end_of_turn>\n<start_of_turn><model>\n"
-                    + x["response"]
-                    + "<end_of_turn><eos>"
-                }
+                ragtruth_rm_prompt
             )
-
-            synthetic_hallucinations_llm = synthetic_hallucinations_llm.map(
-                encode,
-                batched=True,
-                fn_kwargs={
-                    "tokenizer": tokenizer,
-                    "max_seq_length": args.max_seq_length,
-                },
-            )
-            synthetic_hallucinations_llm.set_format("torch")
 
             # Now we create the RM training data
             synthetic_hallucinations_llm_train_data = concatenate_datasets(
-                [synthetic_hallucinations_llm, train_RM_non_hallus]
+                [synthetic_hallucinations_llm, non_hallucinated_data]
             ).shuffle(seed=args.seed)
 
             # Merge the two in the appropriate splits
             synthetic_hallucinations_llm_data = DatasetDict(
                 {
                     "train": synthetic_hallucinations_llm_train_data,
-                    "test": test_RM_dataset,
+                    "test": ragtruth_rm_organic["test"],
                 }
             )
 
-            # Save
-            for split in synthetic_hallucinations_llm_data.keys():
-                synthetic_hallucinations_llm_data[split].push_to_hub(
-                    repo_id=args.task + "_rm_synthetic_llm",
-                    split=split,
-                )
+            synthetic_hallucinations_llm_data.push_to_hub(
+                repo_id=args.task + "_rm_synthetic_llm"
+            )
 
-        #
         # STRUCTURED
-        #
         elif args.synthetic_hallus_struct:
             # Tbh, you can use the same bosch_rm_synthetic_hall_structured
             # function that was used for Bosch, and then retokenize.
-            synthetic_hallucinations_struct = train_RM_synth_llm.map(
+            synthetic_hallucinations_struct = to_become_hallus.map(
                 bosch_rm_synthetic_hall_structured,
-                fn_kwargs=dict(data=train_RM_dataset),
+                fn_kwargs=dict(data=test_dataset),
             )
 
-            # Reconstruct prompts and retokenize
+            # Write the RM prompts with the new response.
             synthetic_hallucinations_struct = (
-                synthetic_hallucinations_struct.map(
-                    lambda x: {
-                        "prompt": "<start_of_turn>user\n"
-                        + x["user_query"]
-                        + "<end_of_turn>\n<start_of_turn><model>\n"
-                        + x["response"]
-                        + "<end_of_turn><eos>"
-                    }
-                )
+                synthetic_hallucinations_struct.map(ragtruth_rm_prompt)
             )
 
-            synthetic_hallucinations_struct = (
-                synthetic_hallucinations_struct.map(
-                    encode,
-                    batched=True,
-                    fn_kwargs={
-                        "tokenizer": tokenizer,
-                        "max_seq_length": args.max_seq_length,
-                    },
-                )
-            )
-            synthetic_hallucinations_struct.set_format("torch")
-
-            # Add the non-hallucinated samples and shuffle
+            # Add some non-hallucinated examples and shuffle!
             synthetic_hallucinations_struct_train_data = concatenate_datasets(
-                [synthetic_hallucinations_struct, train_RM_non_hallus]
+                [synthetic_hallucinations_struct, non_hallucinated_data]
             ).shuffle(seed=args.seed)
 
-            # Put together with test split
+            # Create dataset with same test split as before
             synthetic_hallucinations_struct_data = DatasetDict(
                 {
                     "train": synthetic_hallucinations_struct_train_data,
-                    "test": test_RM_dataset,
+                    "test": ragtruth_rm_organic["test"],
                 }
             )
 
-            # Save
-            for split in synthetic_hallucinations_struct_data.keys():
-                synthetic_hallucinations_struct_data[split].push_to_hub(
-                    repo_id=args.task + "_rm_synthetic_struct",
-                    split=split,
-                )
+            synthetic_hallucinations_struct_data.push_to_hub(
+                repo_id=args.task + "_rm_synthetic_struct"
+            )
 
-        # Convert the PERL data and save to HF Hub
-        perl_dataset = Dataset.from_pandas(perl_data)
-
-        # Tokenize the PERL data
-        perl_dataset = perl_dataset.map(
-            encode,
-            batched=True,
-            fn_kwargs={
-                "tokenizer": tokenizer,
-                "max_seq_length": args.max_seq_length,
-            },
+        # PERL
+        # In the case of PERL, prompt = user_query. It needs a few samples in
+        # the test split, but it is not the real test split!
+        perl_data = DatasetDict(
+            {"train": val_dataset, "test": test_dataset.select(range(10))}
         )
-        perl_dataset.set_format("torch")  # due to using map()
+        for split in perl_data.keys():
+            perl_data[split] = perl_data[split].map(
+                lambda x: {**x, "prompt": x["user_query"]}
+            )
+        perl_data.push_to_hub(args.task + "_perl")
 
-        # PERL requires some test split
-        perl_dataset_dict = perl_dataset.train_test_split(test_size=10)
-        perl_dataset_dict.push_to_hub("leobianco/ragtruth_perl_processed")
+        # FINAL TEST SET
+        # It is simply the train split. Rename "user_query" column to "prompt".
+        train_dataset = train_dataset.rename_column("user_query", "prompt")
+        train_dataset.push_to_hub(args.task + "_final_test_set", split="test")
 
 
 if __name__ == "__main__":

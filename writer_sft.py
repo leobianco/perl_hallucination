@@ -12,10 +12,10 @@ from trl import (
 )
 
 from data import (
-    halomi_formatting_prompts_func,
     npov_formatting_prompts_func,
     npov_formatting_prompts_func_from_fewshot_examples,
     bosch_formatting_prompts_func,
+    ragtruth_formatting_prompts_func,
 )
 from utils import CustomLoraConfig, ScriptArguments
 
@@ -34,13 +34,14 @@ def main():
         padding_side="left",
     )
 
+    # Some models (e.g. Mistral) don't have a pad token, so we add it.
+    NEED_TO_RESIZE_VOCAB=False
+    if 'pad_token' not in tokenizer.special_tokens_map.keys():
+        tokenizer.add_special_tokens({'pad_token': '<pad>'})
+        NEED_TO_RESIZE_VOCAB=True
+
     # For training on completions only.
-    if script_args.task == "halomi":
-        response_template = (
-            "\nTranslated text:<end_of_turn>\n<start_of_turn>model\n"
-        )
-        formatting_prompts_func = halomi_formatting_prompts_func
-    elif script_args.task == "npov":
+    if script_args.task == "npov":
         response_template = "Neutral point-of-view answer to user query, rewriting provided arguments in natural language:<end_of_turn>\n<start_of_turn>model\n"
         if script_args.num_fewshot == 0 or script_args.num_fewshot is None:
             formatting_prompts_func = npov_formatting_prompts_func
@@ -59,8 +60,9 @@ def main():
             "\nAnswer to user's question:<end_of_turn><start_of_turn><model>"
         )
         formatting_prompts_func = bosch_formatting_prompts_func
-    else:
-        raise ValueError("Invalid dataset.")
+    elif script_args.task == "ragtruth":
+        response_template = "\n\noutput:\n"
+        formatting_prompts_func = ragtruth_formatting_prompts_func
 
     response_template_ids = tokenizer.encode(
         response_template, add_special_tokens=False
@@ -75,6 +77,11 @@ def main():
         attn_implementation="eager",
         torch_dtype=torch.bfloat16,
     )
+
+    # If pad token was added, need to resize embeddings.
+    if NEED_TO_RESIZE_VOCAB:
+        model.resize_token_embeddings(len(tokenizer))
+
     model = get_peft_model(model, peft_args)
 
     trainer = SFTTrainer(

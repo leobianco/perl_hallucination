@@ -36,17 +36,27 @@ def main():
     set_seed(training_args.seed)
 
     tokenizer = AutoTokenizer.from_pretrained(
-        script_args.model_repo_id,
+        script_args.sft_model_path,
         padding_side="left",
     )
 
+    # Tokenize data
+    def encode(examples):
+        return tokenizer(
+            examples["prompt"],
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+        )
+
     perl_data = load_dataset(script_args.dataset_repo_id)
-    perl_data["train"] = perl_data["train"].select_columns(
-        ["input_ids", "attention_mask"]
-    )
-    perl_data["test"] = perl_data["test"].select_columns(
-        ["input_ids", "attention_mask"]
-    )
+    for split in perl_data.keys():
+        perl_data[split] = perl_data[split].map(
+            encode,
+            remove_columns=perl_data[split].column_names,
+            batched=True,
+        )
+        perl_data[split].set_format("torch")
 
     id2label = {
         0: "Yes",
