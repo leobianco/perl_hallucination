@@ -36,7 +36,7 @@ def main():
     set_seed(training_args.seed)
 
     tokenizer = AutoTokenizer.from_pretrained(
-        script_args.sft_model_path,
+        training_args.sft_model_path,
         padding_side="left",
     )
 

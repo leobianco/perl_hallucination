@@ -7,18 +7,15 @@ with the dataset name as an argument ("halomi" or "npov").
 
 import os
 import random
-import re
 from argparse import ArgumentParser
 from copy import deepcopy
 from itertools import combinations
 
 import nltk
-import numpy as np
 import pandas as pd
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
 from google import genai
 from google.genai import types
-from transformers import AutoTokenizer
 
 if not os.path.exists(os.path.expanduser("~/nltk_data/tokenizers/punkt_tab")):
     nltk.download("punkt_tab")
@@ -100,13 +97,12 @@ def npov_rm_prompt(entry):
     """
 
     template = (
-        "<start_of_turn>user\n"
         "User query: {user_query}\n"
         "{perspective_1_name} arguments provided: {perspective_1}\n"
         "{perspective_2_name} arguments provided: {perspective_2}\n"
         "Neutral point-of-view answer to user query, rewriting provided"
-        " arguments in natural language:<end_of_turn>\n"
-        "<start_of_turn>model\n{npov_response}<end_of_turn><eos>"
+        " arguments in natural language:\n"
+        "{npov_response}"
     )
 
     formatted_prompt = template.format(
@@ -199,17 +195,16 @@ def npov_writer_prompt(entry, SFT=False, fewshot_examples=None):
     """
 
     template = (
-        "<start_of_turn>user\n"
         "User query: {user_query}\n"
         "{perspective_1_name} arguments provided: {perspective_1}\n"
         "{perspective_2_name} arguments provided: {perspective_2}\n"
         "Neutral point-of-view answer to user query, rewriting provided"
-        " arguments in natural language:<end_of_turn>\n"
-        "<start_of_turn>model\n{npov_response}"
+        " arguments in natural language:\n"
+        "{npov_response}"
     )
 
     npov_response = (
-        (entry["npov_response"] + "<end_of_turn><eos>") if SFT else ""
+        entry["npov_response"] if SFT else ""
     )
 
     formatted_prompt = template.format(
@@ -225,11 +220,11 @@ def npov_writer_prompt(entry, SFT=False, fewshot_examples=None):
 
     if fewshot_examples is not None:
         preamble = (
-            "<start_of_turn>user\nYour task is to answer an user's query"
+            "Your task is to answer an user's query"
             " by rewriting the provided arguments in natural language. Do not "
             "generate arguments other than those provided. "
             f"We provide {fewshot_examples.num_rows} example(s) of what is "
-            "expected, then it is your turn.<end_of_turn>\n"
+            "expected, then it is your turn.\n"
         )
 
         prompt += preamble
@@ -243,7 +238,7 @@ def npov_writer_prompt(entry, SFT=False, fewshot_examples=None):
                 perspective_2=fewshot_example["perspective_2"],
                 npov_response=fewshot_example["npov_response"],
             )
-            prompt += fewshot_prompt + "<end_of_turn>\n"
+            prompt += fewshot_prompt + "\n"
 
         prompt += formatted_prompt
 
@@ -259,7 +254,6 @@ def npov_formatting_prompts_func(entry):
     """Formatting function for SFTTrainer. Imported in writer_sft.py."""
 
     template = (
-        "<start_of_turn>user\n"
         "User query: {user_query}\n"
         "{perspective_1_name} arguments provided: {perspective_1}\n"
         "{perspective_2_name} arguments provided: {perspective_2}"
@@ -278,9 +272,8 @@ def npov_formatting_prompts_func(entry):
 
         text = (
             f"{formatted_prompt}\nNeutral point-of-view answer to user query, "
-            "rewriting provided arguments in natural language:<end_of_turn>\n"
-            f"<start_of_turn>model\n{entry['npov_response'][i]}"
-            "<end_of_turn><eos>"
+            "rewriting provided arguments in natural language:\n"
+            f"{entry['npov_response'][i]}"
         )
 
         output_texts.append(text)
@@ -292,23 +285,22 @@ def npov_formatting_prompts_func_from_fewshot_examples(fewshot_examples):
     """Given a fewshot example, returns a formatting prompts function for writer SFT that includes the given fewshot example in its prompt."""
 
     preamble = (
-        "<start_of_turn>user\nYour task is to answer an user's query"
+        "Your task is to answer an user's query"
         " by rewriting the provided arguments in natural language. Do not "
         "generate arguments other than those provided. "
         f"We provide {fewshot_examples.num_rows} example(s) of what is "
-        "expected, then it is your turn.<end_of_turn>\n"
+        "expected, then it is your turn.\n"
     )
 
     prompt = preamble
 
     template_fewshot = (
-        "<start_of_turn>user\n"
         "User query: {user_query}\n"
         "{perspective_1_name} arguments provided: {perspective_1}\n"
         "{perspective_2_name} arguments provided: {perspective_2}\n"
         "Example neutral point-of-view answer to user query, rewriting provided"
-        " arguments in natural language:<end_of_turn>\n"
-        "<start_of_turn>model\n{npov_response}"
+        " arguments in natural language:\n"
+        "{npov_response}"
     )
 
     for fewshot_example in fewshot_examples:
@@ -320,17 +312,16 @@ def npov_formatting_prompts_func_from_fewshot_examples(fewshot_examples):
             perspective_2=fewshot_example["perspective_2"],
             npov_response=fewshot_example["npov_response"],
         )
-        prompt += fewshot_prompt + "<end_of_turn>\n"
+        prompt += fewshot_prompt + "\n"
 
     def formatting_prompts_func(entry):
         template = (
-            "<start_of_turn>user\n"
             "User query: {user_query}\n"
             "{perspective_1_name} arguments provided: {perspective_1}\n"
             "{perspective_2_name} arguments provided: {perspective_2}"
             "\nNeutral point-of-view answer to user query, rewriting provided"
-            " arguments in natural language:<end_of_turn>\n"
-            "<start_of_turn>model\n{npov_response}<end_of_turn><eos>"
+            " arguments in natural language:\n"
+            "{npov_response}"
         )
 
         output_texts = []
@@ -586,12 +577,12 @@ def bosch_load_and_process_data(data_path, flip_path):
     )
     data["label"] = data["class_hall"].apply(lambda x: 1 if x == "No" else 0)
     data["prompt"] = (
-        "<start_of_turn><user>\nYou are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information giver. Do not add to your answer any information other than those present in the manual excerpt.\n"
+        "You are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information giver. Do not add to your answer any information other than those present in the manual excerpt.\n"
         + "User question:\n"
         + data["Question"]
         + "\nManual information:\n"
         + data["Context"]
-        + "\nAnswer to user's question:<end_of_turn>\n<start_of_turn><model>\n"
+        + "\nAnswer to user's question:\n"
     )
 
     return data
@@ -600,7 +591,7 @@ def bosch_load_and_process_data(data_path, flip_path):
 def bosch_rm_prompt(entry):
     """The dataset already contains a prompt column, which is an instruction for the writer. We just append the generation."""
 
-    entry["prompt"] += entry["response"] + "<end_of_turn><eos>"
+    entry["prompt"] += entry["response"]
 
     return entry
 
@@ -609,10 +600,10 @@ def bosch_formatting_prompts_func(entry):
     """Formatting function for SFTTrainer. Imported in writer_sft.py."""
 
     template = (
-        "<start_of_turn><user>\nYou are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information given.\n"
+        "You are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information given.\n"
         "User question:\n{question}"
         "\nManual information:\n{context}"
-        "\nAnswer to user's question:<end_of_turn>\n<start_of_turn><model>\n"
+        "\nAnswer to user's question:\n"
     )
 
     output_texts = []
@@ -817,9 +808,7 @@ def ragtruth_function_to_map_synthetic_halls_llm(
 def ragtruth_formatting_prompts_func(entry):
     """Formatting function for SFTTrainer. Imported in writer_sft.py."""
 
-    template = (
-        "{user_query}" + "\n" + "{response}"
-    )
+    template = "{user_query}" + "\n" + "{response}"
 
     output_texts = []
 

@@ -5,15 +5,15 @@ TODO: clean imports.
 
 import os
 
-import torch
 import evaluate
 import numpy as np
+import torch
 from datasets import load_dataset
-from peft import PeftModel, get_peft_model
+from peft import get_peft_model
 from transformers import (
     AutoModelForSequenceClassification,
-    DataCollatorWithPadding,
     AutoTokenizer,
+    DataCollatorWithPadding,
     HfArgumentParser,
     Trainer,
     TrainingArguments,
@@ -24,7 +24,6 @@ from utils import CustomLoraConfig, ScriptArguments
 
 
 def main():
-    # SETUP
     parser = HfArgumentParser(
         (ScriptArguments, TrainingArguments, CustomLoraConfig)
     )
@@ -43,12 +42,12 @@ def main():
         script_args.model_repo_id,
         padding_side="left",
     )
-    
+
     # Some models (e.g. Mistral) don't have a pad token.
     # So we set it to some existing token.
     # Advice: avoid changing vocabulary size. It is possible, but it's a hassle.
     pad_token_modified = False
-    if 'pad_token' not in tokenizer.special_tokens_map.keys():
+    if "pad_token" not in tokenizer.special_tokens_map.keys():
         tokenizer.pad_token = tokenizer.unk_token
         pad_token_modified = True
 
@@ -79,7 +78,6 @@ def main():
         "No": 1,
     }
 
-    # DATA
     rm_data = load_dataset(script_args.dataset_repo_id)
 
     for split in rm_data.keys():
@@ -89,7 +87,6 @@ def main():
         )
         rm_data[split].set_format("torch")  # due to using map()
 
-    # MODEL
     reward_model = AutoModelForSequenceClassification.from_pretrained(
         script_args.model_repo_id,
         num_labels=2,
@@ -104,7 +101,6 @@ def main():
 
     reward_model = get_peft_model(reward_model, peft_args)
 
-    # EVALUATION SETUP
     metric = evaluate.load("roc_auc")
 
     def compute_metrics(eval_preds):
@@ -130,7 +126,6 @@ def main():
 
         return metrics
 
-    # TRAINING
     trainer = Trainer(
         model=reward_model,
         args=training_args,
@@ -150,7 +145,6 @@ def main():
         if training_args.push_to_hub:
             reward_model.push_to_hub(training_args.hub_model_id)
 
-    # EVALUATION
     if training_args.do_eval:
         trainer.evaluate()
 

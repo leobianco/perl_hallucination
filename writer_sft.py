@@ -1,8 +1,8 @@
 """TODO: write docstring."""
 
+import torch
 from datasets import load_dataset
 from peft import get_peft_model
-import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 from trl import (
     DataCollatorForCompletionOnlyLM,
@@ -12,9 +12,9 @@ from trl import (
 )
 
 from data import (
+    bosch_formatting_prompts_func,
     npov_formatting_prompts_func,
     npov_formatting_prompts_func_from_fewshot_examples,
-    bosch_formatting_prompts_func,
     ragtruth_formatting_prompts_func,
 )
 from utils import CustomLoraConfig, ScriptArguments
@@ -35,14 +35,14 @@ def main():
     )
 
     # Some models (e.g. Mistral) don't have a pad token.
-    pad_token_modified=False
-    if 'pad_token' not in tokenizer.special_tokens_map.keys():
+    pad_token_modified = False
+    if "pad_token" not in tokenizer.special_tokens_map.keys():
         tokenizer.pad_token = tokenizer.unk_token
-        pad_token_modified=True
+        pad_token_modified = True
 
     # For training on completions only.
     if script_args.task == "npov":
-        response_template = "point-of-view answer to user query, rewriting provided arguments in natural language:<end_of_turn>\n<start_of_turn>model\n"
+        response_template = "point-of-view answer to user query, rewriting provided arguments in natural language:\n"
         if script_args.num_fewshot == 0 or script_args.num_fewshot is None:
             formatting_prompts_func = npov_formatting_prompts_func
         else:
@@ -57,7 +57,7 @@ def main():
             )
     elif script_args.task == "bosch":
         response_template = (
-            "\nAnswer to user's question:<end_of_turn><start_of_turn><model>"
+            "\nAnswer to user's question:\n"
         )
         formatting_prompts_func = bosch_formatting_prompts_func
     elif script_args.task == "ragtruth":
