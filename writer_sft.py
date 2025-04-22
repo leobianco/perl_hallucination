@@ -42,6 +42,9 @@ def main():
 
     # For training on completions only.
     if script_args.task == "npov":
+        # This is model dependent... for Mistral, "point-of-view" forward.
+        # for Gemma, "\nNeutral point-of-view" forward... This is because
+        # the tokenizer tokenizes differently depending on context.
         response_template = "point-of-view answer to user query, rewriting provided arguments in natural language:\n"
         if script_args.num_fewshot == 0 or script_args.num_fewshot is None:
             formatting_prompts_func = npov_formatting_prompts_func
