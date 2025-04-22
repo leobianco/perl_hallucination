@@ -34,15 +34,15 @@ def main():
         padding_side="left",
     )
 
-    # Some models (e.g. Mistral) don't have a pad token, so we add it.
-    NEED_TO_RESIZE_VOCAB=False
+    # Some models (e.g. Mistral) don't have a pad token.
+    pad_token_modified=False
     if 'pad_token' not in tokenizer.special_tokens_map.keys():
-        tokenizer.add_special_tokens({'pad_token': '<pad>'})
-        NEED_TO_RESIZE_VOCAB=True
+        tokenizer.pad_token = tokenizer.unk_token
+        pad_token_modified=True
 
     # For training on completions only.
     if script_args.task == "npov":
-        response_template = "Neutral point-of-view answer to user query, rewriting provided arguments in natural language:<end_of_turn>\n<start_of_turn>model\n"
+        response_template = "point-of-view answer to user query, rewriting provided arguments in natural language:<end_of_turn>\n<start_of_turn>model\n"
         if script_args.num_fewshot == 0 or script_args.num_fewshot is None:
             formatting_prompts_func = npov_formatting_prompts_func
         else:
@@ -79,8 +79,8 @@ def main():
     )
 
     # If pad token was added, need to resize embeddings.
-    if NEED_TO_RESIZE_VOCAB:
-        model.resize_token_embeddings(len(tokenizer))
+    if pad_token_modified:
+        model.config.pad_token_id = tokenizer.pad_token_id
 
     model = get_peft_model(model, peft_args)
 

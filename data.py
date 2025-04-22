@@ -5,6 +5,7 @@ and NPOV to Hugging Face Hub. Call this script via the shell script data.sh
 with the dataset name as an argument ("halomi" or "npov").
 """
 
+import os
 import random
 import re
 from argparse import ArgumentParser
@@ -14,13 +15,13 @@ from itertools import combinations
 import nltk
 import numpy as np
 import pandas as pd
-
-nltk.download("punkt_tab")
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
 from google import genai
 from google.genai import types
 from transformers import AutoTokenizer
 
+if not os.path.exists(os.path.expanduser("~/nltk_data/tokenizers/punkt_tab")):
+    nltk.download("punkt_tab")
 
 ##################
 # NPOV FUNCTIONS #

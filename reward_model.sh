@@ -9,7 +9,7 @@ else
   ORGANIC=true
   SYN_HALL_LLM=false
   SYN_HALL_STRUCT=false
-  DATASET_REPO_ID="leobianco/${TASK}_rm_processed"
+  DATASET_REPO_ID="leobianco/${TASK}_rm"
   DEEPSPEED_CONFIG="./deepspeed_config.yaml"
   MODEL_REPO_ID="mistralai/Mistral-7B-Instruct-v0.3"
   SEED=12345

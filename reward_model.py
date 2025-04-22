@@ -44,11 +44,13 @@ def main():
         padding_side="left",
     )
     
-    # Some models (e.g. Mistral) don't have a pad token, so we add it.
-    NEED_TO_RESIZE_VOCAB=False
+    # Some models (e.g. Mistral) don't have a pad token.
+    # So we set it to some existing token.
+    # Advice: avoid changing vocabulary size. It is possible, but it's a hassle.
+    pad_token_modified = False
     if 'pad_token' not in tokenizer.special_tokens_map.keys():
-        tokenizer.add_special_tokens({'pad_token': '<pad>'})
-        NEED_TO_RESIZE_VOCAB=True
+        tokenizer.pad_token = tokenizer.unk_token
+        pad_token_modified = True
 
     def encode(examples):
         return tokenizer(
@@ -97,9 +99,8 @@ def main():
         attn_implementation="eager",
     )
 
-    # If pad token was added, need to resize embeddings.
-    if NEED_TO_RESIZE_VOCAB:
-        reward_model.resize_token_embeddings(len(tokenizer))
+    if pad_token_modified:
+        reward_model.config.pad_token_id = tokenizer.pad_token_id
 
     reward_model = get_peft_model(reward_model, peft_args)
 
