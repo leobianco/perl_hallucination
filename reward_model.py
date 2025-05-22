@@ -80,6 +80,10 @@ def main():
 
     rm_data = load_dataset(script_args.dataset_repo_id)
 
+    def labels_to_bfloat(entry):
+        entry["label"] = torch.tensor([entry["label"]], dtype=torch.bfloat16)
+        return entry
+
     for split in rm_data.keys():
         rm_data[split] = rm_data[split].map(
             encode,
@@ -87,11 +91,16 @@ def main():
         )
         rm_data[split].set_format("torch")  # due to using map()
 
+        rm_data[split] = rm_data[split].map(labels_to_bfloat)
+
+    print("LEO:", rm_data["train"]["label"][0])
+    print("LEO type:", rm_data["train"]["label"][0].type())
+
     reward_model = AutoModelForSequenceClassification.from_pretrained(
         script_args.model_repo_id,
-        num_labels=2,
-        id2label=id2label,
-        label2id=label2id,
+        num_labels=1,
+    #    id2label=id2label,
+    #    label2id=label2id,
         torch_dtype=torch_dtype,
         attn_implementation="eager",
     )
@@ -101,7 +110,8 @@ def main():
 
     reward_model = get_peft_model(reward_model, peft_args)
 
-    metric = evaluate.load("roc_auc")
+    # metric = evaluate.load("roc_auc")
+    metric = evaluate.load("mse")
 
     def compute_metrics(eval_preds):
         """Recall that whereas logits where torch tensors before, now they are
@@ -114,15 +124,19 @@ def main():
         """
 
         # Compute scores
-        logits = eval_preds.predictions
-        yes_scores = np.exp(logits)[:, 0]
-        no_scores = np.exp(logits)[:, 1]
-        scores = no_scores / (yes_scores + no_scores)
+        # logits = eval_preds.predictions
+        # yes_scores = np.exp(logits)[:, 0]
+        # no_scores = np.exp(logits)[:, 1]
+        # scores = no_scores / (yes_scores + no_scores)
+
+        # Compute scores
+        scores = eval_preds.predictions
 
         # Compute ground truth
         label_ids = eval_preds.label_ids
 
-        metrics = metric.compute(references=label_ids, prediction_scores=scores)
+        # metrics = metric.compute(references=label_ids, prediction_scores=scores)
+        metrics = metric.compute(references=label_ids, predictions=scores)
 
         return metrics
 

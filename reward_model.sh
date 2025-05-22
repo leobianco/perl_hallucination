@@ -6,23 +6,23 @@ if [ $SHLVL -gt 2 ]; then
 else
   # If single-run, set variables here.
   TASK="$1"
-  ORGANIC=true
+  ORGANIC=false
   SYN_HALL_LLM=false
-  SYN_HALL_STRUCT=false
+  SYN_HALL_STRUCT=true
   DATASET_REPO_ID="leobianco/${TASK}_rm"
   DEEPSPEED_CONFIG="./deepspeed_config.yaml"
-  MODEL_REPO_ID="mistralai/Mistral-7B-Instruct-v0.3"
-  SEED=12345
+  MODEL_REPO_ID="google/gemma-2-2b-it"
+  SEED=130104
   PRECISION="BF16"  # BF16 for Gemma, Mistral, Qwen
-  NUM_TRAIN_EPOCHS=2
-  BATCH_SIZE=1
-  LEARNING_RATE=5e-5
-  LR_SCHEDULER_TYPE="cosine"
-  WARMUP_RATIO=0.15
+  NUM_TRAIN_EPOCHS=3
+  BATCH_SIZE=2
+  LEARNING_RATE=1e-3
+  LR_SCHEDULER_TYPE="linear"
+  WARMUP_RATIO=0.0
   LORA_RANK=8
-  LORA_ALPHA=8
-  LORA_DROPOUT=0.1
-  WEIGHT_DECAY=5e-4
+  LORA_ALPHA=16
+  LORA_DROPOUT=0.0
+  WEIGHT_DECAY=0
   MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
   RUN_IDENTIFIER="leobianco/${TASK}_RM_model_${MODEL_NAME}_seed_${SEED}_SYN_LLM_${SYN_HALL_LLM}_SYN_STRUCT_${SYN_HALL_STRUCT}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_lora_${LORA_RANK}"
 fi
@@ -66,7 +66,7 @@ accelerate launch \
   --seed "$SEED" \
   --report_to "wandb" \
   --run_name "$RUN_IDENTIFIER" \
-  --logging_steps 5 \
+  --logging_steps 1 \
   --output_dir "./checkpoints/${TASK}/reward_model/${RUN_IDENTIFIER}" \
   --overwrite_output_dir True \
   --push_to_hub True \
@@ -87,7 +87,7 @@ accelerate launch \
   --do_eval True \
   --eval_on_start True \
   --eval_strategy "steps" \
-  --eval_steps 20 \
+  --eval_steps 15 \
   --per_device_eval_batch_size "$BATCH_SIZE" \
   --eval_accumulation_steps 1 \
   --task_type "SEQ_CLS" \

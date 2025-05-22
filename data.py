@@ -12,6 +12,7 @@ from copy import deepcopy
 from itertools import combinations
 
 import nltk
+import torch
 import pandas as pd
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
 from google import genai
@@ -32,7 +33,7 @@ def npov_hallucination_labels_to_numerical(entry):
     """Data processing utility function which replaces the hallucination labels by
     a numerical version."""
 
-    entry["class_hall_num"] = 0 if entry["class_hall"] == "Yes" else 1
+    entry["class_hall_num"] = torch.tensor([0 if entry["class_hall"] == "Yes" else 1], dtype=torch.bfloat16)[0]
 
     return entry
 
@@ -575,7 +576,8 @@ def bosch_load_and_process_data(data_path, flip_path):
     data["class_hall"] = data["class_hall"].apply(
         lambda x: "Yes" if x == "Hallucinated" else "No"
     )
-    data["label"] = data["class_hall"].apply(lambda x: 1 if x == "No" else 0)
+    #data["label"] = data["class_hall"].apply(lambda x: 1 if x == "No" else 0)
+    data["label"] = data["class_hall"].apply(lambda x: torch.tensor([1], dtype=torch.bfloat16)[0] if x == "No" else torch.tensor([0], dtype=torch.bfloat16)[0])
     data["prompt"] = (
         "You are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information giver. Do not add to your answer any information other than those present in the manual excerpt.\n"
         + "User question:\n"
