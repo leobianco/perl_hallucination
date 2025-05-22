@@ -42,10 +42,19 @@ def main():
 
     # For training on completions only.
     if script_args.task == "npov":
-        # This is model dependent... for Mistral, "point-of-view" forward.
-        # for Gemma, "\nNeutral point-of-view" forward... This is because
-        # the tokenizer tokenizes differently depending on context.
-        response_template = "point-of-view answer to user query, rewriting provided arguments in natural language:\n"
+        # Response template is model dependent... 
+        # For Mistral, "point-of-view" forward.
+        # For Gemma, "\nNeutral point-of-view" forward... 
+        # This is because the tokenizer tokenizes differently depending 
+        # on context.
+        model_company = script_args.model_repo_id.split("/")[0]
+        if model_company=="google":
+            response_template = "\nNeutral point-of-view answer to user query, rewriting provided arguments in natural language:\n"
+        elif model_company=="mistralai":
+            response_template = "point-of-view answer to user query, rewriting provided arguments in natural language:\n"
+        else:
+            raise Exception("Response template not specified for model!")
+
         if script_args.num_fewshot == 0 or script_args.num_fewshot is None:
             formatting_prompts_func = npov_formatting_prompts_func
         else:
