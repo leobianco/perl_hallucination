@@ -8,7 +8,7 @@ import os
 import evaluate
 import numpy as np
 import torch
-from datasets import load_dataset
+from datasets import Value, load_dataset
 from peft import get_peft_model
 from transformers import (
     AutoModelForSequenceClassification,
@@ -86,6 +86,10 @@ def main():
             batched=True,
         )
         rm_data[split].set_format("torch")  # due to using map()
+        # But not for the labels, those we need to be ints
+        new_features = rm_data[split].features.copy()
+        new_features["label"] = Value("int32")
+        rm_data[split] = rm_data[split].cast(new_features)
 
     reward_model = AutoModelForSequenceClassification.from_pretrained(
         script_args.model_repo_id,
