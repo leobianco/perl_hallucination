@@ -4,11 +4,11 @@ USER="leobianco"
 TASK="$1"
 SEED=12345
 SYNTH_LLM="True"
-SYNTH_STRUCT="True"
-NUM_SYNTH_HALLUS=200
+SYNTH_STRUCT="False"
+NUM_SYNTH_HALLUS=100
 GEMINI_API_KEY="AIzaSyCIPXhApp0pcu7TruZ8EyuW086VJ1wzrhk"
 SYNTH_LLM_TEMPERATURE=0.7
-SYNTH_LLM_NUM_FEWSHOT=4
+SYNTH_LLM_NUM_FEWSHOT=5
 
 if [ "$TASK" != "ragtruth" ] && [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ]; then
     echo "Invalid dataset name"

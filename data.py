@@ -203,9 +203,7 @@ def npov_writer_prompt(entry, SFT=False, fewshot_examples=None):
         "{npov_response}"
     )
 
-    npov_response = (
-        entry["npov_response"] if SFT else ""
-    )
+    npov_response = entry["npov_response"] if SFT else ""
 
     formatted_prompt = template.format(
         user_query=entry["user_query"],
@@ -494,51 +492,77 @@ def npov_data_augmentation(data):
 
 
 # Synthetic Hallucinations
-def npov_rm_synthetic_hall_llm(entry):
-    prompt = f"""
-Task: Generate a modified answer that includes controlled hallucinations
+def npov_rm_synthetic_hall_llm(entry, fewshot_examples=None):
+    preamble = """SYSTEM:
+You are a writer tasked with introducing subtle, realistic hallucinations into neutral answers. The original answer is a balanced and neutral synthesis of two opposing perspectives, presenting only the arguments provided in the context. Your goal is to modify this answer by adding some new piece of information or argument that is NOT present in the original answer or context. This addition should be small, plausible, and smoothly integrated, resembling the kind of factual error that language models often make when generating text. It can appear as added information on the existing arguments in the context, or as a new argument on its own.
 
-Question: {entry["user_query"]}
+"""
+
+    prompt = preamble
+
+    if fewshot_examples is not None:
+        prompt += """
+--- FEW-SHOT EXAMPLES OF ANSWERS WITH HALLUCINATIONS ---
+
+"""
+
+        for fewshot in fewshot_examples:
+            prompt += f"""EXAMPLE:
+Question:
+{fewshot["user_query"]}
 
 Context:
-{entry["perspective_1_name"]} arguments:
+List of {fewshot["perspective_1_name"]} arguments:
+{fewshot["perspective_1"]}
+
+List of {fewshot["perspective_2_name"]} arguments:
+{fewshot["perspective_2"]}
+
+Answer with hallucination:
+{fewshot["npov_response"]}
+
+"""
+
+        prompt += """
+--- END FEW-SHOT EXAMPLES ---
+
+"""
+
+    prompt += f"""
+TASK:
+Question:
+{entry["user_query"]}
+
+Context:
+List of {entry["perspective_1_name"]} arguments:
 {entry["perspective_1"]}
 
-{entry["perspective_2_name"]} arguments:
+List of {entry["perspective_2_name"]} arguments:
 {entry["perspective_2"]}
 
-Neutral Point of View Answer:
+Neutral Point-of-View Answer, without hallucinations:
 {entry["npov_response"]}
 
-Instructions:
-1. Create a modified version of the neutral answer that does ONE of the following:
-   a. Adds one entirely new argument (either pro or con) that is NOT present in the context
-   b. Distorts one or two existing arguments to change their meaning or implications
+INSTRUCTIONS:
+Create a version of the Neutral Point-of-View answer containing hallucinations by either introducing subtle, hard-to-detect inaccuracies or misrepresentations to the arguments that were present in the context, OR by adding one new argument not present in the context.
+The hallucinations must respect the following:
+1. Keep most (90%+) of the content faithful to the original arguments. Adding too much text makes hallucinations easy to detect.
+2. Be consistent with the overall argument flow and keep the tone of the original answer.
+3. Be presented as factual.
 
-2. If adding a new argument:
-   - Make it plausible and thematically consistent with the topic
-   - Ensure it appears to be a natural extension of the discussion
-   - Integrate it seamlessly without calling attention to it
+OUTPUT:
+A single, self-contained "Modified Answer" containing the subtle hallucinations (new information not in the context).
 
-3. If distorting existing arguments:
-   - Subtly change key details, statistics, or conclusions
-   - Maintain enough of the original argument to make it recognizable
-   - Ensure the distortion meaningfully alters the argument's strength or implications
-
-4. The hallucinated content should not be marked or highlighted in any way
-5. Maintain the overall balanced structure, tone, and appearance of neutrality
-6. The rest of the answer should remain faithful to the original arguments
-
-Modified Answer with Synthetic Hallucinations:
+Modified Answer with Synthetic Hallucination:
 """
 
     return prompt
 
 
 def npov_function_to_map_synthetic_halls_llm(
-    entry, client, gemini_model, generation_config
+    entry, fewshot_examples, client, gemini_model, generation_config
 ):
-    prompt_to_send = npov_rm_synthetic_hall_llm(entry)
+    prompt_to_send = npov_rm_synthetic_hall_llm(entry, fewshot_examples)
 
     response = client.models.generate_content(
         model=gemini_model,
@@ -911,14 +935,19 @@ def main():
             repo_id=args.task + "_rm_organic"
         )
 
-        # Release memory
-        del npov_rm_data_organic_dataset
-        del npov_rm_data_organic
-
         # SYNTHETIC HALLUCINATIONS
 
         # LLM-GENERATED
         if args.synthetic_hallus_llm:
+            # Fewshot examples of organic hallucinations to help LLM
+            n_fewshot_examples_synth_llm = args.synth_llm_num_fewshot
+            fewshot_examples_synth_llm = (
+                npov_rm_data_organic_dataset["train"]
+                .filter(lambda x: x["class_hall"] == "Yes")
+                .shuffle(seed=args.seed)
+                .select(range(n_fewshot_examples_synth_llm))
+            )
+
             # Copy data
             npov_rm_data_synth_llm = deepcopy(npov_rm_data)
 
@@ -960,6 +989,7 @@ def main():
             synthetic_hallucinations_llm = npov_rm_train_synth_llm.map(
                 npov_function_to_map_synthetic_halls_llm,
                 fn_kwargs=dict(
+                    fewshot_examples=fewshot_examples_synth_llm,
                     client=client,
                     gemini_model=gemini_model,
                     generation_config=generation_config,
