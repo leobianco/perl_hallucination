@@ -863,6 +863,7 @@ def main():
     )
     parser.add_argument("--num_synth_hallus", type=int, default=0)
     parser.add_argument("--num_organic_hallus_to_keep", type=int, default=0)
+    parser.add_argument("--num_struct_hallus_to_keep", type=int, default=0)
     parser.add_argument("--gemini_api_key", type=str)
     parser.add_argument("--synth_llm_temperature", type=float, default=0.7)
     parser.add_argument("--synth_llm_num_fewshot", type=int, default=2)
@@ -938,9 +939,51 @@ def main():
 
         # SYNTHETIC HALLUCINATIONS
 
-        # LLM-GENERATED
+        # STRUCTURED
+        if args.synthetic_hallus_struct:
+            # Copy data
+            npov_rm_data_synth_struct = deepcopy(npov_rm_data)
+
+            # To train on synthetic hallucinations only and evaluate on organic,
+            # drop the organic ones from the training set, and the synthetic
+            # ones from the validation set. Do not mix splits, as this would
+            # mix topics. Do not pass the test set into the validation one,
+            # because it will be the test set for PERL later on and we agreed
+            # that we cannot test both the RM and PERL on the same examples.
+            npov_rm_data_synth_struct["train"] = npov_rm_data_synth_struct[
+                "train"
+            ].filter(
+                lambda x: not (
+                    x["class_hall"] == "Yes"
+                    and x["has synthetic hallucination"] == "No"
+                )
+            )
+
+            # Filter out synthetic hallucinations from validation set
+            npov_rm_data_synth_struct["validation"] = npov_rm_data_synth_struct[
+                "validation"
+            ].filter(
+                lambda x: not (
+                    x["class_hall"] == "Yes"
+                    and x["has synthetic hallucination"] == "Yes"
+                )
+            )
+
+            # Put in splits and save
+            npov_rm_data_synth_struct_dataset = DatasetDict(
+                {
+                    "train": npov_rm_data_synth_struct["train"],
+                    "test": npov_rm_data_synth_struct["validation"],
+                }
+            )
+
+            npov_rm_data_synth_struct_dataset.push_to_hub(
+                repo_id=args.task + "_rm_synthetic_struct"
+            )
+
+        # LLM GENERATED
         if args.synthetic_hallus_llm:
-            # Fewshot examples of organic hallucinations to help LLM
+            # Fewshot examples of organic hallucinations to help LLM generation
             n_fewshot_examples_synth_llm = args.synth_llm_num_fewshot
             fewshot_examples_synth_llm = (
                 npov_rm_data_organic_dataset["train"]
@@ -998,18 +1041,27 @@ def main():
             )
 
             # We add a small number of organic hallucinations to regularize
-            organic_halls_to_keep = (
+            organic_hallus_to_keep = (
                 npov_rm_data_organic_dataset["train"]
                 .filter(lambda x: x["class_hall"] == "Yes")
                 .shuffle(seed=args.seed)
                 .select(range(args.num_organic_hallus_to_keep))
             )
 
+            # We may wish to also add a number of structured hallucinations
+            struct_hallus_to_keep = (
+                npov_rm_data_synth_struct_dataset["train"]
+                .filter(lambda x: x["class_hall"] == "Yes")
+                .shuffle(seed=args.seed)
+                .select(range(args.num_struct_hallus_to_keep))
+            )
+
             # Now we create the RM training data
             synthetic_hallucinations_llm_train_data = concatenate_datasets(
                 [
                     synthetic_hallucinations_llm,
-                    organic_halls_to_keep,
+                    organic_hallus_to_keep,
+                    struct_hallus_to_keep,
                     npov_rm_train_non,
                 ]
             ).shuffle(seed=args.seed)
@@ -1035,52 +1087,6 @@ def main():
                     repo_id=args.task + "_rm_synthetic_llm",
                     split=split,
                 )
-
-        # STRUCTURED
-        if args.synthetic_hallus_struct:
-            # Copy data
-            npov_rm_data_synth_struct = deepcopy(npov_rm_data)
-
-            # To train on synthetic hallucinations only and evaluate on organic,
-            # drop the organic ones from the training set, and the synthetic
-            # ones from the validation set. Do not mix splits, as this would
-            # mix topics. Do not pass the test set into the validation one,
-            # because it will be the test set for PERL later on and we agreed
-            # that we cannot test both the RM and PERL on the same examples.
-            npov_rm_data_synth_struct["train"] = npov_rm_data_synth_struct[
-                "train"
-            ].filter(
-                lambda x: not (
-                    x["class_hall"] == "Yes"
-                    and x["has synthetic hallucination"] == "No"
-                )
-            )
-
-            # Filter out synthetic hallucinations from validation set
-            npov_rm_data_synth_struct["validation"] = npov_rm_data_synth_struct[
-                "validation"
-            ].filter(
-                lambda x: not (
-                    x["class_hall"] == "Yes"
-                    and x["has synthetic hallucination"] == "Yes"
-                )
-            )
-
-            # Put in splits and save
-            npov_rm_data_synth_struct_dataset = DatasetDict(
-                {
-                    "train": npov_rm_data_synth_struct["train"],
-                    "test": npov_rm_data_synth_struct["validation"],
-                }
-            )
-
-            npov_rm_data_synth_struct_dataset.push_to_hub(
-                repo_id=args.task + "_rm_synthetic_struct"
-            )
-
-            # Release memory
-            del npov_rm_data_synth_struct_dataset
-            del npov_rm_data_synth_struct
 
         # SFT
         npov_sft_data = load_dataset(
