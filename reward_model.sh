@@ -67,7 +67,7 @@ accelerate launch \
   --seed "$SEED" \
   --report_to "wandb" \
   --run_name "$RUN_IDENTIFIER" \
-  --logging_steps 5 \
+  --logging_steps 1 \
   --output_dir "./checkpoints/${TASK}/reward_model/${RUN_IDENTIFIER}" \
   --overwrite_output_dir True \
   --push_to_hub True \
