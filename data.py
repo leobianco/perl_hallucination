@@ -862,6 +862,7 @@ def main():
         type=lambda x: (str(x).lower() == "true"),
     )
     parser.add_argument("--num_synth_hallus", type=int, default=0)
+    parser.add_argument("--num_organic_hallus_to_keep", type=int, default=0)
     parser.add_argument("--gemini_api_key", type=str)
     parser.add_argument("--synth_llm_temperature", type=float, default=0.7)
     parser.add_argument("--synth_llm_num_fewshot", type=int, default=2)
@@ -996,9 +997,21 @@ def main():
                 ),
             )
 
+            # We add a small number of organic hallucinations to regularize
+            organic_halls_to_keep = (
+                npov_rm_data_organic_dataset["train"]
+                .filter(lambda x: x["class_hall"] == "Yes")
+                .shuffle(seed=args.seed)
+                .select(range(args.num_organic_hallus_to_keep))
+            )
+
             # Now we create the RM training data
             synthetic_hallucinations_llm_train_data = concatenate_datasets(
-                [synthetic_hallucinations_llm, npov_rm_train_non]
+                [
+                    synthetic_hallucinations_llm,
+                    organic_halls_to_keep,
+                    npov_rm_train_non,
+                ]
             ).shuffle(seed=args.seed)
 
             # Merge the two in the appropriate splits
