@@ -23,6 +23,7 @@ else
   LORA_ALPHA=8
   LORA_DROPOUT=0.1
   WEIGHT_DECAY=5e-4
+  EVAL_STEPS=5
   MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
   RUN_IDENTIFIER="leobianco/${TASK}_RM_model_${MODEL_NAME}_seed_${SEED}_SYN_LLM_${SYN_HALL_LLM}_SYN_STRUCT_${SYN_HALL_STRUCT}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_lora_${LORA_RANK}"
 fi
@@ -87,7 +88,7 @@ accelerate launch \
   --do_eval True \
   --eval_on_start True \
   --eval_strategy "steps" \
-  --eval_steps 20 \
+  --eval_steps "$EVAL_STEPS" \
   --per_device_eval_batch_size "$BATCH_SIZE" \
   --eval_accumulation_steps 1 \
   --task_type "SEQ_CLS" \
