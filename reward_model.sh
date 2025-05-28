@@ -10,6 +10,8 @@ else
   SYN_HALL_LLM=false
   SYN_HALL_STRUCT=false
   DATASET_REPO_ID="leobianco/${TASK}_rm"
+  NUM_ORGANIC_HALLUS_TO_KEEP=0
+  NUM_STRUCT_HALLUS_TO_KEEP=10
   DEEPSPEED_CONFIG="./deepspeed_config.yaml"
   MODEL_REPO_ID="mistralai/Mistral-7B-Instruct-v0.3"
   SEED=12345
@@ -73,6 +75,8 @@ accelerate launch \
   --push_to_hub True \
   --hub_model_id "$RUN_IDENTIFIER" \
   --dataset_repo_id "${DATASET_REPO_ID}" \
+  --num_organic_hallus_to_keep $NUM_ORGANIC_HALLUS_TO_KEEP \
+  --num_struct_hallus_to_keep $NUM_STRUCT_HALLUS_TO_KEEP \
   --model_repo_id "${MODEL_REPO_ID}" \
   --do_train True \
   --fp16 "$FP16" \

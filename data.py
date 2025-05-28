@@ -1040,28 +1040,10 @@ def main():
                 ),
             )
 
-            # We add a small number of organic hallucinations to regularize
-            organic_hallus_to_keep = (
-                npov_rm_data_organic_dataset["train"]
-                .filter(lambda x: x["class_hall"] == "Yes")
-                .shuffle(seed=args.seed)
-                .select(range(args.num_organic_hallus_to_keep))
-            )
-
-            # We may wish to also add a number of structured hallucinations
-            struct_hallus_to_keep = (
-                npov_rm_data_synth_struct_dataset["train"]
-                .filter(lambda x: x["class_hall"] == "Yes")
-                .shuffle(seed=args.seed)
-                .select(range(args.num_struct_hallus_to_keep))
-            )
-
             # Now we create the RM training data
             synthetic_hallucinations_llm_train_data = concatenate_datasets(
                 [
                     synthetic_hallucinations_llm,
-                    organic_hallus_to_keep,
-                    struct_hallus_to_keep,
                     npov_rm_train_non,
                 ]
             ).shuffle(seed=args.seed)

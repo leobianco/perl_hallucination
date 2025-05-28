@@ -4,11 +4,12 @@ TODO: clean imports.
 """
 
 import os
+from typing import Optional
 
 import evaluate
 import numpy as np
 import torch
-from datasets import Value, load_dataset
+from datasets import Value, load_dataset, concatenate_datasets
 from peft import get_peft_model
 from transformers import (
     AutoModelForSequenceClassification,
@@ -23,13 +24,23 @@ from transformers import (
 from utils import CustomLoraConfig, ScriptArguments
 
 
+class LLMSynthScriptArguments:
+    """Additional script arguments controling how many organic and structured samples to keep.
+    """
+
+    num_struct_hallus_to_keep: Optional[int] = 0
+    num_organic_hallus_to_keep: Optional[int] = 0
+
+
+
 def main():
     parser = HfArgumentParser(
-        (ScriptArguments, TrainingArguments, CustomLoraConfig)
+        (ScriptArguments, LLMSynthScriptArguments, TrainingArguments, CustomLoraConfig)
     )
 
     (
         script_args,
+        llm_synth_args,
         training_args,
         peft_args,
     ) = parser.parse_args_into_dataclasses()
@@ -79,6 +90,42 @@ def main():
     }
 
     rm_data = load_dataset(script_args.dataset_repo_id)
+
+    print("LEO: test: nb rows in train BEFORE", rm_data["train"].num_rows)
+
+    # In the case of LLM-generated synthetic hallucinations, we 
+    # might want to add some organic or structured hallucination
+    # samples to the dataset. We do this here.
+    if script_args.dataset_repo_id.ends_with("synthetic_llm"):
+
+        new_train_split = rm_data["train"]
+
+        if script_args.num_organic_hallus_to_keep > 0:
+            organic_dataset_name = script_args.dataset_repo_id.removesuffix("synthetic_llm") + "organic"
+            organic_dataset = load_dataset(organic_dataset_name)
+            organic_hallus_to_keep = (
+                organic_dataset["train"]
+                .filter(lambda x: x["class_hall"] == "Yes")
+                .shuffle(seed=script_args.seed)
+                .select(range(llm_synth_args.num_organic_hallus_to_keep))
+            )
+            new_train_split = concatenate_datasets([new_train_split, organic_hallus_to_keep])
+        
+        if script_args.num_struct_hallus_to_keep > 0:
+            struct_dataset_name = script_args.dataset_repo_id.removesuffix("synthetic_llm") + "synthetic_struct"
+            struct_dataset = load_dataset(struct_dataset_name)
+            struct_hallus_to_keep = (
+                struct_dataset["train"]
+                .filter(lambda x: x["class_hall"] == "Yes")
+                .shuffle(seed=script_args.seed)
+                .select(range(llm_synth_args.num_struct_hallus_to_keep))
+            )
+            new_train_split = concatenate_datasets([new_train_split, struct_hallus_to_keep])
+        
+        # Mix them in training split
+        rm_data["train"] = new_train_split
+
+    print("LEO: test: nb rows in train AFTER", rm_data["train"].num_rows)
 
     for split in rm_data.keys():
         rm_data[split] = rm_data[split].map(
