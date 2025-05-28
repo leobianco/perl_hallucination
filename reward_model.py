@@ -96,8 +96,6 @@ def main():
 
     rm_data = load_dataset(script_args.dataset_repo_id)
 
-    print("LEO: test: nb rows in train BEFORE", rm_data["train"].num_rows)
-
     # In the case of LLM-generated synthetic hallucinations, we
     # might want to add some organic or structured hallucination
     # samples to the dataset. We do this here.
@@ -138,8 +136,6 @@ def main():
 
         # Mix them in training split
         rm_data["train"] = new_train_split.shuffle(seed=training_args.seed)
-
-    print("LEO: test: nb rows in train AFTER", rm_data["train"].num_rows)
 
     for split in rm_data.keys():
         rm_data[split] = rm_data[split].map(
