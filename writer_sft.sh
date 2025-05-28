@@ -18,7 +18,8 @@ else
   NUM_FEWSHOT=0
   SAVE_STEPS=200
   MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
-  RUN_IDENTIFIER="${USER}/${TASK}_SFT_model_${MODEL_NAME}_seed_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_lora_${LORA_RANK}_fewshot_${NUM_FEWSHOT}"
+  TIMESTAMP=$(date '+%y%m%d%H%M')
+  RUN_IDENTIFIER="${USER}/${TASK}_SFT_model_${MODEL_NAME}_seed_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_lora_${LORA_RANK}_fewshot_${NUM_FEWSHOT}_{$TIMESTAMP}"
 fi
 
 if [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ] && [ "$TASK" != "ragtruth" ]; then

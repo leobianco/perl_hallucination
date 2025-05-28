@@ -24,7 +24,8 @@ else
   LOCAL_ROLLOUT_FORWARD_BATCH_SIZE=8
   TEMPERATURE=7e-1
   SAVE_STEPS=1000
-  RUN_IDENTIFIER="leobianco/${TASK}_PERL_model_${MODEL_NAME}_seed_${SEED}_episodes_${TOTAL_EPISODES}_lr_${LEARNING_RATE}_klcoeff_${KL_COEFF}"
+  TIMESTAMP=$(date '+%y%m%d%H%M')
+  RUN_IDENTIFIER="leobianco/${TASK}_PERL_model_${MODEL_NAME}_seed_${SEED}_episodes_${TOTAL_EPISODES}_lr_${LEARNING_RATE}_klcoeff_${KL_COEFF}_${TIMESTAMP}"
   SHUTDOWN=false
 fi
 
