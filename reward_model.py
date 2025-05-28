@@ -113,7 +113,7 @@ def main():
             organic_hallus_to_keep = (
                 organic_dataset["train"]
                 .filter(lambda x: x["class_hall"] == "Yes")
-                .shuffle(seed=script_args.seed)
+                .shuffle(seed=training_args.seed)
                 .select(range(llm_synth_args.num_organic_hallus_to_keep))
             )
             new_train_split = concatenate_datasets(
@@ -129,7 +129,7 @@ def main():
             struct_hallus_to_keep = (
                 struct_dataset["train"]
                 .filter(lambda x: x["class_hall"] == "Yes")
-                .shuffle(seed=script_args.seed)
+                .shuffle(seed=training_args.seed)
                 .select(range(llm_synth_args.num_struct_hallus_to_keep))
             )
             new_train_split = concatenate_datasets(
@@ -137,7 +137,7 @@ def main():
             )
 
         # Mix them in training split
-        rm_data["train"] = new_train_split.shuffle(seed=script_args.seed)
+        rm_data["train"] = new_train_split.shuffle(seed=training_args.seed)
 
     print("LEO: test: nb rows in train AFTER", rm_data["train"].num_rows)
 
