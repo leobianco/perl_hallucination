@@ -98,7 +98,7 @@ def main():
     # In the case of LLM-generated synthetic hallucinations, we 
     # might want to add some organic or structured hallucination
     # samples to the dataset. We do this here.
-    if script_args.dataset_repo_id.ends_with("synthetic_llm"):
+    if script_args.dataset_repo_id.endswith("synthetic_llm"):
 
         new_train_split = rm_data["train"]
 
