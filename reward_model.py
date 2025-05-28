@@ -3,6 +3,7 @@ TODO: write proper docstring.
 TODO: clean imports.
 """
 
+from dataclasses import dataclass
 import os
 from typing import Optional
 
@@ -24,6 +25,7 @@ from transformers import (
 from utils import CustomLoraConfig, ScriptArguments
 
 
+@dataclass
 class LLMSynthScriptArguments:
     """Additional script arguments controling how many organic and structured samples to keep.
     """
@@ -123,7 +125,7 @@ def main():
             new_train_split = concatenate_datasets([new_train_split, struct_hallus_to_keep])
         
         # Mix them in training split
-        rm_data["train"] = new_train_split
+        rm_data["train"] = new_train_split.shuffle(seed=script_args.seed)
 
     print("LEO: test: nb rows in train AFTER", rm_data["train"].num_rows)
 
