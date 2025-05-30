@@ -28,7 +28,7 @@ else
   EVAL_STEPS=5
   MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
   TIMESTAMP=$(date '+%y%m%d%H%M')
-  RUN_IDENTIFIER="leobianco/${TASK}_RM_model_${MODEL_NAME}_seed_${SEED}_SYN_LLM_${SYN_HALL_LLM}_SYN_STRUCT_${SYN_HALL_STRUCT}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_lora_${LORA_RANK}_${TIMESTAMP}"
+  RUN_IDENTIFIER="leobianco/${TASK}_RM_${MODEL_NAME}_S_${SEED}_LLM_${SYN_HALL_LLM}_STRUCT_${SYN_HALL_STRUCT}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_r_${LORA_RANK}_${TIMESTAMP}"
 fi
 
 if [ "$PRECISION" = "FP16" ]; then

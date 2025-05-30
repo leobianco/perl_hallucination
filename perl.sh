@@ -25,7 +25,7 @@ else
   TEMPERATURE=7e-1
   SAVE_STEPS=1000
   TIMESTAMP=$(date '+%y%m%d%H%M')
-  RUN_IDENTIFIER="leobianco/${TASK}_PERL_model_${MODEL_NAME}_seed_${SEED}_episodes_${TOTAL_EPISODES}_lr_${LEARNING_RATE}_klcoeff_${KL_COEFF}_${TIMESTAMP}"
+  RUN_IDENTIFIER="leobianco/${TASK}_PERL_${MODEL_NAME}_S_${SEED}_episodes_${TOTAL_EPISODES}_lr_${LEARNING_RATE}_kl_${KL_COEFF}_${TIMESTAMP}"
   SHUTDOWN=false
 fi
 
@@ -42,7 +42,7 @@ accelerate launch \
   --seed "$SEED" \
   --report_to "wandb" \
   --run_name "$RUN_IDENTIFIER" \
-  --logging_steps 5 \
+  --logging_steps 1 \
   --output_dir "./checkpoints/${TASK}/perl/${RUN_IDENTIFIER}" \
   --overwrite_output_dir True \
   --push_to_hub True \
