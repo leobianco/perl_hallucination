@@ -643,38 +643,68 @@ def bosch_formatting_prompts_func(entry):
     return output_texts
 
 
+# def bosch_rm_synthetic_hall_structured(entry, data):
+#     """Given an entry and the rest of the data, select a random sentence of
+#     the response in the entry, a random different entry in the data and a
+#     random sentence in it, and swap the first by the second.
+#     TO DO: I am not particularly worried with seeds here.
+#     """
+
+#     # Break response into sentences and filter out small ones
+#     tok = nltk.sent_tokenize(entry["response"])
+#     tok_filt = [i for i in tok if len(i) > 5]
+
+#     # Choose a random different entry and do the same
+#     entry2 = data.shuffle()[0]
+#     tok2 = nltk.sent_tokenize(entry2["response"])
+#     tok_filt2 = [i for i in tok2 if len(i) > 5]
+
+#     # Randomly select sentences in both entries
+#     rand = random.choice(tok_filt)
+#     rand_idx = tok.index(rand)
+#     rand2 = random.choice(tok_filt2)
+#     rand_idx2 = tok2.index(rand2)
+
+#     # Switch sentence and join
+#     tok[rand_idx] = tok2[rand_idx2]
+#     new_response = " ".join(tok)
+
+#     # Update response and labels
+#     entry["response"] = new_response
+#     entry["class_hall"] = "Yes"
+#     entry["label"] = 0
+
+#     # Important: you need to retokenize these!
+
+#     return entry
+
+
 def bosch_rm_synthetic_hall_structured(entry, data):
-    """Given an entry and the rest of the data, select a random sentence of
-    the response in the entry, a random different entry in the data and a
-    random sentence in it, and swap the first by the second.
-    TO DO: I am not particularly worried with seeds here.
+    """Given an entry and the rest of the data, select a random sentence in the context, and erase it.
     """
 
     # Break response into sentences and filter out small ones
-    tok = nltk.sent_tokenize(entry["response"])
-    tok_filt = [i for i in tok if len(i) > 5]
+    tok = nltk.sent_tokenize(entry["Context"])
 
-    # Choose a random different entry and do the same
-    entry2 = data.shuffle()[0]
-    tok2 = nltk.sent_tokenize(entry2["response"])
-    tok_filt2 = [i for i in tok2 if len(i) > 5]
+    # Randomly select sentences in the context.
+    # One if there are less than 5 sentences, 2 otherwise.
+    num_to_sample = 1 if len(tok) < 5 else 2
+    rand = random.sample(tok, num_to_sample)
+    rand_idx = [tok.index(r) for r in rand]
 
-    # Randomly select sentences in both entries
-    rand = random.choice(tok_filt)
-    rand_idx = tok.index(rand)
-    rand2 = random.choice(tok_filt2)
-    rand_idx2 = tok2.index(rand2)
+    # Erase that sentence
+    for r_idx in rand_idx:
+        tok[r_idx] = ""
 
-    # Switch sentence and join
-    tok[rand_idx] = tok2[rand_idx2]
-    new_response = " ".join(tok)
+    # Join everything back together
+    new_context = " ".join(tok)
 
     # Update response and labels
-    entry["response"] = new_response
+    entry["Context"] = new_context
     entry["class_hall"] = "Yes"
     entry["label"] = 0
 
-    # Important: you need to retokenize these!
+    # Important: you need to retokenize these later!
 
     return entry
 
