@@ -22,7 +22,7 @@ from transformers import (
     set_seed,
 )
 
-from utils import CustomLoraConfig, ScriptArguments
+from utils import CustomLoraConfig, ScriptArguments, count_trainable_parameters
 
 
 @dataclass
@@ -157,10 +157,18 @@ def main():
         attn_implementation="eager",
     )
 
+    # LEO debugging
+    # Print trainable parameters before LoRA
+    trainable_before_lora, total_params = count_trainable_parameters(reward_model)
+    print(f"Trainable parameters before LoRA: {trainable_before_lora:,} ({(trainable_before_lora/total_params)*100:.2f}%)")
+
     if pad_token_modified:
         reward_model.config.pad_token_id = tokenizer.pad_token_id
 
     reward_model = get_peft_model(reward_model, peft_args)
+
+    trainable_after_lora, total_params = count_trainable_parameters(reward_model)
+    print(f"Trainable parameters after LoRA: {trainable_after_lora:,} ({(trainable_after_lora/total_params)*100:.2f}%)")
 
     metric = evaluate.load("roc_auc")
 

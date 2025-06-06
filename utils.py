@@ -54,6 +54,7 @@ def hallucination_rate_from_score_file(filepath, threshold):
         print(f"Error: The file at '{filepath}' was not found.")
         return None
 
+
 def average_from_score_file(filepath):
     """Given a scores.txt file and a threshold, returns its average."""
 
@@ -80,9 +81,10 @@ def average_from_score_file(filepath):
         print(f"Error: The file at '{filepath}' was not found.")
         return None
 
+
 def histogram_from_score_file(filepath):
     """Histogram of scores."""
-    
+
     name = filepath.rstrip(".txt")
     scores = []
 
@@ -105,3 +107,11 @@ def histogram_from_score_file(filepath):
     except FileNotFoundError:
         print(f"Error: The file at '{filepath}' was not found.")
         return None
+
+
+def count_trainable_parameters(model):
+    trainable_params = sum(
+        p.numel() for p in model.parameters() if p.requires_grad
+    )
+    total_params = sum(p.numel() for p in model.parameters())
+    return trainable_params, total_params
