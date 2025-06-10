@@ -34,7 +34,7 @@ TOP_P=1
 # Check if we're in generation, scoring, or autoratereval mode
 if [ "$2" == "generate" ]; then
     echo "Running in generation mode..."
-    python3 generator.py \
+    python3 evaluator.py \
         --task "$TASK" \
         --user "$USER" \
         --seed "$SEED" \

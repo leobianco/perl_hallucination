@@ -73,6 +73,10 @@ class ScriptArguments:
         },
     )
 
+    writer_model_lora: str = field(
+        metadata={"help": "The path to the LoRA adapters of the writer model."}
+    )
+
     dataset_labels: str = field(
         metadata={
             "help": "Dataset with hallucination labels, for evaluation of evaluator or for getting few-shot examples."
@@ -98,10 +102,6 @@ class ScriptArguments:
     writer_model_base: Optional[str] = field(
         default=None,
         metadata={"help": "The base model for the writer (name or path)."}
-    )
-
-    writer_model_lora: str = field(
-        metadata={"help": "The path to the LoRA adapters of the writer model."}
     )
 
     evaluator_model: str = field(
