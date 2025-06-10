@@ -83,17 +83,20 @@ class ScriptArguments:
         metadata={"help": "What split of the dataset_labels to use."}
     )
 
-    dataset_prompts: str = field(
+    dataset_prompts: Optional[str] = field(
+        default=None,
         metadata={
-            "help": "Dataset with prompts to be used for generation (not necessarily has hallucination labels). Test split will be used!"
+            "help": "Dataset with prompts to be used for generation (not necessarily has hallucination labels)."
         }
     )
 
-    dataset_prompts_split: str = field(
+    dataset_prompts_split: Optional[str] = field(
+        default=None,
         metadata={"help": "What split of the dataset_prompts to use."}
     )
 
-    writer_model_base: str = field(
+    writer_model_base: Optional[str] = field(
+        default=None,
         metadata={"help": "The base model for the writer (name or path)."}
     )
 
@@ -119,9 +122,9 @@ class ScriptArguments:
 
     seed: int = field(default=12345)
 
-    max_tokens: int = field(default=128)
-
     eval_batch_size: int = field(default=1)
+
+    max_tokens: int = field(default=128)
 
     temperature: float = field(default=1)
 
@@ -134,13 +137,6 @@ class ScriptArguments:
         },
     )
 
-    writer_num_fewshot: Optional[int] = field(
-        default=0,
-        metadata={
-            "help": "The number of fewshot examples to give to the writer. Must all be without hallucinations."
-        },
-    )
-
     evaluate_evaluator: bool = field(
         default=False,
         metadata={"help": "Whether to run evaluation of the evaluator or not."},
@@ -150,6 +146,13 @@ class ScriptArguments:
         default=0.5,
         metadata={
             "help": "The value of the threshold to turn scores into classif."
+        },
+    )
+
+    dataset_with_completions: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Name of the dataset with completions on HF Hub. Required when evaluate_evaluator is False and not generating."
         },
     )
 
@@ -320,9 +323,6 @@ Important evaluation criteria:
 Provide ONLY "Yes" or "No" as your final answer.
 <end_of_turn>
 """
-
-    # Previously included:
-    # - If the answer draws reasonable inferences that follow directly from the manual, respond with "No"
 
     prompt = preamble
 
@@ -738,14 +738,15 @@ if __name__ == "__main__":
             + f"eval_autorater_{script_args.evaluator_num_fewshot}_shot"
         )
 
-    else:
+    elif script_args.dataset_with_completions is None:
+        # Generation mode
+        print("Running in generation mode...")
+        
         # Load dataset with prompts to generations (not necessarily labeled).
-        val_data = load_dataset(
+        dataset_prompts = load_dataset(
             script_args.dataset_prompts,
             split=script_args.dataset_prompts_split,
         )
-
-        # Generate Completions
 
         # To evaluate the base model (no LoRA), just re-use the base model path
         # on the LoRA adapters path.
@@ -785,7 +786,9 @@ if __name__ == "__main__":
             max_tokens=script_args.max_tokens,
         )
 
-        prompts = [val_data[i]["prompt"] for i in range(val_data.num_rows)]
+        prompts = [
+            dataset_prompts[i]["prompt"] for i in range(dataset_prompts.num_rows)
+        ]
 
         if enable_lora:
             outputs = llm.generate(
@@ -798,14 +801,53 @@ if __name__ == "__main__":
         else:
             outputs = llm.generate(prompts, sampling_params)
 
-        # Free vLLM memory to free up space for evaluator.
+        generations = [output.outputs[0].text for output in outputs]
+
+        # Free vLLM memory
         destroy_model_parallel()
         del llm.llm_engine.model_executor.driver_worker
         del llm
         gc.collect()
         torch.cuda.empty_cache()
 
-        # Save generations
+        # Save generations locally
+        try:
+            name_for_saving = (
+                "eval_"
+                + script_args.writer_model_lora.split(f"{script_args.user}/")[1]
+            )
+        except Exception:
+            name_for_saving = "eval_" + script_args.writer_model_lora.split("/")[1]
+
+        filepath = f"logs/{name_for_saving}/generations.txt"
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(filepath, "w") as f:
+            for idx, generation in enumerate(generations):
+                f.write(f"\n{idx}. ----------\n" + generation)
+        print(f"Generations saved to {filepath}")
+
+        # Add generations to the dataset_prompts under a column named "completion".
+        dataset_prompts = dataset_prompts.add_column("completion", generations)
+
+        # Save the dataset with completions to HF Hub
+        print(f"Pushing dataset with completions to {script_args.user}/{name_for_saving}_completions")
+        dataset_name = f"{script_args.user}/{name_for_saving}_completions"
+        dataset_prompts.push_to_hub(dataset_name)
+
+    else:
+        # Scoring mode
+        print("Running in scoring mode...")
+        
+        # Load dataset with completions from HF Hub
+        val_data = load_dataset(script_args.dataset_with_completions, split="train")
+
+        # Build the evaluator prompts using fewshot examples + generations.
+        val_data = val_data.map(
+            evaluator_prompt,
+            fn_kwargs=dict(fewshot_examples=evaluator_fewshot_examples),
+        )
+
+        # Save evaluator prompts
         try:
             name_for_saving = (
                 "eval_"
@@ -816,24 +858,6 @@ if __name__ == "__main__":
                 "eval_" + script_args.writer_model_lora.split("/")[1]
             )
 
-        generations = [output.outputs[0].text for output in outputs]
-        filepath = f"logs/{name_for_saving}/generations.txt"
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, "w") as f:
-            for idx, generation in enumerate(generations):
-                f.write(f"\n{idx}. ----------\n" + generation)
-        print(f"Generations saved to {filepath}")
-
-        # Add generations to the val_data under a column named "completion".
-        val_data = val_data.add_column("completion", generations)
-
-        # Build the evaluator prompts using fewshot examples + generations.
-        val_data = val_data.map(
-            evaluator_prompt,
-            fn_kwargs=dict(fewshot_examples=evaluator_fewshot_examples),
-        )
-
-        # Save evaluator prompts
         filepath = f"logs/{name_for_saving}/evaluator_prompts.txt"
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         with open(filepath, "w") as f:
