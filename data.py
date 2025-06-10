@@ -465,13 +465,45 @@ def npov_data_augmentation(data):
         p2_args.update(new_p2_args)
 
         # Create combinations of perspectives
+        # Single arguments
+        p1_singles = list(p1_args)
+        p2_singles = list(p2_args)
+        
+        # Pairs
         p1_pairs = list(combinations(p1_args, 2))
         p2_pairs = list(combinations(p2_args, 2))
+        
+        # Triplets
+        p1_triplets = list(combinations(p1_args, 3))
+        p2_triplets = list(combinations(p2_args, 3))
 
+        # Process single arguments
+        for p1_single in p1_singles:
+            for p2_single in p2_singles:
+                all_p1_arguments.append(p1_single)
+                all_p2_arguments.append(p2_single)
+                all_p1_names.append(p1_name)
+                all_p2_names.append(p2_name)
+                all_topics.append(topic)
+                all_user_queries.append(user_query)
+
+        # Process pairs
         for p1_pair in p1_pairs:
             for p2_pair in p2_pairs:
                 p1_combined = " ".join(p1_pair)
                 p2_combined = " ".join(p2_pair)
+                all_p1_arguments.append(p1_combined)
+                all_p2_arguments.append(p2_combined)
+                all_p1_names.append(p1_name)
+                all_p2_names.append(p2_name)
+                all_topics.append(topic)
+                all_user_queries.append(user_query)
+
+        # Process triplets
+        for p1_triplet in p1_triplets:
+            for p2_triplet in p2_triplets:
+                p1_combined = " ".join(p1_triplet)
+                p2_combined = " ".join(p2_triplet)
                 all_p1_arguments.append(p1_combined)
                 all_p2_arguments.append(p2_combined)
                 all_p1_names.append(p1_name)
@@ -680,8 +712,7 @@ def bosch_formatting_prompts_func(entry):
 
 
 def bosch_rm_synthetic_hall_structured(entry, data):
-    """Given an entry and the rest of the data, select a random sentence in the context, and erase it.
-    """
+    """Given an entry and the rest of the data, select a random sentence in the context, and erase it."""
 
     # Break response into sentences and filter out small ones
     tok = nltk.sent_tokenize(entry["Context"])
