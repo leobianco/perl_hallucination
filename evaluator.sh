@@ -9,11 +9,11 @@ else
   SEED=12345
   USER="leobianco"
   MAX_TOKENS=768
-  DATASET_PROMPTS="${USER}/bosch_perl_processed"
-  DATASET_PROMPTS_SPLIT="test"
-  DATASET_LABELS="${USER}/ragtruth_autorater_data"
+  DATASET_PROMPTS="${USER}/npov_perl"
+  DATASET_PROMPTS_SPLIT="train"
+  DATASET_LABELS="${USER}/npov_autorater"
   DATASET_LABELS_SPLIT="test"
-  RUN_IDENTIFIER="$USER/bosch_PERL_seed_130104_episodes_20000_lr_2e-5_klcoeff_1e-4_temp_7e-1"
+  RUN_IDENTIFIER="$USER/npov_PERL_seed_130104_episodes_20000_lr_2e-5_klcoeff_1e-4_temp_1e-1"
 fi
 
 if [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ] && [ "$TASK" != "ragtruth" ]; then
