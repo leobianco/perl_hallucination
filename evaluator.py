@@ -77,13 +77,15 @@ class ScriptArguments:
         metadata={"help": "The path to the LoRA adapters of the writer model."}
     )
 
-    dataset_labels: str = field(
+    dataset_labels: Optional[str] = field(
+        default=None,
         metadata={
             "help": "Dataset with hallucination labels, for evaluation of evaluator or for getting few-shot examples."
         }
     )
 
-    dataset_labels_split: str = field(
+    dataset_labels_split: Optional[str] = field(
+        default=None,
         metadata={"help": "What split of the dataset_labels to use."}
     )
 
@@ -565,31 +567,35 @@ if __name__ == "__main__":
 
     # Load dataset with hallucination labels (for evaluating the
     # evaluator, or for getting fewshot examples).
-    data = load_dataset(
-        script_args.dataset_labels,
-        split=script_args.dataset_labels_split,
-    )
-
-    if script_args.task == "ragtruth":
-        evaluator_prompt = ragtruth_evaluator_prompt
-    elif script_args.task == "npov":
-        evaluator_prompt = npov_evaluator_prompt
-    elif script_args.task == "bosch":
-        evaluator_prompt = bosch_evaluator_prompt
-
-    # Get fewshot examples to aid the evaluator. These come from the dataset
-    # with labels.
-    if script_args.evaluator_num_fewshot == 0:
-        evaluator_fewshot_examples = None
-    else:
-        evaluator_fewshot_examples = get_fewshot_examples(
-            data,
-            script_args.evaluator_num_fewshot // 2,
-            script_args.evaluator_num_fewshot // 2,
-            seed=script_args.seed,
+    if script_args.dataset_labels is not None:
+        data = load_dataset(
+            script_args.dataset_labels,
+            split=script_args.dataset_labels_split,
         )
 
+        if script_args.task == "ragtruth":
+            evaluator_prompt = ragtruth_evaluator_prompt
+        elif script_args.task == "npov":
+            evaluator_prompt = npov_evaluator_prompt
+        elif script_args.task == "bosch":
+            evaluator_prompt = bosch_evaluator_prompt
+
+        # Get fewshot examples to aid the evaluator. These come from the dataset
+        # with labels.
+        if script_args.evaluator_num_fewshot == 0:
+            evaluator_fewshot_examples = None
+        else:
+            evaluator_fewshot_examples = get_fewshot_examples(
+                data,
+                script_args.evaluator_num_fewshot // 2,
+                script_args.evaluator_num_fewshot // 2,
+                seed=script_args.seed,
+            )
+
     if script_args.evaluate_evaluator:
+        if script_args.dataset_labels is None:
+            raise ValueError("dataset_labels is required when evaluate_evaluator is True")
+            
         data = data.map(
             evaluator_prompt,
             fn_kwargs=dict(
