@@ -1,36 +1,41 @@
 #!/bin/bash
 
-# If calling from hyperparameter search script, variables are imported.
-if [ $SHLVL -gt 2 ]; then
-  :
-else
-  # If single-run, set variables here.
-  TASK="$1"
-  ORGANIC=true
-  SYN_HALL_LLM=false
-  SYN_HALL_STRUCT=false
-  DATASET_REPO_ID="leobianco/${TASK}_rm"
-  NUM_ORGANIC_HALLUS_TO_KEEP=0
-  NUM_STRUCT_HALLUS_TO_KEEP=10
-  DEEPSPEED_CONFIG="./deepspeed_config.yaml"
-  MODEL_REPO_ID="mistralai/Mistral-7B-Instruct-v0.3"
-  SEED=12345
-  PRECISION="BF16"  # BF16 for Gemma, Mistral, Qwen
-  NUM_TRAIN_EPOCHS=2
-  BATCH_SIZE=1
-  LEARNING_RATE=5e-5
-  LR_SCHEDULER_TYPE="cosine"
-  WARMUP_RATIO=0.15
-  LORA_RANK=8
-  LORA_ALPHA=8
-  LORA_DROPOUT=0.1
-  WEIGHT_DECAY=5e-4
-  EVAL_STEPS=5
-  MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
-  TIMESTAMP=$(date '+%y%m%d%H%M')
-  RUN_IDENTIFIER="leobianco/${TASK}_RM_${MODEL_NAME}_S_${SEED}_LLM_${SYN_HALL_LLM}_STRUCT_${SYN_HALL_STRUCT}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_r_${LORA_RANK}_${TIMESTAMP}"
-fi
+# Core Parameters
+USER="leobianco"
+SEED=12345
+MODEL_REPO_ID="mistralai/Mistral-7B-Instruct-v0.3"
 
+# Dataset Parameters
+ORGANIC=true
+SYN_HALL_LLM=false
+SYN_HALL_STRUCT=false
+NUM_ORGANIC_HALLUS_TO_KEEP=0
+NUM_STRUCT_HALLUS_TO_KEEP=10
+
+# Training Parameters
+BATCH_SIZE=1
+NUM_TRAIN_EPOCHS=2
+LEARNING_RATE=5e-5
+WEIGHT_DECAY=5e-4
+LORA_RANK=8
+LORA_ALPHA=8
+LORA_DROPOUT=0.1
+LR_SCHEDULER_TYPE="cosine"
+WARMUP_RATIO=0.15
+
+# Infrastructure Parameters
+PRECISION="BF16"
+EVAL_STEPS=5
+DEEPSPEED_CONFIG="./deepspeed_config.yaml"
+
+# Parameters derived from above
+TASK="$1"
+DATASET_REPO_ID="${USER}/${TASK}_rm"
+MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
+TIMESTAMP=$(date '+%y%m%d%H%M')
+RUN_IDENTIFIER="leobianco/${TASK}_RM_${MODEL_NAME}_S_${SEED}_LLM_${SYN_HALL_LLM}_STRUCT_${SYN_HALL_STRUCT}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_r_${LORA_RANK}_${TIMESTAMP}"
+
+# Checks
 if [ "$PRECISION" = "FP16" ]; then
   FP16="True"
   BF16="False"

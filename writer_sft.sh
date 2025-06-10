@@ -1,29 +1,31 @@
 #!/bin/bash
 
-# If calling from hyperparameter search script, import variables from there
-if [ $SHLVL -gt 2 ]; then
-  :
-else
-  # If single-run, set variables here
-  TASK="$1"
-  USER="leobianco"
-  MODEL_REPO_ID="google/gemma-2-2b-it"
-  DEEPSPEED_CONFIG="./deepspeed_config.yaml"
-  SEED=130104
-  BATCH_SIZE=4
-  NUM_TRAIN_EPOCHS=0.01
-  LEARNING_RATE=3e-3
-  WEIGHT_DECAY=0.0
-  LORA_RANK=8
-  NUM_FEWSHOT=0
-  SAVE_STEPS=200
-  MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
-  TIMESTAMP=$(date '+%y%m%d%H%M')
-  RUN_IDENTIFIER="${USER}/${TASK}_SFT_${MODEL_NAME}_S_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_r_${LORA_RANK}_fs_${NUM_FEWSHOT}_{$TIMESTAMP}"
-fi
+# Core Parameters
+USER="leobianco"
+SEED=130104
+MODEL_REPO_ID="google/gemma-2-2b-it"
+
+# Training Parameters
+BATCH_SIZE=4
+NUM_TRAIN_EPOCHS=0.01
+LEARNING_RATE=3e-3
+WEIGHT_DECAY=0.0
+LORA_RANK=8
+NUM_FEWSHOT=0
+SAVE_STEPS=200
+
+# Infrastructure Parameters
+DEEPSPEED_CONFIG="./deepspeed_config.yaml"
+
+# Parameters derived from above
+TASK="$1"
+MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
+TIMESTAMP=$(date '+%y%m%d%H%M')
+RUN_IDENTIFIER="${USER}/${TASK}_SFT_${MODEL_NAME}_S_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_r_${LORA_RANK}_fs_${NUM_FEWSHOT}_{$TIMESTAMP}"
 
 if [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ] && [ "$TASK" != "ragtruth" ]; then
-    echo "Invalid task name"
+    echo "Invalid task name" 
+    echo "$TASK"
     exit 1
 fi
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
+# Parameters
 USER="leobianco"
-TASK="$1"
 SEED=12345
 SYNTH_LLM="False"
 SYNTH_STRUCT="False"
@@ -10,11 +10,16 @@ GEMINI_API_KEY="AIzaSyCIPXhApp0pcu7TruZ8EyuW086VJ1wzrhk"
 SYNTH_LLM_TEMPERATURE=0.7
 SYNTH_LLM_NUM_FEWSHOT=5
 
+# Parameters derived from above
+TASK="$1"
+
+# Checks
 if [ "$TASK" != "ragtruth" ] && [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ]; then
     echo "Invalid dataset name"
     exit 1
 fi
 
+# Run script
 python data.py \
     --task "$TASK" \
     --seed "$SEED" \

@@ -1,36 +1,40 @@
 #!/bin/bash
 
-# If calling from hyperparameter search script,	variables are imported.
-if [ $SHLVL -gt 2 ]; then
-  :
-else
-  # If single-run, set variables here.
-  TASK="$1"
-  SEED=130104
-  MODEL_REPO_ID="google/gemma-2-2b-it"
-  MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
-  REWARD_MODEL_PATH="leobianco/bosch_RM_seed_130104_SYN_HALL_LLM_true_epochs_3_lr_1e-3_lora_8"
-  SFT_MODEL_PATH="leobianco/bosch_SFT_seed_130104_epochs_0.01_lr_3e-3_lora_8_fewshot_0"
-  DEEPSPEED_CONFIG="./deepspeed_config.yaml"
-  TOTAL_EPISODES=20000
-  RESPONSE_LENGTH=150
-  NUM_SAMPLE_GENERATIONS=10
-  LEARNING_RATE=2e-5
-  KL_COEFF=1e-4
-  RLOO_K=2
-  NUM_PPO_EPOCHS=1
-  NUM_MINIBATCHES=16
-  PER_DEVICE_BATCH_SIZE=4
-  LOCAL_ROLLOUT_FORWARD_BATCH_SIZE=8
-  TEMPERATURE=7e-1
-  SAVE_STEPS=1000
-  TIMESTAMP=$(date '+%y%m%d%H%M')
-  RUN_IDENTIFIER="leobianco/${TASK}_PERL_${MODEL_NAME}_S_${SEED}_episodes_${TOTAL_EPISODES}_lr_${LEARNING_RATE}_kl_${KL_COEFF}_${TIMESTAMP}"
-  SHUTDOWN=false
-fi
+# Core Parameters
+USER="leobianco"
+SEED=130104
+MODEL_REPO_ID="google/gemma-2-2b-it"
+REWARD_MODEL_PATH="${USER}/bosch_RM_seed_130104_SYN_HALL_LLM_true_epochs_3_lr_1e-3_lora_8"
+SFT_MODEL_PATH="${USER}/bosch_SFT_seed_130104_epochs_0.01_lr_3e-3_lora_8_fewshot_0"
 
-if [ "$TASK" != "ragtruth" ] && [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ]; then
-    echo "Invalid task name"
+# Training Parameters
+TOTAL_EPISODES=20000
+LEARNING_RATE=2e-5
+KL_COEFF=1e-4
+RESPONSE_LENGTH=150
+RLOO_K=2
+NUM_PPO_EPOCHS=1
+NUM_MINIBATCHES=16
+PER_DEVICE_BATCH_SIZE=4
+LOCAL_ROLLOUT_FORWARD_BATCH_SIZE=8
+TEMPERATURE=7e-1
+SAVE_STEPS=1000
+NUM_SAMPLE_GENERATIONS=10
+
+# Infrastructure Parameters
+DEEPSPEED_CONFIG="./deepspeed_config.yaml"
+
+# Parameters derived from above
+TASK="$1"
+TIMESTAMP=$(date '+%y%m%d%H%M')
+MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
+RUN_IDENTIFIER="${USER}/${TASK}_PERL_${MODEL_NAME}_S_${SEED}_episodes_${TOTAL_EPISODES}_lr_${LEARNING_RATE}_kl_${KL_COEFF}_${TIMESTAMP}"
+SHUTDOWN=false
+
+# Checks
+if [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ] && [ "$TASK" != "ragtruth" ]; then
+    echo "Invalid task name" 
+    echo "$TASK"
     exit 1
 fi
 
@@ -47,7 +51,7 @@ accelerate launch \
   --overwrite_output_dir True \
   --push_to_hub True \
   --hub_model_id "$RUN_IDENTIFIER" \
-  --dataset_repo_id "leobianco/${TASK}_perl" \
+  --dataset_repo_id "${USER}/${TASK}_perl" \
   --model_repo_id "${MODEL_REPO_ID}" \
   --stop_token "eos" \
   --do_train True \

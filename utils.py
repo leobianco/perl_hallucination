@@ -107,11 +107,3 @@ def histogram_from_score_file(filepath):
     except FileNotFoundError:
         print(f"Error: The file at '{filepath}' was not found.")
         return None
-
-
-def count_trainable_parameters(model):
-    trainable_params = sum(
-        p.numel() for p in model.parameters() if p.requires_grad
-    )
-    total_params = sum(p.numel() for p in model.parameters())
-    return trainable_params, total_params
