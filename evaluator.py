@@ -60,8 +60,6 @@ from vllm import LLM, SamplingParams
 from vllm.distributed.parallel_state import destroy_model_parallel
 from vllm.lora.request import LoRARequest
 
-from data import npov_writer_prompt
-
 
 @dataclass
 class ScriptArguments:
@@ -81,29 +79,29 @@ class ScriptArguments:
         default=None,
         metadata={
             "help": "Dataset with hallucination labels, for evaluation of evaluator or for getting few-shot examples."
-        }
+        },
     )
 
     dataset_labels_split: Optional[str] = field(
         default=None,
-        metadata={"help": "What split of the dataset_labels to use."}
+        metadata={"help": "What split of the dataset_labels to use."},
     )
 
     dataset_prompts: Optional[str] = field(
         default=None,
         metadata={
             "help": "Dataset with prompts to be used for generation (not necessarily has hallucination labels)."
-        }
+        },
     )
 
     dataset_prompts_split: Optional[str] = field(
         default=None,
-        metadata={"help": "What split of the dataset_prompts to use."}
+        metadata={"help": "What split of the dataset_prompts to use."},
     )
 
     writer_model_base: Optional[str] = field(
         default=None,
-        metadata={"help": "The base model for the writer (name or path)."}
+        metadata={"help": "The base model for the writer (name or path)."},
     )
 
     evaluator_model: str = field(
@@ -594,8 +592,10 @@ if __name__ == "__main__":
 
     if script_args.evaluate_evaluator:
         if script_args.dataset_labels is None:
-            raise ValueError("dataset_labels is required when evaluate_evaluator is True")
-            
+            raise ValueError(
+                "dataset_labels is required when evaluate_evaluator is True"
+            )
+
         data = data.map(
             evaluator_prompt,
             fn_kwargs=dict(
@@ -603,7 +603,6 @@ if __name__ == "__main__":
             ),
         )
 
-        # Repetitive code, encapsulate in a function
         if script_args.use_gemini:
             client = genai.Client(api_key=script_args.gemini_api_key)
             scores = gemini_score_dataset(client, data, script_args)
@@ -746,8 +745,7 @@ if __name__ == "__main__":
 
     elif script_args.dataset_with_completions is None:
         # Generation mode
-        print("Running in generation mode...")
-        
+
         # Load dataset with prompts to generations (not necessarily labeled).
         dataset_prompts = load_dataset(
             script_args.dataset_prompts,
@@ -793,7 +791,8 @@ if __name__ == "__main__":
         )
 
         prompts = [
-            dataset_prompts[i]["prompt"] for i in range(dataset_prompts.num_rows)
+            dataset_prompts[i]["prompt"]
+            for i in range(dataset_prompts.num_rows)
         ]
 
         if enable_lora:
@@ -823,7 +822,9 @@ if __name__ == "__main__":
                 + script_args.writer_model_lora.split(f"{script_args.user}/")[1]
             )
         except Exception:
-            name_for_saving = "eval_" + script_args.writer_model_lora.split("/")[1]
+            name_for_saving = (
+                "eval_" + script_args.writer_model_lora.split("/")[1]
+            )
 
         filepath = f"logs/{name_for_saving}/generations.txt"
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
@@ -836,16 +837,19 @@ if __name__ == "__main__":
         dataset_prompts = dataset_prompts.add_column("completion", generations)
 
         # Save the dataset with completions to HF Hub
-        print(f"Pushing dataset with completions to {script_args.user}/{name_for_saving}_completions")
+        print(
+            f"Pushing dataset with completions to {script_args.user}/{name_for_saving}_completions"
+        )
         dataset_name = f"{script_args.user}/{name_for_saving}_completions"
         dataset_prompts.push_to_hub(dataset_name)
 
     else:
         # Scoring mode
-        print("Running in scoring mode...")
-        
+
         # Load dataset with completions from HF Hub
-        val_data = load_dataset(script_args.dataset_with_completions, split="train")
+        val_data = load_dataset(
+            script_args.dataset_with_completions, split="train"
+        )
 
         # Build the evaluator prompts using fewshot examples + generations.
         val_data = val_data.map(

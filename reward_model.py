@@ -22,7 +22,7 @@ from transformers import (
     set_seed,
 )
 
-from utils import CustomLoraConfig, ScriptArguments, count_trainable_parameters
+from utils import CustomLoraConfig, ScriptArguments
 
 
 @dataclass
