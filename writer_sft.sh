@@ -11,6 +11,10 @@ NUM_TRAIN_EPOCHS=1
 LEARNING_RATE=3e-3
 WEIGHT_DECAY=0.0
 LORA_RANK=8
+LORA_ALPHA=8
+LORA_DROPOUT=0.1
+LR_SCHEDULER_TYPE="cosine"
+WARMUP_RATIO=0.15
 NUM_FEWSHOT=0
 SAVE_STEPS=200
 
@@ -50,6 +54,8 @@ accelerate launch \
   --save_steps "$SAVE_STEPS" \
   --num_train_epochs "$NUM_TRAIN_EPOCHS" \
   --learning_rate "$LEARNING_RATE" \
+  --lr_scheduler_type "$LR_SCHEDULER_TYPE" \
+  --warmup_ratio "$WARMUP_RATIO" \
   --weight_decay "$WEIGHT_DECAY" \
   --num_fewshot "$NUM_FEWSHOT" \
   --per_device_train_batch_size "$BATCH_SIZE" \
@@ -60,4 +66,6 @@ accelerate launch \
   --per_device_eval_batch_size "$BATCH_SIZE" \
   --eval_accumulation_steps 1 \
   --task_type "CAUSAL_LM" \
-  --r "$LORA_RANK"
+  --r "$LORA_RANK" \
+  --lora_alpha "$LORA_ALPHA" \
+  --lora_dropout "$LORA_DROPOUT"
