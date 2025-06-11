@@ -468,11 +468,11 @@ def npov_data_augmentation(data):
         # Single arguments
         p1_singles = list(p1_args)
         p2_singles = list(p2_args)
-        
+
         # Pairs
         p1_pairs = list(combinations(p1_args, 2))
         p2_pairs = list(combinations(p2_args, 2))
-        
+
         # Triplets
         p1_triplets = list(combinations(p1_args, 3))
         p2_triplets = list(combinations(p2_args, 3))
@@ -1146,10 +1146,19 @@ def main():
                 npov_sft_data[split]
             )
 
-            npov_sft_data[split].push_to_hub(
-                repo_id=args.task + "_sft",
-                split=split,
-            )
+        # I want to merge validation and test splits before saving.
+        npov_sft_new = DatasetDict(
+            {
+                "train": npov_sft_data["train"],
+                "test": concatenate_datasets(
+                    [npov_sft_data["validation"], npov_sft_data["test"]]
+                ),
+            }
+        )
+
+        npov_sft_new.push_to_hub(
+            repo_id=args.task + "_sft",
+        )
 
         # PERL
         npov_perl_data = npov_process_data_for_perl(
