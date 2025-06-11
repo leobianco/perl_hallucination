@@ -1,5 +1,6 @@
 """TODO: write docstring."""
 
+import evaluate
 import torch
 from datasets import load_dataset
 from peft import get_peft_model
@@ -28,6 +29,7 @@ def main():
     set_seed(training_args.seed)
 
     sft_data = load_dataset(script_args.dataset_repo_id, split="train")
+    eval_data = load_dataset(script_args.dataset_repo_id, split="test")
 
     tokenizer = AutoTokenizer.from_pretrained(
         script_args.model_repo_id,
@@ -101,6 +103,7 @@ def main():
         args=training_args,
         data_collator=collator_completions,
         train_dataset=sft_data,
+        eval_dataset=eval_data,
         processing_class=tokenizer,
         formatting_func=formatting_prompts_func,
     )

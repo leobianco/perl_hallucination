@@ -54,8 +54,9 @@ accelerate launch \
   --num_fewshot "$NUM_FEWSHOT" \
   --per_device_train_batch_size "$BATCH_SIZE" \
   --gradient_accumulation_steps 1 \
-  --do_eval False \
-  --eval_strategy "no" \
+  --do_eval True \
+  --eval_on_start True \
+  --eval_strategy "epoch" \
   --per_device_eval_batch_size "$BATCH_SIZE" \
   --eval_accumulation_steps 1 \
   --task_type "CAUSAL_LM" \
