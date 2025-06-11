@@ -73,10 +73,10 @@ def main():
         response_template = (
             "\nAnswer to user's question:\n"
         )
-        formatting_prompts_func = bosch_formatting_prompts_func
+        formatting_prompts_func = bosch_formatting_prompts_func(tokenizer.eos_token)
     elif script_args.task == "ragtruth":
         response_template = "\n\noutput:\n"
-        formatting_prompts_func = ragtruth_formatting_prompts_func
+        formatting_prompts_func = ragtruth_formatting_prompts_func(tokenizer.eos_token)
 
     response_template_ids = tokenizer.encode(
         response_template, add_special_tokens=False

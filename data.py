@@ -665,63 +665,33 @@ def bosch_rm_prompt(entry):
     return entry
 
 
-def bosch_formatting_prompts_func(entry):
-    """Formatting function for SFTTrainer. Imported in writer_sft.py."""
-
-    template = (
-        "You are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information given.\n"
-        "User question:\n{question}"
-        "\nManual information:\n{context}"
-        "\nAnswer to user's question:\n"
-    )
-
-    output_texts = []
-
-    for i in range(len(entry["Question"])):
-        formatted_prompt = template.format(
-            question=entry["Question"][i],
-            context=entry["Context"][i],
+def bosch_formatting_prompts_func(eos_token):
+    """Formatting function for SFTTrainer. Imported in writer_sft.py.
+    
+    Args:
+        eos_token (str): The end-of-sequence token to append to each response.
+    """
+    def _formatting_func(entry):
+        template = (
+            "You are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information given.\n"
+            "User question:\n{question}"
+            "\nManual information:\n{context}"
+            "\nAnswer to user's question:\n"
         )
 
-        output_texts.append(formatted_prompt)
+        output_texts = []
 
-    return output_texts
+        for i in range(len(entry["Question"])):
+            formatted_prompt = template.format(
+                question=entry["Question"][i],
+                context=entry["Context"][i],
+            )
 
+            output_texts.append(formatted_prompt + f"{entry['Answer'][i]}{eos_token}")
 
-# def bosch_rm_synthetic_hall_structured(entry, data):
-#     """Given an entry and the rest of the data, select a random sentence of
-#     the response in the entry, a random different entry in the data and a
-#     random sentence in it, and swap the first by the second.
-#     TO DO: I am not particularly worried with seeds here.
-#     """
-
-#     # Break response into sentences and filter out small ones
-#     tok = nltk.sent_tokenize(entry["response"])
-#     tok_filt = [i for i in tok if len(i) > 5]
-
-#     # Choose a random different entry and do the same
-#     entry2 = data.shuffle()[0]
-#     tok2 = nltk.sent_tokenize(entry2["response"])
-#     tok_filt2 = [i for i in tok2 if len(i) > 5]
-
-#     # Randomly select sentences in both entries
-#     rand = random.choice(tok_filt)
-#     rand_idx = tok.index(rand)
-#     rand2 = random.choice(tok_filt2)
-#     rand_idx2 = tok2.index(rand2)
-
-#     # Switch sentence and join
-#     tok[rand_idx] = tok2[rand_idx2]
-#     new_response = " ".join(tok)
-
-#     # Update response and labels
-#     entry["response"] = new_response
-#     entry["class_hall"] = "Yes"
-#     entry["label"] = 0
-
-#     # Important: you need to retokenize these!
-
-#     return entry
+        return output_texts
+    
+    return _formatting_func
 
 
 def bosch_rm_synthetic_hall_structured(entry, data):
@@ -903,22 +873,28 @@ def ragtruth_function_to_map_synthetic_halls_llm(
     }
 
 
-def ragtruth_formatting_prompts_func(entry):
-    """Formatting function for SFTTrainer. Imported in writer_sft.py."""
+def ragtruth_formatting_prompts_func(eos_token):
+    """Formatting function for SFTTrainer. Imported in writer_sft.py.
+    
+    Args:
+        eos_token (str): The end-of-sequence token to append to each response.
+    """
+    def _formatting_func(entry):
+        template = "{user_query}" + "\n" + "{response}"
 
-    template = "{user_query}" + "\n" + "{response}"
+        output_texts = []
 
-    output_texts = []
+        for i in range(len(entry["user_query"])):
+            formatted_prompt = template.format(
+                user_query=entry["user_query"][i],
+                response=entry["response"][i],
+            )
 
-    for i in range(len(entry["user_query"])):
-        formatted_prompt = template.format(
-            user_query=entry["user_query"][i],
-            response=entry["response"][i],
-        )
+            output_texts.append(formatted_prompt + eos_token)
 
-        output_texts.append(formatted_prompt)
-
-    return output_texts
+        return output_texts
+    
+    return _formatting_func
 
 
 def main():
