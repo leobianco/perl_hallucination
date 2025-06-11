@@ -7,7 +7,7 @@ MODEL_REPO_ID="google/gemma-2-2b-it"
 
 # Training Parameters
 BATCH_SIZE=4
-NUM_TRAIN_EPOCHS=0.01
+NUM_TRAIN_EPOCHS=1
 LEARNING_RATE=3e-3
 WEIGHT_DECAY=0.0
 LORA_RANK=8
@@ -21,7 +21,7 @@ DEEPSPEED_CONFIG="./deepspeed_config.yaml"
 TASK="$1"
 MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
 TIMESTAMP=$(date '+%y%m%d%H%M')
-RUN_IDENTIFIER="${USER}/${TASK}_SFT_${MODEL_NAME}_S_${SEED}_epochs_${NUM_TRAIN_EPOCHS}_lr_${LEARNING_RATE}_r_${LORA_RANK}_fs_${NUM_FEWSHOT}_{$TIMESTAMP}"
+RUN_IDENTIFIER="${USER}/${TASK}_SFT_${MODEL_NAME}_S${SEED}_epo${NUM_TRAIN_EPOCHS}_lr${LEARNING_RATE}_r${LORA_RANK}_${TIMESTAMP}"
 
 if [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ] && [ "$TASK" != "ragtruth" ]; then
     echo "Invalid task name" 
@@ -36,7 +36,7 @@ accelerate launch \
   --task "$TASK" \
   --report_to "wandb" \
   --run_name "$RUN_IDENTIFIER" \
-  --logging_steps 5 \
+  --logging_steps 1 \
   --output_dir "./checkpoints/${TASK}/writer_sft/${RUN_IDENTIFIER}" \
   --overwrite_output_dir True \
   --push_to_hub True \

@@ -28,7 +28,7 @@ DEEPSPEED_CONFIG="./deepspeed_config.yaml"
 TASK="$1"
 TIMESTAMP=$(date '+%y%m%d%H%M')
 MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
-RUN_IDENTIFIER="${USER}/${TASK}_PERL_${MODEL_NAME}_S_${SEED}_episodes_${TOTAL_EPISODES}_lr_${LEARNING_RATE}_kl_${KL_COEFF}_${TIMESTAMP}"
+RUN_IDENTIFIER="${USER}/${TASK}_PERL_${MODEL_NAME}_S${SEED}_eps${TOTAL_EPISODES}_lr${LEARNING_RATE}_kl${KL_COEFF}_${TIMESTAMP}"
 SHUTDOWN=false
 
 # Checks
