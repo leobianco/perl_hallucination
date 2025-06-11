@@ -1,6 +1,5 @@
 """TODO: write docstring."""
 
-import evaluate
 import torch
 from datasets import load_dataset
 from peft import get_peft_model
@@ -58,7 +57,7 @@ def main():
             raise Exception("Response template not specified for model!")
 
         if script_args.num_fewshot == 0 or script_args.num_fewshot is None:
-            formatting_prompts_func = npov_formatting_prompts_func
+            formatting_prompts_func = npov_formatting_prompts_func(tokenizer.eos_token)
         else:
             # Get fewshot examples and add to formatting_prompts_func
             fewshot_examples = sft_data.shuffle(seed=training_args.seed).select(
@@ -66,7 +65,8 @@ def main():
             )
             formatting_prompts_func = (
                 npov_formatting_prompts_func_from_fewshot_examples(
-                    fewshot_examples=fewshot_examples
+                    fewshot_examples=fewshot_examples,
+                    eos_token=tokenizer.eos_token,
                 )
             )
     elif script_args.task == "bosch":

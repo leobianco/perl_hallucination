@@ -248,39 +248,50 @@ def npov_writer_prompt(entry, SFT=False, fewshot_examples=None):
     return entry
 
 
-def npov_formatting_prompts_func(entry):
-    """Formatting function for SFTTrainer. Imported in writer_sft.py."""
-
-    template = (
-        "User query: {user_query}\n"
-        "{perspective_1_name} arguments provided: {perspective_1}\n"
-        "{perspective_2_name} arguments provided: {perspective_2}"
-    )
-
-    output_texts = []
-
-    for i in range(len(entry["user_query"])):
-        formatted_prompt = template.format(
-            user_query=entry["user_query"][i],
-            perspective_1_name=entry["perspective_1_name"][i],
-            perspective_1=entry["perspective_1"][i],
-            perspective_2_name=entry["perspective_2_name"][i],
-            perspective_2=entry["perspective_2"][i],
+def npov_formatting_prompts_func(eos_token):
+    """Formatting function for SFTTrainer. Imported in writer_sft.py.
+    
+    Args:
+        eos_token (str): The end-of-sequence token to append to each response.
+    """
+    def _formatting_func(entry):
+        template = (
+            "User query: {user_query}\n"
+            "{perspective_1_name} arguments provided: {perspective_1}\n"
+            "{perspective_2_name} arguments provided: {perspective_2}"
         )
 
-        text = (
-            f"{formatted_prompt}\nNeutral point-of-view answer to user query, "
-            "rewriting provided arguments in natural language:\n"
-            f"{entry['npov_response'][i]}"
-        )
+        output_texts = []
 
-        output_texts.append(text)
+        for i in range(len(entry["user_query"])):
+            formatted_prompt = template.format(
+                user_query=entry["user_query"][i],
+                perspective_1_name=entry["perspective_1_name"][i],
+                perspective_1=entry["perspective_1"][i],
+                perspective_2_name=entry["perspective_2_name"][i],
+                perspective_2=entry["perspective_2"][i],
+            )
 
-    return output_texts
+            text = (
+                f"{formatted_prompt}\nNeutral point-of-view answer to user query, "
+                "rewriting provided arguments in natural language:\n"
+                f"{entry['npov_response'][i]}{eos_token}"
+            )
+
+            output_texts.append(text)
+
+        return output_texts
+    
+    return _formatting_func
 
 
-def npov_formatting_prompts_func_from_fewshot_examples(fewshot_examples):
-    """Given a fewshot example, returns a formatting prompts function for writer SFT that includes the given fewshot example in its prompt."""
+def npov_formatting_prompts_func_from_fewshot_examples(fewshot_examples, eos_token):
+    """Given a fewshot example, returns a formatting prompts function for writer SFT that includes the given fewshot example in its prompt.
+    
+    Args:
+        fewshot_examples: The examples to use for few-shot learning
+        eos_token (str): The end-of-sequence token to append to each response.
+    """
 
     preamble = (
         "Your task is to answer an user's query"
@@ -298,7 +309,7 @@ def npov_formatting_prompts_func_from_fewshot_examples(fewshot_examples):
         "{perspective_2_name} arguments provided: {perspective_2}\n"
         "Example neutral point-of-view answer to user query, rewriting provided"
         " arguments in natural language:\n"
-        "{npov_response}"
+        "{npov_response}{eos_token}"
     )
 
     for fewshot_example in fewshot_examples:
@@ -309,6 +320,7 @@ def npov_formatting_prompts_func_from_fewshot_examples(fewshot_examples):
             perspective_2_name=fewshot_example["perspective_2_name"],
             perspective_2=fewshot_example["perspective_2"],
             npov_response=fewshot_example["npov_response"],
+            eos_token=eos_token,
         )
         prompt += fewshot_prompt + "\n"
 
@@ -319,7 +331,7 @@ def npov_formatting_prompts_func_from_fewshot_examples(fewshot_examples):
             "{perspective_2_name} arguments provided: {perspective_2}"
             "\nNeutral point-of-view answer to user query, rewriting provided"
             " arguments in natural language:\n"
-            "{npov_response}"
+            "{npov_response}{eos_token}"
         )
 
         output_texts = []
@@ -332,6 +344,7 @@ def npov_formatting_prompts_func_from_fewshot_examples(fewshot_examples):
                 perspective_2_name=entry["perspective_2_name"][i],
                 perspective_2=entry["perspective_2"][i],
                 npov_response=entry["npov_response"][i],
+                eos_token=eos_token,
             )
 
             output_texts.append(prompt + formatted_prompt)
