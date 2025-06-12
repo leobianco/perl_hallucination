@@ -848,7 +848,7 @@ if __name__ == "__main__":
 
         # Load dataset with completions from HF Hub
         val_data = load_dataset(
-            script_args.dataset_with_completions, split="train"
+            script_args.dataset_with_completions, split="test"
         )
 
         # Build the evaluator prompts using fewshot examples + generations.
