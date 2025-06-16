@@ -10,6 +10,8 @@ SFT_MODEL_PATH="${USER}/bosch_SFT_seed_130104_epochs_0.01_lr_3e-3_lora_8_fewshot
 # Training Parameters
 TOTAL_EPISODES=20000
 LEARNING_RATE=2e-5
+LR_SCHEDULER_TYPE="cosine"
+WARMUP_RATIO=0.05
 KL_COEFF=1e-4
 RESPONSE_LENGTH=150
 RLOO_K=2
@@ -60,6 +62,8 @@ accelerate launch \
   --save_only_model True \
   --total_episodes "$TOTAL_EPISODES" \
   --learning_rate "$LEARNING_RATE" \
+  --lr_scheduler_type "$LR_SCHEDULER_TYPE" \
+  --warmup_ratio "$WARMUP_RATIO" \
   --response_length "$RESPONSE_LENGTH" \
   --weight_decay 0.0 \
   --gradient_accumulation_steps 1 \
