@@ -590,6 +590,7 @@ if __name__ == "__main__":
                 seed=script_args.seed,
             )
 
+    # Evaluate the autorater.
     if script_args.evaluate_evaluator:
         if script_args.dataset_labels is None:
             raise ValueError(
@@ -743,9 +744,8 @@ if __name__ == "__main__":
             + f"eval_autorater_{script_args.evaluator_num_fewshot}_shot"
         )
 
+    # Generate completions with a writer model.
     elif script_args.dataset_with_completions is None:
-        # Generation mode
-
         # Load dataset with prompts to generations (not necessarily labeled).
         dataset_prompts = load_dataset(
             script_args.dataset_prompts,
@@ -843,9 +843,8 @@ if __name__ == "__main__":
         dataset_name = f"{script_args.user}/{name_for_saving}_completions"
         dataset_prompts.push_to_hub(dataset_name)
 
+    # Scoring mode
     else:
-        # Scoring mode
-
         # Load dataset with completions from HF Hub
         val_data = load_dataset(
             script_args.dataset_with_completions, split="test"
@@ -912,6 +911,28 @@ if __name__ == "__main__":
         rate_hallucination = 1 - torch.mean(classifs)
         print("Rate of hallucination:", rate_hallucination.item())
 
+        # Add scores and classifications to the dataset
+        val_data = val_data.add_column("scores", scores.tolist())
+        val_data = val_data.add_column("classifications", classifs.tolist())
+
+        # Push updated dataset back to HF Hub
+        print(f"Pushing updated dataset with scores to {script_args.dataset_with_completions}")
+        val_data.push_to_hub(script_args.dataset_with_completions)
+
+        # P.S. to calculate the rate of hallucination for a different 
+        # threshold, directly on Hugging Face Data Studio, you can do:
+
+        # SELECT 
+        #   1 - AVG(CASE WHEN scores >= 0.9995 THEN 1 ELSE 0 END) AS rate_of_hallucination
+        # FROM 
+        #   test;
+
+        # P.S. to find the examples the are hallucinations for a different 
+        # threshold, directly on Hugging Face Data Studio, you can do:
+
+        # SELECT * FROM test WHERE scores < 0.9995;
+
+        # Save local files
         filepath = f"logs/{name_for_saving}/scores.txt"
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         with open(filepath, "w") as f:

@@ -3,20 +3,20 @@
 # Core Parameters
 USER="leobianco"
 SEED=12345
-RUN_IDENTIFIER="$USER/npov_PERL_seed_130104_episodes_20000_lr_2e-5_klcoeff_1e-4_temp_1e-1"
+RUN_IDENTIFIER="$USER/npov_SFT_google_S200898_epo25_lr1e-4_r8_2506111442"
 BASE_MODEL="google/gemma-2-2b-it"
 EVALUATOR_MODEL="gemini-2.0-flash"
 USE_GEMINI="True"
 GEMINI_API_KEY="AIzaSyCIPXhApp0pcu7TruZ8EyuW086VJ1wzrhk"
-THRESHOLD=0.9998
+THRESHOLD=0.9995
 EVALUATOR_NUM_FEWSHOT=2
 MAX_TOKENS=768
 TEMPERATURE=7e-1
 TOP_P=1
 
 # Dataset Parameters
-DATASET_PROMPTS="${USER}/npov_perl"
-DATASET_PROMPTS_SPLIT="train"
+DATASET_PROMPTS="${USER}/npov_hyperparam_test_set"
+DATASET_PROMPTS_SPLIT="test"
 DATASET_LABELS="${USER}/npov_autorater"
 DATASET_LABELS_SPLIT="test"
 
