@@ -815,7 +815,6 @@ if __name__ == "__main__":
         gc.collect()
         torch.cuda.empty_cache()
 
-        # Save generations locally
         try:
             name_for_saving = (
                 "eval_"
@@ -825,13 +824,6 @@ if __name__ == "__main__":
             name_for_saving = (
                 "eval_" + script_args.writer_model_lora.split("/")[1]
             )
-
-        filepath = f"logs/{name_for_saving}/generations.txt"
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, "w") as f:
-            for idx, generation in enumerate(generations):
-                f.write(f"\n{idx}. ----------\n" + generation)
-        print(f"Generations saved to {filepath}")
 
         # Add generations to the dataset_prompts under a column named "completion".
         dataset_prompts = dataset_prompts.add_column("completion", generations)
@@ -931,19 +923,3 @@ if __name__ == "__main__":
         # threshold, directly on Hugging Face Data Studio, you can do:
 
         # SELECT * FROM test WHERE scores < 0.9995;
-
-        # Save local files
-        filepath = f"logs/{name_for_saving}/scores.txt"
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, "w") as f:
-            for idx, score in enumerate(scores):
-                f.write("{:.5f}\n".format(score.item()))
-        print(f"Scores saved to {filepath}")
-
-        filepath = f"logs/{name_for_saving}/classifs.txt"
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, "w") as f:
-            for idx, classif in enumerate(classifs):
-                f.write("{:.5f}\n".format(classif.item()))
-        print(f"Classifs saved to {filepath}")
-        print(f"Classif mean: {torch.mean(classifs)}")
