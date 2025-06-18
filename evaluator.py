@@ -838,7 +838,8 @@ if __name__ == "__main__":
         print(
             f"Pushing dataset with completions to {script_args.user}/{name_for_saving}_completions"
         )
-        dataset_name = f"{script_args.user}/{name_for_saving}_completions"
+        temp_str = f"{script_args.temperature:.3g}".replace(".", "p")
+        dataset_name = f"{script_args.user}/{name_for_saving}_gens_T{temp_str}"
         dataset_prompts.push_to_hub(dataset_name)
 
     # Scoring mode
