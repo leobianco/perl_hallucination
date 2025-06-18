@@ -22,6 +22,7 @@ LOCAL_ROLLOUT_FORWARD_BATCH_SIZE=8
 TEMPERATURE=0.1
 SAVE_STEPS=1000
 NUM_SAMPLE_GENERATIONS=10
+MISSING_EOS_PENALTY=1.0
 
 # Infrastructure Parameters
 DEEPSPEED_CONFIG="./deepspeed_config.yaml"
@@ -77,7 +78,7 @@ accelerate launch \
   --num_mini_batches "$NUM_MINIBATCHES" \
   --per_device_train_batch_size "$PER_DEVICE_BATCH_SIZE" \
   --local_rollout_forward_batch_size "$LOCAL_ROLLOUT_FORWARD_BATCH_SIZE" \
-  --missing_eos_penalty 1.0 \
+  --missing_eos_penalty "$MISSING_EOS_PENALTY" \
   --temperature "$TEMPERATURE" \
   --num_sample_generations "$NUM_SAMPLE_GENERATIONS"
 
