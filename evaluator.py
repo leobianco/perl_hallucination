@@ -835,7 +835,7 @@ if __name__ == "__main__":
         dataset_prompts = dataset_prompts.add_column("completion", generations)
 
         # Save the dataset with completions to HF Hub
-        temp_str = str(script_args.temperature)
+        temp_str = str(float(script_args.temperature))
         dataset_name = f"{script_args.user}/{name_for_saving}_gens_T{temp_str}"
         print(
             f"Pushing dataset with generations to {dataset_name}"
