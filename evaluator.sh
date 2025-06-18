@@ -46,7 +46,7 @@ if [ "$2" == "generate" ]; then
         --top_p "$TOP_P" \
         --top_k "$TOP_K"
 elif [ "$2" == "score" ]; then
-    DATASET_WITH_COMPLETIONS="${USER}/eval_${RUN_IDENTIFIER#*/}_completions"
+    DATASET_WITH_COMPLETIONS="${USER}/eval_${RUN_IDENTIFIER#*/}_gens_T${TEMPERATURE}"
     echo "Running in scoring mode..."
     python3 evaluator.py \
         --task "$TASK" \
