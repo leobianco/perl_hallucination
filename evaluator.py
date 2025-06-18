@@ -130,6 +130,11 @@ class ScriptArguments:
 
     top_p: float = field(default=1)
 
+    top_k: int = field(
+        default=0,
+        metadata={"help": "The number of highest probability vocabulary tokens to keep for top-k-filtering. 0 means no top-k filtering."},
+    )
+
     evaluator_num_fewshot: Optional[int] = field(
         default=0,
         metadata={
@@ -786,6 +791,7 @@ if __name__ == "__main__":
             seed=script_args.seed,
             temperature=script_args.temperature,
             top_p=script_args.top_p,
+            top_k=script_args.top_k,
             min_tokens=10,  # avoid empty generations
             max_tokens=script_args.max_tokens,
         )

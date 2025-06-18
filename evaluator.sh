@@ -10,9 +10,10 @@ USE_GEMINI="True"
 GEMINI_API_KEY="AIzaSyCIPXhApp0pcu7TruZ8EyuW086VJ1wzrhk"
 THRESHOLD=0.9995
 EVALUATOR_NUM_FEWSHOT=2
-MAX_TOKENS=768
-TEMPERATURE=7e-1
-TOP_P=1
+MAX_TOKENS=150
+TEMPERATURE=1e-1
+TOP_P=0.9
+TOP_K=40
 
 # Dataset Parameters
 DATASET_PROMPTS="${USER}/npov_hyperparam_test_set"
@@ -42,7 +43,8 @@ if [ "$2" == "generate" ]; then
         --writer_model_lora "${RUN_IDENTIFIER}" \
         --max_tokens "$MAX_TOKENS" \
         --temperature "$TEMPERATURE" \
-        --top_p "$TOP_P"
+        --top_p "$TOP_P" \
+        --top_k "$TOP_K"
 elif [ "$2" == "score" ]; then
     DATASET_WITH_COMPLETIONS="${USER}/eval_${RUN_IDENTIFIER#*/}_completions"
     echo "Running in scoring mode..."
