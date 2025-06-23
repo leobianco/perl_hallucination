@@ -60,6 +60,8 @@ from vllm import LLM, SamplingParams
 from vllm.distributed.parallel_state import destroy_model_parallel
 from vllm.lora.request import LoRARequest
 
+from utils import compute_best_roc_threshold_and_log
+
 
 @dataclass
 class ScriptArguments:
@@ -132,7 +134,9 @@ class ScriptArguments:
 
     top_k: int = field(
         default=0,
-        metadata={"help": "The number of highest probability vocabulary tokens to keep for top-k-filtering. 0 means no top-k filtering."},
+        metadata={
+            "help": "The number of highest probability vocabulary tokens to keep for top-k-filtering. 0 means no top-k filtering."
+        },
     )
 
     evaluator_num_fewshot: Optional[int] = field(
@@ -675,9 +679,13 @@ if __name__ == "__main__":
         print(f"Scores saved to {filepath}")
 
         auc = roc_auc_score(ground_truth, scores)
-        fpr, tpr, thresholds = roc_curve(ground_truth, scores.numpy())
-        threshold_idx = np.argmax(tpr - fpr)
-        threshold = thresholds[threshold_idx]
+        metrics = compute_best_roc_threshold_and_log(
+            ground_truth, scores.numpy(), log_to_wandb=True
+        )
+        threshold = metrics["best_threshold"]
+        tpr = metrics["tpr_at_best_threshold"]
+        fpr = metrics["fpr_at_best_threshold"]
+        accuracy = metrics["accuracy_at_best_threshold"]
         classif_at_threshold = [
             0 if score < threshold else 1 for score in scores
         ]
@@ -688,13 +696,9 @@ if __name__ == "__main__":
         with open(metrics_filepath, "w") as f:
             f.write("AUC: {:.5f}\n".format(auc))
             f.write("Threshold: {:.5f}\n".format(threshold))
-            f.write("TPR (recall): {:.5f}\n".format(tpr[threshold_idx]))
-            f.write("FPR: {:.5f}\n".format(fpr[threshold_idx]))
-            f.write(
-                "Accuracy: {:.5f}\n".format(
-                    accuracy_score(ground_truth, classif_at_threshold)
-                )
-            )
+            f.write("TPR (recall): {:.5f}\n".format(tpr))
+            f.write("FPR: {:.5f}\n".format(fpr))
+            f.write("Accuracy: {:.5f}\n".format(accuracy))
             f.write(
                 "Precision: {:.5f}\n".format(
                     precision_score(ground_truth, classif_at_threshold)
@@ -704,13 +708,9 @@ if __name__ == "__main__":
 
         print("AUC: {:.5f}".format(auc))
         print("Threshold: {:.5f}".format(threshold))
-        print("TPR (recall): {:.5f}".format(tpr[threshold_idx]))
-        print("FPR: {:.5f}".format(fpr[threshold_idx]))
-        print(
-            "Accuracy: {:.5f}".format(
-                accuracy_score(ground_truth, classif_at_threshold)
-            )
-        )
+        print("TPR (recall): {:.5f}".format(tpr))
+        print("FPR: {:.5f}".format(fpr))
+        print("Accuracy: {:.5f}".format(accuracy))
         print(
             "Precision: {:.5f}".format(
                 precision_score(ground_truth, classif_at_threshold)
@@ -720,7 +720,7 @@ if __name__ == "__main__":
         # ROC-AUC plot
         RocCurveDisplay.from_predictions(ground_truth, scores)
         plt.title(f"ROC Curve (Threshold: {threshold:.5f})")
-        plt.scatter([fpr[threshold_idx]], [tpr[threshold_idx]], c="r")
+        plt.scatter([fpr], [tpr], c="r")
         os.makedirs(f"logs/{name_for_saving}/", exist_ok=True)
         plt.savefig(
             f"logs/{name_for_saving}/"
@@ -837,9 +837,7 @@ if __name__ == "__main__":
         # Save the dataset with completions to HF Hub
         temp_str = str(float(script_args.temperature))
         dataset_name = f"{script_args.user}/{name_for_saving}_gens_T{temp_str}"
-        print(
-            f"Pushing dataset with generations to {dataset_name}"
-        )
+        print(f"Pushing dataset with generations to {dataset_name}")
         dataset_prompts.push_to_hub(dataset_name)
 
     # Scoring mode
@@ -915,18 +913,20 @@ if __name__ == "__main__":
         val_data = val_data.add_column("classifications", classifs.tolist())
 
         # Push updated dataset back to HF Hub
-        print(f"Pushing updated dataset with scores to {script_args.dataset_with_completions}")
+        print(
+            f"Pushing updated dataset with scores to {script_args.dataset_with_completions}"
+        )
         val_data.push_to_hub(script_args.dataset_with_completions)
 
-        # P.S. to calculate the rate of hallucination for a different 
+        # P.S. to calculate the rate of hallucination for a different
         # threshold, directly on Hugging Face Data Studio, you can do:
 
-        # SELECT 
+        # SELECT
         #   1 - AVG(CASE WHEN scores >= 0.9995 THEN 1 ELSE 0 END) AS rate_of_hallucination
-        # FROM 
+        # FROM
         #   test;
 
-        # P.S. to find the examples the are hallucinations for a different 
+        # P.S. to find the examples the are hallucinations for a different
         # threshold, directly on Hugging Face Data Studio, you can do:
 
         # SELECT * FROM test WHERE scores < 0.9995;

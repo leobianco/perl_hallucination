@@ -2,10 +2,12 @@
 
 from dataclasses import dataclass, field
 from typing import Optional
-import numpy as np
-import matplotlib.pyplot as plt
 
+import matplotlib.pyplot as plt
+import numpy as np
+import wandb
 from peft import LoraConfig
+from sklearn.metrics import accuracy_score, roc_curve
 
 
 @dataclass
@@ -107,3 +109,25 @@ def histogram_from_score_file(filepath):
     except FileNotFoundError:
         print(f"Error: The file at '{filepath}' was not found.")
         return None
+
+
+def compute_best_roc_threshold_and_log(labels, scores, log_to_wandb=False):
+    """
+    Given ground truth labels and prediction scores, compute the ROC curve,
+    find the best threshold (maximizing tpr-fpr), and return threshold, tpr, fpr, accuracy.
+    Optionally log these metrics to wandb.
+    """
+    fpr, tpr, thresholds = roc_curve(labels, scores)
+    threshold_idx = np.argmax(tpr - fpr)
+    threshold = thresholds[threshold_idx]
+    classif_at_threshold = [0 if score < threshold else 1 for score in scores]
+    accuracy = accuracy_score(labels, classif_at_threshold)
+    metrics = {
+        "best_threshold": threshold,
+        "tpr_at_best_threshold": tpr[threshold_idx],
+        "fpr_at_best_threshold": fpr[threshold_idx],
+        "accuracy_at_best_threshold": accuracy,
+    }
+    if log_to_wandb:
+        wandb.log(metrics)
+    return metrics
