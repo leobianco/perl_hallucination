@@ -196,9 +196,21 @@ def main():
         # Compute ground truth
         label_ids = eval_preds.label_ids
 
+        # Compute AUC and log statistics at best threshold
         metrics = metric.compute(references=label_ids, prediction_scores=scores)
         threshold_metrics = compute_best_roc_threshold(label_ids, scores)
         metrics.update(threshold_metrics)
+
+        # Compute and log average score for true positives and true negatives
+        scores = np.array(scores)
+        label_ids = np.array(label_ids)
+        avg_score_true_positives = scores[label_ids == 1].mean() if np.any(label_ids == 1) else float('nan')
+        avg_score_true_negatives = scores[label_ids == 0].mean() if np.any(label_ids == 0) else float('nan')
+        avg_score_metrics = {
+            "avg_score_true_positives": avg_score_true_positives,
+            "avg_score_true_negatives": avg_score_true_negatives,
+        }
+        metrics.update(avg_score_metrics)
 
         return metrics
 
