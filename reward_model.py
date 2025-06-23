@@ -25,7 +25,7 @@ from transformers import (
 from utils import (
     CustomLoraConfig,
     ScriptArguments,
-    compute_best_roc_threshold_and_log,
+    compute_best_roc_threshold,
 )
 
 
@@ -228,13 +228,12 @@ def main():
         no_scores = np.exp(logits)[:, 1]
         scores = no_scores / (yes_scores + no_scores)
 
-        metrics = compute_best_roc_threshold_and_log(
-            labels, scores, log_to_wandb=True
-        )
+        metrics = compute_best_roc_threshold(labels, scores)
         print(f"Best threshold: {metrics['best_threshold']:.5f}")
         print(f"TPR (recall): {metrics['tpr_at_best_threshold']:.5f}")
         print(f"FPR: {metrics['fpr_at_best_threshold']:.5f}")
         print(f"Accuracy: {metrics['accuracy_at_best_threshold']:.5f}")
+        trainer.log(metrics)
 
     filepath = f"logs/{name_for_saving}/logs.txt"
     os.makedirs(os.path.dirname(filepath), exist_ok=True)

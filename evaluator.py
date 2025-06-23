@@ -60,7 +60,7 @@ from vllm import LLM, SamplingParams
 from vllm.distributed.parallel_state import destroy_model_parallel
 from vllm.lora.request import LoRARequest
 
-from utils import compute_best_roc_threshold_and_log
+from utils import compute_best_roc_threshold
 
 
 @dataclass
@@ -567,7 +567,7 @@ def gemini_score_dataset(client, dataset, script_args):
     return torch.tensor(scores)
 
 
-if __name__ == "__main__":
+def main():
     parser = HfArgumentParser(ScriptArguments)
     script_args = parser.parse_args_into_dataclasses()[0]
     set_seed(script_args.seed)
@@ -679,9 +679,7 @@ if __name__ == "__main__":
         print(f"Scores saved to {filepath}")
 
         auc = roc_auc_score(ground_truth, scores)
-        metrics = compute_best_roc_threshold_and_log(
-            ground_truth, scores.numpy(), log_to_wandb=True
-        )
+        metrics = compute_best_roc_threshold(ground_truth, scores.numpy())
         threshold = metrics["best_threshold"]
         tpr = metrics["tpr_at_best_threshold"]
         fpr = metrics["fpr_at_best_threshold"]
@@ -930,3 +928,7 @@ if __name__ == "__main__":
         # threshold, directly on Hugging Face Data Studio, you can do:
 
         # SELECT * FROM test WHERE scores < 0.9995;
+
+
+if __name__ == "__main__":
+    main()

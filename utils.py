@@ -111,7 +111,7 @@ def histogram_from_score_file(filepath):
         return None
 
 
-def compute_best_roc_threshold_and_log(labels, scores, log_to_wandb=False):
+def compute_best_roc_threshold(labels, scores):
     """
     Given ground truth labels and prediction scores, compute the ROC curve,
     find the best threshold (maximizing tpr-fpr), and return threshold, tpr, fpr, accuracy.
@@ -128,6 +128,5 @@ def compute_best_roc_threshold_and_log(labels, scores, log_to_wandb=False):
         "fpr_at_best_threshold": fpr[threshold_idx],
         "accuracy_at_best_threshold": accuracy,
     }
-    if log_to_wandb:
-        wandb.log(metrics)
+
     return metrics
