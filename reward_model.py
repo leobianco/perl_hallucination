@@ -197,6 +197,8 @@ def main():
         label_ids = eval_preds.label_ids
 
         metrics = metric.compute(references=label_ids, prediction_scores=scores)
+        threshold_metrics = compute_best_roc_threshold(label_ids, scores)
+        metrics.update(threshold_metrics)
 
         return metrics
 
@@ -210,37 +212,8 @@ def main():
         compute_metrics=compute_metrics,
     )
 
-    if training_args.do_train:
-        trainer.train(
-            resume_from_checkpoint=training_args.resume_from_checkpoint
-        )
-        reward_model.save_pretrained(f"checkpoints/{name_for_saving}/")
-
-        if training_args.push_to_hub:
-            reward_model.push_to_hub(training_args.hub_model_id)
-
-    if training_args.do_eval:
-        # Calculate best threshold and related metrics using utility function
-        outputs = trainer.predict(rm_data["test"])
-        logits = outputs.predictions
-        labels = outputs.label_ids
-        yes_scores = np.exp(logits)[:, 0]
-        no_scores = np.exp(logits)[:, 1]
-        scores = no_scores / (yes_scores + no_scores)
-
-        metrics = compute_best_roc_threshold(labels, scores)
-        print(f"Best threshold: {metrics['best_threshold']:.5f}")
-        print(f"TPR (recall): {metrics['tpr_at_best_threshold']:.5f}")
-        print(f"FPR: {metrics['fpr_at_best_threshold']:.5f}")
-        print(f"Accuracy: {metrics['accuracy_at_best_threshold']:.5f}")
-        trainer.log(metrics)
-
-    filepath = f"logs/{name_for_saving}/logs.txt"
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    with open(filepath, "w") as f:
-        for d in trainer.state.log_history:
-            f.write(str(d) + "\n----------\n")
-    print(f"Logs saved to {filepath}")
+    trainer.train()
+    reward_model.push_to_hub(training_args.hub_model_id)
 
 
 if __name__ == "__main__":
