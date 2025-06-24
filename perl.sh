@@ -4,11 +4,11 @@
 USER="leobianco"
 SEED=130104
 MODEL_REPO_ID="google/gemma-2-2b-it"
-REWARD_MODEL_PATH="${USER}/bosch_RM_seed_130104_SYN_HALL_LLM_true_epochs_3_lr_1e-3_lora_8"
-SFT_MODEL_PATH="${USER}/bosch_SFT_seed_130104_epochs_0.01_lr_3e-3_lora_8_fewshot_0"
+REWARD_MODEL_PATH="${USER}/"
+SFT_MODEL_PATH="${USER}/"
 
 # Training Parameters
-TOTAL_EPISODES=20000
+TOTAL_EPISODES=10000
 LEARNING_RATE=2e-5
 LR_SCHEDULER_TYPE="cosine"
 WARMUP_RATIO=0.05
@@ -26,13 +26,13 @@ MISSING_EOS_PENALTY=1.0
 
 # Infrastructure Parameters
 DEEPSPEED_CONFIG="./deepspeed_config.yaml"
+SHUTDOWN=false
 
 # Parameters derived from above
 TASK="$1"
 TIMESTAMP=$(date '+%y%m%d%H%M')
 MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
 RUN_IDENTIFIER="${USER}/${TASK}_PERL_${MODEL_NAME}_S${SEED}_eps${TOTAL_EPISODES}_lr${LEARNING_RATE}_kl${KL_COEFF}_${TIMESTAMP}"
-SHUTDOWN=false
 
 # Checks
 if [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ] && [ "$TASK" != "ragtruth" ]; then
