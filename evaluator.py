@@ -530,31 +530,30 @@ def gemini_score_dataset(client, dataset, script_args):
     print("Calling the Gemini API...")
 
     # Initialize scores column if it doesn't exist
-    if 'scores' not in dataset.column_names:
-        dataset = dataset.add_column('scores', [None] * len(dataset))
-    
+    if 'scores' in dataset.column_names:
+        scores = list(dataset['scores'])
+    else:
+        scores = [None] * len(dataset)
+
     queries_per_minute = 2000
     time_window = 60
     query_count = 0
     start_time = time.time()
     save_frequency = 50  # Save progress every 50 entries
-
-    # Track entries that still need scoring
-    entries_to_score = [i for i, score in enumerate(dataset['scores']) if score is None]
+    entries_to_score = [i for i, score in enumerate(scores) if score is None]
     print(f"Found {len(entries_to_score)} entries that need scoring...")
 
-    for idx in tqdm(entries_to_score, desc="Scoring with Gemini API"):
-        # Check if we are approaching the rate limit
-        elapsed_time = time.time() - start_time
-        if query_count == (queries_per_minute - 1):
-            if elapsed_time < time_window:
-                wait_time = time_window - elapsed_time
-                print(f"Wait {wait_time:.2f} seconds to avoid API rate limit...")
-                time.sleep(wait_time + 1)
-            query_count = 0
-            start_time = time.time()
+    try:
+        for n, idx in enumerate(tqdm(entries_to_score, desc="Scoring with Gemini API")):
+            elapsed_time = time.time() - start_time
+            if query_count == (queries_per_minute - 1):
+                if elapsed_time < time_window:
+                    wait_time = time_window - elapsed_time
+                    print(f"Wait {wait_time:.2f} seconds to avoid API rate limit...")
+                    time.sleep(wait_time + 1)
+                query_count = 0
+                start_time = time.time()
 
-        try:
             response = client.models.generate_content(
                 model=model,
                 contents=dataset[idx]['evaluator_prompt'],
@@ -566,38 +565,44 @@ def gemini_score_dataset(client, dataset, script_args):
                     seed=script_args.seed,
                 ),
             )
-            new_score = gemini_score_response(response)
-            
-            # Update score in dataset
-            dataset = dataset.map(
-                lambda x, i: {'scores': new_score if i == idx else x['scores']},
-                with_indices=True
-            )
-            
+            scores[idx] = gemini_score_response(response)
             query_count += 1
 
             # Save progress periodically
-            if (idx + 1) % save_frequency == 0:
-                print(f"\nSaving progress after {idx + 1} entries...")
+            if (n + 1) % save_frequency == 0:
+                print(f"\nSaving progress after {n + 1} new entries...")
                 try:
+                    dataset = dataset.remove_columns('scores') if 'scores' in dataset.column_names else dataset
+                    dataset = dataset.add_column('scores', scores)
                     if hasattr(script_args, 'dataset_with_completions') and script_args.dataset_with_completions:
                         dataset.push_to_hub(script_args.dataset_with_completions)
                 except Exception as e:
                     print(f"Warning: Could not save intermediate progress to hub: {e}")
 
-        except Exception as e:
-            print(f"\nError encountered at entry {idx}: {str(e)}")
-            print("Saving current progress...")
+    except Exception as e:
+        print(f"\nError encountered at entry {idx}: {str(e)}")
+        print("Saving current progress...")
+        try:
+            dataset = dataset.remove_columns('scores') if 'scores' in dataset.column_names else dataset
+            dataset = dataset.add_column('scores', scores)
             if hasattr(script_args, 'dataset_with_completions') and script_args.dataset_with_completions:
-                try:
-                    dataset.push_to_hub(script_args.dataset_with_completions)
-                except Exception as save_error:
-                    print(f"Error saving progress: {save_error}")
-            raise e
+                dataset.push_to_hub(script_args.dataset_with_completions)
+        except Exception as save_error:
+            print(f"Error saving progress: {save_error}")
+        raise e
+
+    # Final save after all scoring is done
+    dataset = dataset.remove_columns('scores') if 'scores' in dataset.column_names else dataset
+    dataset = dataset.add_column('scores', scores)
+    if hasattr(script_args, 'dataset_with_completions') and script_args.dataset_with_completions:
+        try:
+            dataset.push_to_hub(script_args.dataset_with_completions)
+        except Exception as e:
+            print(f"Warning: Could not save final progress to hub: {e}")
 
     # Convert scores to tensor, replacing any remaining None with 0
-    scores = [score if score is not None else 0 for score in dataset['scores']]
-    return torch.tensor(scores)
+    scores_tensor = torch.tensor([s if s is not None else 0 for s in scores])
+    return scores_tensor
 
 
 def main():
