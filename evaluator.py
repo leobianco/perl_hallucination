@@ -529,9 +529,25 @@ def gemini_score_dataset(client, dataset, script_args):
     schema = {"type": "STRING", "enum": ["No", "Yes"]}
     print("Calling the Gemini API...")
 
-    # Initialize scores column if it doesn't exist
-    if 'scores' in dataset.column_names:
-        scores = list(dataset['scores'])
+    # Prepare local checkpoint directory
+    checkpoint_dir = os.path.join("checkpoints", "eval")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_path = os.path.join(
+        checkpoint_dir,
+        f"{script_args.dataset_with_completions}_scores_checkpoint.pt",
+    )
+
+    # Initialize scores: load from checkpoint if exists, else from dataset or None
+    if os.path.exists(checkpoint_path):
+        print(f"Loading scores from checkpoint: {checkpoint_path}")
+        scores = torch.load(checkpoint_path)
+        # If checkpoint is shorter than dataset (e.g. dataset updated), pad with None
+        if len(scores) < len(dataset):
+            scores = list(scores) + [None] * (len(dataset) - len(scores))
+        elif len(scores) > len(dataset):
+            scores = list(scores)[: len(dataset)]
+    elif "scores" in dataset.column_names:
+        scores = list(dataset["scores"])
     else:
         scores = [None] * len(dataset)
 
@@ -546,12 +562,16 @@ def gemini_score_dataset(client, dataset, script_args):
     print(f"Found {len(entries_to_score)} entries that need scoring...")
 
     try:
-        for n, idx in enumerate(tqdm(entries_to_score, desc="Scoring with Gemini API")):
+        for n, idx in enumerate(
+            tqdm(entries_to_score, desc="Scoring with Gemini API")
+        ):
             elapsed_time = time.time() - start_time
             if query_count == (queries_per_minute - 1):
                 if elapsed_time < time_window:
                     wait_time = time_window - elapsed_time
-                    print(f"Wait {wait_time:.2f} seconds to avoid API rate limit...")
+                    print(
+                        f"Wait {wait_time:.2f} seconds to avoid API rate limit..."
+                    )
                     time.sleep(wait_time + 1)
                 query_count = 0
                 start_time = time.time()
@@ -561,7 +581,7 @@ def gemini_score_dataset(client, dataset, script_args):
                 try:
                     response = client.models.generate_content(
                         model=model,
-                        contents=dataset[idx]['evaluator_prompt'],
+                        contents=dataset[idx]["evaluator_prompt"],
                         config=types.GenerateContentConfig(
                             response_mime_type="text/x.enum",
                             response_schema=schema,
@@ -575,45 +595,58 @@ def gemini_score_dataset(client, dataset, script_args):
                     break  # Success, break out of retry loop
                 except Exception as e:
                     error_str = str(e).lower()
-                    if ("unavailable" in error_str or "overloaded" in error_str or "overcharged" in error_str or "server" in error_str) and retry_count < server_max_retries - 1:
-                        print(f"Server unavailable/overloaded at entry {idx}, attempt {retry_count+1}/{server_max_retries}. Waiting {server_retry_wait} seconds before retrying...")
+                    if (
+                        "unavailable" in error_str
+                        or "overloaded" in error_str
+                        or "overcharged" in error_str
+                        or "server" in error_str
+                    ) and retry_count < server_max_retries - 1:
+                        print(
+                            f"Server unavailable/overloaded at entry {idx}, attempt {retry_count + 1}/{server_max_retries}. Waiting {server_retry_wait} seconds before retrying..."
+                        )
                         time.sleep(server_retry_wait)
                         retry_count += 1
                         continue
                     else:
                         raise  # Not a server error or max retries reached
 
-            # Save progress periodically
+            # Save progress periodically to local file
             if (n + 1) % save_frequency == 0:
-                print(f"\nSaving progress after {n + 1} new entries...")
+                print(f"\nSaving progress locally after {n + 1} new entries...")
                 try:
-                    dataset = dataset.remove_columns('scores') if 'scores' in dataset.column_names else dataset
-                    dataset = dataset.add_column('scores', scores)
-                    if hasattr(script_args, 'dataset_with_completions') and script_args.dataset_with_completions:
-                        dataset.push_to_hub(script_args.dataset_with_completions)
+                    torch.save(scores, checkpoint_path)
                 except Exception as e:
-                    print(f"Warning: Could not save intermediate progress to hub: {e}")
+                    print(
+                        f"Warning: Could not save intermediate progress locally: {e}"
+                    )
 
     except Exception as e:
         print(f"\nError encountered at entry {idx}: {str(e)}")
-        print("Saving current progress...")
+        print("Saving current progress locally...")
         try:
-            dataset = dataset.remove_columns('scores') if 'scores' in dataset.column_names else dataset
-            dataset = dataset.add_column('scores', scores)
-            if hasattr(script_args, 'dataset_with_completions') and script_args.dataset_with_completions:
-                dataset.push_to_hub(script_args.dataset_with_completions)
+            torch.save(scores, checkpoint_path)
         except Exception as save_error:
-            print(f"Error saving progress: {save_error}")
+            print(f"Error saving progress locally: {save_error}")
         raise e
 
     # Final save after all scoring is done
-    dataset = dataset.remove_columns('scores') if 'scores' in dataset.column_names else dataset
-    dataset = dataset.add_column('scores', scores)
-    if hasattr(script_args, 'dataset_with_completions') and script_args.dataset_with_completions:
+    dataset = (
+        dataset.remove_columns("scores")
+        if "scores" in dataset.column_names
+        else dataset
+    )
+    dataset = dataset.add_column("scores", scores)
+    if (
+        hasattr(script_args, "dataset_with_completions")
+        and script_args.dataset_with_completions
+    ):
         try:
             dataset.push_to_hub(script_args.dataset_with_completions)
         except Exception as e:
             print(f"Warning: Could not save final progress to hub: {e}")
+    # Remove local checkpoint after successful push
+    if os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
 
     # Convert scores to tensor, replacing any remaining None with 0
     scores_tensor = torch.tensor([s if s is not None else 0 for s in scores])
