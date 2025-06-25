@@ -540,6 +540,8 @@ def gemini_score_dataset(client, dataset, script_args):
     query_count = 0
     start_time = time.time()
     save_frequency = 50  # Save progress every 50 entries
+    server_retry_wait = 20  # seconds to wait between server error retries
+    server_max_retries = 3  # number of times to retry on server error
     entries_to_score = [i for i, score in enumerate(scores) if score is None]
     print(f"Found {len(entries_to_score)} entries that need scoring...")
 
@@ -555,7 +557,7 @@ def gemini_score_dataset(client, dataset, script_args):
                 start_time = time.time()
 
             retry_count = 0
-            while retry_count < 3:
+            while retry_count < server_max_retries:
                 try:
                     response = client.models.generate_content(
                         model=model,
@@ -573,9 +575,9 @@ def gemini_score_dataset(client, dataset, script_args):
                     break  # Success, break out of retry loop
                 except Exception as e:
                     error_str = str(e).lower()
-                    if ("unavailable" in error_str or "overloaded" in error_str or "overcharged" in error_str or "server" in error_str) and retry_count < 2:
-                        print(f"Server unavailable/overloaded at entry {idx}, attempt {retry_count+1}/3. Waiting 60 seconds before retrying...")
-                        time.sleep(60)
+                    if ("unavailable" in error_str or "overloaded" in error_str or "overcharged" in error_str or "server" in error_str) and retry_count < server_max_retries - 1:
+                        print(f"Server unavailable/overloaded at entry {idx}, attempt {retry_count+1}/{server_max_retries}. Waiting {server_retry_wait} seconds before retrying...")
+                        time.sleep(server_retry_wait)
                         retry_count += 1
                         continue
                     else:
