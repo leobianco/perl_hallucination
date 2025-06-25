@@ -5,7 +5,6 @@ from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
-import wandb
 from peft import LoraConfig
 from sklearn.metrics import accuracy_score, roc_curve
 

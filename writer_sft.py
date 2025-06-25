@@ -43,21 +43,23 @@ def main():
 
     # For training on completions only.
     if script_args.task == "npov":
-        # Response template is model dependent... 
+        # Response template is model dependent...
         # For Mistral, "point-of-view" forward.
-        # For Gemma, "\nNeutral point-of-view" forward... 
-        # This is because the tokenizer tokenizes differently depending 
+        # For Gemma, "\nNeutral point-of-view" forward...
+        # This is because the tokenizer tokenizes differently depending
         # on context.
         model_company = script_args.model_repo_id.split("/")[0]
-        if model_company=="google":
+        if model_company == "google":
             response_template = "\nNeutral point-of-view answer to user query, rewriting provided arguments in natural language:\n"
-        elif model_company=="mistralai":
+        elif model_company == "mistralai":
             response_template = "point-of-view answer to user query, rewriting provided arguments in natural language:\n"
         else:
             raise Exception("Response template not specified for model!")
 
         if script_args.num_fewshot == 0 or script_args.num_fewshot is None:
-            formatting_prompts_func = npov_formatting_prompts_func(tokenizer.eos_token)
+            formatting_prompts_func = npov_formatting_prompts_func(
+                tokenizer.eos_token
+            )
         else:
             # Get fewshot examples and add to formatting_prompts_func
             fewshot_examples = sft_data.shuffle(seed=training_args.seed).select(
@@ -70,13 +72,15 @@ def main():
                 )
             )
     elif script_args.task == "bosch":
-        response_template = (
-            "\nAnswer to user's question:\n"
+        response_template = "\nAnswer to user's question:\n"
+        formatting_prompts_func = bosch_formatting_prompts_func(
+            tokenizer.eos_token
         )
-        formatting_prompts_func = bosch_formatting_prompts_func(tokenizer.eos_token)
     elif script_args.task == "ragtruth":
         response_template = "\n\noutput:\n"
-        formatting_prompts_func = ragtruth_formatting_prompts_func(tokenizer.eos_token)
+        formatting_prompts_func = ragtruth_formatting_prompts_func(
+            tokenizer.eos_token
+        )
 
     response_template_ids = tokenizer.encode(
         response_template, add_special_tokens=False

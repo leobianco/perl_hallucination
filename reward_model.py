@@ -3,7 +3,6 @@ TODO: write proper docstring.
 TODO: clean imports.
 """
 
-import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -204,8 +203,16 @@ def main():
         # Compute and log average score for true positives and true negatives
         scores = np.array(scores)
         label_ids = np.array(label_ids)
-        avg_score_true_positives = scores[label_ids == 1].mean() if np.any(label_ids == 1) else float('nan')
-        avg_score_true_negatives = scores[label_ids == 0].mean() if np.any(label_ids == 0) else float('nan')
+        avg_score_true_positives = (
+            scores[label_ids == 1].mean()
+            if np.any(label_ids == 1)
+            else float("nan")
+        )
+        avg_score_true_negatives = (
+            scores[label_ids == 0].mean()
+            if np.any(label_ids == 0)
+            else float("nan")
+        )
         avg_score_metrics = {
             "avg_score_true_positives": avg_score_true_positives,
             "avg_score_true_negatives": avg_score_true_negatives,

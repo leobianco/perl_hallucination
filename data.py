@@ -126,9 +126,13 @@ def npov_process_data_for_rm(
     npov_rm_data = deepcopy(npov_data)
 
     if "has hallucination" in npov_rm_data.column_names:
-        npov_rm_data = npov_rm_data.rename_column("has hallucination", "class_hall")
+        npov_rm_data = npov_rm_data.rename_column(
+            "has hallucination", "class_hall"
+        )
     if "has coverage issue" in npov_rm_data.column_names:
-        npov_rm_data = npov_rm_data.rename_column("has coverage issue", "class_omit")
+        npov_rm_data = npov_rm_data.rename_column(
+            "has coverage issue", "class_omit"
+        )
 
     npov_rm_data = npov_rm_data.select_columns(
         [
@@ -174,7 +178,9 @@ def npov_process_data_for_sft(npov_data):
         ]
     )
 
-    npov_data = npov_data.rename_column("npov_response_combined", "npov_response")
+    npov_data = npov_data.rename_column(
+        "npov_response_combined", "npov_response"
+    )
 
     return npov_data
 
@@ -280,7 +286,9 @@ def npov_formatting_prompts_func(eos_token):
     return _formatting_func
 
 
-def npov_formatting_prompts_func_from_fewshot_examples(fewshot_examples, eos_token):
+def npov_formatting_prompts_func_from_fewshot_examples(
+    fewshot_examples, eos_token
+):
     """Given a fewshot example, returns a formatting prompts function for writer SFT that includes the given fewshot example in its prompt.
 
     Args:
@@ -624,7 +632,9 @@ def bosch_load_and_process_data(data_path, flip_path):
     data_to_flip = pd.read_csv(flip_path)
 
     # Filter unanswerable samples.
-    data = data.loc[data["Answerable"] == True].drop(labels=["Answerable"], axis=1)
+    data = data.loc[data["Answerable"] == True].drop(
+        labels=["Answerable"], axis=1
+    )
 
     # Flip labels of mis-annotated samples.
     data.loc[
@@ -681,7 +691,9 @@ def bosch_formatting_prompts_func(eos_token):
                 context=entry["Context"][i],
             )
 
-            output_texts.append(formatted_prompt + f"{entry['Answer'][i]}{eos_token}")
+            output_texts.append(
+                formatted_prompt + f"{entry['Answer'][i]}{eos_token}"
+            )
 
         return output_texts
 
@@ -955,14 +967,18 @@ def main():
         # Filter out synthetic hallucinations from train set
         npov_rm_data_organic["train"] = npov_rm_data_organic["train"].filter(
             lambda x: not (
-                x["class_hall"] == "Yes" and x["has synthetic hallucination"] == "Yes"
+                x["class_hall"] == "Yes"
+                and x["has synthetic hallucination"] == "Yes"
             )
         )
 
         # Filter out synthetic hallucinations from validation set
-        npov_rm_data_organic["validation"] = npov_rm_data_organic["validation"].filter(
+        npov_rm_data_organic["validation"] = npov_rm_data_organic[
+            "validation"
+        ].filter(
             lambda x: not (
-                x["class_hall"] == "Yes" and x["has synthetic hallucination"] == "Yes"
+                x["class_hall"] == "Yes"
+                and x["has synthetic hallucination"] == "Yes"
             )
         )
 
@@ -974,7 +990,9 @@ def main():
             }
         )
 
-        npov_rm_data_organic_dataset.push_to_hub(repo_id=args.task + "_rm_organic")
+        npov_rm_data_organic_dataset.push_to_hub(
+            repo_id=args.task + "_rm_organic"
+        )
 
         # SYNTHETIC HALLUCINATIONS
 
@@ -1052,9 +1070,9 @@ def main():
             )
 
             # We use some non-hallus. to generate synthetic hallus.
-            npov_rm_train_synth_llm = npov_rm_train_non.shuffle(seed=args.seed).select(
-                range(args.num_synth_hallus)
-            )
+            npov_rm_train_synth_llm = npov_rm_train_non.shuffle(
+                seed=args.seed
+            ).select(range(args.num_synth_hallus))
             npov_rm_train_non = npov_rm_train_non.filter(
                 lambda x: x not in npov_rm_train_synth_llm
             )
@@ -1098,8 +1116,10 @@ def main():
             # Since the response changed, you need to rewrite the
             # prompt
             for split in synthetic_hallucinations_llm_data.keys():
-                synthetic_hallucinations_llm_data[split] = npov_process_data_for_rm(
-                    synthetic_hallucinations_llm_data[split],
+                synthetic_hallucinations_llm_data[split] = (
+                    npov_process_data_for_rm(
+                        synthetic_hallucinations_llm_data[split],
+                    )
                 )
 
                 synthetic_hallucinations_llm_data[split].push_to_hub(
@@ -1118,7 +1138,9 @@ def main():
         )
 
         for split in npov_sft_data.keys():
-            npov_sft_data[split] = npov_process_data_for_sft(npov_sft_data[split])
+            npov_sft_data[split] = npov_process_data_for_sft(
+                npov_sft_data[split]
+            )
 
         # I want to merge validation and test splits before saving.
         npov_sft_new = DatasetDict(
@@ -1158,7 +1180,9 @@ def main():
 
         # Create hyperparameter search test set (1000 samples)
         hyperparam_test_set = (
-            npov_augmented_data_dict["test"].shuffle(seed=args.seed).select(range(1000))
+            npov_augmented_data_dict["test"]
+            .shuffle(seed=args.seed)
+            .select(range(1000))
         )
         hyperparam_test_set_dict = DatasetDict({"test": hyperparam_test_set})
         hyperparam_test_set_dict.push_to_hub(
@@ -1171,7 +1195,9 @@ def main():
             .shuffle(seed=args.seed)
             .select(range(10000))
         )
-        capped_final_test_set_dict = DatasetDict({"test": capped_final_test_set})
+        capped_final_test_set_dict = DatasetDict(
+            {"test": capped_final_test_set}
+        )
         capped_final_test_set_dict.push_to_hub(
             repo_id=args.task + "_final_test_set",
         )
@@ -1215,7 +1241,9 @@ def main():
         autorater_dataset = concatenate_datasets(
             [dataset_train, dataset_val, dataset_test]
         )
-        autorater_dataset.push_to_hub(repo_id=args.task + "_autorater", split="test")
+        autorater_dataset.push_to_hub(
+            repo_id=args.task + "_autorater", split="test"
+        )
 
         # SFT
         sft_data = dataset_val.filter(lambda entry: entry["class_hall"] == "No")
@@ -1224,10 +1252,14 @@ def main():
         # REWARD MODEL
         # ORGANIC HALLUCINATIONS
         # train -> validation, test -> test
-        bosch_rm_organic = DatasetDict({"train": dataset_val, "test": dataset_test})
+        bosch_rm_organic = DatasetDict(
+            {"train": dataset_val, "test": dataset_test}
+        )
         # RM prompt
         for split in bosch_rm_organic.keys():
-            bosch_rm_organic[split] = bosch_rm_organic[split].map(bosch_rm_prompt)
+            bosch_rm_organic[split] = bosch_rm_organic[split].map(
+                bosch_rm_prompt
+            )
         # Save
         bosch_rm_organic.push_to_hub(repo_id=args.task + "_rm_organic")
 
@@ -1311,8 +1343,8 @@ def main():
             )
 
             # Write the RM prompts with the new response.
-            synthetic_hallucinations_struct = synthetic_hallucinations_struct.map(
-                bosch_rm_prompt
+            synthetic_hallucinations_struct = (
+                synthetic_hallucinations_struct.map(bosch_rm_prompt)
             )
 
             # Add some non-hallucinated examples and shuffle!
@@ -1341,7 +1373,9 @@ def main():
         perl_data.push_to_hub(repo_id=args.task + "_perl")
 
         # FINAL TEST SET
-        dataset_train.push_to_hub(repo_id=args.task + "_final_test_set", split="test")
+        dataset_train.push_to_hub(
+            repo_id=args.task + "_final_test_set", split="test"
+        )
 
     elif args.task == "ragtruth":
         # GENERAL DATA PROCESSING
@@ -1358,7 +1392,9 @@ def main():
             data_responses["source_id"].isin(sources["source_id"])
         ]
         unified = pd.merge(sources, responses, on="source_id", how="left")
-        unified = unified.drop(["source_info", "task_type", "source", "id"], axis=1)
+        unified = unified.drop(
+            ["source_info", "task_type", "source", "id"], axis=1
+        )
         # Define necessary columns.
         unified["label"] = unified.apply(
             lambda entry: 1 if len(entry["labels"]) == 0 else 0, axis=1
@@ -1377,8 +1413,12 @@ def main():
         # Create a validation split by taking the samples corresponding to
         # the first 150 unique queries in the train set
         val_source_ids = train_data["source_id"].drop_duplicates().iloc[:150]
-        val_data = train_data[train_data["source_id"].isin(val_source_ids)].copy()
-        train_data = train_data[~train_data["source_id"].isin(val_source_ids)].copy()
+        val_data = train_data[
+            train_data["source_id"].isin(val_source_ids)
+        ].copy()
+        train_data = train_data[
+            ~train_data["source_id"].isin(val_source_ids)
+        ].copy()
         # Convert to dataset format
         train_dataset = Dataset.from_pandas(train_data)
         val_dataset = Dataset.from_pandas(val_data)
@@ -1389,17 +1429,23 @@ def main():
         unified_dataset = concatenate_datasets(
             [train_dataset, val_dataset, test_dataset]
         )
-        unified_dataset.push_to_hub(repo_id=args.task + "_autorater", split="test")
+        unified_dataset.push_to_hub(
+            repo_id=args.task + "_autorater", split="test"
+        )
 
         # SFT data
         # We use the non-hallucinated samples in the validation split for SFT.
-        sft_data = test_dataset.filter(lambda entry: entry["class_hall"] == "No")
+        sft_data = test_dataset.filter(
+            lambda entry: entry["class_hall"] == "No"
+        )
         sft_data.push_to_hub(repo_id=args.task + "_sft")
 
         # REWARD MODEL
         # ORGANIC HALLUCINATIONS
         # train -> validation, test -> test
-        ragtruth_rm_organic = DatasetDict({"train": test_dataset, "test": val_dataset})
+        ragtruth_rm_organic = DatasetDict(
+            {"train": test_dataset, "test": val_dataset}
+        )
         # RM prompt
         for split in ragtruth_rm_organic.keys():
             ragtruth_rm_organic[split] = ragtruth_rm_organic[split].map(
@@ -1481,8 +1527,8 @@ def main():
             )
 
             # Write the RM prompts with the new response.
-            synthetic_hallucinations_struct = synthetic_hallucinations_struct.map(
-                ragtruth_rm_prompt
+            synthetic_hallucinations_struct = (
+                synthetic_hallucinations_struct.map(ragtruth_rm_prompt)
             )
 
             # Add some non-hallucinated examples and shuffle!

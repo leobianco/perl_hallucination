@@ -164,8 +164,9 @@ cython_debug/
 # WandB logs
 wandb/
 
-# Checkpoints
+# Checkpoints and logs
 checkpoints/
+logs/
 
 # For the paper (Latex)
 .DS_Store

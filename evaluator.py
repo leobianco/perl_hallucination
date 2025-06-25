@@ -43,10 +43,8 @@ from google.genai import types
 from huggingface_hub import snapshot_download
 from sklearn.metrics import (
     RocCurveDisplay,
-    accuracy_score,
     precision_score,
     roc_auc_score,
-    roc_curve,
 )
 from torch import nn
 from tqdm import tqdm
@@ -533,7 +531,10 @@ def gemini_score_dataset(client, dataset, script_args):
     checkpoint_dir = os.path.join("checkpoints", "eval")
     os.makedirs(checkpoint_dir, exist_ok=True)
     # Use only the dataset name after the slash for checkpoint filename
-    if script_args.dataset_with_completions and "/" in script_args.dataset_with_completions:
+    if (
+        script_args.dataset_with_completions
+        and "/" in script_args.dataset_with_completions
+    ):
         dataset_name = script_args.dataset_with_completions.split("/", 1)[1]
     else:
         dataset_name = str(script_args.dataset_with_completions)
