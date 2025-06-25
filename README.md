@@ -1,39 +1,26 @@
 # Hallucination Reduction with PERL and Synthetic Data Generation
 
-*TO DO:* write a proper README.
+This project studies the reduction of hallucinations via RLAIF with *synthetic* data.
 
 ## Usage
 
-Each shell script runs the corresponding python script. See the script's docstring for more information.
+Here is a brief description about the usage of each script, roughly in the order that they should be executed. Substitute `TASK` by `npov`, `bosch`, or `ragtruth` to select the correct dataset. Every `.sh` script runs the `.py` script with the same name with the corresponding parameters set.
 
-We perform our experiments in a multi-GPU setting. More precisely, we use 8 x L4 GPUs. For an efficient use of GPU memory, we employ pipeline parallelism, specifically ZeRO Phase-3 [(link to paper)](https://arxiv.org/abs/1910.02054). To do so, we use Hugging Face's Accelerate library integration of Microsoft's DeepSpeed. The configuration used for our experiments is as follows (you should run `accelerate config` to set up your environment, see [Accelerate's documentation](https://huggingface.co/docs/transformers/en/deepspeed) for more details).
+* `data.sh (TASK)`: processes the raw dataset and saves resulting datasets to the HuggingFace Hub. This includes creating prompts to be passed to the LLMs later, putting data in the right format, creating synthetic hallucinations, creating data for evaluation.
+* `writer_sft.sh (TASK)`: LoRA-SFT the model indicated as a writer.
+* `reward_model.sh (TASK)`: trains the reward model. Set one of the `ORGANIC`, `SYN_HALL_LLM`, or `SYN_HALL_STRUCT` parameters to true to choose what type of hallucinations to train on.
+* `perl.sh (TASK)`: runs the PERL loop with the indicated reward model and SFT model as reference. Since these jobs are longer, there is a `SHUTDOWN` parameter that allows the VM to be automatically shut down once the job finishes.
+* `evaluator.sh (TASK) (MODE)`:
+    * When `(MODE)` is set to `generate`, the model indicated by the `RUN_IDENTIFIER` parameter is used as a writer and generates completions for the prompts in `DATASET_PROMPTS`. This generation is done using vLLM.
+    * When `(MODE)` is set to `score`, the `EVALUATOR_MODEL` scores the generations of the previous step, and a rate of hallucination is calculated using `THRESHOLD`. The evaluator uses `EVALUATOR_NUM_FEWSHOT` examples taken from `DATASET_LABELS` to help it classify the samples.
+    * When `(MODE)` is set to `autoratereval`, the quality of the evaluator itself is evaluated. We ask for it to score the samples in `DATASET_LABELS`, and we return the best threshold along with the associated metrics.
 
-```yaml
-compute_environment: LOCAL_MACHINE
-debug: false
-deepspeed_config:
-  gradient_accumulation_steps: 1
-  offload_optimizer_device: cpu
-  offload_param_device: cpu
-  zero3_init_flag: false
-  zero3_save_16bit_model: false
-  zero_stage: 3
-distributed_type: DEEPSPEED
-downcast_bf16: 'no'
-enable_cpu_affinity: false
-machine_rank: 0
-main_training_function: main
-mixed_precision: 'no'
-num_machines: 1
-num_processes: 8
-rdzv_backend: static
-same_network: true
-tpu_env: []
-tpu_use_cluster: false
-tpu_use_sudo: false
-use_cpu: false
-```
+We perform our experiments in a multi-GPU setting. More precisely, we use 8 x L4 GPUs. For an efficient use of GPU memory, we employ pipeline parallelism, specifically ZeRO Phase-3 [(link to paper)](https://arxiv.org/abs/1910.02054). To do so, we use Hugging Face's Accelerate library integration of Microsoft's DeepSpeed. The configuration used for our experiments is stored in `deepspeed_config.yaml` (you should run `accelerate config` to set up your environment, see [Accelerate's documentation](https://huggingface.co/docs/transformers/en/deepspeed) for more details).
 
-Please install the necessary Python header files by installing the `python-dev` package.
+## Other notes
 
-Please install the CUDA drivers following the [Google Cloud CUDA Driver Installation Guide](https://cloud.google.com/compute/docs/gpus/install-drivers-gpu).
+The experiments were run with Python 3.11.
+
+Please also install the necessary Python header files by installing the `python-dev` package.
+
+Please also install the CUDA drivers following the [Google Cloud CUDA Driver Installation Guide](https://cloud.google.com/compute/docs/gpus/install-drivers-gpu).
