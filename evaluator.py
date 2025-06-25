@@ -515,7 +515,7 @@ def gemini_score_response(response):
 
 
 def gemini_score_dataset(client, dataset, script_args):
-    """Score a whole dataset with Gemini API.
+    """Score a whole dataset with Gemini API, with intermediate saves.
 
     Args:
         client: Initialized Gemini API client
@@ -527,43 +527,76 @@ def gemini_score_dataset(client, dataset, script_args):
     """
     model = "gemini-2.0-flash-001"
     schema = {"type": "STRING", "enum": ["No", "Yes"]}
-    scores = []
     print("Calling the Gemini API...")
 
+    # Initialize scores column if it doesn't exist
+    if 'scores' not in dataset.column_names:
+        dataset = dataset.add_column('scores', [None] * len(dataset))
+    
     queries_per_minute = 2000
     time_window = 60
     query_count = 0
     start_time = time.time()
+    save_frequency = 50  # Save progress every 50 entries
 
-    for query in tqdm(
-        dataset["evaluator_prompt"], desc="Scoring with Gemini API"
-    ):
+    # Track entries that still need scoring
+    entries_to_score = [i for i, score in enumerate(dataset['scores']) if score is None]
+    print(f"Found {len(entries_to_score)} entries that need scoring...")
+
+    for idx in tqdm(entries_to_score, desc="Scoring with Gemini API"):
         # Check if we are approaching the rate limit
         elapsed_time = time.time() - start_time
         if query_count == (queries_per_minute - 1):
             if elapsed_time < time_window:
                 wait_time = time_window - elapsed_time
-                print(
-                    f"Wait {wait_time:.2f} seconds to avoid API rate limit..."
-                )
+                print(f"Wait {wait_time:.2f} seconds to avoid API rate limit...")
                 time.sleep(wait_time + 1)
             query_count = 0
             start_time = time.time()
 
-        response = client.models.generate_content(
-            model=model,
-            contents=query,
-            config=types.GenerateContentConfig(
-                response_mime_type="text/x.enum",
-                response_schema=schema,
-                temperature=0,
-                max_output_tokens=1,
-                seed=script_args.seed,
-            ),
-        )
-        scores.append(gemini_score_response(response))
-        query_count += 1
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=dataset[idx]['evaluator_prompt'],
+                config=types.GenerateContentConfig(
+                    response_mime_type="text/x.enum",
+                    response_schema=schema,
+                    temperature=0,
+                    max_output_tokens=1,
+                    seed=script_args.seed,
+                ),
+            )
+            new_score = gemini_score_response(response)
+            
+            # Update score in dataset
+            dataset = dataset.map(
+                lambda x, i: {'scores': new_score if i == idx else x['scores']},
+                with_indices=True
+            )
+            
+            query_count += 1
 
+            # Save progress periodically
+            if (idx + 1) % save_frequency == 0:
+                print(f"\nSaving progress after {idx + 1} entries...")
+                try:
+                    if hasattr(script_args, 'dataset_with_completions') and script_args.dataset_with_completions:
+                        dataset.push_to_hub(script_args.dataset_with_completions)
+                except Exception as e:
+                    print(f"Warning: Could not save intermediate progress to hub: {e}")
+
+        except Exception as e:
+            print(f"\nError encountered at entry {idx}: {str(e)}")
+            print("Saving current progress...")
+            if hasattr(script_args, 'dataset_with_completions') and script_args.dataset_with_completions:
+                try:
+                    dataset.push_to_hub(script_args.dataset_with_completions)
+                except Exception as save_error:
+                    print(f"Error saving progress: {save_error}")
+            raise e
+
+    # Convert scores to tensor, replacing any remaining None with 0
+    scores = [score if score is not None else 0 for score in dataset['scores']]
     return torch.tensor(scores)
 
 
