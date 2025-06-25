@@ -532,9 +532,14 @@ def gemini_score_dataset(client, dataset, script_args):
     # Prepare local checkpoint directory
     checkpoint_dir = os.path.join("checkpoints", "eval")
     os.makedirs(checkpoint_dir, exist_ok=True)
+    # Use only the dataset name after the slash for checkpoint filename
+    if script_args.dataset_with_completions and "/" in script_args.dataset_with_completions:
+        dataset_name = script_args.dataset_with_completions.split("/", 1)[1]
+    else:
+        dataset_name = str(script_args.dataset_with_completions)
     checkpoint_path = os.path.join(
         checkpoint_dir,
-        f"{script_args.dataset_with_completions}_scores_checkpoint.pt",
+        f"{dataset_name}_scores_checkpoint.pt",
     )
 
     # Initialize scores: load from checkpoint if exists, else from dataset or None
