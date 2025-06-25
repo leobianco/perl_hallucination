@@ -554,19 +554,32 @@ def gemini_score_dataset(client, dataset, script_args):
                 query_count = 0
                 start_time = time.time()
 
-            response = client.models.generate_content(
-                model=model,
-                contents=dataset[idx]['evaluator_prompt'],
-                config=types.GenerateContentConfig(
-                    response_mime_type="text/x.enum",
-                    response_schema=schema,
-                    temperature=0,
-                    max_output_tokens=1,
-                    seed=script_args.seed,
-                ),
-            )
-            scores[idx] = gemini_score_response(response)
-            query_count += 1
+            retry_count = 0
+            while retry_count < 3:
+                try:
+                    response = client.models.generate_content(
+                        model=model,
+                        contents=dataset[idx]['evaluator_prompt'],
+                        config=types.GenerateContentConfig(
+                            response_mime_type="text/x.enum",
+                            response_schema=schema,
+                            temperature=0,
+                            max_output_tokens=1,
+                            seed=script_args.seed,
+                        ),
+                    )
+                    scores[idx] = gemini_score_response(response)
+                    query_count += 1
+                    break  # Success, break out of retry loop
+                except Exception as e:
+                    error_str = str(e).lower()
+                    if ("unavailable" in error_str or "overloaded" in error_str or "overcharged" in error_str or "server" in error_str) and retry_count < 2:
+                        print(f"Server unavailable/overloaded at entry {idx}, attempt {retry_count+1}/3. Waiting 60 seconds before retrying...")
+                        time.sleep(60)
+                        retry_count += 1
+                        continue
+                    else:
+                        raise  # Not a server error or max retries reached
 
             # Save progress periodically
             if (n + 1) % save_frequency == 0:
