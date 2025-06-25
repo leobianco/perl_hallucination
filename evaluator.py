@@ -958,7 +958,6 @@ def main():
         print("Rate of hallucination:", rate_hallucination.item())
 
         # Add scores and classifications to the dataset
-        val_data = val_data.add_column("scores", scores.tolist())
         val_data = val_data.add_column("classifications", classifs.tolist())
 
         # Push updated dataset back to HF Hub
