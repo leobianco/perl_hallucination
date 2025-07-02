@@ -54,7 +54,7 @@ def main():
         pad_token_modified = True
 
     # For training on completions only.
-    if script_args.task == "npov":
+    if script_args.task_name == "npov":
         # Response template is model dependent...
         # For Mistral, "point-of-view" forward.
         # For Gemma, "\nNeutral point-of-view" forward...
@@ -83,12 +83,12 @@ def main():
                     eos_token=tokenizer.eos_token,
                 )
             )
-    elif script_args.task == "bosch":
+    elif script_args.task_name == "bosch":
         response_template = "\nAnswer to user's question:\n"
         formatting_prompts_func = bosch_formatting_prompts_func(
             tokenizer.eos_token
         )
-    elif script_args.task == "ragtruth":
+    elif script_args.task_name == "ragtruth":
         response_template = "\n\noutput:\n"
         formatting_prompts_func = ragtruth_formatting_prompts_func(
             tokenizer.eos_token
