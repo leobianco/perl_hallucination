@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 from typing import Optional
+import argparse
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -20,12 +21,38 @@ class ScriptArguments:
 
 
 @dataclass
-class CustomLoraConfig(LoraConfig):
-    """Work around HfArgumentParser bug..."""
+class LLMSynthScriptArguments:
+    """Additional script arguments controling how many organic and structured samples to keep."""
 
-    init_lora_weights: bool = field(default=True)
-    layers_to_transform: int = field(default=None)
-    loftq_config: dict = field(default_factory=dict)
+    num_struct_hallus_to_keep: Optional[int] = 0
+    num_organic_hallus_to_keep: Optional[int] = 0
+
+
+def create_lora_argument_parser():
+    """Create argument parser with LoRA configuration options."""
+    parser = argparse.ArgumentParser(description="Training script with LoRA configuration")
+    
+    # LoRA configuration arguments
+    parser.add_argument(
+        "--r", 
+        type=int, 
+        default=8, 
+        help="LoRA attention dimension (rank). Default: 8"
+    )
+    parser.add_argument(
+        "--lora_alpha", 
+        type=int, 
+        default=16, 
+        help="LoRA alpha parameter for scaling. Default: 16"
+    )
+    parser.add_argument(
+        "--lora_dropout", 
+        type=float, 
+        default=0.0, 
+        help="LoRA dropout probability. Default: 0.0"
+    )
+
+    return parser
 
 
 def hallucination_rate_from_score_file(filepath, threshold):

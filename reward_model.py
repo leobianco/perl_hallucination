@@ -10,7 +10,7 @@ import evaluate
 import numpy as np
 import torch
 from datasets import Value, concatenate_datasets, load_dataset
-from peft import get_peft_model
+from peft import LoraConfig, get_peft_model
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
@@ -22,18 +22,11 @@ from transformers import (
 )
 
 from utils import (
-    CustomLoraConfig,
     ScriptArguments,
+    LLMSynthScriptArguments,
     compute_best_roc_threshold,
+    create_lora_argument_parser,
 )
-
-
-@dataclass
-class LLMSynthScriptArguments:
-    """Additional script arguments controling how many organic and structured samples to keep."""
-
-    num_struct_hallus_to_keep: Optional[int] = 0
-    num_organic_hallus_to_keep: Optional[int] = 0
 
 
 def main():
@@ -42,7 +35,6 @@ def main():
             ScriptArguments,
             LLMSynthScriptArguments,
             TrainingArguments,
-            CustomLoraConfig,
         )
     )
 
@@ -50,10 +42,16 @@ def main():
         script_args,
         llm_synth_args,
         training_args,
-        peft_args,
     ) = parser.parse_args_into_dataclasses()
 
-    name_for_saving = training_args.run_name.split("/")[1]
+    # HfArgumentParser does not work with LoraConfig due to type hints
+    parser_lora = create_lora_argument_parser()
+    lora_args = parser_lora.parse_args()
+    peft_args = LoraConfig(
+        r=lora_args.r,
+        lora_alpha=lora_args.lora_alpha,
+        lora_dropout=lora_args.lora_dropout,
+    )
 
     set_seed(training_args.seed)
 
