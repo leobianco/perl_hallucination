@@ -103,6 +103,6 @@ accelerate launch \
   --eval_accumulation_steps 1 \
   --task_type "SEQ_CLS" \
   --peft_type "LORA" \
-  --r "$LORA_RANK" \
+  --lora_r "$LORA_RANK" \
   --lora_alpha "$LORA_ALPHA" \
   --lora_dropout "$LORA_DROPOUT" 

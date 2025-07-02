@@ -29,12 +29,28 @@ class LLMSynthScriptArguments:
 
 
 def create_lora_argument_parser():
-    """Create argument parser with LoRA configuration options."""
+    """Work around LoraConfig not being compatible with HfArgumentParser."""
     parser = argparse.ArgumentParser(description="Training script with LoRA configuration")
+    
+    # PEFT configuration arguments
+    parser.add_argument(
+        "--task_type", 
+        type=str, 
+        default="CAUSAL_LM", 
+        choices=["CAUSAL_LM", "SEQ_CLS", "SEQ_2_SEQ_LM", "TOKEN_CLS", "QUESTION_ANS", "FEATURE_EXTRACTION"],
+        help="Task type for PEFT. Default: CAUSAL_LM"
+    )
+    parser.add_argument(
+        "--peft_type", 
+        type=str, 
+        default="LORA", 
+        choices=["LORA", "PROMPT_TUNING", "P_TUNING", "PREFIX_TUNING", "IA3", "ADALORA"],
+        help="PEFT method type. Default: LORA"
+    )
     
     # LoRA configuration arguments
     parser.add_argument(
-        "--r", 
+        "--lora_r", 
         type=int, 
         default=8, 
         help="LoRA attention dimension (rank). Default: 8"
@@ -51,7 +67,7 @@ def create_lora_argument_parser():
         default=0.0, 
         help="LoRA dropout probability. Default: 0.0"
     )
-
+    
     return parser
 
 

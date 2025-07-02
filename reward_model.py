@@ -30,6 +30,17 @@ from utils import (
 
 
 def main():
+    # HfArgumentParser does not work with LoraConfig due to type hints
+    parser_lora = create_lora_argument_parser()
+    lora_args = parser_lora.parse_args()
+    lora_config = LoraConfig(
+        r=lora_args.lora_r,
+        lora_alpha=lora_args.lora_alpha,
+        lora_dropout=lora_args.lora_dropout,
+        task_type=lora_args.task_type,
+        peft_type=lora_args.peft_type,
+    )
+
     parser = HfArgumentParser(
         (
             ScriptArguments,
@@ -44,14 +55,6 @@ def main():
         training_args,
     ) = parser.parse_args_into_dataclasses()
 
-    # HfArgumentParser does not work with LoraConfig due to type hints
-    parser_lora = create_lora_argument_parser()
-    lora_args = parser_lora.parse_args()
-    peft_args = LoraConfig(
-        r=lora_args.r,
-        lora_alpha=lora_args.lora_alpha,
-        lora_dropout=lora_args.lora_dropout,
-    )
 
     set_seed(training_args.seed)
 
