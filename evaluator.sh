@@ -22,19 +22,19 @@ DATASET_LABELS="${USER}/npov_autorater"
 DATASET_LABELS_SPLIT="test"
 
 # Parameters derived from above
-TASK="$1"
+TASK_NAME="$1"
 
 # Checks
-if [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ] && [ "$TASK" != "ragtruth" ]; then
+if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ]; then
     echo "Invalid task name" 
-    echo "$TASK"
+    echo "$TASK_NAME"
     exit 1
 fi
 
 if [ "$2" == "generate" ]; then
     echo "Running in generation mode..."
     python3 evaluator.py \
-        --task "$TASK" \
+        --task_name "$TASK_NAME" \
         --user "$USER" \
         --seed "$SEED" \
         --dataset_prompts "$DATASET_PROMPTS" \
@@ -49,7 +49,7 @@ elif [ "$2" == "score" ]; then
     DATASET_WITH_COMPLETIONS="${USER}/eval_${RUN_IDENTIFIER#*/}_gens_T${TEMPERATURE}"
     echo "Running in scoring mode..."
     python3 evaluator.py \
-        --task "$TASK" \
+        --task_name "$TASK_NAME" \
         --user "$USER" \
         --seed "$SEED" \
         --dataset_labels "$DATASET_LABELS" \
@@ -65,7 +65,7 @@ elif [ "$2" == "score" ]; then
 elif [ "$2" == "autoratereval" ]; then
     echo "Running in autoratereval mode..."
     python3 evaluator.py \
-        --task "$TASK" \
+        --task_name "$TASK_NAME" \
         --user "$USER" \
         --seed "$SEED" \
         --dataset_labels "$DATASET_LABELS" \

@@ -63,7 +63,7 @@ from utils import compute_best_roc_threshold
 
 @dataclass
 class ScriptArguments:
-    task: str = field(metadata={"help": "Name of the task (NPOV, HalOmi)."})
+    task_name: str = field(metadata={"help": "Name of the task (NPOV, HalOmi)."})
 
     user: str = field(
         metadata={
@@ -672,11 +672,11 @@ def main():
             split=script_args.dataset_labels_split,
         )
 
-        if script_args.task == "ragtruth":
+        if script_args.task_name == "ragtruth":
             evaluator_prompt = ragtruth_evaluator_prompt
-        elif script_args.task == "npov":
+        elif script_args.task_name == "npov":
             evaluator_prompt = npov_evaluator_prompt
-        elif script_args.task == "bosch":
+        elif script_args.task_name == "bosch":
             evaluator_prompt = bosch_evaluator_prompt
 
         # Get fewshot examples to aid the evaluator. These come from the dataset
