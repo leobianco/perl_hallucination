@@ -2,7 +2,7 @@
 
 import torch
 from datasets import load_dataset
-from peft import get_peft_model
+from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 from trl import (
     DataCollatorForCompletionOnlyLM,
@@ -17,13 +17,25 @@ from data import (
     npov_formatting_prompts_func_from_fewshot_examples,
     ragtruth_formatting_prompts_func,
 )
-from utils import CustomLoraConfig, ScriptArguments
+from utils import ScriptArguments, create_lora_argument_parser
 
 
 def main():
-    parser = TrlParser((ScriptArguments, SFTConfig, CustomLoraConfig))
-    (script_args, training_args, peft_args) = (
-        parser.parse_args_into_dataclasses()
+    # Parse LoRA arguments first
+    parser_lora = create_lora_argument_parser()
+    lora_args, remaining_args = parser_lora.parse_known_args()
+    lora_config = LoraConfig(
+        task_type=lora_args.task_type,
+        peft_type=lora_args.peft_type,
+        lora_r=lora_args.lora_r,
+        lora_alpha=lora_args.lora_alpha,
+        lora_dropout=lora_args.lora_dropout,
+    )
+
+    # Parse the rest of the arguments
+    parser = TrlParser((ScriptArguments, SFTConfig))
+    script_args, training_args = parser.parse_args_into_dataclasses(
+        remaining_args
     )
     set_seed(training_args.seed)
 
@@ -100,7 +112,7 @@ def main():
     if pad_token_modified:
         model.config.pad_token_id = tokenizer.pad_token_id
 
-    model = get_peft_model(model, peft_args)
+    model = get_peft_model(model, lora_config)
 
     trainer = SFTTrainer(
         model,

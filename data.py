@@ -906,7 +906,7 @@ def ragtruth_formatting_prompts_func(eos_token):
 
 def main():
     parser = ArgumentParser()
-    parser.add_argument("--task", type=str)
+    parser.add_argument("--task_name", type=str)
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument(
         "--synthetic_hallus_llm",
@@ -926,7 +926,7 @@ def main():
     parser.add_argument("--synth_llm_num_fewshot", type=int, default=2)
     args = parser.parse_args()
 
-    if args.task == "npov":
+    if args.task_name == "npov":
         # GENERAL DATA PROCESSING
         npov_rm_data = load_dataset(
             "leobianco/npov",
@@ -941,7 +941,7 @@ def main():
             npov_rm_data[split] = npov_process_data_for_rm(
                 npov_rm_data[split],
             )
-            npov_rm_data[split].push_to_hub(repo_id=args.task + "_processed")
+            npov_rm_data[split].push_to_hub(repo_id=args.task_name + "_processed")
 
         # AUTORATER
         npov_autorater_data = concatenate_datasets(
@@ -957,7 +957,7 @@ def main():
         )
         # Save
         npov_autorater_data.push_to_hub(
-            repo_id=args.task + "_autorater",
+            repo_id=args.task_name + "_autorater",
             split="test",
         )
 
@@ -991,7 +991,7 @@ def main():
         )
 
         npov_rm_data_organic_dataset.push_to_hub(
-            repo_id=args.task + "_rm_organic"
+            repo_id=args.task_name + "_rm_organic"
         )
 
         # SYNTHETIC HALLUCINATIONS
@@ -1035,7 +1035,7 @@ def main():
             )
 
             npov_rm_data_synth_struct_dataset.push_to_hub(
-                repo_id=args.task + "_rm_synthetic_struct"
+                repo_id=args.task_name + "_rm_synthetic_struct"
             )
 
         # LLM GENERATED
@@ -1123,7 +1123,7 @@ def main():
                 )
 
                 synthetic_hallucinations_llm_data[split].push_to_hub(
-                    repo_id=args.task + "_rm_synthetic_llm",
+                    repo_id=args.task_name + "_rm_synthetic_llm",
                     split=split,
                 )
 
@@ -1153,7 +1153,7 @@ def main():
         )
 
         npov_sft_new.push_to_hub(
-            repo_id=args.task + "_sft",
+            repo_id=args.task_name + "_sft",
         )
 
         # PERL
@@ -1165,7 +1165,7 @@ def main():
 
         for split in npov_perl_data.keys():
             npov_perl_data[split].push_to_hub(
-                repo_id=args.task + "_perl",
+                repo_id=args.task_name + "_perl",
                 split=split,
             )
 
@@ -1186,7 +1186,7 @@ def main():
         )
         hyperparam_test_set_dict = DatasetDict({"test": hyperparam_test_set})
         hyperparam_test_set_dict.push_to_hub(
-            repo_id=args.task + "_hyperparam_test_set",
+            repo_id=args.task_name + "_hyperparam_test_set",
         )
 
         # Create capped final test set (10k samples)
@@ -1199,10 +1199,10 @@ def main():
             {"test": capped_final_test_set}
         )
         capped_final_test_set_dict.push_to_hub(
-            repo_id=args.task + "_final_test_set",
+            repo_id=args.task_name + "_final_test_set",
         )
 
-    elif args.task == "bosch":
+    elif args.task_name == "bosch":
         # GENERAL DATA PROCESSING
         # TODO: put these files on a HF repo.
         data_train = bosch_load_and_process_data(
@@ -1233,7 +1233,7 @@ def main():
                 "test": dataset_test,
             }
         )
-        dataset.push_to_hub(args.task + "_processed")
+        dataset.push_to_hub(args.task_name + "_processed")
 
         # AUTORATER
         # For the autorater, we want to measure its ability on all samples, so
@@ -1242,12 +1242,12 @@ def main():
             [dataset_train, dataset_val, dataset_test]
         )
         autorater_dataset.push_to_hub(
-            repo_id=args.task + "_autorater", split="test"
+            repo_id=args.task_name + "_autorater", split="test"
         )
 
         # SFT
         sft_data = dataset_val.filter(lambda entry: entry["class_hall"] == "No")
-        sft_data.push_to_hub(repo_id=args.task + "_sft")
+        sft_data.push_to_hub(repo_id=args.task_name + "_sft")
 
         # REWARD MODEL
         # ORGANIC HALLUCINATIONS
@@ -1261,7 +1261,7 @@ def main():
                 bosch_rm_prompt
             )
         # Save
-        bosch_rm_organic.push_to_hub(repo_id=args.task + "_rm_organic")
+        bosch_rm_organic.push_to_hub(repo_id=args.task_name + "_rm_organic")
 
         # SYNTHETIC HALLUCINATIONS
 
@@ -1331,7 +1331,7 @@ def main():
             )
 
             synthetic_hallucinations_llm_data.push_to_hub(
-                repo_id=args.task + "_rm_synthetic_llm"
+                repo_id=args.task_name + "_rm_synthetic_llm"
             )
 
         # STRUCTURED
@@ -1361,7 +1361,7 @@ def main():
             )
 
             synthetic_hallucinations_struct_data.push_to_hub(
-                repo_id=args.task + "_rm_synthetic_struct"
+                repo_id=args.task_name + "_rm_synthetic_struct"
             )
 
         # PERL
@@ -1370,14 +1370,14 @@ def main():
             {"train": dataset_test, "test": dataset_val.select(range(10))}
         )
 
-        perl_data.push_to_hub(repo_id=args.task + "_perl")
+        perl_data.push_to_hub(repo_id=args.task_name + "_perl")
 
         # FINAL TEST SET
         dataset_train.push_to_hub(
-            repo_id=args.task + "_final_test_set", split="test"
+            repo_id=args.task_name + "_final_test_set", split="test"
         )
 
-    elif args.task == "ragtruth":
+    elif args.task_name == "ragtruth":
         # GENERAL DATA PROCESSING
         # TODO: put these files on huggingface.
         data_sources = pd.read_json(
@@ -1430,7 +1430,7 @@ def main():
             [train_dataset, val_dataset, test_dataset]
         )
         unified_dataset.push_to_hub(
-            repo_id=args.task + "_autorater", split="test"
+            repo_id=args.task_name + "_autorater", split="test"
         )
 
         # SFT data
@@ -1438,7 +1438,7 @@ def main():
         sft_data = test_dataset.filter(
             lambda entry: entry["class_hall"] == "No"
         )
-        sft_data.push_to_hub(repo_id=args.task + "_sft")
+        sft_data.push_to_hub(repo_id=args.task_name + "_sft")
 
         # REWARD MODEL
         # ORGANIC HALLUCINATIONS
@@ -1452,7 +1452,7 @@ def main():
                 ragtruth_rm_prompt
             )
         # Save
-        ragtruth_rm_organic.push_to_hub(repo_id=args.task + "_rm_organic")
+        ragtruth_rm_organic.push_to_hub(repo_id=args.task_name + "_rm_organic")
 
         # SYNTHETIC HALLUCINATIONS
 
@@ -1514,7 +1514,7 @@ def main():
             )
 
             synthetic_hallucinations_llm_data.push_to_hub(
-                repo_id=args.task + "_rm_synthetic_llm"
+                repo_id=args.task_name + "_rm_synthetic_llm"
             )
 
         # STRUCTURED
@@ -1545,7 +1545,7 @@ def main():
             )
 
             synthetic_hallucinations_struct_data.push_to_hub(
-                repo_id=args.task + "_rm_synthetic_struct"
+                repo_id=args.task_name + "_rm_synthetic_struct"
             )
 
         # PERL
@@ -1558,12 +1558,12 @@ def main():
             perl_data[split] = perl_data[split].map(
                 lambda x: {**x, "prompt": x["user_query"]}
             )
-        perl_data.push_to_hub(args.task + "_perl")
+        perl_data.push_to_hub(args.task_name + "_perl")
 
         # FINAL TEST SET
         # It is simply the train split. Rename "user_query" column to "prompt".
         train_dataset = train_dataset.rename_column("user_query", "prompt")
-        train_dataset.push_to_hub(args.task + "_final_test_set", split="test")
+        train_dataset.push_to_hub(args.task_name + "_final_test_set", split="test")
 
 
 if __name__ == "__main__":

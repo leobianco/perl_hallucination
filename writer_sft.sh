@@ -22,14 +22,14 @@ SAVE_STEPS=200
 DEEPSPEED_CONFIG="./deepspeed_config.yaml"
 
 # Parameters derived from above
-TASK="$1"
+TASK_NAME="$1"
 MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
 TIMESTAMP=$(date '+%y%m%d%H%M')
-RUN_IDENTIFIER="${USER}/${TASK}_SFT_${MODEL_NAME}_S${SEED}_epo${NUM_TRAIN_EPOCHS}_lr${LEARNING_RATE}_r${LORA_RANK}_${TIMESTAMP}"
+RUN_IDENTIFIER="${USER}/${TASK_NAME}_SFT_${MODEL_NAME}_S${SEED}_epo${NUM_TRAIN_EPOCHS}_lr${LEARNING_RATE}_r${LORA_RANK}_${TIMESTAMP}"
 
-if [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ] && [ "$TASK" != "ragtruth" ]; then
+if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ]; then
     echo "Invalid task name" 
-    echo "$TASK"
+    echo "$TASK_NAME"
     exit 1
 fi
 
@@ -37,16 +37,16 @@ accelerate launch \
   --config_file="${DEEPSPEED_CONFIG}" \
   writer_sft.py \
   -- \
-  --task "$TASK" \
+  --task_name "$TASK_NAME" \
   --report_to "wandb" \
   --run_name "$RUN_IDENTIFIER" \
   --logging_steps 1 \
-  --output_dir "./checkpoints/${TASK}/writer_sft/${RUN_IDENTIFIER}" \
+  --output_dir "./checkpoints/${TASK_NAME}/writer_sft/${RUN_IDENTIFIER}" \
   --overwrite_output_dir True \
   --push_to_hub True \
   --hub_model_id "$RUN_IDENTIFIER" \
   --seed "$SEED" \
-  --dataset_repo_id "${USER}/${TASK}_sft" \
+  --dataset_repo_id "${USER}/${TASK_NAME}_sft" \
   --model_repo_id "${MODEL_REPO_ID}" \
   --do_train True \
   --bf16 True \
@@ -65,7 +65,8 @@ accelerate launch \
   --eval_strategy "epoch" \
   --per_device_eval_batch_size "$BATCH_SIZE" \
   --eval_accumulation_steps 1 \
+  --peft_type "LORA" \
   --task_type "CAUSAL_LM" \
-  --r "$LORA_RANK" \
+  --lora_r "$LORA_RANK" \
   --lora_alpha "$LORA_ALPHA" \
   --lora_dropout "$LORA_DROPOUT"

@@ -11,17 +11,17 @@ SYNTH_LLM_TEMPERATURE=0.7
 SYNTH_LLM_NUM_FEWSHOT=5
 
 # Parameters derived from above
-TASK="$1"
+TASK_NAME="$1"
 
 # Checks
-if [ "$TASK" != "ragtruth" ] && [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ]; then
+if [ "$TASK_NAME" != "ragtruth" ] && [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ]; then
     echo "Invalid dataset name"
     exit 1
 fi
 
 # Run script
 python data.py \
-    --task "$TASK" \
+    --task_name "$TASK_NAME" \
     --seed "$SEED" \
     --synthetic_hallus_llm $SYNTH_LLM \
     --synthetic_hallus_struct $SYNTH_STRUCT \
