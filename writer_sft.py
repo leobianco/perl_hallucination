@@ -27,7 +27,7 @@ def main():
     lora_config = LoraConfig(
         task_type=lora_args.task_type,
         peft_type=lora_args.peft_type,
-        lora_r=lora_args.lora_r,
+        r=lora_args.lora_r,
         lora_alpha=lora_args.lora_alpha,
         lora_dropout=lora_args.lora_dropout,
     )
