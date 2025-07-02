@@ -3,9 +3,6 @@ TODO: write proper docstring.
 TODO: clean imports.
 """
 
-from dataclasses import dataclass
-from typing import Optional
-
 import evaluate
 import numpy as np
 import torch
@@ -22,8 +19,8 @@ from transformers import (
 )
 
 from utils import (
-    ScriptArguments,
     LLMSynthScriptArguments,
+    ScriptArguments,
     compute_best_roc_threshold,
     create_lora_argument_parser,
 )
@@ -32,7 +29,7 @@ from utils import (
 def main():
     # HfArgumentParser does not work with LoraConfig due to type hints
     parser_lora = create_lora_argument_parser()
-    lora_args = parser_lora.parse_args()
+    lora_args, remaining_args = parser_lora.parse_known_args()
     lora_config = LoraConfig(
         r=lora_args.lora_r,
         lora_alpha=lora_args.lora_alpha,
@@ -53,8 +50,7 @@ def main():
         script_args,
         llm_synth_args,
         training_args,
-    ) = parser.parse_args_into_dataclasses()
-
+    ) = parser.parse_args_into_dataclasses(remaining_args)
 
     set_seed(training_args.seed)
 
@@ -164,7 +160,7 @@ def main():
     if pad_token_modified:
         reward_model.config.pad_token_id = tokenizer.pad_token_id
 
-    reward_model = get_peft_model(reward_model, peft_args)
+    reward_model = get_peft_model(reward_model, lora_config)
 
     # Loading LoRA freezes the projection layer at initialization value,
     # which we don't want! Let us make them trainable again.
