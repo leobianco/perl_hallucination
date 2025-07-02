@@ -14,7 +14,7 @@ from sklearn.metrics import accuracy_score, roc_curve
 class ScriptArguments:
     """Arguments common to all scripts (reward model, SFT, PERL)."""
 
-    task: str
+    task_name: str
     dataset_repo_id: str
     model_repo_id: str
     num_fewshot: Optional[int] = None

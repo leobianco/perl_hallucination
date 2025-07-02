@@ -3,7 +3,7 @@
 # Core Parameters
 USER="leobianco"
 SEED=12345
-MODEL_REPO_ID="mistralai/Mistral-7B-Instruct-v0.3"
+MODEL_REPO_ID="google/gemma-2-2b-it"
 
 # Dataset Parameters
 ORGANIC=true
@@ -13,13 +13,13 @@ NUM_ORGANIC_HALLUS_TO_KEEP=0
 NUM_STRUCT_HALLUS_TO_KEEP=0
 
 # Training Parameters
-BATCH_SIZE=1
-NUM_TRAIN_EPOCHS=2
-LEARNING_RATE=5e-5
-WEIGHT_DECAY=5e-4
+BATCH_SIZE=4
+NUM_TRAIN_EPOCHS=3
+LEARNING_RATE=1e-3
+WEIGHT_DECAY=0.0
 LORA_RANK=8
 LORA_ALPHA=16
-LORA_DROPOUT=0.1
+LORA_DROPOUT=0.0
 LR_SCHEDULER_TYPE="cosine"
 WARMUP_RATIO=0.1
 
@@ -29,11 +29,11 @@ EVAL_STEPS=5
 DEEPSPEED_CONFIG="./deepspeed_config.yaml"
 
 # Parameters derived from above
-TASK="$1"
-DATASET_REPO_ID="${USER}/${TASK}_rm"
+TASK_NAME="$1"
+DATASET_REPO_ID="${USER}/${TASK_NAME}_rm"
 MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
 TIMESTAMP=$(date '+%y%m%d%H%M')
-RUN_IDENTIFIER="leobianco/${TASK}_RM_${MODEL_NAME}_S${SEED}_LLM_${SYN_HALL_LLM}_STRUCT_${SYN_HALL_STRUCT}_epo${NUM_TRAIN_EPOCHS}_lr${LEARNING_RATE}_r${LORA_RANK}_${TIMESTAMP}"
+RUN_IDENTIFIER="leobianco/${TASK_NAME}_RM_${MODEL_NAME}_S${SEED}_LLM_${SYN_HALL_LLM}_STRUCT_${SYN_HALL_STRUCT}_epo${NUM_TRAIN_EPOCHS}_lr${LEARNING_RATE}_r${LORA_RANK}_${TIMESTAMP}"
 
 # Checks
 if [ "$PRECISION" = "FP16" ]; then
@@ -47,7 +47,7 @@ else
   exit 1
 fi
 
-if [ "$TASK" != "ragtruth" ] && [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ]; then
+if [ "$TASK_NAME" != "ragtruth" ] && [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ]; then
     echo "Invalid task name"
     exit 1
 fi
@@ -71,12 +71,12 @@ accelerate launch \
   --config_file="${DEEPSPEED_CONFIG}" \
   reward_model.py \
   -- \
-  --task "$TASK" \
+  --task_name "$TASK_NAME" \
   --seed "$SEED" \
   --report_to "wandb" \
   --run_name "$RUN_IDENTIFIER" \
   --logging_steps 1 \
-  --output_dir "./checkpoints/${TASK}/reward_model/${RUN_IDENTIFIER}" \
+  --output_dir "./checkpoints/${TASK_NAME}/reward_model/${RUN_IDENTIFIER}" \
   --overwrite_output_dir True \
   --push_to_hub True \
   --hub_model_id "$RUN_IDENTIFIER" \
