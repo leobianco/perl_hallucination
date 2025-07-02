@@ -29,15 +29,15 @@ DEEPSPEED_CONFIG="./deepspeed_config.yaml"
 SHUTDOWN=false
 
 # Parameters derived from above
-TASK="$1"
+TASK_NAME="$1"
 TIMESTAMP=$(date '+%y%m%d%H%M')
 MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
-RUN_IDENTIFIER="${USER}/${TASK}_PERL_${MODEL_NAME}_S${SEED}_eps${TOTAL_EPISODES}_lr${LEARNING_RATE}_kl${KL_COEFF}_${TIMESTAMP}"
+RUN_IDENTIFIER="${USER}/${TASK_NAME}_PERL_${MODEL_NAME}_S${SEED}_eps${TOTAL_EPISODES}_lr${LEARNING_RATE}_kl${KL_COEFF}_${TIMESTAMP}"
 
 # Checks
-if [ "$TASK" != "npov" ] && [ "$TASK" != "bosch" ] && [ "$TASK" != "ragtruth" ]; then
+if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ]; then
     echo "Invalid task name" 
-    echo "$TASK"
+    echo "$TASK_NAME"
     exit 1
 fi
 
@@ -45,16 +45,16 @@ accelerate launch \
   --config_file="${DEEPSPEED_CONFIG}" \
   perl.py \
   -- \
-  --task "$TASK" \
+  --task_name "$TASK_NAME" \
   --seed "$SEED" \
   --report_to "wandb" \
   --run_name "$RUN_IDENTIFIER" \
   --logging_steps 1 \
-  --output_dir "./checkpoints/${TASK}/perl/${RUN_IDENTIFIER}" \
+  --output_dir "./checkpoints/${TASK_NAME}/perl/${RUN_IDENTIFIER}" \
   --overwrite_output_dir True \
   --push_to_hub True \
   --hub_model_id "$RUN_IDENTIFIER" \
-  --dataset_repo_id "${USER}/${TASK}_perl" \
+  --dataset_repo_id "${USER}/${TASK_NAME}_perl" \
   --model_repo_id "${MODEL_REPO_ID}" \
   --stop_token "eos" \
   --do_train True \
