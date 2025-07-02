@@ -118,7 +118,7 @@ nltk==3.9.1
 notebook==7.4.4
 notebook_shim==0.2.4
 numba==0.61.2
-numpy==2.3.1
+numpy
 nvidia-cublas-cu12==12.6.4.1
 nvidia-cuda-cupti-cu12==12.6.80
 nvidia-cuda-nvrtc-cu12==12.6.77
