@@ -126,6 +126,7 @@ def main():
 
     if training_args.do_train:
         trainer.train()
+        trainer.push_to_hub()
 
 
 if __name__ == "__main__":

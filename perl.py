@@ -128,6 +128,7 @@ def main():
 
     if training_args.do_train:
         trainer.train()
+        trainer.push_to_hub()
 
     filepath = f"logs/{name_for_saving}/logs.txt"
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
