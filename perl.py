@@ -19,6 +19,27 @@ from trl import RLOOConfig, RLOOTrainer
 from utils import ScriptArguments
 
 
+def no_compile(model, *args, **kwargs):
+    """Open issue: https://github.com/huggingface/transformers/issues/39191
+
+    Transformers v.4.53.0 introduced automatic compilation of forward passes.
+    This disregards other explicit configurations disabling compilation.
+    policy.generation_config.disable_compilation = True also had no effect.
+    This compilation led to no significant speed-up, and I was getting errors
+    of the type:
+    torch._dynamo.exc.FailOnRecompileLimitHit: recompile_limit reached with one_graph=True. Excessive recompilations can degrade performance due to the compilation overhead of each recompilation.
+
+    For this reason, I am disabling model compilation via this function.
+    """
+
+    print("[INFO] torch.compile() was called but it is disabled by the user")
+
+    return model
+
+
+torch.compile = no_compile
+
+
 def main():
     parser = HfArgumentParser(
         (
