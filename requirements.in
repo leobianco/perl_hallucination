@@ -11,4 +11,4 @@ git+https://github.com/leobianco/trl.git@my-trl-0.19.0#egg=trl
 wandb
 huggingface-hub
 ipython
-vllm
+vllm>=0.6.4
