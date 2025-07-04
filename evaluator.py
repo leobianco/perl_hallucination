@@ -55,7 +55,6 @@ from transformers import (
     set_seed,
 )
 from vllm import LLM, SamplingParams
-from vllm.distributed.parallel_state import destroy_model_parallel
 from vllm.lora.request import LoRARequest
 
 from utils import compute_best_roc_threshold
@@ -937,13 +936,6 @@ def main():
 
         # Add generations to the dataset_prompts on a column named "completion".
         dataset_prompts = dataset_prompts.add_column("completion", generations)
-
-        # Free vLLM memory
-        destroy_model_parallel()
-        del llm.llm_engine.model_executor.driver_worker
-        del llm
-        gc.collect()
-        torch.cuda.empty_cache()
 
         # Save
         try:
