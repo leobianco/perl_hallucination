@@ -953,7 +953,7 @@ def main():
         print(
             f"Pushing dataset with generations to {script_args.user}/{name_for_saving}"
         )
-        dataset_prompts.push_to_hub({script_args.user} / {name_for_saving})
+        dataset_prompts.push_to_hub(f"{script_args.user}/{name_for_saving}")
 
     # Scoring mode
     else:
