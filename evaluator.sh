@@ -38,6 +38,8 @@ if [ "$2" == "generate" ]; then
         --task_name "$TASK_NAME" \
         --user "$USER" \
         --seed "$SEED" \
+        --dataset_labels "$DATASET_LABELS" \
+        --dataset_labels_split "$DATASET_LABELS_SPLIT" \
         --dataset_prompts "$DATASET_PROMPTS" \
         --dataset_prompts_split "$DATASET_PROMPTS_SPLIT" \
         --writer_model_base ${BASE_MODEL} \
