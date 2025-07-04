@@ -10,6 +10,7 @@ USE_GEMINI="True"
 GEMINI_API_KEY="AIzaSyCIPXhApp0pcu7TruZ8EyuW086VJ1wzrhk"
 THRESHOLD=0.9995
 EVALUATOR_NUM_FEWSHOT=2
+WRITER_NUM_FEWSHOT=0
 MAX_TOKENS=150
 TEMPERATURE=0.1
 TOP_P=0.9
@@ -44,9 +45,10 @@ if [ "$2" == "generate" ]; then
         --max_tokens "$MAX_TOKENS" \
         --temperature "$TEMPERATURE" \
         --top_p "$TOP_P" \
-        --top_k "$TOP_K"
+        --top_k "$TOP_K" \
+        --writer_num_fewshot $WRITER_NUM_FEWSHOT
 elif [ "$2" == "score" ]; then
-    DATASET_WITH_COMPLETIONS="${USER}/eval_${RUN_IDENTIFIER#*/}_gens_T${TEMPERATURE}"
+    DATASET_WITH_COMPLETIONS="${USER}/eval_${RUN_IDENTIFIER#*/}_gens_T${TEMPERATURE}_wfs${WRITER_NUM_FEWSHOT}"
     echo "Running in scoring mode..."
     python3 evaluator.py \
         --task_name "$TASK_NAME" \

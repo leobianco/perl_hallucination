@@ -63,7 +63,9 @@ from utils import compute_best_roc_threshold
 
 @dataclass
 class ScriptArguments:
-    task_name: str = field(metadata={"help": "Name of the task (NPOV, HalOmi)."})
+    task_name: str = field(
+        metadata={"help": "Name of the task (NPOV, HalOmi)."}
+    )
 
     user: str = field(
         metadata={
@@ -160,6 +162,14 @@ class ScriptArguments:
         default=None,
         metadata={
             "help": "Name of the dataset with completions on HF Hub. Required when evaluate_evaluator is False and not generating."
+        },
+    )
+
+    # New argument for few-shot prepending (renamed)
+    writer_num_fewshot: int = field(
+        default=0,
+        metadata={
+            "help": "Number of few-shot examples to prepend to each prompt. If zero, no few-shot examples are prepended."
         },
     )
 
@@ -891,6 +901,27 @@ def main():
             for i in range(dataset_prompts.num_rows)
         ]
 
+        # Prepend few-shot examples if requested
+        if (
+            script_args.writer_num_fewshot > 0
+            and script_args.dataset_labels is not None
+        ):
+            fewshot_data = load_dataset(
+                script_args.dataset_labels,
+                split=script_args.dataset_labels_split,
+            )
+            fewshot_examples = get_fewshot_examples(
+                fewshot_data,
+                n_yes=0,
+                n_no=script_args.writer_num_fewshot,
+                seed=script_args.seed,
+            )
+            # Concatenate few-shot prompts
+            fewshot_prompts = "\n".join(
+                [ex["prompt"] for ex in fewshot_examples]
+            )
+            prompts = [fewshot_prompts + "\n" + p for p in prompts]
+
         if enable_lora:
             outputs = llm.generate(
                 prompts,
@@ -904,6 +935,9 @@ def main():
 
         generations = [output.outputs[0].text for output in outputs]
 
+        # Add generations to the dataset_prompts on a column named "completion".
+        dataset_prompts = dataset_prompts.add_column("completion", generations)
+
         # Free vLLM memory
         destroy_model_parallel()
         del llm.llm_engine.model_executor.driver_worker
@@ -911,24 +945,23 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
 
+        # Save
         try:
-            name_for_saving = (
-                "eval_"
-                + script_args.writer_model_lora.split(f"{script_args.user}/")[1]
-            )
+            name_for_saving = script_args.writer_model_lora.split(
+                f"{script_args.user}/"
+            )[1]
         except Exception:
-            name_for_saving = (
-                "eval_" + script_args.writer_model_lora.split("/")[1]
-            )
+            name_for_saving = script_args.writer_model_lora.split("/")[1]
 
-        # Add generations to the dataset_prompts under a column named "completion".
-        dataset_prompts = dataset_prompts.add_column("completion", generations)
+        name_for_saving = "eval_" + name_for_saving + "_gens"
+        name_for_saving += f"_T{str(float(script_args.temperature))}"
+        name_for_saving += f"_wfs{script_args.writer_num_fewshot}"
 
         # Save the dataset with completions to HF Hub
-        temp_str = str(float(script_args.temperature))
-        dataset_name = f"{script_args.user}/{name_for_saving}_gens_T{temp_str}"
-        print(f"Pushing dataset with generations to {dataset_name}")
-        dataset_prompts.push_to_hub(dataset_name)
+        print(
+            f"Pushing dataset with generations to {script_args.user}/{name_for_saving}"
+        )
+        dataset_prompts.push_to_hub({script_args.user} / {name_for_saving})
 
     # Scoring mode
     else:
