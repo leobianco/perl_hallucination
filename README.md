@@ -24,3 +24,18 @@ The experiments were run with Python 3.11.
 Please also install the necessary Python header files by installing the `python-dev` package.
 
 Please also install the CUDA drivers following the [Google Cloud CUDA Driver Installation Guide](https://cloud.google.com/compute/docs/gpus/install-drivers-gpu).
+
+Install Python package requirements by first compiling `requirements.in` using `pip-tools`:
+```
+pip-compile requirements.in -o requirements.txt
+```
+then install them:
+```
+pip install -r requirements.txt
+```
+
+*Note:* `pip-compile` can be slow. For this reason I recommend using [uv](https://docs.astral.sh/uv/), a Python package manager written in Rust that is much faster. After installing it, run
+```
+uv pip compile requirements.in > requirements.txt
+pip install -r requirements.txt
+```
