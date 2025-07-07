@@ -1,31 +1,16 @@
 """
-For an interactive Python shell after running evaluation, run:
-python -m IPython -i evaluator.py \
-        -- \
-        --seed 130104 \
-        --writer_model_base "google/gemma-2-2b-it" \
-        --writer_model_lora "leobianco/HALOMI_SFT_seed_130104_epochs_1_lr_5e-5_lora_32" \
-        --max_tokens 256 \
-        --eval_batch_size 4 \
-        --evaluator_model "google/gemma-2-27b-it" \
-        --evaluator_num_fewshot 4 \
-        --evaluate_evaluator False \
-        --threshold 0.144
+Evaluation script for hallucination detection and scoring.
 
-Evaluation script.
+This module provides tools for evaluating hallucination in text generation tasks using various models and datasets. It supports evaluation with both local models and the Gemini API, and can:
+- Generate completions with a writer model (optionally with LoRA adapters)
+- Score completions using an evaluator model or Gemini API
+- Compute and save evaluation metrics, ROC curves, and other artifacts
+- Prepare prompts for different datasets (HalOmi, NPOV, Bosch, RAGTruth)
+- Support few-shot learning for both writer and evaluator models
 
-Given a checkpoint of the writer and validation prompts, we use the writer to 
-generate completions, and send the prompts + completions to the evaluator. We 
-then get the score for the token "No", normalized to consider only "Yes" as 
-an alternative.
-
-Checkpoints that we will consider: writer SFT (baseline), writer checkpoints 
-over PERL. All of these are fine-tuned Gemma 2 2b models.
-
-There is a separate script to evaluate the quality of the evaluator 
-itself, and to choose the classification threshold.
-
-The writer checkpoint will be loaded as a vLLM LLM.
+Usage: call the associated shell script, with the first argument being the task name (npov, bosch, ragtruth), and the second argument being the mode (generate, score, autoratereval). E.g.:
+    ./evaluator.sh npov generate
+    ./evaluator.sh npov score
 """
 
 import gc
@@ -174,7 +159,17 @@ class ScriptArguments:
 
 
 def get_fewshot_examples(data, n_yes: int, n_no: int, seed: int):
-    """Returns n balanced fewshot examples from data."""
+    """Returns a balanced set of few-shot examples from the dataset.
+
+    Args:
+        data (datasets.Dataset): The dataset to sample from.
+        n_yes (int): Number of positive (with hallucination) examples.
+        n_no (int): Number of negative (without hallucination) examples.
+        seed (int): Random seed for shuffling.
+
+    Returns:
+        datasets.Dataset or None: Concatenated and shuffled few-shot examples, or None if n_yes and n_no are zero.
+    """
 
     if n_yes == 0 and n_no == 0:
         fewshot_examples = None
@@ -202,12 +197,15 @@ def get_fewshot_examples(data, n_yes: int, n_no: int, seed: int):
 
 
 def halomi_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False):
-    """Function for transforming entries in the HalOmi dataset into prompts for
-    the evaluator model.
+    """Transforms a HalOmi dataset entry into an evaluator prompt.
 
-    TO DO (LEO): perhaps split this function into two functions instead of
-    using the use_true_label parameter. Either way you must do something, because
-    it looks really bad.
+    Args:
+        entry (dict): The dataset entry.
+        fewshot_examples (datasets.Dataset, optional): Few-shot examples to prepend.
+        use_true_label (bool): If True, use the true label for the completion; otherwise, use the generated completion.
+
+    Returns:
+        dict: The entry with an added 'evaluator_prompt' key.
     """
 
     preamble = (
@@ -260,12 +258,15 @@ def halomi_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False):
 
 
 def npov_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False):
-    """Function for transforming entries in the NPOV dataset into prompts for
-    the evaluator model.
+    """Transforms an NPOV dataset entry into an evaluator prompt.
 
-    TO DO (LEO): perhaps split this function into two functions instead of
-    using the use_true_label parameter. Either way you must do something, because
-    it looks really bad.
+    Args:
+        entry (dict): The dataset entry.
+        fewshot_examples (datasets.Dataset, optional): Few-shot examples to prepend.
+        use_true_label (bool): If True, use the true label for the completion; otherwise, use the generated completion.
+
+    Returns:
+        dict: The entry with an added 'evaluator_prompt' key.
     """
 
     preamble = "<start_of_turn>user\nBelow are examples where an expert linguist identifies when the neutral natural language rewritings of arguments used to answer a user query contains additional arguments not present in the original list.<end_of_turn>\n"
@@ -309,12 +310,15 @@ def npov_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False):
 
 
 def bosch_evaluator_prompt(entry, fewshot_examples=None, use_true_label=False):
-    """Function for transforming entries in the Bosch dataset into prompts
-    for the evaluator model.
+    """Transforms a Bosch dataset entry into an evaluator prompt.
 
-    TO DO (LEO): perhaps split this function into two functions instead of
-    using the use_true_label parameter. Either way you must do something, because
-    it looks really bad.
+    Args:
+        entry (dict): The dataset entry.
+        fewshot_examples (datasets.Dataset, optional): Few-shot examples to prepend.
+        use_true_label (bool): If True, use the true label for the completion; otherwise, use the generated completion.
+
+    Returns:
+        dict: The entry with an added 'evaluator_prompt' key.
     """
 
     preamble = """<start_of_turn>user
@@ -391,12 +395,15 @@ Does the proposed answer state anything not supported by the information in the 
 def ragtruth_evaluator_prompt(
     entry, fewshot_examples=None, use_true_label=False
 ):
-    """Function for transforming entries in the RAGTruth dataset into prompts
-    for the evaluator model.
+    """Transforms a RAGTruth dataset entry into an evaluator prompt.
 
-    TO DO (LEO): perhaps split this function into two functions instead of
-    using the use_true_label parameter. Either way you must do something, because
-    it looks really bad.
+    Args:
+        entry (dict): The dataset entry.
+        fewshot_examples (datasets.Dataset, optional): Few-shot examples to prepend.
+        use_true_label (bool): If True, use the true label for the completion; otherwise, use the generated completion.
+
+    Returns:
+        dict: The entry with an added 'evaluator_prompt' key.
     """
 
     preamble = """You are an expert evaluator specializing in detecting hallucinations in text summarization. Your task is to determine whether a summary contains any information not present in the original text.
@@ -460,7 +467,17 @@ Does the summary (output) contain ANY information not present in or directly inf
 def evaluator_score_batch(
     evaluator, tokenized_prompts, yes_token_id, no_token_id
 ):
-    """Evaluator scoring of a batch."""
+    """Scores a batch of prompts using the evaluator model.
+
+    Args:
+        evaluator (transformers.PreTrainedModel): The evaluator model.
+        tokenized_prompts (dict): Tokenized prompts as input tensors.
+        yes_token_id (int): Token ID for "Yes".
+        no_token_id (int): Token ID for "No".
+
+    Returns:
+        torch.Tensor: Batch of normalized scores for "No".
+    """
 
     with torch.no_grad():
         # Cache in Gemma is different and was giving me errors, so I disable it.
@@ -482,7 +499,19 @@ def evaluator_score(
     yes_token_id,
     no_token_id,
 ):
-    """Scores the whole Dataset `data`, based on the column 'evaluator_prompt'."""
+    """Scores an entire dataset using the evaluator model.
+
+    Args:
+        data (datasets.Dataset): Dataset with 'evaluator_prompt' column.
+        script_args (ScriptArguments): Parsed script arguments.
+        tokenizer (transformers.PreTrainedTokenizer): Tokenizer for the evaluator model.
+        evaluator (transformers.PreTrainedModel): The evaluator model.
+        yes_token_id (int): Token ID for "Yes".
+        no_token_id (int): Token ID for "No".
+
+    Returns:
+        torch.Tensor: Scores for each entry in the dataset.
+    """
 
     iterator = data.iter(batch_size=script_args.eval_batch_size)
     num_batches = int(data.num_rows / script_args.eval_batch_size)
@@ -511,6 +540,15 @@ def evaluator_score(
 
 
 def gemini_score_response(response):
+    """Converts a Gemini API response to a normalized score.
+
+    Args:
+        response (google.genai.types.GenerateContentResponse): Gemini API response.
+
+    Returns:
+        float: Normalized score for the response.
+    """
+
     if response.candidates[0].avg_logprobs is None:
         return 0
     if response.text == "No":
@@ -522,16 +560,17 @@ def gemini_score_response(response):
 
 
 def gemini_score_dataset(client, dataset, script_args):
-    """Score a whole dataset with Gemini API, with intermediate saves.
+    """Scores a dataset using the Gemini API, with checkpointing and retries.
 
     Args:
-        client: Initialized Gemini API client
-        dataset: Dataset containing evaluator_prompt column
-        script_args: Script arguments containing seed
+        client (google.genai.Client): Initialized Gemini API client.
+        dataset (datasets.Dataset): Dataset with 'evaluator_prompt' column.
+        script_args (ScriptArguments): Parsed script arguments.
 
     Returns:
-        torch.tensor: Tensor of scores
+        torch.Tensor: Scores for each entry in the dataset.
     """
+
     model = "gemini-2.0-flash-001"
     schema = {"type": "STRING", "enum": ["No", "Yes"]}
     print("Calling the Gemini API...")
@@ -669,6 +708,11 @@ def gemini_score_dataset(client, dataset, script_args):
 
 
 def main():
+    """Main entry point for evaluation script.
+
+    Parses arguments, loads datasets, prepares prompts, runs evaluation or generation, computes metrics, and saves results.
+    """
+
     parser = HfArgumentParser(ScriptArguments)
     script_args = parser.parse_args_into_dataclasses()[0]
     set_seed(script_args.seed)
@@ -1024,13 +1068,17 @@ def main():
         print("Rate of hallucination:", rate_hallucination.item())
 
         # Add scores and classifications to the dataset
+        if "scores" in val_data.column_names:
+            val_data = val_data.remove_columns("scores")
+        val_data = val_data.add_column("scores", scores.tolist())
+
         if "classifications" in val_data.column_names:
             val_data = val_data.remove_columns("classifications")
         val_data = val_data.add_column("classifications", classifs.tolist())
 
         # Push updated dataset back to HF Hub
         print(
-            f"Pushing updated dataset with scores to {script_args.dataset_with_completions}"
+            f"Pushing updated dataset to {script_args.dataset_with_completions}"
         )
         val_data.push_to_hub(script_args.dataset_with_completions)
 

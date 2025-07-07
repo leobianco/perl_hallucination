@@ -1,6 +1,13 @@
-""" "
-TODO: write proper docstring.
-TODO: clean imports.
+"""
+reward_model.py
+
+This module implements the training and evaluation pipeline for a reward model using sequence classification with LoRA (Low-Rank Adaptation) and Hugging Face Transformers. It supports augmenting datasets with organic and structured hallucination samples, computes ROC-AUC metrics, and pushes the trained model to the Hugging Face Hub.
+
+Functions:
+    main(): Entry point for training and evaluating the reward model.
+
+Usage: call the associated shell script along with the corresponding task. E.g.:
+    ./reward_model.sh npov
 """
 
 import evaluate
@@ -27,6 +34,12 @@ from utils import (
 
 
 def main():
+    """
+    Trains and evaluates a reward model for sequence classification using LoRA and Hugging Face Transformers.
+
+    This function parses command-line arguments for model, dataset, and training configuration, loads and optionally augments the dataset, tokenizes the data, prepares the model with LoRA, and trains the model. It computes evaluation metrics including ROC-AUC and pushes the trained model to the Hugging Face Hub.
+    """
+
     # HfArgumentParser does not work with LoraConfig due to type hints
     parser_lora = create_lora_argument_parser()
     lora_args, remaining_args = parser_lora.parse_known_args()
@@ -68,6 +81,15 @@ def main():
         pad_token_modified = True
 
     def encode(examples):
+        """Tokenizes the 'prompt' field in the dataset examples using the loaded tokenizer.
+
+        Args:
+            examples (dict): A batch of dataset examples with a 'prompt' field.
+
+        Returns:
+            dict: Tokenized examples as PyTorch tensors.
+        """
+
         return tokenizer(
             examples["prompt"],
             padding=True,

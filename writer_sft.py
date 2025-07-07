@@ -1,4 +1,14 @@
-"""TODO: write docstring."""
+"""
+This module provides the main script for supervised fine-tuning (SFT) of language models using LoRA (Low-Rank Adaptation) and the TRL library.
+
+It loads datasets, configures LoRA and SFT training arguments, prepares tokenizers and data collators, and launches training for various prompt-based tasks (e.g., npov, bosch, ragtruth).
+
+Functions:
+    main: Entry point for parsing arguments, preparing data, configuring the model, and running SFT training.
+
+Usage: call the associated shell script along with the corresponding task. E.g.:
+    ./writer_sft.sh npov
+"""
 
 import torch
 from datasets import load_dataset
@@ -21,6 +31,16 @@ from utils import ScriptArguments, create_lora_argument_parser
 
 
 def main():
+    """
+    Main entry point for supervised fine-tuning (SFT) with LoRA and TRL.
+
+    This function parses LoRA and SFT arguments, loads datasets, prepares the tokenizer and data collator,
+    configures the model with LoRA, and launches SFT training for the specified task.
+
+    Raises:
+        Exception: If the response template is not specified for the selected model.
+    """
+
     # Parse LoRA arguments first
     parser_lora = create_lora_argument_parser()
     lora_args, remaining_args = parser_lora.parse_known_args()

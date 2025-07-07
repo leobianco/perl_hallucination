@@ -1,5 +1,10 @@
 """
-TODO: write proper docstring.
+perl.py
+
+This script orchestrates the training and evaluation of a reinforcement learning from human feedback (RLHF) model using the Hugging Face Transformers and TRL libraries. It loads datasets, tokenizes data, initializes models (policy, reference policy, reward model), and sets up the RLOOTrainer for RL training. The script also disables automatic model compilation due to known issues with torch.compile in recent Transformers versions. Training logs are saved to disk after completion.
+
+Usage: call the associated shell script along with the corresponding task. E.g.:
+    ./perl.sh npov
 """
 
 import os
@@ -20,16 +25,20 @@ from utils import ScriptArguments
 
 
 def no_compile(model, *args, **kwargs):
-    """Open issue: https://github.com/huggingface/transformers/issues/39191
+    """Disables torch.compile for the model to avoid unwanted compilation and related errors.
 
-    Transformers v.4.53.0 introduced automatic compilation of forward passes.
-    This disregards other explicit configurations disabling compilation.
-    policy.generation_config.disable_compilation = True also had no effect.
-    This compilation led to no significant speed-up, and I was getting errors
-    of the type:
-    torch._dynamo.exc.FailOnRecompileLimitHit: recompile_limit reached with one_graph=True. Excessive recompilations can degrade performance due to the compilation overhead of each recompilation.
+    Args:
+        model (torch.nn.Module): The model to (not) compile.
+        *args: Additional positional arguments (ignored).
+        **kwargs: Additional keyword arguments (ignored).
 
-    For this reason, I am disabling model compilation via this function.
+    Returns:
+        torch.nn.Module: The unmodified model.
+
+    Notes:
+        See: https://github.com/huggingface/transformers/issues/39191
+        Transformers v4.53.0 introduced automatic compilation of forward passes, which can cause
+        excessive recompilations and errors. This function disables compilation by overriding torch.compile.
     """
 
     print("[INFO] torch.compile() was called but it is disabled by the user")
@@ -41,6 +50,12 @@ torch.compile = no_compile
 
 
 def main():
+    """Main entry point for RLHF training and evaluation.
+
+    Parses command-line arguments, loads and tokenizes the dataset, initializes models (policy, reference policy, reward model),
+    sets up the RLOOTrainer, and runs training if specified. Logs are saved to disk after training.
+    """
+
     parser = HfArgumentParser(
         (
             ScriptArguments,
@@ -63,6 +78,15 @@ def main():
 
     # Tokenize data
     def encode(examples):
+        """Tokenizes the 'prompt' field in the dataset examples using the loaded tokenizer.
+
+        Args:
+            examples (dict): A batch of dataset examples with a 'prompt' field.
+
+        Returns:
+            dict: Tokenized examples as PyTorch tensors.
+        """
+
         return tokenizer(
             examples["prompt"],
             padding=True,

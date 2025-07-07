@@ -1,8 +1,14 @@
-"""Data processing functions for the HalOmi and NPOV datasets.
+"""
+Data processing utilities for HalOmi, NPOV, Bosch, and RAGTruth datasets.
 
-This script contains functions for loading, processing, and saving the HalOmi
-and NPOV to Hugging Face Hub. Call this script via the shell script data.sh
-with the dataset name as an argument ("halomi" or "npov").
+This module provides functions for loading, processing, augmenting, and saving datasets for hallucination and omission detection tasks. It includes utilities for label normalization, prompt formatting, synthetic hallucination generation, and dataset preparation for Hugging Face Hub. The main entry point is via the command line, typically called from data.sh with the dataset name as an argument ("npov", "bosch", or "ragtruth").
+
+Functions in this module support:
+- Label normalization and conversion
+- Prompt formatting for reward models and SFT
+- Data augmentation by generating new argument combinations
+- Synthetic hallucination generation (LLM-based and structured)
+- Dataset preparation and upload for Hugging Face Hub
 """
 
 import os
@@ -29,8 +35,14 @@ if not os.path.exists(os.path.expanduser("~/nltk_data/tokenizers/punkt_tab")):
 
 
 def npov_hallucination_labels_to_numerical(entry):
-    """Data processing utility function which replaces the hallucination labels by
-    a numerical version."""
+    """Convert hallucination labels to numerical values for NPOV entries.
+
+    Args:
+        entry (dict): A dictionary containing the key 'class_hall' with values 'Yes' or 'No'.
+
+    Returns:
+        dict: The entry with an added 'class_hall_num' key (0 for 'Yes', 1 for 'No').
+    """
 
     entry["class_hall_num"] = 0 if entry["class_hall"] == "Yes" else 1
 
@@ -38,8 +50,14 @@ def npov_hallucination_labels_to_numerical(entry):
 
 
 def npov_omission_labels_to_numerical(entry):
-    """Data processing utility function which replaces the omission labels by
-    a numerical version."""
+    """Convert omission labels to numerical values for NPOV entries.
+
+    Args:
+        entry (dict): A dictionary containing the key 'class_omit' with values 'Yes' or 'No'.
+
+    Returns:
+        dict: The entry with an added 'class_omit_num' key (0 for 'Yes', 1 for 'No').
+    """
 
     entry["class_omit_num"] = 0 if entry["class_omit"] == "Yes" else 1
 
@@ -47,8 +65,13 @@ def npov_omission_labels_to_numerical(entry):
 
 
 def npov_change_hallucination_labels(entry):
-    """Data processing utility function which replaces the hallucination labels by
-    a simplified version.
+    """Normalize hallucination label values for NPOV entries.
+
+    Args:
+        entry (dict): Entry with possible label variants for hallucination fields.
+
+    Returns:
+        dict: Entry with standardized 'class_hall' and 'has synthetic hallucination' fields ('Yes'/'No').
     """
 
     class_hallucination_to_label = {
@@ -68,8 +91,13 @@ def npov_change_hallucination_labels(entry):
 
 
 def npov_change_omission_labels(entry):
-    """Data processing utility function which replaces the omission labels by
-    a simplified version.
+    """Normalize omission label values for NPOV entries.
+
+    Args:
+        entry (dict): Entry with possible label variants for omission fields.
+
+    Returns:
+        dict: Entry with standardized 'class_omit' and 'has synthetic coverage issue' fields ('Yes'/'No').
     """
 
     class_omission_to_label = {
@@ -92,8 +120,13 @@ def npov_change_omission_labels(entry):
 
 
 def npov_rm_prompt(entry):
-    """Function for transforming entries in the NPOV dataset into training
-    prompts for the reward model.
+    """Format a reward model prompt for an NPOV entry.
+
+    Args:
+        entry (dict): Entry with user query, perspectives, and NPOV response.
+
+    Returns:
+        dict: Entry with a new 'prompt' field containing the formatted prompt.
     """
 
     template = (
@@ -122,6 +155,15 @@ def npov_rm_prompt(entry):
 def npov_process_data_for_rm(
     npov_data,
 ):
+    """Process NPOV data for reward model training.
+
+    Args:
+        npov_data (datasets.Dataset): The NPOV dataset split.
+
+    Returns:
+        datasets.Dataset: Processed dataset with normalized labels and prompts.
+    """
+
     # Copy original NPOV data
     npov_rm_data = deepcopy(npov_data)
 
@@ -163,7 +205,14 @@ def npov_process_data_for_rm(
 
 
 def npov_process_data_for_sft(npov_data):
-    """Preprocesses NPOV SFT dataset."""
+    """Preprocess NPOV SFT dataset by selecting and renaming relevant columns.
+
+    Args:
+        npov_data (datasets.Dataset): The NPOV SFT dataset split.
+
+    Returns:
+        datasets.Dataset: Processed dataset for SFT training.
+    """
 
     # Select relevant subset of columns
     npov_data = npov_data.select_columns(
@@ -186,12 +235,15 @@ def npov_process_data_for_sft(npov_data):
 
 
 def npov_writer_prompt(entry, SFT=False, fewshot_examples=None):
-    """Function for transforming entries in the NPOV dataset into prompts for
-    the writer to rewrite.
+    """Format a prompt for the NPOV writer task, optionally with few-shot examples.
 
-    Previously used for SFT, but now used as prompt for generation during PERL.
-    The SFT now uses the "npov_formatting_prompts_func" function, which has
-    the same prompt as this one, but is used by the SFTTrainer differently.
+    Args:
+        entry (dict): Entry with user query, perspectives, and NPOV response.
+        SFT (bool, optional): If True, include the NPOV response in the prompt. Defaults to False.
+        fewshot_examples (datasets.Dataset, optional): Few-shot examples to prepend. Defaults to None.
+
+    Returns:
+        dict: Entry with a new 'prompt' field.
     """
 
     template = (
@@ -249,10 +301,13 @@ def npov_writer_prompt(entry, SFT=False, fewshot_examples=None):
 
 
 def npov_formatting_prompts_func(eos_token):
-    """Formatting function for SFTTrainer. Imported in writer_sft.py.
+    """Return a formatting function for SFTTrainer for NPOV data.
 
     Args:
-        eos_token (str): The end-of-sequence token to append to each response.
+        eos_token (str): End-of-sequence token to append to each response.
+
+    Returns:
+        Callable: Function that formats a batch of entries for SFT.
     """
 
     def _formatting_func(entry):
@@ -289,11 +344,14 @@ def npov_formatting_prompts_func(eos_token):
 def npov_formatting_prompts_func_from_fewshot_examples(
     fewshot_examples, eos_token
 ):
-    """Given a fewshot example, returns a formatting prompts function for writer SFT that includes the given fewshot example in its prompt.
+    """Return a formatting function for SFTTrainer with few-shot examples for NPOV data.
 
     Args:
-        fewshot_examples: The examples to use for few-shot learning
-        eos_token (str): The end-of-sequence token to append to each response.
+        fewshot_examples (datasets.Dataset): Few-shot examples to include in the prompt.
+        eos_token (str): End-of-sequence token to append to each response.
+
+    Returns:
+        Callable: Function that formats a batch of entries for SFT with few-shot examples.
     """
 
     preamble = (
@@ -365,9 +423,15 @@ def npov_process_data_for_perl(
     npov_sft_data,
     seed=12345,
 ):
-    """
-    Processes NPOV data for PERL by creating train and test splits
-    from the RM and SFT datasets.
+    """Prepare NPOV data for PERL by creating train and test splits and formatting prompts.
+
+    Args:
+        npov_rm_data (datasets.DatasetDict): Reward model data.
+        npov_sft_data (datasets.DatasetDict): SFT data.
+        seed (int, optional): Random seed for shuffling. Defaults to 12345.
+
+    Returns:
+        datasets.DatasetDict: DatasetDict with 'train' and 'test' splits for PERL.
     """
 
     train_data = npov_rm_data["validation"]
@@ -407,16 +471,13 @@ def npov_process_data_for_perl(
 
 
 def npov_data_augmentation(data):
-    """
-    Augment NPOV dataset by
-    (1) Adding more unique perspectives to some topics.
-    (2) Generating combinations of arguments for different perspectives
-    on each topic.
+    """Augment NPOV dataset by adding new perspectives and generating argument combinations.
 
-    Notice that for the moment I have hard coded pairs of arguments.
-    Initially, the different topics do not have the same amount of
-    arguments. The combinatorics of the thing makes some topics appear
-    much more than others.
+    Args:
+        data (datasets.Dataset): The NPOV dataset split to augment.
+
+    Returns:
+        dict: Dictionary with augmented data fields for new argument combinations.
     """
 
     topics = set(data["topic"])
@@ -541,10 +602,20 @@ def npov_data_augmentation(data):
 
 # Synthetic Hallucinations
 def npov_rm_synthetic_hall_llm(entry, fewshot_examples=None):
-    preamble = """SYSTEM:
-You are a writer tasked with introducing subtle, realistic hallucinations into neutral answers. The original answer is a balanced and neutral synthesis of two opposing perspectives, presenting only the arguments provided in the context. Your goal is to modify this answer by adding some new piece of information or argument that is NOT present in the original answer or context. This addition should be small, plausible, and smoothly integrated, resembling the kind of factual error that language models often make when generating text. It can appear as added information on the existing arguments in the context, or as a new argument on its own.
+    """Generate a prompt for LLM-based synthetic hallucination creation for NPOV entries.
 
-"""
+    Args:
+        entry (dict): Entry with user query, perspectives, and NPOV response.
+        fewshot_examples (datasets.Dataset, optional): Few-shot examples to include. Defaults to None.
+
+    Returns:
+        str: Prompt for LLM to generate a hallucinated answer.
+    """
+
+    preamble = (
+        "SYSTEM:\n"
+        "You are a writer tasked with introducing subtle, realistic hallucinations into neutral answers. The original answer is a balanced and neutral synthesis of two opposing perspectives, presenting only the arguments provided in the context. Your goal is to modify this answer by adding some new piece of information or argument that is NOT present in the original answer or context. This addition should be small, plausible, and smoothly integrated, resembling the kind of factual error that language models often make when generating text. It can appear as added information on the existing arguments in the context, or as a new argument on its own.\n"
+    )
 
     prompt = preamble
 
@@ -610,6 +681,19 @@ Modified Answer with Synthetic Hallucination:
 def npov_function_to_map_synthetic_halls_llm(
     entry, fewshot_examples, client, gemini_model, generation_config
 ):
+    """Call Gemini LLM to generate a synthetic hallucinated NPOV response.
+
+    Args:
+        entry (dict): Entry to modify.
+        fewshot_examples (datasets.Dataset): Few-shot examples for the LLM.
+        client: Gemini API client.
+        gemini_model (str): Model name.
+        generation_config: Generation configuration for the LLM.
+
+    Returns:
+        dict: Entry with hallucinated response and updated labels.
+    """
+
     prompt_to_send = npov_rm_synthetic_hall_llm(entry, fewshot_examples)
 
     response = client.models.generate_content(
@@ -627,6 +711,16 @@ def npov_function_to_map_synthetic_halls_llm(
 
 
 def bosch_load_and_process_data(data_path, flip_path):
+    """Load and process Bosch dataset, flipping mis-annotated samples and formatting prompts.
+
+    Args:
+        data_path (str): Path to the main Bosch data CSV.
+        flip_path (str): Path to the CSV with sample IDs to flip.
+
+    Returns:
+        pandas.DataFrame: Processed Bosch data with prompts and labels.
+    """
+
     # Load
     data = pd.read_csv(data_path)
     data_to_flip = pd.read_csv(flip_path)
@@ -661,7 +755,14 @@ def bosch_load_and_process_data(data_path, flip_path):
 
 
 def bosch_rm_prompt(entry):
-    """The dataset already contains a prompt column, which is an instruction for the writer. We just append the generation."""
+    """Append the response to the existing Bosch prompt in the entry.
+
+    Args:
+        entry (dict): Entry with 'prompt' and 'response' fields.
+
+    Returns:
+        dict: Entry with updated 'prompt' field.
+    """
 
     entry["prompt"] += entry["response"]
 
@@ -669,10 +770,13 @@ def bosch_rm_prompt(entry):
 
 
 def bosch_formatting_prompts_func(eos_token):
-    """Formatting function for SFTTrainer. Imported in writer_sft.py.
+    """Return a formatting function for SFTTrainer for Bosch data.
 
     Args:
-        eos_token (str): The end-of-sequence token to append to each response.
+        eos_token (str): End-of-sequence token to append to each response.
+
+    Returns:
+        Callable: Function that formats a batch of entries for SFT.
     """
 
     def _formatting_func(entry):
@@ -701,7 +805,15 @@ def bosch_formatting_prompts_func(eos_token):
 
 
 def bosch_rm_synthetic_hall_structured(entry, data):
-    """Given an entry and the rest of the data, select a random sentence in the context, and erase it."""
+    """Create a structured synthetic hallucination in Bosch data by removing sentences from the context.
+
+    Args:
+        entry (dict): Entry to modify.
+        data (datasets.Dataset): The full validation dataset for context.
+
+    Returns:
+        dict: Entry with modified context and updated labels.
+    """
 
     # Break response into sentences and filter out small ones
     tok = nltk.sent_tokenize(entry["Context"])
@@ -730,6 +842,16 @@ def bosch_rm_synthetic_hall_structured(entry, data):
 
 
 def bosch_rm_synthetic_hall_llm(entry, fewshot_examples=None):
+    """Generate a prompt for LLM-based synthetic hallucination creation for Bosch entries.
+
+    Args:
+        entry (dict): Entry with question, context, and response.
+        fewshot_examples (datasets.Dataset, optional): Few-shot examples to include. Defaults to None.
+
+    Returns:
+        str: Prompt for LLM to generate a hallucinated answer.
+    """
+
     preamble = """
     Objective:
     Generate a modified version of a given answer that includes subtle, natural-sounding synthetic hallucinations (information plausible but not directly supported by the provided context), mimicking the kinds of errors LLMs sometimes make organically.
@@ -806,6 +928,19 @@ def bosch_rm_synthetic_hall_llm(entry, fewshot_examples=None):
 def bosch_function_to_map_synthetic_halls_llm(
     entry, fewshot_examples, client, gemini_model, generation_config
 ):
+    """Call Gemini LLM to generate a synthetic hallucinated Bosch response.
+
+    Args:
+        entry (dict): Entry to modify.
+        fewshot_examples (datasets.Dataset): Few-shot examples for the LLM.
+        client: Gemini API client.
+        gemini_model (str): Model name.
+        generation_config: Generation configuration for the LLM.
+
+    Returns:
+        dict: Entry with hallucinated response and updated labels.
+    """
+
     prompt_to_send = bosch_rm_synthetic_hall_llm(entry, fewshot_examples)
 
     response = client.models.generate_content(
@@ -822,7 +957,14 @@ def bosch_function_to_map_synthetic_halls_llm(
 
 
 def ragtruth_rm_prompt(entry):
-    """The dataset already contains a prompt column, which is an instruction for the writer. We just append the generation."""
+    """Format a reward model prompt for a RAGTruth entry.
+
+    Args:
+        entry (dict): Entry with user query and response.
+
+    Returns:
+        dict: Entry with a new 'prompt' field.
+    """
 
     entry["prompt"] = entry["user_query"] + "\n" + entry["response"]
 
@@ -830,6 +972,15 @@ def ragtruth_rm_prompt(entry):
 
 
 def ragtruth_rm_synthetic_hall_llm(entry):
+    """Generate a prompt for LLM-based synthetic hallucination creation for RAGTruth entries.
+
+    Args:
+        entry (dict): Entry with user query and response.
+
+    Returns:
+        str: Prompt for LLM to generate a hallucinated summary.
+    """
+
     prompt = f"""Task: Generate a modified summary that includes controlled hallucinations
 
 Source Text:
@@ -864,6 +1015,18 @@ Modified Summary with Subtle Hallucinations:
 def ragtruth_function_to_map_synthetic_halls_llm(
     entry, client, gemini_model, generation_config
 ):
+    """Call Gemini LLM to generate a synthetic hallucinated RAGTruth response.
+
+    Args:
+        entry (dict): Entry to modify.
+        client: Gemini API client.
+        gemini_model (str): Model name.
+        generation_config: Generation configuration for the LLM.
+
+    Returns:
+        dict: Entry with hallucinated response and updated labels.
+    """
+
     prompt_to_send = ragtruth_rm_synthetic_hall_llm(entry)
 
     response = client.models.generate_content(
@@ -880,10 +1043,13 @@ def ragtruth_function_to_map_synthetic_halls_llm(
 
 
 def ragtruth_formatting_prompts_func(eos_token):
-    """Formatting function for SFTTrainer. Imported in writer_sft.py.
+    """Return a formatting function for SFTTrainer for RAGTruth data.
 
     Args:
-        eos_token (str): The end-of-sequence token to append to each response.
+        eos_token (str): End-of-sequence token to append to each response.
+
+    Returns:
+        Callable: Function that formats a batch of entries for SFT.
     """
 
     def _formatting_func(entry):
@@ -905,6 +1071,11 @@ def ragtruth_formatting_prompts_func(eos_token):
 
 
 def main():
+    """Main entry point for data processing and dataset preparation.
+
+    Parses command-line arguments to determine the dataset and processing options, then loads, processes, augments, and uploads datasets to Hugging Face Hub as needed for NPOV, Bosch, or RAGTruth tasks.
+    """
+
     parser = ArgumentParser()
     parser.add_argument("--task_name", type=str)
     parser.add_argument("--seed", type=int, default=12345)
@@ -941,7 +1112,9 @@ def main():
             npov_rm_data[split] = npov_process_data_for_rm(
                 npov_rm_data[split],
             )
-            npov_rm_data[split].push_to_hub(repo_id=args.task_name + "_processed")
+            npov_rm_data[split].push_to_hub(
+                repo_id=args.task_name + "_processed"
+            )
 
         # AUTORATER
         npov_autorater_data = concatenate_datasets(
@@ -1563,7 +1736,9 @@ def main():
         # FINAL TEST SET
         # It is simply the train split. Rename "user_query" column to "prompt".
         train_dataset = train_dataset.rename_column("user_query", "prompt")
-        train_dataset.push_to_hub(args.task_name + "_final_test_set", split="test")
+        train_dataset.push_to_hub(
+            args.task_name + "_final_test_set", split="test"
+        )
 
 
 if __name__ == "__main__":
