@@ -153,6 +153,7 @@ def npov_rm_prompt(entry):
 
 
 def npov_process_data_for_rm(
+
     npov_data,
 ):
     """Process NPOV data for reward model training.
