@@ -230,12 +230,9 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         )
 
         # Since the response changed, you need to rewrite the prompt
-        for split in synthetic_hallucinations_llm_data.keys():
-            synthetic_hallucinations_llm_data[split] = (
-                synthetic_hallucinations_llm_data[split].map(
-                    self._preprocess_data
-                )
-            )
+        synthetic_hallucinations_llm_data = self._preprocess_data(
+            synthetic_hallucinations_llm_data
+        )
 
         return synthetic_hallucinations_llm_data
 
