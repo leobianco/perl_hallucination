@@ -1,4 +1,5 @@
 from itertools import combinations
+
 import genai
 import pandas as pd
 from base_task_processor import BaseTaskProcessor
@@ -12,9 +13,8 @@ except ImportError:
 
 class NPOVTaskProcessor(BaseTaskProcessor):
     def _load_data(self):
-        # Hard coded for the moment
         data = load_dataset(
-            "leobianco/npov",
+            self.args.hf_repo,
             data_files={
                 "train": "hc_rm5x_train.json",
                 "validation": "hc_rm5x_validation.json",
@@ -68,7 +68,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         """Process NPOV data for supervised fine-tuning."""
 
         sft_data = load_dataset(
-            "leobianco/npov",
+            self.args.hf_repo,
             data_files={
                 "train": "writer_train.json",
                 "validation": "writer_validation.json",
@@ -310,13 +310,15 @@ class NPOVTaskProcessor(BaseTaskProcessor):
 
         # Create capped final test set (10k samples)
         # TODO: this can be enhanced to keep topics balanced.
-        capped_final_test_set = (
-            augmented_dataset.shuffle(seed=args.seed).select(range(10000))
-        )
+        capped_final_test_set = augmented_dataset.shuffle(
+            seed=args.seed
+        ).select(range(10000))
 
-        evaluation_data = DatasetDict({
-            "test": capped_final_test_set,
-        })
+        evaluation_data = DatasetDict(
+            {
+                "test": capped_final_test_set,
+            }
+        )
 
         return evaluation_data
 
@@ -656,7 +658,9 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             Extract unique arguments for a given topic and perspective (pro or con).
             """
 
-            topic_data = data.filter(lambda x: x["topic"] == topic)[perspective_col]
+            topic_data = data.filter(lambda x: x["topic"] == topic)[
+                perspective_col
+            ]
 
             arguments = {
                 f"{perspective_name}: {arg.strip()}"
@@ -667,15 +671,20 @@ class NPOVTaskProcessor(BaseTaskProcessor):
 
             return arguments
 
-        # Load new perspectives from CSV
-        # hard coded the file name due to hurry -> fix later
+        # Load new perspectives from local CSV
         new_perspectives = pd.read_csv("npov_new_perspectives.csv")
 
         for topic in topics:
-            user_query = data.filter(lambda x: x["topic"] == topic)["user_query"][0]
+            user_query = data.filter(lambda x: x["topic"] == topic)[
+                "user_query"
+            ][0]
 
-            p1_args = _extract_perspective_arguments(topic, "perspective_1", p1_name)
-            p2_args = _extract_perspective_arguments(topic, "perspective_2", p2_name)
+            p1_args = _extract_perspective_arguments(
+                topic, "perspective_1", p1_name
+            )
+            p2_args = _extract_perspective_arguments(
+                topic, "perspective_2", p2_name
+            )
 
             # Filter new perspectives for the current topic
             new_perspectives_for_topic = new_perspectives[

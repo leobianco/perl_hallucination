@@ -42,41 +42,45 @@ class BaseTaskProcessor(abc.ABC):
         pass
 
     def run(self):
+        args = self.args
+
         data = self._load_data()
         data = self._preprocess_data(data)
-        data.push_to_hub(repo_id=self.args.task_name + "_processed")
+        data.push_to_hub(repo_id=args.task_name + "_processed")
 
         autorater_data = self._make_autorater_data(data)
         autorater_data.push_to_hub(
-            repo_id=self.args.task_name + "_autorater", split="test"
+            repo_id=args.task_name + "_autorater", split="test"
         )
 
         organic_hallucinations_data = self._make_organic_hallucinations_data(
             data
         )
         organic_hallucinations_data.push_to_hub(
-            repo_id=self.args.task_name + "_rm_organic"
+            repo_id=args.task_name + "_rm_organic"
         )
 
-        structured_hallucinations_data = (
-            self._make_structured_hallucinations_data(data)
-        )
-        structured_hallucinations_data.push_to_hub(
-            repo_id=self.args.task_name + "_rm_synthetic_struct"
-        )
+        if args.synthetic_hallus_struct:
+            structured_hallucinations_data = (
+                self._make_structured_hallucinations_data(data)
+            )
+            structured_hallucinations_data.push_to_hub(
+                repo_id=args.task_name + "_rm_synthetic_struct"
+            )
 
-        llm_hallucinations_data = self._make_llm_hallucinations_data(data, organic_hallucinations_data)
-        llm_hallucinations_data.push_to_hub(
-            repo_id=self.args.task_name + "_rm_synthetic_llm"
-        )
+        if args.synthetic_hallus_llm:
+            llm_hallucinations_data = self._make_llm_hallucinations_data(data, organic_hallucinations_data)
+            llm_hallucinations_data.push_to_hub(
+                repo_id=args.task_name + "_rm_synthetic_llm"
+            )
 
         sft_data = self._make_sft_data(data)
-        sft_data.push_to_hub(repo_id=self.args.task_name + "_sft")
+        sft_data.push_to_hub(repo_id=args.task_name + "_sft")
 
         perl_data = self._make_perl_data(data)
-        perl_data.push_to_hub(repo_id=self.args.task_name + "_perl")
+        perl_data.push_to_hub(repo_id=args.task_name + "_perl")
 
         evaluation_data = self._make_evaluation_data(data)
         evaluation_data.push_to_hub(
-            repo_id=self.args.task_name + "_final_test_set"
+            repo_id=args.task_name + "_final_test_set"
         )

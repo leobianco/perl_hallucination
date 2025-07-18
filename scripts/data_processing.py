@@ -9,6 +9,7 @@ def main():
     parser = ArgumentParser()
     parser.add_argument("--task_name", type=str)
     parser.add_argument("--seed", type=int, default=12345)
+    parser.add_argument("--hf_repo", type=str)
     parser.add_argument(
         "--synthetic_hallus_llm",
         default=False,
@@ -20,8 +21,6 @@ def main():
         type=lambda x: (str(x).lower() == "true"),
     )
     parser.add_argument("--num_synth_hallus", type=int, default=0)
-    parser.add_argument("--num_organic_hallus_to_keep", type=int, default=0)
-    parser.add_argument("--num_struct_hallus_to_keep", type=int, default=0)
     parser.add_argument("--gemini_api_key", type=str)
     parser.add_argument("--synth_llm_temperature", type=float, default=0.7)
     parser.add_argument("--synth_llm_num_fewshot", type=int, default=2)
