@@ -1,5 +1,12 @@
 from argparse import ArgumentParser
 
+import sys
+import os
+
+print("Current working directory:", os.getcwd())
+print("sys.path:", sys.path)
+
+
 from data.bosch_task_processor import BoschTaskProcessor
 from data.npov_task_processor import NPOVTaskProcessor
 from data.ragtruth_task_processor import RagtruthTaskProcessor
