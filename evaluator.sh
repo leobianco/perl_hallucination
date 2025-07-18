@@ -7,7 +7,6 @@ RUN_IDENTIFIER="$USER/npov_SFT_google_S200898_epo25_lr1e-4_r8_2506111442"
 BASE_MODEL="google/gemma-2-2b-it"
 EVALUATOR_MODEL="gemini-2.0-flash"
 USE_GEMINI="True"
-GEMINI_API_KEY="AIzaSyCIPXhApp0pcu7TruZ8EyuW086VJ1wzrhk"
 THRESHOLD=0.9995
 EVALUATOR_NUM_FEWSHOT=2
 WRITER_NUM_FEWSHOT=0
@@ -29,6 +28,11 @@ TASK_NAME="$1"
 if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ]; then
     echo "Invalid task name" 
     echo "$TASK_NAME"
+    exit 1
+fi
+
+if [ -z "${GEMINI_API_KEY}" ]; then
+    echo "GEMINI_API_KEY environment variable is not set. Please export it before running this script."
     exit 1
 fi
 

@@ -8,7 +8,6 @@ HF_REPO="${USER}/${TASK_NAME}"
 SYNTH_STRUCT="False"
 SYNTH_LLM="False"
 NUM_SYNTH_HALLUS=100
-GEMINI_API_KEY="AIzaSyCIPXhApp0pcu7TruZ8EyuW086VJ1wzrhk"
 SYNTH_LLM_TEMPERATURE=0.7
 SYNTH_LLM_NUM_FEWSHOT=5
 
@@ -17,6 +16,11 @@ SYNTH_LLM_NUM_FEWSHOT=5
 # Checks
 if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ]; then
     echo "Invalid dataset name"
+    exit 1
+fi
+
+if [ -z "${GEMINI_API_KEY}" ]; then
+    echo "GEMINI_API_KEY environment variable is not set. Please export it before running this script."
     exit 1
 fi
 

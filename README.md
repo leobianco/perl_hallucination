@@ -6,6 +6,11 @@ This project studies the reduction of hallucinations via RLAIF with *synthetic* 
 
 Here is a brief description about the usage of each script, roughly in the order that they should be executed. Substitute `TASK` by `npov`, `bosch`, or `ragtruth` to select the correct dataset. Every `.sh` script runs the `.py` script with the same name with the corresponding parameters set. Run the scripts from the top-most project folder, in order to have the path correctly set.
 
+Please, set the Gemini API key in order to use the LLM-generated synthetic data, as well as the autorater:
+```
+export GEMINI_API_KEY="your-key-here"
+```
+
 * `./scripts/data_processing.sh (TASK)`: processes the raw dataset and saves resulting datasets to the HuggingFace Hub. This includes creating prompts to be passed to the LLMs later, putting data in the right format, creating synthetic hallucinations, creating data for evaluation.
 * `writer_sft.sh (TASK)`: LoRA-SFT the model indicated as a writer.
 * `reward_model.sh (TASK)`: trains the reward model. Set one of the `ORGANIC`, `SYN_HALL_LLM`, or `SYN_HALL_STRUCT` parameters to true to choose what type of hallucinations to train on.
