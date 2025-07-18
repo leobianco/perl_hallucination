@@ -21,7 +21,7 @@ if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" !
 fi
 
 # Run script
-python data_processing.py \
+python ./scripts/data_processing.py \
     --task_name "$TASK_NAME" \
     --seed "$SEED" \
     --hf_repo "$HF_REPO" \
