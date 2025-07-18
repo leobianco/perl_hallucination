@@ -59,6 +59,8 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             split_data = split_data.rename_column("class_hall_num", "label")
             processed[split] = split_data
 
+        processed = DatasetDict(processed)
+
         return processed
 
     def _make_sft_data(self, data):
