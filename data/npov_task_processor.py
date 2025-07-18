@@ -1,14 +1,11 @@
 from itertools import combinations
 
-import genai
 import pandas as pd
-from base_task_processor import BaseTaskProcessor
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
+from google import genai
+from google.genai import types
 
-try:
-    from google.generativeai import types
-except ImportError:
-    types = None
+from data.base_task_processor import BaseTaskProcessor
 
 
 class NPOVTaskProcessor(BaseTaskProcessor):
@@ -61,6 +58,8 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             split_data = split_data.map(self._rm_prompt)
             split_data = split_data.rename_column("class_hall_num", "label")
             processed[split] = split_data
+
+        processed = DatasetDict(processed)
 
         return processed
 
@@ -231,12 +230,9 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         )
 
         # Since the response changed, you need to rewrite the prompt
-        for split in synthetic_hallucinations_llm_data.keys():
-            synthetic_hallucinations_llm_data[split] = (
-                synthetic_hallucinations_llm_data[split].map(
-                    self._preprocess_data
-                )
-            )
+        synthetic_hallucinations_llm_data = self._preprocess_data(
+            synthetic_hallucinations_llm_data
+        )
 
         return synthetic_hallucinations_llm_data
 
@@ -672,7 +668,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             return arguments
 
         # Load new perspectives from local CSV
-        new_perspectives = pd.read_csv("npov_new_perspectives.csv")
+        new_perspectives = pd.read_csv("./data/npov_new_perspectives.csv")
 
         for topic in topics:
             user_query = data.filter(lambda x: x["topic"] == topic)[

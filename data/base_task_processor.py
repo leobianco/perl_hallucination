@@ -77,7 +77,7 @@ class BaseTaskProcessor(abc.ABC):
         sft_data = self._make_sft_data(data)
         sft_data.push_to_hub(repo_id=args.task_name + "_sft")
 
-        perl_data = self._make_perl_data(data)
+        perl_data = self._make_perl_data(data, sft_data, seed=args.seed)
         perl_data.push_to_hub(repo_id=args.task_name + "_perl")
 
         evaluation_data = self._make_evaluation_data(data)

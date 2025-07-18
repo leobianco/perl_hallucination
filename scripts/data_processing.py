@@ -38,3 +38,7 @@ def main():
 
     processor = processor_cls(args)
     processor.run()
+
+
+if __name__ == "__main__":
+    main()

@@ -5,8 +5,8 @@ TASK_NAME="$1"
 USER="leobianco"
 SEED=12345
 HF_REPO="${USER}/${TASK_NAME}"
-SYNTH_STRUCT="True"
-SYNTH_LLM="True"
+SYNTH_STRUCT="False"
+SYNTH_LLM="False"
 NUM_SYNTH_HALLUS=100
 GEMINI_API_KEY="AIzaSyCIPXhApp0pcu7TruZ8EyuW086VJ1wzrhk"
 SYNTH_LLM_TEMPERATURE=0.7
@@ -21,7 +21,7 @@ if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" !
 fi
 
 # Run script
-python ./scripts/data_processing.py \
+python -m scripts.data_processing \
     --task_name "$TASK_NAME" \
     --seed "$SEED" \
     --hf_repo "$HF_REPO" \

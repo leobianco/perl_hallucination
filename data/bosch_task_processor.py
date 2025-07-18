@@ -1,4 +1,4 @@
-import BaseTaskProcessor from base_task_processor
+from data.base_task_processor import BaseTaskProcessor 
 from datasets import load_dataset
 
 class BoschTaskProcessor(BaseTaskProcessor):
