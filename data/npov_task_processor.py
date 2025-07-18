@@ -1,14 +1,11 @@
 from itertools import combinations
 
-import genai
 import pandas as pd
-from base_task_processor import BaseTaskProcessor
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
+from google import genai
+from google.genai import types
 
-try:
-    from google.generativeai import types
-except ImportError:
-    types = None
+from data.base_task_processor import BaseTaskProcessor
 
 
 class NPOVTaskProcessor(BaseTaskProcessor):
