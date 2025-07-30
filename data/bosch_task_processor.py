@@ -226,7 +226,7 @@ class BoschTaskProcessor(BaseTaskProcessor):
         """For the autorater, we want to measure its ability on all samples, so we just merge all of them and save as a single test split."""
 
         autorater_dataset = concatenate_datasets(
-            data["train"], data["validation"], data["test"]
+            [data["train"], data["validation"], data["test"]]
         )
 
         return autorater_dataset
