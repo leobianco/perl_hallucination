@@ -1,6 +1,8 @@
 import random
 
 import nltk
+
+nltk.download("punkt_tab")
 from datasets import DatasetDict, concatenate_datasets, load_dataset
 from google import genai
 from google.genai import types
