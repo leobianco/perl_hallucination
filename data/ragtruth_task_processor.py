@@ -28,3 +28,22 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
 
     def evaluation_data(self):
         pass
+
+    @classmethod
+    def get_formatting_prompts_and_response_template(
+        cls, eos_token, fewshot_examples=None, model_repo_id=None
+    ):
+        """Provide a simple formatting function and response template for Ragtruth.
+
+        This is a placeholder until a full implementation is available. It returns
+        a function that expects an example and returns it unchanged, and a
+        minimal response template matching the old behavior.
+        """
+
+        response_template = "\n\noutput:\n"
+
+        def formatting_prompts_func(example):
+            # No-op formatting for now
+            return example
+
+        return formatting_prompts_func, response_template

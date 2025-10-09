@@ -499,6 +499,100 @@ class NPOVTaskProcessor(BaseTaskProcessor):
 
         return entry
 
+    @classmethod
+    def get_formatting_prompts_and_response_template(
+        cls, eos_token, fewshot_examples=None, model_repo_id=None
+    ):
+        """Return a formatting function and response template for SFT training.
+
+        Args:
+            eos_token (str): Tokenizer eos token.
+            fewshot_examples (datasets.Dataset | None): Few-shot examples to include.
+            model_repo_id (str | None): Model repo id to choose model-specific template.
+
+        Returns:
+            (callable, str): formatting function and response template string.
+        """
+
+        # Choose response template based on model company
+        response_template = None
+        if model_repo_id is not None:
+            model_company = model_repo_id.split("/")[0]
+            if model_company == "google":
+                response_template = "\nNeutral point-of-view answer to user query, rewriting provided arguments in natural language:\n"
+            elif model_company == "mistralai":
+                response_template = "point-of-view answer to user query, rewriting provided arguments in natural language:\n"
+        if response_template is None:
+            raise Exception("Response template not specified for model!")
+
+        def formatting_prompts_func(entry):
+            template = (
+                "User query: {user_query}\n"
+                "{perspective_1_name} arguments provided: {perspective_1}\n"
+                "{perspective_2_name} arguments provided: {perspective_2}\n"
+                "Neutral point-of-view answer to user query, rewriting provided"
+                " arguments in natural language:\n"
+                "{npov_response}{eos_token}"
+            )
+
+            template_fewshot = (
+                "User query: {user_query}\n"
+                "{perspective_1_name} arguments provided: {perspective_1}\n"
+                "{perspective_2_name} arguments provided: {perspective_2}\n"
+                "Example neutral point-of-view answer to user query, rewriting provided"
+                " arguments in natural language:\n"
+                "{npov_response}{eos_token}"
+            )
+
+            prompt = ""
+
+            output_texts = []
+
+            # Build prompt with few-shot examples, if any
+            if fewshot_examples is not None:
+                preamble = (
+                    "Your task is to answer an user's query"
+                    " by rewriting the provided arguments in natural language. Do not "
+                    "generate arguments other than those provided. "
+                    f"We provide {fewshot_examples.num_rows} example(s) of what is "
+                    "expected, then it is your turn.\n"
+                )
+
+                prompt += preamble
+
+                for fewshot_example in fewshot_examples:
+                    fewshot_prompt = template_fewshot.format(
+                        user_query=fewshot_example["user_query"],
+                        perspective_1_name=fewshot_example[
+                            "perspective_1_name"
+                        ],
+                        perspective_1=fewshot_example["perspective_1"],
+                        perspective_2_name=fewshot_example[
+                            "perspective_2_name"
+                        ],
+                        perspective_2=fewshot_example["perspective_2"],
+                        npov_response=fewshot_example["npov_response"],
+                        eos_token=eos_token,
+                    )
+                    prompt += fewshot_prompt + "\n"
+
+            for i in range(len(entry["user_query"])):
+                formatted_prompt = template.format(
+                    user_query=entry["user_query"][i],
+                    perspective_1_name=entry["perspective_1_name"][i],
+                    perspective_1=entry["perspective_1"][i],
+                    perspective_2_name=entry["perspective_2_name"][i],
+                    perspective_2=entry["perspective_2"][i],
+                    npov_response=entry["npov_response"][i],
+                    eos_token=eos_token,
+                )
+
+                output_texts.append(prompt + formatted_prompt)
+
+            return output_texts
+
+        return formatting_prompts_func, response_template
+
     @staticmethod
     def _process_data_for_sft(split_data):
         """Preprocess NPOV SFT dataset by selecting and renaming relevant columns.

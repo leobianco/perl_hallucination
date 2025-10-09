@@ -21,12 +21,9 @@ from trl import (
     TrlParser,
 )
 
-from data import (
-    bosch_formatting_prompts_func,
-    npov_formatting_prompts_func,
-    npov_formatting_prompts_func_from_fewshot_examples,
-    ragtruth_formatting_prompts_func,
-)
+from data.npov_task_processor import NPOVTaskProcessor
+from data.bosch_task_processor import BoschTaskProcessor
+from data.ragtruth_task_processor import RagtruthTaskProcessor
 from utils import ScriptArguments, create_lora_argument_parser
 
 
@@ -73,46 +70,33 @@ def main():
         tokenizer.pad_token = tokenizer.unk_token
         pad_token_modified = True
 
-    # For training on completions only.
-    if script_args.task_name == "npov":
-        # Response template is model dependent...
-        # For Mistral, "point-of-view" forward.
-        # For Gemma, "\nNeutral point-of-view" forward...
-        # This is because the tokenizer tokenizes differently depending
-        # on context.
-        model_company = script_args.model_repo_id.split("/")[0]
-        if model_company == "google":
-            response_template = "\nNeutral point-of-view answer to user query, rewriting provided arguments in natural language:\n"
-        elif model_company == "mistralai":
-            response_template = "point-of-view answer to user query, rewriting provided arguments in natural language:\n"
-        else:
-            raise Exception("Response template not specified for model!")
+    task_map = {
+        "npov": NPOVTaskProcessor,
+        "bosch": BoschTaskProcessor,
+        "ragtruth": RagtruthTaskProcessor,
+    }
 
-        if script_args.num_fewshot == 0 or script_args.num_fewshot is None:
-            formatting_prompts_func = npov_formatting_prompts_func(
-                tokenizer.eos_token
-            )
-        else:
-            # Get fewshot examples and add to formatting_prompts_func
-            fewshot_examples = sft_data.shuffle(seed=training_args.seed).select(
-                range(script_args.num_fewshot)
-            )
-            formatting_prompts_func = (
-                npov_formatting_prompts_func_from_fewshot_examples(
-                    fewshot_examples=fewshot_examples,
-                    eos_token=tokenizer.eos_token,
-                )
-            )
-    elif script_args.task_name == "bosch":
-        response_template = "\nAnswer to user's question:\n"
-        formatting_prompts_func = bosch_formatting_prompts_func(
-            tokenizer.eos_token
+    processor_cls = task_map.get(script_args.task_name)
+    if processor_cls is None:
+        raise Exception(f"Unknown task: {script_args.task_name}")
+
+    fewshot_examples = None
+    if (
+        script_args.task_name == "npov"
+        and script_args.num_fewshot is not None
+        and script_args.num_fewshot > 0
+    ):
+        fewshot_examples = sft_data.shuffle(seed=training_args.seed).select(
+            range(script_args.num_fewshot)
         )
-    elif script_args.task_name == "ragtruth":
-        response_template = "\n\noutput:\n"
-        formatting_prompts_func = ragtruth_formatting_prompts_func(
-            tokenizer.eos_token
+
+    formatting_prompts_func, response_template = (
+        processor_cls.get_formatting_prompts_and_response_template(
+            eos_token=tokenizer.eos_token,
+            fewshot_examples=fewshot_examples,
+            model_repo_id=script_args.model_repo_id,
         )
+    )
 
     response_template_ids = tokenizer.encode(
         response_template, add_special_tokens=False
@@ -144,9 +128,8 @@ def main():
         formatting_func=formatting_prompts_func,
     )
 
-    if training_args.do_train:
-        trainer.train()
-        trainer.push_to_hub()
+    trainer.train()
+    trainer.push_to_hub()
 
 
 if __name__ == "__main__":

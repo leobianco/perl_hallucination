@@ -273,6 +273,43 @@ class BoschTaskProcessor(BaseTaskProcessor):
 
         return entry
 
+    @classmethod
+    def get_formatting_prompts_and_response_template(
+        cls, eos_token, fewshot_examples=None, model_repo_id=None
+    ):
+        """Return a formatting function and response template for Bosch SFT.
+
+        For Bosch the response template is fixed and the formatting function
+        appends the response to the prompt (the RM prompt already contains the
+        rest). This mirrors the old `bosch_formatting_prompts_func` behavior.
+        """
+
+        response_template = "\nAnswer to user's question:\n"
+
+        def formatting_prompts_func(entry):
+            template = (
+                "You are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information given.\n"
+                "User question:\n{question}"
+                "\nManual information:\n{context}"
+                "\nAnswer to user's question:\n{answer}{eos_token}"
+            )
+
+            output_texts = []
+
+            for i in range(len(entry["Question"])):
+                formatted_prompt = template.format(
+                    question=entry["Question"][i],
+                    context=entry["Context"][i],
+                    answer=entry["Answer"][i],
+                    eos_token=eos_token,
+                )
+
+                output_texts.append(formatted_prompt)
+
+            return output_texts
+
+        return formatting_prompts_func, response_template
+
     @staticmethod
     def _split_nonhallucinated_for_synthetic(
         data_split, num_synth_hallus, seed
