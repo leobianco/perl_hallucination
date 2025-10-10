@@ -126,6 +126,17 @@ class BaseTaskProcessor(abc.ABC):
         """
         raise NotImplementedError()
 
+    @classmethod
+    @abc.abstractmethod
+    def get_evaluator_prompt(cls):
+        """Return a callable that maps a dataset entry into an evaluator prompt.
+
+        The callable should accept the same signature used in the original
+        evaluator code: (entry, fewshot_examples=None, use_true_label=False)
+        and return the entry with an added 'evaluator_prompt' field.
+        """
+        raise NotImplementedError()
+
     def run(self):
         args = self.args
 
@@ -154,7 +165,9 @@ class BaseTaskProcessor(abc.ABC):
             )
 
         if args.synthetic_hallus_llm:
-            llm_hallucinations_data = self._make_llm_hallucinations_data(data, organic_hallucinations_data)
+            llm_hallucinations_data = self._make_llm_hallucinations_data(
+                data, organic_hallucinations_data
+            )
             llm_hallucinations_data.push_to_hub(
                 repo_id=args.task_name + "_rm_synthetic_llm"
             )
@@ -166,6 +179,4 @@ class BaseTaskProcessor(abc.ABC):
         perl_data.push_to_hub(repo_id=args.task_name + "_perl")
 
         evaluation_data = self._make_evaluation_data(data)
-        evaluation_data.push_to_hub(
-            repo_id=args.task_name + "_final_test_set"
-        )
+        evaluation_data.push_to_hub(repo_id=args.task_name + "_final_test_set")

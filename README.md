@@ -20,6 +20,27 @@ export GEMINI_API_KEY="your-key-here"
     * When `(MODE)` is set to `score`, the `EVALUATOR_MODEL` scores the generations of the previous step, and a rate of hallucination is calculated using `THRESHOLD`. The evaluator uses `EVALUATOR_NUM_FEWSHOT` examples taken from `DATASET_LABELS` to help it classify the samples.
     * When `(MODE)` is set to `autoratereval`, the quality of the evaluator itself is evaluated. We ask for it to score the samples in `DATASET_LABELS`, and we return the best threshold along with the associated metrics.
 
+Refactored evaluator interface
+--------------------------------
+
+The evaluator logic has been refactored into a small dispatcher script and three pipeline implementations. The public entry point remains `evaluator.py` (and the thin wrapper `evaluator.sh`), but the behavior is now implemented in `scripts/pipelines.py`.
+
+How it maps to the old modes:
+- generate -> EvaluationGenerationPipeline: uses vLLM to create completions from `DATASET_PROMPTS` (supports LoRA adapters and optional few-shot prepending). The generated dataset is pushed to the Hugging Face Hub.
+- score -> EvaluationScoringPipeline: loads a dataset with completions (`DATASET_WITH_COMPLETIONS`), builds evaluator prompts (optionally few-shot), scores with a local model or with Gemini, and pushes the scored dataset back to the Hub.
+- autoratereval -> EvaluationAutoraterPipeline: evaluates the evaluator itself on `DATASET_LABELS`, computes AUC, best threshold, TPR/FPR/accuracy/precision, saves prompts, scores, metrics, ROC plot, and histogram to `logs/`.
+
+Usage notes (same CLI as before)
+--------------------------------
+The `evaluator.py` script still uses the same CLI arguments as before (see `scripts/evaluator_args.py`). If you previously used `evaluator.sh`, no change is necessary: it will call `evaluator.py` which now dispatches to the appropriate pipeline based on the CLI arguments (`evaluate_evaluator`, `dataset_with_completions`, etc.).
+
+Example (unchanged):
+```
+./evaluator.sh npov generate
+./evaluator.sh npov score
+./evaluator.sh npov autoratereval
+```
+
 Notice that you can chain commands, *e.g.* `./evaluator.sh npov generate ; ./evaluator.sh npov score`.
 
 We perform our experiments in a multi-GPU setting. More precisely, we use 8 x L4 GPUs. For an efficient use of GPU memory, we employ pipeline parallelism, specifically ZeRO Phase-3 [(link to paper)](https://arxiv.org/abs/1910.02054). To do so, we use Hugging Face's Accelerate library integration of Microsoft's DeepSpeed. The configuration used for our experiments is stored in `deepspeed_config.yaml` (you should run `accelerate config` to set up your environment, see [Accelerate's documentation](https://huggingface.co/docs/transformers/en/deepspeed) for more details).

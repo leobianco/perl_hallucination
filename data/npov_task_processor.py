@@ -400,6 +400,63 @@ class NPOVTaskProcessor(BaseTaskProcessor):
 
         return entry
 
+    @classmethod
+    def get_evaluator_prompt(cls):
+        """Return a function that builds evaluator prompts for NPOV entries.
+
+        The returned function has signature func(entry, fewshot_examples=None, use_true_label=False).
+        """
+
+        def npov_evaluator_prompt(
+            entry, fewshot_examples=None, use_true_label=False
+        ):
+            preamble = "<start_of_turn>user\nBelow are examples where an expert linguist identifies when the neutral natural language rewritings of arguments used to answer a user query contains additional arguments not present in the original list.<end_of_turn>\n"
+
+            template = "<start_of_turn>user\nUser query: {user_query}\n{perspective_1_name} arguments provided: {perspective_1}\n{perspective_2_name} arguments provided: {perspective_2}\nNeutral point-of-view answer to user query, rewriting provided arguments in natural language:{npov_response}\nExpert linguist review: the rewriting of the provided arguments contains additional arguments not present in the original list (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
+
+            response = (
+                entry["npov_response"]
+                if use_true_label
+                else entry["completion"]
+            )
+
+            formatted_prompt = template.format(
+                user_query=entry["user_query"],
+                perspective_1_name=entry["perspective_1_name"],
+                perspective_1=entry["perspective_1"],
+                perspective_2_name=entry["perspective_2_name"],
+                perspective_2=entry["perspective_2"],
+                npov_response=response,
+                ans="",
+            )
+
+            prompt = preamble
+
+            if fewshot_examples is not None:
+                for fewshot_example in fewshot_examples:
+                    fewshot_prompt = template.format(
+                        user_query=fewshot_example["user_query"],
+                        perspective_1_name=fewshot_example[
+                            "perspective_1_name"
+                        ],
+                        perspective_1=fewshot_example["perspective_1"],
+                        perspective_2_name=fewshot_example[
+                            "perspective_2_name"
+                        ],
+                        perspective_2=fewshot_example["perspective_2"],
+                        npov_response=fewshot_example["npov_response"],
+                        ans=fewshot_example["class_hall"],
+                    )
+                    prompt += fewshot_prompt + "<end_of_turn>\n"
+                prompt += formatted_prompt
+            else:
+                prompt += formatted_prompt
+
+            entry["evaluator_prompt"] = prompt
+            return entry
+
+        return npov_evaluator_prompt
+
     @staticmethod
     def _rm_prompt(entry):
         """Format a reward model prompt for an NPOV entry.
