@@ -27,7 +27,7 @@ import evaluate
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from datasets import Value, concatenate_datasets, load_dataset
+from datasets import Value, load_dataset
 from google import genai
 from huggingface_hub import snapshot_download
 from peft import LoraConfig, PeftModel, get_peft_model
@@ -90,7 +90,6 @@ class Pipeline(abc.ABC):
         self.trainer: Optional[Any] = None
 
     def run(self, *cli_args, **cli_kwargs):
-        # high level orchestration
         self.setup_arguments(*cli_args, **cli_kwargs)
         self.setup_tokenizer()
         self.load_data()
@@ -98,6 +97,23 @@ class Pipeline(abc.ABC):
         self.setup_model()
         self.setup_trainer()
         self.run_and_save()
+
+    def _get_task_processor(self, task_name: str):
+        """Return the TaskProcessor class for a given task name.
+
+        Centralizes the mapping between task_name strings and the
+        corresponding processor classes so callers don't need to repeat
+        the same small mapping block.
+        """
+        task_map = {
+            "npov": NPOVTaskProcessor,
+            "bosch": BoschTaskProcessor,
+            "ragtruth": RagtruthTaskProcessor,
+        }
+        processor_cls = task_map.get(task_name)
+        if processor_cls is None:
+            raise Exception(f"Unknown task: {task_name}")
+        return processor_cls
 
     @abc.abstractmethod
     def setup_arguments(self, *cli_args, **cli_kwargs):
@@ -179,15 +195,7 @@ class SFTPipeline(Pipeline):
             lora_dropout=self._lora_args.lora_dropout,
         )
 
-        task_map = {
-            "npov": NPOVTaskProcessor,
-            "bosch": BoschTaskProcessor,
-            "ragtruth": RagtruthTaskProcessor,
-        }
-
-        processor_cls = task_map.get(self.args.task_name)
-        if processor_cls is None:
-            raise Exception(f"Unknown task: {self.args.task_name}")
+        processor_cls = self._get_task_processor(self.args.task_name)
 
         fewshot_examples = None
         if (
@@ -294,49 +302,16 @@ class RewardModelPipeline(Pipeline):
         else:
             raise Exception("Not training in mixed precision!")
 
-        # Possibly augment dataset for synthetic_llm cases as in original
-        if self.args.dataset_repo_id.endswith("synthetic_llm"):
-            new_train_split = self.data["train"]
+        # Possibly augment dataset for synthetic_llm cases using the task
+        # processor extension point. 
+        processor_cls = self._get_task_processor(self.args.task_name)
 
-            if self._llm_synth_args.num_organic_hallus_to_keep > 0:
-                organic_dataset_name = (
-                    self.args.dataset_repo_id.removesuffix("synthetic_llm")
-                    + "organic"
-                )
-                organic_dataset = load_dataset(organic_dataset_name)
-                organic_hallus_to_keep = (
-                    organic_dataset["train"]
-                    .filter(lambda x: x["class_hall"] == "Yes")
-                    .shuffle(seed=self.training_args.seed)
-                    .select(
-                        range(self._llm_synth_args.num_organic_hallus_to_keep)
-                    )
-                )
-                new_train_split = concatenate_datasets(
-                    [new_train_split, organic_hallus_to_keep]
-                )
-
-            if self._llm_synth_args.num_struct_hallus_to_keep > 0:
-                struct_dataset_name = (
-                    self.args.dataset_repo_id.removesuffix("synthetic_llm")
-                    + "synthetic_struct"
-                )
-                struct_dataset = load_dataset(struct_dataset_name)
-                struct_hallus_to_keep = (
-                    struct_dataset["train"]
-                    .filter(lambda x: x["class_hall"] == "Yes")
-                    .shuffle(seed=self.training_args.seed)
-                    .select(
-                        range(self._llm_synth_args.num_struct_hallus_to_keep)
-                    )
-                )
-                new_train_split = concatenate_datasets(
-                    [new_train_split, struct_hallus_to_keep]
-                )
-
-            self.data["train"] = new_train_split.shuffle(
-                seed=self.training_args.seed
-            )
+        self.data["train"] = processor_cls.augment_training_split(
+            self.data["train"],
+            self._llm_synth_args,
+            self.training_args,
+            self.args.dataset_repo_id,
+        )
 
         # Tokenize and cast labels
         def encode(examples):
@@ -545,14 +520,7 @@ class EvaluationAutoraterPipeline(Pipeline):
 
     def process_data(self):
         # Map the evaluator prompt onto the dataset
-        task_map = {
-            "npov": NPOVTaskProcessor,
-            "bosch": BoschTaskProcessor,
-            "ragtruth": RagtruthTaskProcessor,
-        }
-        processor_cls = task_map.get(self.args.task_name)
-        if processor_cls is None:
-            raise Exception(f"Unknown task: {self.args.task_name}")
+        processor_cls = self._get_task_processor(self.args.task_name)
 
         prompt_fn = processor_cls.get_evaluator_prompt()
         # Map using fewshot examples if requested
@@ -857,12 +825,7 @@ class EvaluationScoringPipeline(Pipeline):
         self.evaluator.eval()
 
     def process_data(self):
-        task_map = {
-            "npov": NPOVTaskProcessor,
-            "bosch": BoschTaskProcessor,
-            "ragtruth": RagtruthTaskProcessor,
-        }
-        processor_cls = task_map.get(self.args.task_name)
+        processor_cls = self._get_task_processor(self.args.task_name)
         prompt_fn = processor_cls.get_evaluator_prompt()
         fewshot_examples = None
         if (

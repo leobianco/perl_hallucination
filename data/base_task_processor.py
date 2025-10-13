@@ -1,4 +1,6 @@
 import abc
+from datasets import load_dataset, concatenate_datasets
+from typing import Any
 
 
 class BaseTaskProcessor(abc.ABC):
@@ -136,6 +138,63 @@ class BaseTaskProcessor(abc.ABC):
         and return the entry with an added 'evaluator_prompt' field.
         """
         raise NotImplementedError()
+
+    @classmethod
+    def augment_training_split(
+        cls,
+        train_split: Any,
+        llm_synth_args,
+        training_args,
+        dataset_repo_id: str,
+    ):
+        """Optionally augment a training split when synthetic LLM data is used.
+
+        Default implementation mirrors the previous inline logic used in
+        RewardModelPipeline: if `dataset_repo_id` ends with "synthetic_llm",
+        it will load the corresponding 'organic' and 'synthetic_struct'
+        datasets and sample a fixed number of positive (hallucination)
+        examples to append to the train split. Returns the (possibly)
+        augmented training split.
+        """
+
+        new_train_split = train_split
+
+        if dataset_repo_id.endswith("synthetic_llm"):
+            # organic
+            if getattr(llm_synth_args, "num_organic_hallus_to_keep", 0) > 0:
+                organic_dataset_name = (
+                    dataset_repo_id.removesuffix("synthetic_llm") + "organic"
+                )
+                organic_dataset = load_dataset(organic_dataset_name)
+                organic_hallus_to_keep = (
+                    organic_dataset["train"]
+                    .filter(lambda x: x["class_hall"] == "Yes")
+                    .shuffle(seed=training_args.seed)
+                    .select(range(getattr(llm_synth_args, "num_organic_hallus_to_keep")))
+                )
+                new_train_split = concatenate_datasets(
+                    [new_train_split, organic_hallus_to_keep]
+                )
+
+            # structured synthetic
+            if getattr(llm_synth_args, "num_struct_hallus_to_keep", 0) > 0:
+                struct_dataset_name = (
+                    dataset_repo_id.removesuffix("synthetic_llm") + "synthetic_struct"
+                )
+                struct_dataset = load_dataset(struct_dataset_name)
+                struct_hallus_to_keep = (
+                    struct_dataset["train"]
+                    .filter(lambda x: x["class_hall"] == "Yes")
+                    .shuffle(seed=training_args.seed)
+                    .select(range(getattr(llm_synth_args, "num_struct_hallus_to_keep")))
+                )
+                new_train_split = concatenate_datasets(
+                    [new_train_split, struct_hallus_to_keep]
+                )
+
+            new_train_split = new_train_split.shuffle(seed=training_args.seed)
+
+        return new_train_split
 
     def run(self):
         args = self.args

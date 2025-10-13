@@ -1,8 +1,6 @@
 from argparse import ArgumentParser
 
-from data.bosch_task_processor import BoschTaskProcessor
-from data.npov_task_processor import NPOVTaskProcessor
-from data.ragtruth_task_processor import RagtruthTaskProcessor
+from scripts.pipelines import Pipeline
 
 
 def main():
@@ -26,16 +24,7 @@ def main():
     parser.add_argument("--synth_llm_num_fewshot", type=int, default=2)
     args = parser.parse_args()
 
-    task_map = {
-        "npov": NPOVTaskProcessor,
-        "bosch": BoschTaskProcessor,
-        "ragtruth": RagtruthTaskProcessor,
-    }
-
-    processor_cls = task_map.get(args.task_name)
-    if processor_cls is None:
-        raise ValueError(f"Unknown task: {args.task_name}")
-
+    processor_cls = Pipeline()._get_task_processor(args.task_name)
     processor = processor_cls(args)
     processor.run()
 
