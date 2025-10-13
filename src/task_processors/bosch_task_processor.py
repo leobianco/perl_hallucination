@@ -1,13 +1,14 @@
 import random
 
 import nltk
-
-nltk.download("punkt_tab")
 from datasets import DatasetDict, concatenate_datasets, load_dataset
 from google import genai
 from google.genai import types
 
-from data.base_task_processor import BaseTaskProcessor
+from .base_task_processor import BaseTaskProcessor
+
+# Ensure punkt_tab tokenizer is available
+nltk.download("punkt_tab")
 
 
 class BoschTaskProcessor(BaseTaskProcessor):

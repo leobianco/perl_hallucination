@@ -9,8 +9,8 @@ implementations.
 
 from transformers import HfArgumentParser, set_seed
 
-from src.evaluator_args import ScriptArguments as EvalArgs
 from src.pipelines import (
+    EvalArgs,
     EvaluationAutoraterPipeline,
     EvaluationGenerationPipeline,
     EvaluationScoringPipeline,

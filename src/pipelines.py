@@ -27,7 +27,7 @@ import evaluate
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from datasets import Value, load_dataset
+from datasets import Value, concatenate_datasets, load_dataset
 from google import genai
 from huggingface_hub import snapshot_download
 from peft import LoraConfig, PeftModel, get_peft_model
@@ -36,6 +36,7 @@ from sklearn.metrics import (
     precision_score,
     roc_auc_score,
 )
+from tqdm import tqdm
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForSequenceClassification,
@@ -57,16 +58,11 @@ from trl import (
 from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
 
-from data.bosch_task_processor import BoschTaskProcessor
-from data.npov_task_processor import NPOVTaskProcessor
-from data.ragtruth_task_processor import RagtruthTaskProcessor
-from src.evaluator_args import ScriptArguments as EvalArgs
-from src.evaluator_utils import (
-    evaluator_score,
-    gemini_score_dataset,
-    get_fewshot_examples,
-)
+from src.task_processors.bosch_task_processor import BoschTaskProcessor
+from src.task_processors.npov_task_processor import NPOVTaskProcessor
+from src.task_processors.ragtruth_task_processor import RagtruthTaskProcessor
 from src.utils import (
+    EvalArguments,
     LLMSynthScriptArguments,
     ScriptArguments,
     compute_best_roc_threshold,
@@ -120,7 +116,10 @@ class Pipeline(abc.ABC):
         raise NotImplementedError()
 
     def setup_tokenizer(self):
-        # Default tokenizer loading uses self.args.model_repo_id or training args
+        """
+        Default tokenizer loading uses self.args.model_repo_id or training args.
+        Subclasses may override if they need a different tokenizer setup.
+        """
         model_repo = getattr(self.args, "model_repo_id", None) or getattr(
             self.training_args, "sft_model_path", None
         )
@@ -303,7 +302,7 @@ class RewardModelPipeline(Pipeline):
             raise Exception("Not training in mixed precision!")
 
         # Possibly augment dataset for synthetic_llm cases using the task
-        # processor extension point. 
+        # processor extension point.
         processor_cls = self._get_task_processor(self.args.task_name)
 
         self.data["train"] = processor_cls.augment_training_split(
@@ -492,11 +491,93 @@ class PERLPipeline(Pipeline):
         print(f"Logs saved to {filepath}")
 
 
-class EvaluationAutoraterPipeline(Pipeline):
+class EvaluationPipeline(Pipeline):
+    """Base class for evaluator flows. Provides helper methods previously
+    implemented in `evaluator_utils.py` so evaluation pipelines can call
+    them as instance methods and share configuration/state.
+    """
+
+    def get_fewshot_examples(self, data, n_yes: int, n_no: int, seed: int):
+        if n_yes == 0 and n_no == 0:
+            return None
+        positive_examples = (
+            data.filter(lambda entry: entry["class_hall"] == "Yes")
+            .shuffle(seed=seed)
+            .select(range(n_yes))
+        )
+        negative_examples = (
+            data.filter(lambda entry: entry["class_hall"] == "No")
+            .shuffle(seed=seed)
+            .select(range(n_no))
+        )
+        fewshot_examples = (
+            concatenate_datasets(
+                [positive_examples, negative_examples]
+            ).shuffle(seed=seed)
+            if positive_examples is not None
+            else None
+        )
+        return fewshot_examples
+
+    def evaluator_score_batch(
+        self, evaluator, tokenized_prompts, yes_token_id, no_token_id
+    ):
+        with torch.no_grad():
+            outputs = evaluator(**tokenized_prompts, use_cache=False)
+            score_yes = torch.exp(outputs.logits[:, -1, yes_token_id])
+            score_no = torch.exp(outputs.logits[:, -1, no_token_id])
+            score_batch = score_no / (score_yes + score_no)
+        return score_batch
+
+    def evaluator_score(
+        self, data, script_args, tokenizer, evaluator, yes_token_id, no_token_id
+    ):
+        iterator = data.iter(batch_size=script_args.eval_batch_size)
+        num_batches = int(data.num_rows / script_args.eval_batch_size)
+        scores = torch.tensor([])
+        for batch in tqdm(
+            iterator, desc="Evaluator scoring", total=num_batches
+        ):
+            tokenized_prompts = tokenizer(
+                batch["evaluator_prompt"],
+                return_tensors="pt",
+                padding="longest",
+            )
+            tokenized_prompts = {
+                k: v.to(evaluator.device) for k, v in tokenized_prompts.items()
+            }
+            score_batch = self.evaluator_score_batch(
+                evaluator, tokenized_prompts, yes_token_id, no_token_id
+            )
+            score_batch = score_batch.cpu()
+            scores = torch.cat((scores, score_batch))
+            del tokenized_prompts
+        return scores
+
+    def gemini_score_dataset(self, client, dataset, script_args):
+        model = "gemini-2.0-flash-001"
+        scores = []
+        for entry in dataset:
+            resp = client.models.generate_content(
+                model=model, contents=entry["evaluator_prompt"]
+            )
+            # reproduce gemini score response logic
+            if resp.candidates[0].avg_logprobs is None:
+                scores.append(0)
+            elif resp.text == "No":
+                scores.append(np.exp(resp.candidates[0].avg_logprobs))
+            elif resp.text == "Yes":
+                scores.append(1 - np.exp(resp.candidates[0].avg_logprobs))
+            else:
+                raise Exception("Invalid response")
+        return torch.tensor(scores)
+
+
+class EvaluationAutoraterPipeline(EvaluationPipeline):
     """Pipeline for the autorater evaluation (script_args.evaluate_evaluator == True)."""
 
     def setup_arguments(self, *cli_args, **cli_kwargs):
-        parser = HfArgumentParser(EvalArgs)
+        parser = HfArgumentParser(EvalArguments)
         script_args = parser.parse_args_into_dataclasses()[0]
         self.args = script_args
         set_seed(self.args.seed)
@@ -532,7 +613,7 @@ class EvaluationAutoraterPipeline(Pipeline):
             # derive fewshot examples from the loaded dataset
             n_yes = self.args.evaluator_num_fewshot // 2
             n_no = self.args.evaluator_num_fewshot - n_yes
-            fewshot_examples = get_fewshot_examples(
+            fewshot_examples = self.get_fewshot_examples(
                 self.data, n_yes, n_no, self.args.seed
             )
 
@@ -559,12 +640,12 @@ class EvaluationAutoraterPipeline(Pipeline):
         # Score using evaluator (either gemini or local model)
         if self.args.use_gemini:
             client = genai.Client(api_key=self.args.gemini_api_key)
-            scores = gemini_score_dataset(client, self.data, self.args)
+            scores = self.gemini_score_dataset(client, self.data, self.args)
         else:
             # Tokenize in batches and compute scores using tokenizer token ids for Yes/No
             yes_token_id = self.tokenizer.convert_tokens_to_ids("Yes")
             no_token_id = self.tokenizer.convert_tokens_to_ids("No")
-            scores = evaluator_score(
+            scores = self.evaluator_score(
                 self.data,
                 self.args,
                 self.tokenizer,
@@ -678,11 +759,11 @@ class EvaluationAutoraterPipeline(Pipeline):
         )
 
 
-class EvaluationGenerationPipeline(Pipeline):
+class EvaluationGenerationPipeline(EvaluationPipeline):
     """Pipeline for generation: create completions with writer model."""
 
     def setup_arguments(self, *cli_args, **cli_kwargs):
-        parser = HfArgumentParser(EvalArgs)
+        parser = HfArgumentParser(EvalArguments)
         self.args = parser.parse_args_into_dataclasses()[0]
         set_seed(self.args.seed)
 
@@ -717,7 +798,7 @@ class EvaluationGenerationPipeline(Pipeline):
                 self.args.dataset_labels,
                 split=self.args.dataset_labels_split,
             )
-            fewshot_examples = get_fewshot_examples(
+            fewshot_examples = self.get_fewshot_examples(
                 fewshot_data,
                 n_yes=0,
                 n_no=self.args.writer_num_fewshot,
@@ -793,11 +874,11 @@ class EvaluationGenerationPipeline(Pipeline):
         self.dataset_prompts.push_to_hub(f"{self.args.user}/{name_for_saving}")
 
 
-class EvaluationScoringPipeline(Pipeline):
+class EvaluationScoringPipeline(EvaluationPipeline):
     """Pipeline for scoring existing dataset with completions."""
 
     def setup_arguments(self, *cli_args, **cli_kwargs):
-        parser = HfArgumentParser(EvalArgs)
+        parser = HfArgumentParser(EvalArguments)
         self.args = parser.parse_args_into_dataclasses()[0]
         set_seed(self.args.seed)
 
@@ -838,7 +919,7 @@ class EvaluationScoringPipeline(Pipeline):
             )
             n_yes = self.args.evaluator_num_fewshot // 2
             n_no = self.args.evaluator_num_fewshot - n_yes
-            fewshot_examples = get_fewshot_examples(
+            fewshot_examples = self.get_fewshot_examples(
                 label_data, n_yes, n_no, self.args.seed
             )
         self.val_data = self.val_data.map(
@@ -849,11 +930,11 @@ class EvaluationScoringPipeline(Pipeline):
         # Score dataset using tokenizer and evaluator (support gemini)
         if self.args.use_gemini:
             client = genai.Client(api_key=self.args.gemini_api_key)
-            scores = gemini_score_dataset(client, self.val_data, self.args)
+            scores = self.gemini_score_dataset(client, self.val_data, self.args)
         else:
             yes_token_id = self.tokenizer.convert_tokens_to_ids("Yes")
             no_token_id = self.tokenizer.convert_tokens_to_ids("No")
-            scores = evaluator_score(
+            scores = self.evaluator_score(
                 self.val_data,
                 self.args,
                 self.tokenizer,

@@ -1,6 +1,4 @@
-from datasets import load_dataset
-
-from data.base_task_processor import BaseTaskProcessor
+from .base_task_processor import BaseTaskProcessor
 
 
 class RagtruthTaskProcessor(BaseTaskProcessor):

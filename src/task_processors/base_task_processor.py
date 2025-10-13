@@ -1,6 +1,7 @@
 import abc
-from datasets import load_dataset, concatenate_datasets
 from typing import Any
+
+from datasets import concatenate_datasets, load_dataset
 
 
 class BaseTaskProcessor(abc.ABC):
@@ -170,7 +171,13 @@ class BaseTaskProcessor(abc.ABC):
                     organic_dataset["train"]
                     .filter(lambda x: x["class_hall"] == "Yes")
                     .shuffle(seed=training_args.seed)
-                    .select(range(getattr(llm_synth_args, "num_organic_hallus_to_keep")))
+                    .select(
+                        range(
+                            getattr(
+                                llm_synth_args, "num_organic_hallus_to_keep"
+                            )
+                        )
+                    )
                 )
                 new_train_split = concatenate_datasets(
                     [new_train_split, organic_hallus_to_keep]
@@ -179,14 +186,19 @@ class BaseTaskProcessor(abc.ABC):
             # structured synthetic
             if getattr(llm_synth_args, "num_struct_hallus_to_keep", 0) > 0:
                 struct_dataset_name = (
-                    dataset_repo_id.removesuffix("synthetic_llm") + "synthetic_struct"
+                    dataset_repo_id.removesuffix("synthetic_llm")
+                    + "synthetic_struct"
                 )
                 struct_dataset = load_dataset(struct_dataset_name)
                 struct_hallus_to_keep = (
                     struct_dataset["train"]
                     .filter(lambda x: x["class_hall"] == "Yes")
                     .shuffle(seed=training_args.seed)
-                    .select(range(getattr(llm_synth_args, "num_struct_hallus_to_keep")))
+                    .select(
+                        range(
+                            getattr(llm_synth_args, "num_struct_hallus_to_keep")
+                        )
+                    )
                 )
                 new_train_split = concatenate_datasets(
                     [new_train_split, struct_hallus_to_keep]
