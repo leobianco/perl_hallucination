@@ -10,7 +10,7 @@ Usage: call the associated shell script along with the corresponding task. E.g.:
     ./writer_sft.sh npov
 """
 
-from scripts.pipelines import SFTPipeline
+from src.pipelines import SFTPipeline
 
 
 def main():

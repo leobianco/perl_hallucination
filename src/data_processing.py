@@ -1,6 +1,6 @@
 from argparse import ArgumentParser
 
-from scripts.pipelines import Pipeline
+from src.pipelines import Pipeline
 
 
 def main():

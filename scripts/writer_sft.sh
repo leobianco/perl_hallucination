@@ -35,7 +35,7 @@ fi
 
 accelerate launch \
   --config_file="${DEEPSPEED_CONFIG}" \
-  writer_sft.py \
+  src/writer_sft.py \
   -- \
   --task_name "$TASK_NAME" \
   --report_to "wandb" \

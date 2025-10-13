@@ -60,13 +60,13 @@ from vllm.lora.request import LoRARequest
 from data.bosch_task_processor import BoschTaskProcessor
 from data.npov_task_processor import NPOVTaskProcessor
 from data.ragtruth_task_processor import RagtruthTaskProcessor
-from scripts.evaluator_args import ScriptArguments as EvalArgs
-from scripts.evaluator_utils import (
+from src.evaluator_args import ScriptArguments as EvalArgs
+from src.evaluator_utils import (
     evaluator_score,
     gemini_score_dataset,
     get_fewshot_examples,
 )
-from scripts.utils import (
+from src.utils import (
     LLMSynthScriptArguments,
     ScriptArguments,
     compute_best_roc_threshold,

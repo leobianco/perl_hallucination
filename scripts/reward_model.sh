@@ -69,7 +69,7 @@ fi
 
 accelerate launch \
   --config_file="${DEEPSPEED_CONFIG}" \
-  reward_model.py \
+  src/reward_model.py \
   -- \
   --task_name "$TASK_NAME" \
   --seed "$SEED" \

@@ -43,7 +43,7 @@ fi
 
 accelerate launch \
   --config_file="${DEEPSPEED_CONFIG}" \
-  perl.py \
+  src/perl.py \
   -- \
   --task_name "$TASK_NAME" \
   --seed "$SEED" \
