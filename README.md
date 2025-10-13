@@ -4,7 +4,7 @@ This project studies the reduction of hallucinations via RLAIF with *synthetic* 
 
 ## Usage
 
-Here is a brief description about the usage of each script, roughly in the order that they should be executed. Substitute `TASK` by `npov`, `bosch`, or `ragtruth` to select the correct dataset. Every `.sh` script runs the `.py` script with the same name with the corresponding parameters set. Run the scripts from the top-most project folder, in order to have the path correctly set.
+Here is a brief description about the usage of each script, roughly in the order that they should be executed. Substitute `TASK` by `npov`, `bosch`, or `ragtruth` to select the correct dataset. Every `.sh` script runs the corresponding Python entrypoint located under `src/` (for example `src/writer_sft.py`). Run the scripts from the top-most project folder so paths resolve correctly.
 
 Please, set the Gemini API key in order to use the LLM-generated synthetic data, as well as the autorater:
 ```
@@ -23,7 +23,7 @@ export GEMINI_API_KEY="your-key-here"
 Refactored evaluator interface
 --------------------------------
 
-The evaluator logic has been refactored into a small dispatcher script and three pipeline implementations. The public entry point remains `evaluator.py` (and the thin wrapper `evaluator.sh`), but the behavior is now implemented in `scripts/pipelines.py`.
+The evaluator logic has been refactored into a small dispatcher script and three pipeline implementations. The public entry point remains `evaluator.py` (and the thin wrapper `evaluator.sh`), but the behavior is now implemented in `src/pipelines.py`.
 
 How it maps to the old modes:
 - generate -> EvaluationGenerationPipeline: uses vLLM to create completions from `DATASET_PROMPTS` (supports LoRA adapters and optional few-shot prepending). The generated dataset is pushed to the Hugging Face Hub.
@@ -32,7 +32,15 @@ How it maps to the old modes:
 
 Usage notes (same CLI as before)
 --------------------------------
-The `evaluator.py` script still uses the same CLI arguments as before (see `scripts/evaluator_args.py`). If you previously used `evaluator.sh`, no change is necessary: it will call `evaluator.py` which now dispatches to the appropriate pipeline based on the CLI arguments (`evaluate_evaluator`, `dataset_with_completions`, etc.).
+The `evaluator.py` script still uses the same CLI surface as before; the CLI dataclass has been inlined into `src/pipelines.py` and is exposed there as `EvalArgs`. If you previously used `evaluator.sh`, no change is necessary: it will call `evaluator.py` which dispatches to the appropriate pipeline based on the CLI arguments (`evaluate_evaluator`, `dataset_with_completions`, etc.).
+
+If you prefer package-style invocation (recommended for consistent imports), run the entrypoints with module mode, for example:
+
+```bash
+python -m src.evaluator --help
+python -m src.writer_sft --help
+```
+Or, from the shell scripts, use `python -m src.<module>` in place of `python src/<module>.py`.
 
 Example (unchanged):
 ```
