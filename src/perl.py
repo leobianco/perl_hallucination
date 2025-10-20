@@ -9,7 +9,7 @@ Usage: call the associated shell script along with the corresponding task. E.g.:
 
 import torch
 
-from src.pipelines import PERLPipeline
+from .pipelines import PERLPipeline
 
 
 def no_compile(model, *args, **kwargs):

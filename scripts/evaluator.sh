@@ -38,7 +38,7 @@ fi
 
 if [ "$2" == "generate" ]; then
     echo "Running in generation mode..."
-    python3 src/evaluator.py \
+    python3 -m src.evaluator \
         --task_name "$TASK_NAME" \
         --user "$USER" \
         --seed "$SEED" \
@@ -56,7 +56,7 @@ if [ "$2" == "generate" ]; then
 elif [ "$2" == "score" ]; then
     DATASET_WITH_COMPLETIONS="${USER}/eval_${RUN_IDENTIFIER#*/}_gens_T${TEMPERATURE}_wfs${WRITER_NUM_FEWSHOT}"
     echo "Running in scoring mode..."
-    python3 src/evaluator.py \
+    python3 -m src.evaluator \
         --task_name "$TASK_NAME" \
         --user "$USER" \
         --seed "$SEED" \
@@ -72,7 +72,7 @@ elif [ "$2" == "score" ]; then
         --dataset_with_completions "$DATASET_WITH_COMPLETIONS"
 elif [ "$2" == "autoratereval" ]; then
     echo "Running in autoratereval mode..."
-    python3 src/evaluator.py \
+    python3 -m src.evaluator \
         --task_name "$TASK_NAME" \
         --user "$USER" \
         --seed "$SEED" \

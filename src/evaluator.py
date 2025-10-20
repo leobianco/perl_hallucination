@@ -9,7 +9,7 @@ implementations.
 
 from transformers import HfArgumentParser, set_seed
 
-from src.pipelines import (
+from .pipelines import (
     EvalArgs,
     EvaluationAutoraterPipeline,
     EvaluationGenerationPipeline,

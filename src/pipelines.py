@@ -58,10 +58,10 @@ from trl import (
 from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
 
-from src.task_processors.bosch_task_processor import BoschTaskProcessor
-from src.task_processors.npov_task_processor import NPOVTaskProcessor
-from src.task_processors.ragtruth_task_processor import RagtruthTaskProcessor
-from src.utils import (
+from .task_processors.bosch_task_processor import BoschTaskProcessor
+from .task_processors.npov_task_processor import NPOVTaskProcessor
+from .task_processors.ragtruth_task_processor import RagtruthTaskProcessor
+from .utils import (
     EvalArguments,
     LLMSynthScriptArguments,
     ScriptArguments,

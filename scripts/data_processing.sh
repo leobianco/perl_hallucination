@@ -23,7 +23,7 @@ if [ -z "${GEMINI_API_KEY}" ]; then
 fi
 
 # Run script
-python3 src/data_processing.py \
+python3 -m src.data_processing \
     --task_name "$TASK_NAME" \
     --seed "$SEED" \
     --hf_repo "$HF_REPO" \
