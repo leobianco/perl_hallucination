@@ -1,6 +1,6 @@
 # Hallucination Reduction with PERL and Synthetic Data Generation
 
-This project studies the reduction of hallucinations via RLAIF with *synthetic* data.
+This project studies the reduction of hallucinations via RLAIF with *synthetic* data. More precisely, we use Parameter-Efficient Reinforcement Learning [PE-RL](https://arxiv.org/abs/2403.10704).
 
 ## Usage
 
@@ -45,7 +45,7 @@ then install them:
 pip install -r requirements.txt
 ```
 
-*Note:* `pip-compile` can be slow. For this reason I recommend using [uv](https://docs.astral.sh/uv/), a Python package manager written in Rust that is much faster. After installing it, run
+*Note:* `pip-compile` can be slow. For this reason we recommend using [uv](https://docs.astral.sh/uv/), a Python package manager written in Rust that is much faster. After installing it, run
 ```
 uv pip compile requirements.in > requirements.txt
 pip install -r requirements.txt

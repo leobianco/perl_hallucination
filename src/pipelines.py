@@ -1,8 +1,5 @@
 """
-pipelines.py
-
-Defines an abstract Pipeline class and concrete pipeline implementations for
-SFT (writer_sft), reward model training, and PERL (rlhf) workflows.
+Defines an abstract Pipeline class and concrete pipeline implementations for SFT (writer_sft), reward model training, and PERL (rlhf) workflows. Also defines EvaluationPipeline and concrete classes corresponding to each step of the evaluation procedure (autorater evaluation, completion generation, scoring of completions).
 
 Each pipeline implements the sequence of steps described in the project:
 1. setup_arguments
@@ -12,15 +9,13 @@ Each pipeline implements the sequence of steps described in the project:
 5. setup_model
 6. setup_trainer
 7. run_and_save
-
-The goal is to centralize common code and make the three scripts thin wrappers
-that create and run the appropriate pipeline.
 """
 
 from __future__ import annotations
 
 import abc
 import os
+import time
 from typing import Any, Optional
 
 import evaluate
@@ -29,6 +24,7 @@ import numpy as np
 import torch
 from datasets import Value, concatenate_datasets, load_dataset
 from google import genai
+from google.genai import types
 from huggingface_hub import snapshot_download
 from peft import LoraConfig, PeftModel, get_peft_model
 from sklearn.metrics import (
@@ -138,11 +134,7 @@ class Pipeline(abc.ABC):
 
 
 class SFTPipeline(Pipeline):
-    """Pipeline for supervised fine-tuning (writer_sft.py).
-
-    This class re-implements the logic that was previously in writer_sft.py but
-    keeps the external script as a thin wrapper.
-    """
+    """Pipeline for supervised fine-tuning (writer_sft.py)."""
 
     def setup_arguments(self, *cli_args, **cli_kwargs):
         parser_lora = create_lora_argument_parser()
@@ -243,7 +235,6 @@ class RewardModelPipeline(Pipeline):
         parser_lora = create_lora_argument_parser()
         lora_args, remaining_args = parser_lora.parse_known_args()
 
-        # HfArgumentParser equivalence: we'll import TrainingArguments through HfArgumentParser in the original script
         parser = HfArgumentParser(
             (ScriptArguments, LLMSynthScriptArguments, TrainingArguments)
         )
@@ -261,7 +252,6 @@ class RewardModelPipeline(Pipeline):
         self.data = load_dataset(self.args.dataset_repo_id)
 
     def process_data(self):
-        # Build lora config
         self._lora_config = LoraConfig(
             r=self._lora_args.lora_r,
             lora_alpha=self._lora_args.lora_alpha,
@@ -270,11 +260,9 @@ class RewardModelPipeline(Pipeline):
             peft_type=self._lora_args.peft_type,
         )
 
-        # Tokenizer pad token already set in base
         data_collator = DataCollatorWithPadding(tokenizer=self.tokenizer)
         self.data_collator = data_collator
 
-        # Determine torch dtype from training args
         if self.training_args.fp16:
             self.torch_dtype = torch.float16
         elif self.training_args.bf16:
@@ -328,7 +316,7 @@ class RewardModelPipeline(Pipeline):
 
         self.model = get_peft_model(self.model, self._lora_config)
 
-        # adjust score parameters as in original
+        # adjust score parameters
         self.model.score.requires_grad_()
         with torch.no_grad():
             self.model.score.weight.mul_(0.1)
@@ -401,7 +389,6 @@ class PERLPipeline(Pipeline):
         self.data = load_dataset(self.args.dataset_repo_id)
 
     def process_data(self):
-        # Tokenize data similarly to original perl.py
         def encode(examples):
             return self.tokenizer(
                 examples["prompt"],
@@ -539,23 +526,171 @@ class EvaluationPipeline(Pipeline):
             del tokenized_prompts
         return scores
 
+    def gemini_score_response(self, response):
+        """Converts a Gemini API response to a normalized score.
+
+        Args:
+            response (google.genai.types.GenerateContentResponse): Gemini API response.
+
+        Returns:
+            float: Normalized score for the response.
+        """
+
+        if response.candidates[0].avg_logprobs is None:
+            return 0
+        if response.text == "No":
+            return np.exp(response.candidates[0].avg_logprobs)
+        elif response.text == "Yes":
+            return 1 - np.exp(response.candidates[0].avg_logprobs)
+        else:
+            raise Exception("Invalid response")
+
     def gemini_score_dataset(self, client, dataset, script_args):
+        """Scores a dataset using the Gemini API, with checkpointing and retries.
+
+        Args:
+            client (google.genai.Client): Initialized Gemini API client.
+            dataset (datasets.Dataset): Dataset with 'evaluator_prompt' column.
+            script_args (ScriptArguments): Parsed script arguments.
+
+        Returns:
+            torch.Tensor: Scores for each entry in the dataset.
+        """
+
         model = "gemini-2.0-flash-001"
-        scores = []
-        for entry in dataset:
-            resp = client.models.generate_content(
-                model=model, contents=entry["evaluator_prompt"]
-            )
-            # reproduce gemini score response logic
-            if resp.candidates[0].avg_logprobs is None:
-                scores.append(0)
-            elif resp.text == "No":
-                scores.append(np.exp(resp.candidates[0].avg_logprobs))
-            elif resp.text == "Yes":
-                scores.append(1 - np.exp(resp.candidates[0].avg_logprobs))
-            else:
-                raise Exception("Invalid response")
-        return torch.tensor(scores)
+        schema = {"type": "STRING", "enum": ["No", "Yes"]}
+        print("Calling the Gemini API...")
+
+        # Prepare local checkpoint directory
+        checkpoint_dir = os.path.join("checkpoints", "eval")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        # Use only the dataset name after the slash for checkpoint filename
+        if (
+            script_args.dataset_with_completions
+            and "/" in script_args.dataset_with_completions
+        ):
+            dataset_name = script_args.dataset_with_completions.split("/", 1)[1]
+        else:
+            dataset_name = str(script_args.dataset_with_completions)
+        checkpoint_path = os.path.join(
+            checkpoint_dir,
+            f"{dataset_name}_scores_checkpoint.pt",
+        )
+
+        # Initialize scores: load from checkpoint if exists, else from dataset or None
+        if os.path.exists(checkpoint_path):
+            print(f"Loading scores from checkpoint: {checkpoint_path}")
+            scores = torch.load(checkpoint_path)
+            # If checkpoint is shorter than dataset (e.g. dataset updated), pad with None
+            if len(scores) < len(dataset):
+                scores = list(scores) + [None] * (len(dataset) - len(scores))
+            elif len(scores) > len(dataset):
+                scores = list(scores)[: len(dataset)]
+        elif "scores" in dataset.column_names:
+            scores = list(dataset["scores"])
+        else:
+            scores = [None] * len(dataset)
+
+        queries_per_minute = 2000
+        time_window = 60
+        query_count = 0
+        start_time = time.time()
+        save_frequency = 50  # Save progress every 50 entries
+        server_retry_wait = 20  # seconds to wait between server error retries
+        server_max_retries = 3  # number of times to retry on server error
+        entries_to_score = [i for i, score in enumerate(scores) if score is None]
+        print(f"Found {len(entries_to_score)} entries that need scoring...")
+
+        try:
+            for n, idx in enumerate(
+                tqdm(entries_to_score, desc="Scoring with Gemini API")
+            ):
+                elapsed_time = time.time() - start_time
+                if query_count == (queries_per_minute - 1):
+                    if elapsed_time < time_window:
+                        wait_time = time_window - elapsed_time
+                        print(
+                            f"Wait {wait_time:.2f} seconds to avoid API rate limit..."
+                        )
+                        time.sleep(wait_time + 1)
+                    query_count = 0
+                    start_time = time.time()
+
+                retry_count = 0
+                while retry_count < server_max_retries:
+                    try:
+                        response = client.models.generate_content(
+                            model=model,
+                            contents=dataset[idx]["evaluator_prompt"],
+                            config=types.GenerateContentConfig(
+                                response_mime_type="text/x.enum",
+                                response_schema=schema,
+                                temperature=0,
+                                max_output_tokens=1,
+                                seed=script_args.seed,
+                            ),
+                        )
+                        scores[idx] = self.gemini_score_response(response)
+                        query_count += 1
+                        break  # Success, break out of retry loop
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        if (
+                            "unavailable" in error_str
+                            or "overloaded" in error_str
+                            or "overcharged" in error_str
+                            or "server" in error_str
+                        ) and retry_count < server_max_retries - 1:
+                            print(
+                                f"Server unavailable/overloaded at entry {idx}, attempt {retry_count + 1}/{server_max_retries}. Waiting {server_retry_wait} seconds before retrying..."
+                            )
+                            time.sleep(server_retry_wait)
+                            retry_count += 1
+                            continue
+                        else:
+                            raise  # Not a server error or max retries reached
+
+                # Save progress periodically to local file
+                if (n + 1) % save_frequency == 0:
+                    print(f"\nSaving progress locally after {n + 1} new entries...")
+                    try:
+                        torch.save(scores, checkpoint_path)
+                    except Exception as e:
+                        print(
+                            f"Warning: Could not save intermediate progress locally: {e}"
+                        )
+
+        except Exception as e:
+            print(f"\nError encountered at entry {idx}: {str(e)}")
+            print("Saving current progress locally...")
+            try:
+                torch.save(scores, checkpoint_path)
+            except Exception as save_error:
+                print(f"Error saving progress locally: {save_error}")
+            raise e
+
+        # Final save after all scoring is done
+        dataset = (
+            dataset.remove_columns("scores")
+            if "scores" in dataset.column_names
+            else dataset
+        )
+        dataset = dataset.add_column("scores", scores)
+        if (
+            hasattr(script_args, "dataset_with_completions")
+            and script_args.dataset_with_completions
+        ):
+            try:
+                dataset.push_to_hub(script_args.dataset_with_completions)
+            except Exception as e:
+                print(f"Warning: Could not save final progress to hub: {e}")
+        # Remove local checkpoint after successful push
+        if os.path.exists(checkpoint_path):
+            os.remove(checkpoint_path)
+
+        # Convert scores to tensor, replacing any remaining None with 0
+        scores_tensor = torch.tensor([s if s is not None else 0 for s in scores])
+        return scores_tensor
 
 
 class EvaluationAutoraterPipeline(EvaluationPipeline):
@@ -611,7 +746,7 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
         )
 
     def setup_model(self):
-        # Load evaluator as causal LM (same as original evaluator.py) and set eval mode
+        # Load evaluator as causal LM and set eval mode
         if not self.args.use_gemini:
             self.evaluator = AutoModelForCausalLM.from_pretrained(
                 self.args.evaluator_model,
@@ -638,7 +773,7 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
                 no_token_id,
             )
 
-        # Compute metrics (restore original evaluator metrics & plotting)
+        # Compute metrics
         ground_truth = self.data["label"]
 
         # Save evaluator prompts
@@ -767,7 +902,7 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
             for i in range(self.dataset_prompts.num_rows)
         ]
 
-        # Prepend few-shot examples if requested (same behavior as original evaluator.py)
+        # Prepend few-shot examples if requested
         if (
             self.args.writer_num_fewshot > 0
             and self.args.dataset_labels is not None
@@ -796,7 +931,7 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
             else True
         )
         self.enable_lora = enable_lora
-        # vLLM model identifier (we instantiate the LLM in run_and_save)
+        # vLLM model identifier (instantiated in run_and_save)
         self.vllm_model = self.args.writer_model_base
 
     def run_and_save(self):
@@ -821,7 +956,7 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
                     allow_patterns=["*.json", "*.safetensors"],
                 )
 
-        # Instantiate vLLM LLM (use bfloat16 dtype to match original)
+        # Instantiate vLLM LLM (use bfloat16 dtype)
         llm = LLM(
             model=self.vllm_model,
             enable_lora=self.enable_lora,
@@ -908,7 +1043,7 @@ class EvaluationScoringPipeline(EvaluationPipeline):
 
     def setup_model(self):
         if not self.args.use_gemini:
-            # Use causal LM evaluator (same as original evaluator) and set eval mode
+            # Use causal LM evaluator and set eval mode
             self.evaluator = AutoModelForCausalLM.from_pretrained(
                 self.args.evaluator_model,
                 attn_implementation="eager",

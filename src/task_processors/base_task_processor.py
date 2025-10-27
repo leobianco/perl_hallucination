@@ -161,7 +161,7 @@ class BaseTaskProcessor(abc.ABC):
         new_train_split = train_split
 
         if dataset_repo_id.endswith("synthetic_llm"):
-            # organic
+            # Organic
             if getattr(llm_synth_args, "num_organic_hallus_to_keep", 0) > 0:
                 organic_dataset_name = (
                     dataset_repo_id.removesuffix("synthetic_llm") + "organic"
@@ -183,7 +183,7 @@ class BaseTaskProcessor(abc.ABC):
                     [new_train_split, organic_hallus_to_keep]
                 )
 
-            # structured synthetic
+            # Structured synthetic
             if getattr(llm_synth_args, "num_struct_hallus_to_keep", 0) > 0:
                 struct_dataset_name = (
                     dataset_repo_id.removesuffix("synthetic_llm")

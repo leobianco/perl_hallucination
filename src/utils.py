@@ -1,6 +1,6 @@
 """Utility functions and argument dataclasses for training and evaluation scripts.
 
-This module provides argument dataclasses for script configuration, helper functions for LoRA argument parsing, and utilities for analyzing and visualizing model scores, including ROC analysis and histogram plotting.
+Argument dataclasses for script configuration, helper functions for LoRA argument parsing, and utilities for analyzing and visualizing model scores, including ROC analysis and histogram plotting.
 """
 
 import argparse
@@ -56,7 +56,6 @@ def create_lora_argument_parser():
         description="Training script with LoRA configuration"
     )
 
-    # PEFT configuration arguments
     parser.add_argument(
         "--task_type",
         type=str,
@@ -86,7 +85,6 @@ def create_lora_argument_parser():
         help="PEFT method type. Default: LORA",
     )
 
-    # LoRA configuration arguments
     parser.add_argument(
         "--lora_r",
         type=int,
@@ -368,7 +366,6 @@ def get_task_processor(task_name: str):
     Raises:
         Exception: If an unknown task_name is provided.
     """
-    # Task processor classes are imported at module level.
 
     task_map = {
         "npov": NPOVTaskProcessor,

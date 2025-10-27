@@ -7,14 +7,14 @@ Functions:
     main: Entry point for parsing arguments, preparing data, configuring the model, and running SFT training.
 
 Usage: call the associated shell script along with the corresponding task. E.g.:
-    ./writer_sft.sh npov
+    ./scripts/writer_sft.sh npov
 """
 
 from src.pipelines import SFTPipeline
 
 
 def main():
-    """Run the SFT pipeline (refactored to use `pipelines.SFTPipeline`)."""
+    """Run the SFT pipeline."""
 
     SFTPipeline().run()
 

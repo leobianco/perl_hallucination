@@ -1,10 +1,14 @@
 """
-Thin dispatcher for evaluator-related flows.
+Main script to dispatch and run various LLM evaluation pipelines (autorating, generation, or scoring) based on command-line arguments.
 
-This module delegates to the pipeline implementations in
-`scripts.pipelines`. It intentionally keeps the interface small and
-lightweight so the heavy code (vLLM/gemini/plotting) lives in the pipeline
-implementations.
+To generate completions on test set:
+./scripts/evaluator.sh npov generate
+
+To score these completions
+./scripts/evaluator.sh npov score 
+
+To evaluate the quality of the autorater model:
+./scripts/evaluator.sh npov autoratereval
 """
 
 from transformers import HfArgumentParser, set_seed

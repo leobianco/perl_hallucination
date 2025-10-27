@@ -12,5 +12,6 @@ wandb
 huggingface-hub
 ipython
 matplotlib
+nltk
 scikit-learn
 vllm>=0.6.4

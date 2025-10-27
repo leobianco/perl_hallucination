@@ -1,10 +1,8 @@
 """
-perl.py
-
-This script orchestrates the training and evaluation of a reinforcement learning from human feedback (RLHF) model using the Hugging Face Transformers and TRL libraries. It loads datasets, tokenizes data, initializes models (policy, reference policy, reward model), and sets up the RLOOTrainer for RL training. The script also disables automatic model compilation due to known issues with torch.compile in recent Transformers versions. Training logs are saved to disk after completion.
+Script for fine-tuning a model using Parameter-Efficient Reinforcement Learning (PE-RL). Implementation via Hugging Face Transformers and TRL libraries. Dispatches to PERLPipeline, which loads datasets, tokenizes data, initializes models (policy, reference policy, reward model), and sets up the RLOOTrainer for RL training. The script also disables automatic model compilation due to known issues with torch.compile in recent Transformers versions. Training logs are saved to disk after completion.
 
 Usage: call the associated shell script along with the corresponding task. E.g.:
-    ./perl.sh npov
+    ./scripts/perl.sh npov
 """
 
 import torch
@@ -38,7 +36,7 @@ torch.compile = no_compile
 
 
 def main():
-    """Run the PERL pipeline (refactored to use `pipelines.PERLPipeline`)."""
+    """Run the PERL pipeline."""
 
     PERLPipeline().run()
 
