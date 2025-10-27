@@ -92,10 +92,6 @@ class Pipeline(abc.ABC):
         self.setup_trainer()
         self.run_and_save()
 
-    # Task processor lookup moved to `utils.get_task_processor` to keep
-    # pipelines focused on orchestration. Call `get_task_processor(task_name)`
-    # from utils where needed.
-
     @abc.abstractmethod
     def setup_arguments(self, *cli_args, **cli_kwargs):
         raise NotImplementedError()
@@ -482,6 +478,10 @@ class EvaluationPipeline(Pipeline):
     them as instance methods and share configuration/state.
     """
 
+    def setup_trainer(self):
+        # Evaluation pipelines do not have trainers
+        pass
+
     def get_fewshot_examples(self, data, n_yes: int, n_no: int, seed: int):
         if n_yes == 0 and n_no == 0:
             return None
@@ -619,8 +619,6 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
         )
         self.evaluator.eval()
 
-    # use gemini helpers from scripts.evaluator_utils
-
     def run_and_save(self):
         # Score using evaluator (either gemini or local model)
         if self.args.use_gemini:
@@ -757,16 +755,6 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
             self.args.dataset_prompts, split=self.args.dataset_prompts_split
         )
 
-    def setup_model(self):
-        enable_lora = (
-            False
-            if self.args.writer_model_base == self.args.writer_model_lora
-            else True
-        )
-        self.enable_lora = enable_lora
-        # vLLM model identifier (we instantiate the LLM in run_and_save)
-        self.vllm_model = self.args.writer_model_base
-
     def process_data(self):
         # Prepare prompts and fewshot if requested
         prompts = [
@@ -795,6 +783,16 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
             prompts = [fewshot_prompts + "\n" + p for p in prompts]
 
         self.prompts = prompts
+
+    def setup_model(self):
+        enable_lora = (
+            False
+            if self.args.writer_model_base == self.args.writer_model_lora
+            else True
+        )
+        self.enable_lora = enable_lora
+        # vLLM model identifier (we instantiate the LLM in run_and_save)
+        self.vllm_model = self.args.writer_model_base
 
     def run_and_save(self):
         # Prepare sampling parameters for vLLM
@@ -867,6 +865,11 @@ class EvaluationScoringPipeline(EvaluationPipeline):
         self.args = parser.parse_args_into_dataclasses()[0]
         set_seed(self.args.seed)
 
+    def setup_tokenizer(self):
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.args.evaluator_model, padding_side="left"
+        )
+
     def load_data(self):
         if self.args.dataset_with_completions is None:
             raise ValueError(
@@ -875,20 +878,6 @@ class EvaluationScoringPipeline(EvaluationPipeline):
         self.val_data = load_dataset(
             self.args.dataset_with_completions, split="test"
         )
-
-    def setup_tokenizer(self):
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.args.evaluator_model, padding_side="left"
-        )
-
-    def setup_model(self):
-        # Use causal LM evaluator (same as original evaluator) and set eval mode
-        self.evaluator = AutoModelForCausalLM.from_pretrained(
-            self.args.evaluator_model,
-            attn_implementation="eager",
-            torch_dtype=torch.bfloat16,
-        )
-        self.evaluator.eval()
 
     def process_data(self):
         processor_cls = get_task_processor(self.args.task_name)
@@ -910,6 +899,15 @@ class EvaluationScoringPipeline(EvaluationPipeline):
         self.val_data = self.val_data.map(
             prompt_fn, fn_kwargs={"fewshot_examples": fewshot_examples}
         )
+
+    def setup_model(self):
+        # Use causal LM evaluator (same as original evaluator) and set eval mode
+        self.evaluator = AutoModelForCausalLM.from_pretrained(
+            self.args.evaluator_model,
+            attn_implementation="eager",
+            torch_dtype=torch.bfloat16,
+        )
+        self.evaluator.eval()
 
     def run_and_save(self):
         # Score dataset using tokenizer and evaluator (support gemini)
