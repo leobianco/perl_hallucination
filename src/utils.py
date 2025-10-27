@@ -11,9 +11,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.metrics import accuracy_score, roc_curve
 
-from task_processors.npov_task_processor import NPOVTaskProcessor
-from task_processors.bosch_task_processor import BoschTaskProcessor
-from task_processors.ragtruth_task_processor import RagtruthTaskProcessor
+from src.task_processors.npov_task_processor import NPOVTaskProcessor
+from src.task_processors.bosch_task_processor import BoschTaskProcessor
+from src.task_processors.ragtruth_task_processor import RagtruthTaskProcessor
 
 
 @dataclass

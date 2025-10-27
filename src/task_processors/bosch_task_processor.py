@@ -5,7 +5,7 @@ from datasets import DatasetDict, concatenate_datasets, load_dataset
 from google import genai
 from google.genai import types
 
-from task_processors.base_task_processor import BaseTaskProcessor
+from src.task_processors.base_task_processor import BaseTaskProcessor
 
 # Ensure punkt_tab tokenizer is available
 nltk.download("punkt_tab")

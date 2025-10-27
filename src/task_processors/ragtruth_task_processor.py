@@ -1,4 +1,4 @@
-from task_processors.base_task_processor import BaseTaskProcessor
+from src.task_processors.base_task_processor import BaseTaskProcessor
 
 
 class RagtruthTaskProcessor(BaseTaskProcessor):

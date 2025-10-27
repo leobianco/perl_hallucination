@@ -10,7 +10,7 @@ Usage: call the associated shell script along with the corresponding task. E.g.:
     ./reward_model.sh npov
 """
 
-from pipelines import RewardModelPipeline
+from src.pipelines import RewardModelPipeline
 
 
 def main():
