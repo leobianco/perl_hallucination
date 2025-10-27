@@ -568,9 +568,12 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
         set_seed(self.args.seed)
 
     def setup_tokenizer(self):
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.args.evaluator_model, padding_side="left"
-        )
+        if self.args.use_gemini:
+            pass
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.args.evaluator_model, padding_side="left"
+            )
 
     def load_data(self):
         # Load dataset with hallucination labels
@@ -869,9 +872,12 @@ class EvaluationScoringPipeline(EvaluationPipeline):
         set_seed(self.args.seed)
 
     def setup_tokenizer(self):
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.args.evaluator_model, padding_side="left"
-        )
+        if self.args.use_gemini:
+            pass
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.args.evaluator_model, padding_side="left"
+            )
 
     def load_data(self):
         if self.args.dataset_with_completions is None:
