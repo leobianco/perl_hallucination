@@ -819,7 +819,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             return arguments
 
         # Load new perspectives from local CSV
-        new_perspectives = pd.read_csv("./data/npov_new_perspectives.csv")
+        new_perspectives = pd.read_csv("src/task_processors/npov_new_perspectives.csv")
 
         for topic in topics:
             user_query = data.filter(lambda x: x["topic"] == topic)[
