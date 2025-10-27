@@ -9,13 +9,13 @@ implementations.
 
 from transformers import HfArgumentParser, set_seed
 
-from pipelines import (
+from src.pipelines import (
     EvaluationAutoraterPipeline,
     EvaluationGenerationPipeline,
     EvaluationScoringPipeline,
 )
 
-from utils import EvalArguments
+from src.utils import EvalArguments
 
 
 def main():
