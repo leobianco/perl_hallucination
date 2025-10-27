@@ -11,6 +11,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.metrics import accuracy_score, roc_curve
 
+# Task processor classes (moved to top-level at user's request)
+from .task_processors.npov_task_processor import NPOVTaskProcessor
+from .task_processors.bosch_task_processor import BoschTaskProcessor
+from .task_processors.ragtruth_task_processor import RagtruthTaskProcessor
+
 
 @dataclass
 class ScriptArguments:
@@ -347,3 +352,32 @@ def compute_best_roc_threshold(labels, scores):
     }
 
     return metrics
+
+
+def get_task_processor(task_name: str):
+    """Return the TaskProcessor class for a given task name.
+
+    This helper performs local imports to avoid circular import issues
+    when pipelines import utils.
+
+    Args:
+        task_name (str): One of 'npov', 'bosch', 'ragtruth'.
+
+    Returns:
+        class: The TaskProcessor class corresponding to task_name.
+
+    Raises:
+        Exception: If an unknown task_name is provided.
+    """
+    # Task processor classes are imported at module level.
+
+    task_map = {
+        "npov": NPOVTaskProcessor,
+        "bosch": BoschTaskProcessor,
+        "ragtruth": RagtruthTaskProcessor,
+    }
+
+    processor_cls = task_map.get(task_name)
+    if processor_cls is None:
+        raise Exception(f"Unknown task: {task_name}")
+    return processor_cls

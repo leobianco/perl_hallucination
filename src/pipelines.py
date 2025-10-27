@@ -58,15 +58,14 @@ from trl import (
 from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
 
-from .task_processors.bosch_task_processor import BoschTaskProcessor
-from .task_processors.npov_task_processor import NPOVTaskProcessor
-from .task_processors.ragtruth_task_processor import RagtruthTaskProcessor
+# Task processor classes are imported lazily inside utils.get_task_processor
 from .utils import (
     EvalArguments,
     LLMSynthScriptArguments,
     ScriptArguments,
     compute_best_roc_threshold,
     create_lora_argument_parser,
+    get_task_processor,
 )
 
 
@@ -94,22 +93,9 @@ class Pipeline(abc.ABC):
         self.setup_trainer()
         self.run_and_save()
 
-    def _get_task_processor(self, task_name: str):
-        """Return the TaskProcessor class for a given task name.
-
-        Centralizes the mapping between task_name strings and the
-        corresponding processor classes so callers don't need to repeat
-        the same small mapping block.
-        """
-        task_map = {
-            "npov": NPOVTaskProcessor,
-            "bosch": BoschTaskProcessor,
-            "ragtruth": RagtruthTaskProcessor,
-        }
-        processor_cls = task_map.get(task_name)
-        if processor_cls is None:
-            raise Exception(f"Unknown task: {task_name}")
-        return processor_cls
+    # Task processor lookup moved to `utils.get_task_processor` to keep
+    # pipelines focused on orchestration. Call `get_task_processor(task_name)`
+    # from utils where needed.
 
     @abc.abstractmethod
     def setup_arguments(self, *cli_args, **cli_kwargs):
@@ -194,7 +180,7 @@ class SFTPipeline(Pipeline):
             lora_dropout=self._lora_args.lora_dropout,
         )
 
-        processor_cls = self._get_task_processor(self.args.task_name)
+        processor_cls = get_task_processor(self.args.task_name)
 
         fewshot_examples = None
         if (
@@ -303,7 +289,7 @@ class RewardModelPipeline(Pipeline):
 
         # Possibly augment dataset for synthetic_llm cases using the task
         # processor extension point.
-        processor_cls = self._get_task_processor(self.args.task_name)
+        processor_cls = get_task_processor(self.args.task_name)
 
         self.data["train"] = processor_cls.augment_training_split(
             self.data["train"],
@@ -601,7 +587,7 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
 
     def process_data(self):
         # Map the evaluator prompt onto the dataset
-        processor_cls = self._get_task_processor(self.args.task_name)
+        processor_cls = get_task_processor(self.args.task_name)
 
         prompt_fn = processor_cls.get_evaluator_prompt()
         # Map using fewshot examples if requested
@@ -906,7 +892,7 @@ class EvaluationScoringPipeline(EvaluationPipeline):
         self.evaluator.eval()
 
     def process_data(self):
-        processor_cls = self._get_task_processor(self.args.task_name)
+        processor_cls = get_task_processor(self.args.task_name)
         prompt_fn = processor_cls.get_evaluator_prompt()
         fewshot_examples = None
         if (

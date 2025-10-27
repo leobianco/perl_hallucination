@@ -1,6 +1,6 @@
 from argparse import ArgumentParser
 
-from .pipelines import Pipeline
+from .utils import get_task_processor
 
 
 def main():
@@ -24,7 +24,7 @@ def main():
     parser.add_argument("--synth_llm_num_fewshot", type=int, default=2)
     args = parser.parse_args()
 
-    processor_cls = Pipeline()._get_task_processor(args.task_name)
+    processor_cls = get_task_processor(args.task_name)
     processor = processor_cls(args)
     processor.run()
 
