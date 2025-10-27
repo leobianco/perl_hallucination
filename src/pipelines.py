@@ -568,7 +568,6 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
         set_seed(self.args.seed)
 
     def setup_tokenizer(self):
-        # Tokenizer for the evaluator model
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.args.evaluator_model, padding_side="left"
         )
@@ -749,6 +748,10 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
         parser = HfArgumentParser(EvalArguments)
         self.args = parser.parse_args_into_dataclasses()[0]
         set_seed(self.args.seed)
+
+    def setup_tokenizer(self):
+        # This part of the evaluation pipeline does not need a tokenizer
+        pass
 
     def load_data(self):
         self.dataset_prompts = load_dataset(
