@@ -10,15 +10,16 @@ implementations.
 from transformers import HfArgumentParser, set_seed
 
 from pipelines import (
-    EvalArgs,
     EvaluationAutoraterPipeline,
     EvaluationGenerationPipeline,
     EvaluationScoringPipeline,
 )
 
+from utils import EvalArguments
+
 
 def main():
-    parser = HfArgumentParser(EvalArgs)
+    parser = HfArgumentParser(EvalArguments)
     script_args = parser.parse_args_into_dataclasses()[0]
     set_seed(script_args.seed)
 
