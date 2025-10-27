@@ -26,7 +26,7 @@ WARMUP_RATIO=0.1
 # Infrastructure Parameters
 PRECISION="BF16"
 EVAL_STEPS=5
-DEEPSPEED_CONFIG="./deepspeed_config.yaml"
+DEEPSPEED_CONFIG="scripts/deepspeed_config.yaml"
 
 # Parameters derived from above
 TASK_NAME="$1"
