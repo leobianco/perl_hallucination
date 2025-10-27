@@ -1,6 +1,6 @@
 from argparse import ArgumentParser
 
-from utils import get_task_processor
+from src.utils import get_task_processor
 
 
 def main():

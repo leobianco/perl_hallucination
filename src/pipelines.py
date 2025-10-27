@@ -58,7 +58,7 @@ from trl import (
 from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
 
-from utils import (
+from src.utils import (
     EvalArguments,
     LLMSynthScriptArguments,
     ScriptArguments,
