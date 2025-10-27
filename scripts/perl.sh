@@ -25,7 +25,7 @@ NUM_SAMPLE_GENERATIONS=10
 MISSING_EOS_PENALTY=1.0
 
 # Infrastructure Parameters
-DEEPSPEED_CONFIG="./deepspeed_config.yaml"
+DEEPSPEED_CONFIG="scripts/deepspeed_config.yaml"
 SHUTDOWN=false
 
 # Parameters derived from above

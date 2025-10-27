@@ -19,7 +19,7 @@ NUM_FEWSHOT=0
 SAVE_STEPS=200
 
 # Infrastructure Parameters
-DEEPSPEED_CONFIG="./deepspeed_config.yaml"
+DEEPSPEED_CONFIG="scripts/deepspeed_config.yaml"
 
 # Parameters derived from above
 TASK_NAME="$1"
