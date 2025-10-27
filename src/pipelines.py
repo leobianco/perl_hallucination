@@ -568,9 +568,7 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
         set_seed(self.args.seed)
 
     def setup_tokenizer(self):
-        if self.args.use_gemini:
-            pass
-        else:
+        if not self.args.use_gemini:
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.args.evaluator_model, padding_side="left"
             )
@@ -614,12 +612,13 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
 
     def setup_model(self):
         # Load evaluator as causal LM (same as original evaluator.py) and set eval mode
-        self.evaluator = AutoModelForCausalLM.from_pretrained(
-            self.args.evaluator_model,
-            attn_implementation="eager",
-            torch_dtype=torch.bfloat16,
-        )
-        self.evaluator.eval()
+        if not self.args.use_gemini:
+            self.evaluator = AutoModelForCausalLM.from_pretrained(
+                self.args.evaluator_model,
+                attn_implementation="eager",
+                torch_dtype=torch.bfloat16,
+            )
+            self.evaluator.eval()
 
     def run_and_save(self):
         # Score using evaluator (either gemini or local model)
@@ -872,9 +871,7 @@ class EvaluationScoringPipeline(EvaluationPipeline):
         set_seed(self.args.seed)
 
     def setup_tokenizer(self):
-        if self.args.use_gemini:
-            pass
-        else:
+        if not self.args.use_gemini:
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.args.evaluator_model, padding_side="left"
             )
@@ -910,13 +907,14 @@ class EvaluationScoringPipeline(EvaluationPipeline):
         )
 
     def setup_model(self):
-        # Use causal LM evaluator (same as original evaluator) and set eval mode
-        self.evaluator = AutoModelForCausalLM.from_pretrained(
-            self.args.evaluator_model,
-            attn_implementation="eager",
-            torch_dtype=torch.bfloat16,
-        )
-        self.evaluator.eval()
+        if not self.args.use_gemini:
+            # Use causal LM evaluator (same as original evaluator) and set eval mode
+            self.evaluator = AutoModelForCausalLM.from_pretrained(
+                self.args.evaluator_model,
+                attn_implementation="eager",
+                torch_dtype=torch.bfloat16,
+            )
+            self.evaluator.eval()
 
     def run_and_save(self):
         # Score dataset using tokenizer and evaluator (support gemini)
