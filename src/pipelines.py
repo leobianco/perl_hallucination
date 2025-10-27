@@ -58,8 +58,7 @@ from trl import (
 from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
 
-# Task processor classes are imported lazily inside utils.get_task_processor
-from .utils import (
+from utils import (
     EvalArguments,
     LLMSynthScriptArguments,
     ScriptArguments,

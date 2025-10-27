@@ -5,7 +5,7 @@ from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
 from google import genai
 from google.genai import types
 
-from .base_task_processor import BaseTaskProcessor
+from task_processors.base_task_processor import BaseTaskProcessor
 
 
 class NPOVTaskProcessor(BaseTaskProcessor):
