@@ -77,6 +77,8 @@ class BoschTaskProcessor(BaseTaskProcessor):
             lambda entry: entry["class_hall"] == "No"
         )
 
+        sft_data = sft_data.train_test_split(test_size=0.2)
+
         return sft_data
 
     def _make_organic_hallucinations_data(self, data):
