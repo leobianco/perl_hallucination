@@ -598,7 +598,9 @@ class EvaluationPipeline(Pipeline):
         save_frequency = 50  # Save progress every 50 entries
         server_retry_wait = 20  # seconds to wait between server error retries
         server_max_retries = 3  # number of times to retry on server error
-        entries_to_score = [i for i, score in enumerate(scores) if score is None]
+        entries_to_score = [
+            i for i, score in enumerate(scores) if score is None
+        ]
         print(f"Found {len(entries_to_score)} entries that need scoring...")
 
         try:
@@ -652,7 +654,9 @@ class EvaluationPipeline(Pipeline):
 
                 # Save progress periodically to local file
                 if (n + 1) % save_frequency == 0:
-                    print(f"\nSaving progress locally after {n + 1} new entries...")
+                    print(
+                        f"\nSaving progress locally after {n + 1} new entries..."
+                    )
                     try:
                         torch.save(scores, checkpoint_path)
                     except Exception as e:
@@ -689,7 +693,9 @@ class EvaluationPipeline(Pipeline):
             os.remove(checkpoint_path)
 
         # Convert scores to tensor, replacing any remaining None with 0
-        scores_tensor = torch.tensor([s if s is not None else 0 for s in scores])
+        scores_tensor = torch.tensor(
+            [s if s is not None else 0 for s in scores]
+        )
         return scores_tensor
 
 
@@ -987,7 +993,9 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
         except Exception:
             name_for_saving = self.args.writer_model_lora.split("/")[1]
 
-        name_for_saving = "eval_" + name_for_saving + "_gens"
+        name_for_saving = (
+            f"{self.args.task_name}_eval_" + name_for_saving + "_gens"
+        )
         name_for_saving += f"_T{str(float(self.args.temperature))}"
         name_for_saving += f"_wfs{self.args.writer_num_fewshot}"
 
