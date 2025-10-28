@@ -3,7 +3,7 @@
 # Core Parameters
 USER="leobianco"
 SEED=12345
-RUN_IDENTIFIER="gemma-2-2b-it"
+RUN_IDENTIFIER="google/gemma-2-2b-it"
 BASE_MODEL="google/gemma-2-2b-it"
 EVALUATOR_MODEL="gemini-2.0-flash"
 USE_GEMINI="True"
