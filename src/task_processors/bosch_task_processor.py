@@ -77,6 +77,9 @@ class BoschTaskProcessor(BaseTaskProcessor):
             lambda entry: entry["class_hall"] == "No"
         )
 
+        # prompt-completion format, for training on completion only
+        sft_data = sft_data.rename_column("response", "completion")
+
         sft_data = sft_data.train_test_split(test_size=0.2)
 
         return sft_data

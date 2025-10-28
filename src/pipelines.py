@@ -220,7 +220,7 @@ class SFTPipeline(Pipeline):
             train_dataset=self.data["train"],
             eval_dataset=self.data["test"],
             processing_class=self.tokenizer,
-            formatting_func=self.formatting_prompts_func,
+            # formatting_func=self.formatting_prompts_func,
         )
 
     def run_and_save(self):
