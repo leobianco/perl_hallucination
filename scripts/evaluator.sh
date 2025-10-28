@@ -9,7 +9,7 @@ EVALUATOR_MODEL="gemini-2.0-flash"
 USE_GEMINI="True"
 THRESHOLD=0.991
 EVALUATOR_NUM_FEWSHOT=2
-WRITER_NUM_FEWSHOT=2
+WRITER_NUM_FEWSHOT=1
 MAX_TOKENS=150
 TEMPERATURE=0.1
 TOP_P=0.9
@@ -54,7 +54,7 @@ if [ "$2" == "generate" ]; then
         --top_k "$TOP_K" \
         --writer_num_fewshot $WRITER_NUM_FEWSHOT
 elif [ "$2" == "score" ]; then
-    DATASET_WITH_COMPLETIONS="${USER}/${TASK_NAME}_eval_${RUN_IDENTIFIER#*/}_gens_T${TEMPERATURE}_wfs${WRITER_NUM_FEWSHOT}"
+    DATASET_WITH_COMPLETIONS="${USER}/eval_${RUN_IDENTIFIER#*/}_gens_T${TEMPERATURE}_wfs${WRITER_NUM_FEWSHOT}"
     echo "Running in scoring mode..."
     python3 -m src.evaluator \
         --task_name "$TASK_NAME" \
