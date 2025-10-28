@@ -216,7 +216,7 @@ class SFTPipeline(Pipeline):
         self.trainer = SFTTrainer(
             self.model,
             args=self.training_args,
-            data_collator=self.data_collator,
+            # data_collator=self.data_collator,
             train_dataset=self.data["train"],
             eval_dataset=self.data["test"],
             processing_class=self.tokenizer,
