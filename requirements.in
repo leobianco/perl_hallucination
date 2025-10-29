@@ -1,3 +1,4 @@
+absl-py
 accelerate
 datasets
 deepspeed
@@ -15,3 +16,4 @@ matplotlib
 nltk
 scikit-learn
 vllm>=0.6.4
+rouge-score
