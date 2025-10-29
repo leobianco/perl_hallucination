@@ -993,7 +993,7 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
         except Exception:
             name_for_saving = self.args.writer_model_lora.split("/")[1]
 
-        name_for_saving += "eval_" + name_for_saving + "_gens"
+        name_for_saving = "eval_" + name_for_saving + "_gens"
         name_for_saving += f"_T{str(float(self.args.temperature))}"
         name_for_saving += f"_wfs{self.args.writer_num_fewshot}"
 
