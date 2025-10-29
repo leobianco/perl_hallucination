@@ -450,13 +450,14 @@ class PERLPipeline(Pipeline):
             self.trainer.train()
             self.trainer.push_to_hub()
 
-        name_for_saving = self.training_args.run_name.split("/")[1]
-        filepath = os.path.join("logs", name_for_saving, "logs.txt")
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, "w") as f:
-            for d in self.trainer.state.log_history:
-                f.write(str(d) + "\n----------\n")
-        print(f"Logs saved to {filepath}")
+        # Was getting errors with this (TODO: fix)
+        # name_for_saving = self.training_args.run_name.split("/")[1]
+        # filepath = os.path.join("logs", name_for_saving, "logs.txt")
+        # os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        # with open(filepath, "w") as f:
+        #     for d in self.trainer.state.log_history:
+        #         f.write(str(d) + "\n----------\n")
+        # print(f"Logs saved to {filepath}")
 
 
 class EvaluationPipeline(Pipeline):
