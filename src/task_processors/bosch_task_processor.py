@@ -1,5 +1,6 @@
 import random
 
+import evaluate
 import nltk
 from datasets import DatasetDict, concatenate_datasets, load_dataset
 from google import genai
@@ -110,9 +111,15 @@ class BoschTaskProcessor(BaseTaskProcessor):
             self._rm_prompt
         )
         # Apply the map that creates structured hallucinations.
+        rouge_metric = evaluate.load("rouge")
+
         synthetic_hallucinations_struct = to_become_hallus.map(
-            self._synthetic_hall_structured
+            self._synthetic_hall_structured,
+            fn_kwargs=dict(rouge_metric=rouge_metric),
         )
+
+        print("debug:", synthetic_hallucinations_struct)
+
         # Write the RM prompts with the modified entries.
         synthetic_hallucinations_struct = synthetic_hallucinations_struct.map(
             self._rm_prompt
@@ -464,7 +471,7 @@ class BoschTaskProcessor(BaseTaskProcessor):
         return bosch_evaluator_prompt
 
     @staticmethod
-    def _synthetic_hall_structured(entry):
+    def _synthetic_hall_structured(entry, rouge_metric):
         """Create a structured synthetic hallucination in Bosch data by removing sentences from the context.
 
         Args:
@@ -476,22 +483,32 @@ class BoschTaskProcessor(BaseTaskProcessor):
         """
 
         # Break response into sentences and filter out small ones
-        tok = nltk.sent_tokenize(entry["Context"])
+        sentences_context = nltk.sent_tokenize(entry["Context"])
+        sentences_response = nltk.sent_tokenize(entry["response"])
 
-        # Randomly select sentences in the context.
-        # One if there are less than 5 sentences, 2 otherwise.
-        num_to_sample = 1 if len(tok) < 5 else 2
-        rand = random.sample(tok, num_to_sample)
-        rand_idx = [tok.index(r) for r in rand]
+        # Pick a random sentence in generation
+        random_sentence_response = random.sample(sentences_response, 1)
 
-        # Erase that sentence
-        for r_idx in rand_idx:
-            tok[r_idx] = ""
+        # Compute the ROUGE-1 score between this and sentences in context
+        # and pick sentence in context with maximal ROUGE-1 score to erase
+        best_idx = 0
+        max_rouge = 0
+        for idx_context, sentence_context in enumerate(sentences_context):
+            rouge_results = rouge_metric.compute(
+                predictions=random_sentence_response,
+                references=sentence_context,
+            )
+            if rouge_results["rouge1"] > max_rouge:
+                best_idx = idx_context
+                max_rouge = rouge_results["rouge1"]
 
-        # Join everything back together
-        new_context = " ".join(tok)
+        # Store information about erased sentence
+        entry["erased_context"] = sentences_context[best_idx]
+        entry["rouge1_score"] = max_rouge
 
-        # Update response and labels
+        # Erase the chosen sentence and join everything back together
+        sentences_context[best_idx] = ""
+        new_context = " ".join(sentences_context)
         entry["Context"] = new_context
         entry["class_hall"] = "Yes"
         entry["label"] = 0
