@@ -132,8 +132,12 @@ class BoschTaskProcessor(BaseTaskProcessor):
         organic_test_split = organic["test"]
         # Add placeholder columns so that in the train split you can store
         # information about what sentence in context was erased
-        organic_test_split = organic_test_split.add_column("erased_context", [""]*len(organic_test_split))
-        organic_test_split = organic_test_split.add_column("rouge1_score", [0.0]*len(organic_test_split))
+        organic_test_split = organic_test_split.add_column(
+            "erased_context", [""] * len(organic_test_split)
+        )
+        organic_test_split = organic_test_split.add_column(
+            "rouge1_score", [0.0] * len(organic_test_split)
+        )
 
         synthetic_hallucinations_struct_data = DatasetDict(
             {
@@ -500,7 +504,7 @@ class BoschTaskProcessor(BaseTaskProcessor):
         for idx_context, sentence_context in enumerate(sentences_context):
             rouge_results = rouge_metric.compute(
                 predictions=random_sentence_response,
-                references=sentence_context,
+                references=[sentence_context],
             )
             if rouge_results["rouge1"] > max_rouge:
                 best_idx = idx_context
@@ -516,6 +520,14 @@ class BoschTaskProcessor(BaseTaskProcessor):
         entry["Context"] = new_context
         entry["class_hall"] = "Yes"
         entry["label"] = 0
+        entry["prompt"] = (
+            "You are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information giver. Do not add to your answer any information other than those present in the manual excerpt.\n"
+            + "User question:\n"
+            + entry["Question"]
+            + "\nManual information:\n"
+            + entry["Context"]
+            + "\nAnswer to user's question:\n"
+        )
 
         # Important: you need to retokenize these later!
         return entry
