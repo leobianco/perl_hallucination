@@ -500,7 +500,7 @@ class BoschTaskProcessor(BaseTaskProcessor):
         for idx_context, sentence_context in enumerate(sentences_context):
             rouge_results = rouge_metric.compute(
                 predictions=random_sentence_response,
-                references=[sentence_context],
+                references=sentence_context,
             )
             if rouge_results["rouge1"] > max_rouge:
                 best_idx = idx_context
