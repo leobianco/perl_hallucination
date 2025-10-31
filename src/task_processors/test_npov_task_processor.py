@@ -3,10 +3,11 @@ import unittest
 from unittest.mock import Mock
 
 from datasets import Dataset, DatasetDict
+
 from src.task_processors.npov_task_processor import NPOVTaskProcessor
 
 
-class TestNPOVDataPreprocessing(unittest.TestCase):
+class TestNPOVTaskProcessor(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # Create a synthetic raw dataset (one entry of npov_rm_raw)
@@ -30,30 +31,31 @@ class TestNPOVDataPreprocessing(unittest.TestCase):
         processor_cls = NPOVTaskProcessor(mock_args)
         cls.data = processor_cls._preprocess_data(raw_datasetdict_hf)
 
-    def test_column_label(self):
-        """Test for the existence of the `label' column, and that it only has integers."""
+    def test_preprocess_data(self):
+        """Test the `_preprocess_data` method end-to-end on a small synthetic dataset.
+
+        Verifies that:
+        - `label` column exists and contains only integers
+        - `class_hall` column exists, is strings, and values are either 'Yes' or 'No'
+        - `prompt` column exists and contains strings
+        """
 
         for split in self.data.keys():
+            # Test label column
             self.assertIn("label", self.data[split].column_names)
-            for value in self.data[split]["label"]:
-                self.assertIsInstance(value, int)
+            for v in self.data[split]["label"]:
+                self.assertIsInstance(v, int)
 
-    def test_column_class_hall(self):
-        """Test for the existence of the `class_hall' column, that it contains strings, and that these strings are either `Yes' or `No'."""
-
-        for split in self.data.keys():
+            # Test class_hall column
             self.assertIn("class_hall", self.data[split].column_names)
-            for value in self.data[split]["class_hall"]:
-                self.assertIsInstance(value, str)
-                self.assertIn(value, ["Yes", "No"])
+            for v in self.data[split]["class_hall"]:
+                self.assertIsInstance(v, str)
+                self.assertIn(v, ["Yes", "No"])
 
-    def test_column_prompt(self):
-        """Test for the existence of the `prompt' column, that it contains strings."""
-
-        for split in self.data.keys():
+            # Test prompt column
             self.assertIn("prompt", self.data[split].column_names)
-            for value in self.data[split]["prompt"]:
-                self.assertIsInstance(value, str)
+            for v in self.data[split]["prompt"]:
+                self.assertIsInstance(v, str)
 
 
 if __name__ == "__main__":
