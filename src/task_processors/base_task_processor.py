@@ -1,7 +1,7 @@
 import abc
-from typing import Any
+from typing import Any, Callable, Optional, Tuple
 
-from datasets import concatenate_datasets, load_dataset
+from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
 
 
 class BaseTaskProcessor(abc.ABC):
@@ -9,7 +9,7 @@ class BaseTaskProcessor(abc.ABC):
         self.args = args
 
     @abc.abstractmethod
-    def _load_data(self):
+    def _load_data(self) -> DatasetDict:
         """Load raw dataset(s) from source (local files, HF repo, etc).
 
         Returns:
@@ -18,7 +18,7 @@ class BaseTaskProcessor(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def _preprocess_data(self, data):
+    def _preprocess_data(self, data: DatasetDict) -> DatasetDict:
         """Preprocess and normalize raw data for later pipeline steps.
 
         Args:
@@ -30,7 +30,7 @@ class BaseTaskProcessor(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def _make_sft_data(self, data):
+    def _make_sft_data(self, data: DatasetDict) -> DatasetDict:
         """Create supervised fine-tuning dataset from preprocessed data.
 
         Args:
@@ -42,7 +42,9 @@ class BaseTaskProcessor(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def _make_organic_hallucinations_data(self, data):
+    def _make_organic_hallucinations_data(
+        self, data: DatasetDict
+    ) -> DatasetDict:
         """Extract organic (human/annotated) hallucination examples.
 
         Args:
@@ -54,7 +56,9 @@ class BaseTaskProcessor(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def _make_structured_hallucinations_data(self, data):
+    def _make_structured_hallucinations_data(
+        self, data: DatasetDict
+    ) -> DatasetDict:
         """Create structured synthetic hallucination examples (rule-based).
 
         Args:
@@ -66,7 +70,9 @@ class BaseTaskProcessor(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def _make_llm_hallucinations_data(self, data):
+    def _make_llm_hallucinations_data(
+        self, data: DatasetDict, organic_hallucinations_data: DatasetDict
+    ) -> DatasetDict:
         """Generate synthetic hallucinations using an LLM and return dataset.
 
         Args:
@@ -78,7 +84,9 @@ class BaseTaskProcessor(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def _make_perl_data(self, data, sft_data, seed=12345):
+    def _make_perl_data(
+        self, data: DatasetDict, sft_data: DatasetDict, seed: int = 12345
+    ) -> DatasetDict:
         """Create PERL dataset from RM and SFT data.
 
         Args:
@@ -92,19 +100,19 @@ class BaseTaskProcessor(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def _make_autorater_data(self, data):
+    def _make_autorater_data(self, data: DatasetDict) -> Dataset:
         """Prepare dataset for the autorater (combined test set or similar).
 
         Args:
             data: Preprocessed dataset(s).
 
         Returns:
-            Dataset or DatasetDict used by the autorater.
+            Dataset used by the autorater.
         """
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def _make_evaluation_data(self, data):
+    def _make_evaluation_data(self, data: DatasetDict) -> DatasetDict:
         """Prepare evaluation datasets (capped final test sets, etc).
 
         Args:
@@ -118,8 +126,11 @@ class BaseTaskProcessor(abc.ABC):
     @classmethod
     @abc.abstractmethod
     def get_formatting_prompts_and_response_template(
-        cls, eos_token, fewshot_examples=None, model_repo_id=None
-    ):
+        cls,
+        eos_token: str,
+        fewshot_examples: Optional[Dataset] = None,
+        model_repo_id: Optional[str] = None,
+    ) -> Tuple[Callable[[Any], list[str]], str]:
         """Return a tuple (formatting_func, response_template).
 
         - formatting_func: a callable that formats an example (or batch) into the prompt/inputs expected by the trainer.
@@ -131,7 +142,9 @@ class BaseTaskProcessor(abc.ABC):
 
     @classmethod
     @abc.abstractmethod
-    def get_evaluator_prompt(cls):
+    def get_evaluator_prompt(
+        cls,
+    ) -> Callable[[dict, Optional[Dataset], bool], dict]:
         """Return a callable that maps a dataset entry into an evaluator prompt.
 
         The callable should accept the same signature used in the original
@@ -143,11 +156,11 @@ class BaseTaskProcessor(abc.ABC):
     @classmethod
     def augment_training_split(
         cls,
-        train_split: Any,
-        llm_synth_args,
-        training_args,
+        train_split: Dataset,
+        llm_synth_args: Any,
+        training_args: Any,
         dataset_repo_id: str,
-    ):
+    ) -> Dataset:
         """Optionally augment a training split when synthetic LLM data is used.
 
         Default implementation mirrors the previous inline logic used in
@@ -158,7 +171,7 @@ class BaseTaskProcessor(abc.ABC):
         augmented training split.
         """
 
-        new_train_split = train_split
+        new_train_split: Dataset = train_split
 
         if dataset_repo_id.endswith("synthetic_llm"):
             # Organic

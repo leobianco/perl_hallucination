@@ -5,7 +5,7 @@ To generate completions on test set:
 ./scripts/evaluator.sh npov generate
 
 To score these completions
-./scripts/evaluator.sh npov score 
+./scripts/evaluator.sh npov score
 
 To evaluate the quality of the autorater model:
 ./scripts/evaluator.sh npov autoratereval
@@ -18,7 +18,6 @@ from src.pipelines import (
     EvaluationGenerationPipeline,
     EvaluationScoringPipeline,
 )
-
 from src.utils import EvalArguments
 
 
