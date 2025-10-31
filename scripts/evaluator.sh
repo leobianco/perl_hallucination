@@ -3,22 +3,22 @@
 # Core Parameters
 USER="leobianco"
 SEED=12345
-RUN_IDENTIFIER="$USER/npov_SFT_google_S200898_epo25_lr1e-4_r8_2506111442"
+RUN_IDENTIFIER="google/gemma-2-2b-it"
 BASE_MODEL="google/gemma-2-2b-it"
 EVALUATOR_MODEL="gemini-2.0-flash"
 USE_GEMINI="True"
-THRESHOLD=0.9995
+THRESHOLD=0.991
 EVALUATOR_NUM_FEWSHOT=2
-WRITER_NUM_FEWSHOT=0
+WRITER_NUM_FEWSHOT=1
 MAX_TOKENS=150
 TEMPERATURE=0.1
 TOP_P=0.9
 TOP_K=40
 
 # Dataset Parameters
-DATASET_PROMPTS="${USER}/npov_hyperparam_test_set"
+DATASET_PROMPTS="${USER}/bosch_final_test_set"
 DATASET_PROMPTS_SPLIT="test"
-DATASET_LABELS="${USER}/npov_autorater"
+DATASET_LABELS="${USER}/bosch_autorater"
 DATASET_LABELS_SPLIT="test"
 
 # Parameters derived from above

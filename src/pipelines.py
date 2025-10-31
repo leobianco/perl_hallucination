@@ -22,7 +22,12 @@ import evaluate
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from datasets import Value, concatenate_datasets, load_dataset
+from datasets import (
+    Dataset,
+    Value,
+    concatenate_datasets,
+    load_dataset,
+)
 from google import genai
 from google.genai import types
 from huggingface_hub import snapshot_download
@@ -79,7 +84,7 @@ class Pipeline(abc.ABC):
         self.model: Optional[torch.nn.Module] = None
         self.trainer: Optional[Any] = None
 
-    def run(self, *cli_args, **cli_kwargs):
+    def run(self, *cli_args, **cli_kwargs) -> None:
         self.setup_arguments(*cli_args, **cli_kwargs)
         self.setup_tokenizer()
         self.load_data()
@@ -89,10 +94,10 @@ class Pipeline(abc.ABC):
         self.run_and_save()
 
     @abc.abstractmethod
-    def setup_arguments(self, *cli_args, **cli_kwargs):
+    def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
         raise NotImplementedError()
 
-    def setup_tokenizer(self):
+    def setup_tokenizer(self) -> None:
         """
         Default tokenizer loading uses self.args.model_repo_id or training args.
         Subclasses may override if they need a different tokenizer setup.
@@ -113,30 +118,30 @@ class Pipeline(abc.ABC):
             self.tokenizer.pad_token = self.tokenizer.unk_token
 
     @abc.abstractmethod
-    def load_data(self):
+    def load_data(self) -> None:
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def process_data(self):
+    def process_data(self) -> None:
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def setup_model(self):
+    def setup_model(self) -> None:
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def setup_trainer(self):
+    def setup_trainer(self) -> None:
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def run_and_save(self):
+    def run_and_save(self) -> None:
         raise NotImplementedError()
 
 
 class SFTPipeline(Pipeline):
     """Pipeline for supervised fine-tuning (writer_sft.py)."""
 
-    def setup_arguments(self, *cli_args, **cli_kwargs):
+    def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
         parser_lora = create_lora_argument_parser()
         lora_args, remaining_args = parser_lora.parse_known_args()
         parser = TrlParser((ScriptArguments, SFTConfig))
@@ -150,13 +155,13 @@ class SFTPipeline(Pipeline):
         # keep lora config object around for setup_model
         self._lora_args = lora_args
 
-    def load_data(self):
+    def load_data(self) -> None:
         self.data = {
             "train": load_dataset(self.args.dataset_repo_id, split="train"),
             "test": load_dataset(self.args.dataset_repo_id, split="test"),
         }
 
-    def process_data(self):
+    def process_data(self) -> None:
         # task-specific processor
         # lora config created from parsed args
         self._lora_config = LoraConfig(
@@ -199,7 +204,7 @@ class SFTPipeline(Pipeline):
         # expose formatting func for trainer
         self.formatting_prompts_func = formatting_prompts_func
 
-    def setup_model(self):
+    def setup_model(self) -> None:
         model = AutoModelForCausalLM.from_pretrained(
             self.args.model_repo_id,
             attn_implementation="eager",
@@ -212,18 +217,18 @@ class SFTPipeline(Pipeline):
 
         self.model = get_peft_model(model, self._lora_config)
 
-    def setup_trainer(self):
+    def setup_trainer(self) -> None:
         self.trainer = SFTTrainer(
             self.model,
             args=self.training_args,
-            data_collator=self.data_collator,
+            # data_collator=self.data_collator,
             train_dataset=self.data["train"],
             eval_dataset=self.data["test"],
             processing_class=self.tokenizer,
-            formatting_func=self.formatting_prompts_func,
+            # formatting_func=self.formatting_prompts_func,
         )
 
-    def run_and_save(self):
+    def run_and_save(self) -> None:
         self.trainer.train()
         self.trainer.push_to_hub()
 
@@ -231,7 +236,7 @@ class SFTPipeline(Pipeline):
 class RewardModelPipeline(Pipeline):
     """Pipeline for reward model training (reward_model.py)."""
 
-    def setup_arguments(self, *cli_args, **cli_kwargs):
+    def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
         parser_lora = create_lora_argument_parser()
         lora_args, remaining_args = parser_lora.parse_known_args()
 
@@ -248,10 +253,10 @@ class RewardModelPipeline(Pipeline):
         self._lora_args = lora_args
         set_seed(training_args.seed)
 
-    def load_data(self):
+    def load_data(self) -> None:
         self.data = load_dataset(self.args.dataset_repo_id)
 
-    def process_data(self):
+    def process_data(self) -> None:
         self._lora_config = LoraConfig(
             r=self._lora_args.lora_r,
             lora_alpha=self._lora_args.lora_alpha,
@@ -298,7 +303,7 @@ class RewardModelPipeline(Pipeline):
             new_features["label"] = Value("int32")
             self.data[split] = self.data[split].cast(new_features)
 
-    def setup_model(self):
+    def setup_model(self) -> None:
         id2label = {0: "Yes", 1: "No"}
         label2id = {"Yes": 0, "No": 1}
 
@@ -321,7 +326,7 @@ class RewardModelPipeline(Pipeline):
         with torch.no_grad():
             self.model.score.weight.mul_(0.1)
 
-    def setup_trainer(self):
+    def setup_trainer(self) -> None:
         metric = evaluate.load("roc_auc")
 
         def compute_metrics(eval_preds):
@@ -366,7 +371,7 @@ class RewardModelPipeline(Pipeline):
             compute_metrics=compute_metrics,
         )
 
-    def run_and_save(self):
+    def run_and_save(self) -> None:
         self.trainer.train()
         self.model.push_to_hub(self.training_args.hub_model_id)
 
@@ -378,17 +383,17 @@ class PERLPipeline(Pipeline):
     reward model, and uses RLOOTrainer to run RL training.
     """
 
-    def setup_arguments(self, *cli_args, **cli_kwargs):
+    def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
         parser = HfArgumentParser((ScriptArguments, RLOOConfig))
         script_args, training_args = parser.parse_args_into_dataclasses()
         self.args = script_args
         self.training_args = training_args
         set_seed(training_args.seed)
 
-    def load_data(self):
+    def load_data(self) -> None:
         self.data = load_dataset(self.args.dataset_repo_id)
 
-    def process_data(self):
+    def process_data(self) -> None:
         def encode(examples):
             return self.tokenizer(
                 examples["prompt"],
@@ -405,7 +410,7 @@ class PERLPipeline(Pipeline):
             )
             self.data[split].set_format("torch")
 
-    def setup_model(self):
+    def setup_model(self) -> None:
         id2label = {0: "Yes", 1: "No"}
         label2id = {"Yes": 0, "No": 1}
 
@@ -434,7 +439,7 @@ class PERLPipeline(Pipeline):
             policy_base, self.training_args.sft_model_path, is_trainable=True
         )
 
-    def setup_trainer(self):
+    def setup_trainer(self) -> None:
         self.trainer = RLOOTrainer(
             config=self.training_args,
             processing_class=self.tokenizer,
@@ -445,18 +450,19 @@ class PERLPipeline(Pipeline):
             eval_dataset=self.data["test"],
         )
 
-    def run_and_save(self):
+    def run_and_save(self) -> None:
         if self.training_args.do_train:
             self.trainer.train()
             self.trainer.push_to_hub()
 
-        name_for_saving = self.training_args.run_name.split("/")[1]
-        filepath = os.path.join("logs", name_for_saving, "logs.txt")
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, "w") as f:
-            for d in self.trainer.state.log_history:
-                f.write(str(d) + "\n----------\n")
-        print(f"Logs saved to {filepath}")
+        # Was getting errors with this (TODO: fix)
+        # name_for_saving = self.training_args.run_name.split("/")[1]
+        # filepath = os.path.join("logs", name_for_saving, "logs.txt")
+        # os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        # with open(filepath, "w") as f:
+        #     for d in self.trainer.state.log_history:
+        #         f.write(str(d) + "\n----------\n")
+        # print(f"Logs saved to {filepath}")
 
 
 class EvaluationPipeline(Pipeline):
@@ -465,11 +471,13 @@ class EvaluationPipeline(Pipeline):
     them as instance methods and share configuration/state.
     """
 
-    def setup_trainer(self):
+    def setup_trainer(self) -> None:
         # Evaluation pipelines do not have trainers
         pass
 
-    def get_fewshot_examples(self, data, n_yes: int, n_no: int, seed: int):
+    def get_fewshot_examples(
+        self, data: Dataset, n_yes: int, n_no: int, seed: int
+    ) -> Dataset:
         if n_yes == 0 and n_no == 0:
             return None
         positive_examples = (
@@ -492,8 +500,12 @@ class EvaluationPipeline(Pipeline):
         return fewshot_examples
 
     def evaluator_score_batch(
-        self, evaluator, tokenized_prompts, yes_token_id, no_token_id
-    ):
+        self,
+        evaluator: AutoModelForCausalLM,
+        tokenized_prompts: dict[str, torch.Tensor],
+        yes_token_id: int,
+        no_token_id: int,
+    ) -> torch.Tensor:
         with torch.no_grad():
             outputs = evaluator(**tokenized_prompts, use_cache=False)
             score_yes = torch.exp(outputs.logits[:, -1, yes_token_id])
@@ -502,8 +514,14 @@ class EvaluationPipeline(Pipeline):
         return score_batch
 
     def evaluator_score(
-        self, data, script_args, tokenizer, evaluator, yes_token_id, no_token_id
-    ):
+        self,
+        data: Dataset,
+        script_args: ScriptArguments,
+        tokenizer: AutoTokenizer,
+        evaluator: AutoModelForCausalLM,
+        yes_token_id: int,
+        no_token_id: int,
+    ) -> torch.Tensor:
         iterator = data.iter(batch_size=script_args.eval_batch_size)
         num_batches = int(data.num_rows / script_args.eval_batch_size)
         scores = torch.tensor([])
@@ -526,7 +544,9 @@ class EvaluationPipeline(Pipeline):
             del tokenized_prompts
         return scores
 
-    def gemini_score_response(self, response):
+    def gemini_score_response(
+        self, response: types.GenerateContentResponse
+    ) -> float:
         """Converts a Gemini API response to a normalized score.
 
         Args:
@@ -545,7 +565,12 @@ class EvaluationPipeline(Pipeline):
         else:
             raise Exception("Invalid response")
 
-    def gemini_score_dataset(self, client, dataset, script_args):
+    def gemini_score_dataset(
+        self,
+        client: genai.Client,
+        dataset: Dataset,
+        script_args: ScriptArguments,
+    ) -> torch.Tensor:
         """Scores a dataset using the Gemini API, with checkpointing and retries.
 
         Args:
@@ -598,7 +623,9 @@ class EvaluationPipeline(Pipeline):
         save_frequency = 50  # Save progress every 50 entries
         server_retry_wait = 20  # seconds to wait between server error retries
         server_max_retries = 3  # number of times to retry on server error
-        entries_to_score = [i for i, score in enumerate(scores) if score is None]
+        entries_to_score = [
+            i for i, score in enumerate(scores) if score is None
+        ]
         print(f"Found {len(entries_to_score)} entries that need scoring...")
 
         try:
@@ -652,7 +679,9 @@ class EvaluationPipeline(Pipeline):
 
                 # Save progress periodically to local file
                 if (n + 1) % save_frequency == 0:
-                    print(f"\nSaving progress locally after {n + 1} new entries...")
+                    print(
+                        f"\nSaving progress locally after {n + 1} new entries..."
+                    )
                     try:
                         torch.save(scores, checkpoint_path)
                     except Exception as e:
@@ -689,26 +718,28 @@ class EvaluationPipeline(Pipeline):
             os.remove(checkpoint_path)
 
         # Convert scores to tensor, replacing any remaining None with 0
-        scores_tensor = torch.tensor([s if s is not None else 0 for s in scores])
+        scores_tensor = torch.tensor(
+            [s if s is not None else 0 for s in scores]
+        )
         return scores_tensor
 
 
 class EvaluationAutoraterPipeline(EvaluationPipeline):
     """Pipeline for the autorater evaluation (script_args.evaluate_evaluator == True)."""
 
-    def setup_arguments(self, *cli_args, **cli_kwargs):
+    def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
         parser = HfArgumentParser(EvalArguments)
         script_args = parser.parse_args_into_dataclasses()[0]
         self.args = script_args
         set_seed(self.args.seed)
 
-    def setup_tokenizer(self):
+    def setup_tokenizer(self) -> None:
         if not self.args.use_gemini:
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.args.evaluator_model, padding_side="left"
             )
 
-    def load_data(self):
+    def load_data(self) -> None:
         # Load dataset with hallucination labels
         if self.args.dataset_labels is None:
             raise ValueError(
@@ -719,7 +750,7 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
             self.args.dataset_labels, split=self.args.dataset_labels_split
         )
 
-    def process_data(self):
+    def process_data(self) -> None:
         # Map the evaluator prompt onto the dataset
         processor_cls = get_task_processor(self.args.task_name)
 
@@ -745,7 +776,7 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
             },
         )
 
-    def setup_model(self):
+    def setup_model(self) -> None:
         # Load evaluator as causal LM and set eval mode
         if not self.args.use_gemini:
             self.evaluator = AutoModelForCausalLM.from_pretrained(
@@ -755,7 +786,7 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
             )
             self.evaluator.eval()
 
-    def run_and_save(self):
+    def run_and_save(self) -> None:
         # Score using evaluator (either gemini or local model)
         if self.args.use_gemini:
             client = genai.Client(api_key=self.args.gemini_api_key)
@@ -881,21 +912,21 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
 class EvaluationGenerationPipeline(EvaluationPipeline):
     """Pipeline for generation: create completions with writer model."""
 
-    def setup_arguments(self, *cli_args, **cli_kwargs):
+    def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
         parser = HfArgumentParser(EvalArguments)
         self.args = parser.parse_args_into_dataclasses()[0]
         set_seed(self.args.seed)
 
-    def setup_tokenizer(self):
+    def setup_tokenizer(self) -> None:
         # This part of the evaluation pipeline does not need a tokenizer
         pass
 
-    def load_data(self):
+    def load_data(self) -> None:
         self.dataset_prompts = load_dataset(
             self.args.dataset_prompts, split=self.args.dataset_prompts_split
         )
 
-    def process_data(self):
+    def process_data(self) -> None:
         # Prepare prompts and fewshot if requested
         prompts = [
             self.dataset_prompts[i]["prompt"]
@@ -924,7 +955,7 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
 
         self.prompts = prompts
 
-    def setup_model(self):
+    def setup_model(self) -> None:
         enable_lora = (
             False
             if self.args.writer_model_base == self.args.writer_model_lora
@@ -934,7 +965,7 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
         # vLLM model identifier (instantiated in run_and_save)
         self.vllm_model = self.args.writer_model_base
 
-    def run_and_save(self):
+    def run_and_save(self) -> None:
         # Prepare sampling parameters for vLLM
         sampling_params = SamplingParams(
             seed=self.args.seed,
