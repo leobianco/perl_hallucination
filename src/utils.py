@@ -5,14 +5,15 @@ Argument dataclasses for script configuration, helper functions for LoRA argumen
 
 import argparse
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Dict, Optional, Sequence, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.metrics import accuracy_score, roc_curve
 
-from src.task_processors.npov_task_processor import NPOVTaskProcessor
+from src.task_processors.base_task_processor import BaseTaskProcessor
 from src.task_processors.bosch_task_processor import BoschTaskProcessor
+from src.task_processors.npov_task_processor import NPOVTaskProcessor
 from src.task_processors.ragtruth_task_processor import RagtruthTaskProcessor
 
 
@@ -46,7 +47,7 @@ class LLMSynthScriptArguments:
     num_organic_hallus_to_keep: Optional[int] = 0
 
 
-def create_lora_argument_parser():
+def create_lora_argument_parser() -> argparse.ArgumentParser:
     """Create an argument parser for LoRA and PEFT configuration. This is a workaround the fact that the original LoraConfig is not compatible with HfArgumentParser due to the use of complex type hints.
 
     Returns:
@@ -219,7 +220,9 @@ class EvalArguments:
     )
 
 
-def hallucination_rate_from_score_file(filepath, threshold):
+def hallucination_rate_from_score_file(
+    filepath: str, threshold: float
+) -> Optional[float]:
     """Compute the hallucination rate from a score file given a threshold.
 
     Args:
@@ -255,7 +258,7 @@ def hallucination_rate_from_score_file(filepath, threshold):
         return None
 
 
-def average_from_score_file(filepath):
+def average_from_score_file(filepath: str) -> Optional[float]:
     """Compute the average score from a score file.
 
     Args:
@@ -289,7 +292,7 @@ def average_from_score_file(filepath):
         return None
 
 
-def histogram_from_score_file(filepath):
+def histogram_from_score_file(filepath: str) -> None:
     """Plot and save a histogram of scores from a file.
 
     Args:
@@ -323,7 +326,10 @@ def histogram_from_score_file(filepath):
         return None
 
 
-def compute_best_roc_threshold(labels, scores):
+def compute_best_roc_threshold(
+    labels: Union[Sequence[int], np.ndarray],
+    scores: Union[Sequence[float], np.ndarray],
+) -> Dict[str, float]:
     """Compute the best ROC threshold and related metrics.
 
     Given ground truth labels and prediction scores, compute the ROC curve, find the best threshold (maximizing TPR-FPR), and return threshold, TPR, FPR, and accuracy.
@@ -351,7 +357,7 @@ def compute_best_roc_threshold(labels, scores):
     return metrics
 
 
-def get_task_processor(task_name: str):
+def get_task_processor(task_name: str) -> type[BaseTaskProcessor]:
     """Return the TaskProcessor class for a given task name.
 
     This helper performs local imports to avoid circular import issues

@@ -6,11 +6,12 @@ Usage: call the associated shell script along with the corresponding task. E.g.:
 """
 
 import torch
+from torch import nn
 
 from src.pipelines import PERLPipeline
 
 
-def no_compile(model, *args, **kwargs):
+def no_compile(model: nn.Module, *args, **kwargs) -> nn.Module:
     """Disables torch.compile for the model to avoid unwanted compilation and related errors.
 
     Args:

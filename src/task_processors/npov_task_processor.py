@@ -1,4 +1,5 @@
 from itertools import combinations
+from typing import Any, Callable, Optional, Tuple
 
 import pandas as pd
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
@@ -9,7 +10,7 @@ from src.task_processors.base_task_processor import BaseTaskProcessor
 
 
 class NPOVTaskProcessor(BaseTaskProcessor):
-    def _load_data(self):
+    def _load_data(self) -> DatasetDict:
         data = load_dataset(
             self.args.hf_repo,
             data_files={
@@ -21,7 +22,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
 
         return data
 
-    def _preprocess_data(self, data):
+    def _preprocess_data(self, data: DatasetDict) -> DatasetDict:
         """Process NPOV data for reward model training."""
 
         processed = {}
@@ -63,7 +64,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
 
         return processed
 
-    def _make_sft_data(self, data):
+    def _make_sft_data(self, data: DatasetDict) -> DatasetDict:
         """Process NPOV data for supervised fine-tuning."""
 
         sft_data = load_dataset(
@@ -90,7 +91,9 @@ class NPOVTaskProcessor(BaseTaskProcessor):
 
         return sft_data
 
-    def _make_organic_hallucinations_data(self, data):
+    def _make_organic_hallucinations_data(
+        self, data: DatasetDict
+    ) -> DatasetDict:
         # Filter out synthetic hallucinations from train set
         data["train"] = data["train"].filter(
             lambda x: not (
@@ -117,7 +120,9 @@ class NPOVTaskProcessor(BaseTaskProcessor):
 
         return dataset
 
-    def _make_structured_hallucinations_data(self, data):
+    def _make_structured_hallucinations_data(
+        self, data: DatasetDict
+    ) -> DatasetDict:
         """
         Processes and filters hallucination data to create structured training and test splits.
         This method modifies the input data dictionary by:
@@ -157,7 +162,9 @@ class NPOVTaskProcessor(BaseTaskProcessor):
 
         return dataset
 
-    def _make_llm_hallucinations_data(self, data, organic_hallucinations_data):
+    def _make_llm_hallucinations_data(
+        self, data: DatasetDict, organic_hallucinations_data: DatasetDict
+    ) -> DatasetDict:
         """Generate synthetic hallucinations using LLM and return DatasetDict for reward model training."""
 
         args = self.args
@@ -238,10 +245,10 @@ class NPOVTaskProcessor(BaseTaskProcessor):
 
     def _make_perl_data(
         self,
-        data,
-        sft_data,
-        seed=12345,
-    ):
+        data: DatasetDict,
+        sft_data: DatasetDict,
+        seed: int = 12345,
+    ) -> DatasetDict:
         """Prepare NPOV data for PERL by creating train and test splits and formatting prompts.
 
         Args:
@@ -285,7 +292,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
 
         return perl_data
 
-    def _make_autorater_data(self, data):
+    def _make_autorater_data(self, data: DatasetDict) -> Dataset:
         concat_data = concatenate_datasets(
             [data["train"], data["validation"], data["test"]]
         )
@@ -294,7 +301,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         )
         return concat_data
 
-    def _make_evaluation_data(self, data):
+    def _make_evaluation_data(self, data: DatasetDict) -> DatasetDict:
         """Create hyperparameter and capped final test sets from the test split."""
 
         args = self.args
@@ -319,7 +326,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         return evaluation_data
 
     @staticmethod
-    def _change_hallucination_labels(entry):
+    def _change_hallucination_labels(entry: dict) -> dict:
         """Normalize hallucination label values for NPOV entries.
 
         Args:
@@ -345,7 +352,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         return entry
 
     @staticmethod
-    def _change_omission_labels(entry):
+    def _change_omission_labels(entry: dict) -> dict:
         """Normalize omission label values for NPOV entries.
 
         Args:
@@ -371,7 +378,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         return entry
 
     @staticmethod
-    def _hallucination_labels_to_numerical(entry):
+    def _hallucination_labels_to_numerical(entry: dict) -> dict:
         """Convert hallucination labels to numerical values for NPOV entries.
 
         Args:
@@ -386,7 +393,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         return entry
 
     @staticmethod
-    def _omission_labels_to_numerical(entry):
+    def _omission_labels_to_numerical(entry: dict) -> dict:
         """Convert omission labels to numerical values for NPOV entries.
 
         Args:
@@ -401,15 +408,19 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         return entry
 
     @classmethod
-    def get_evaluator_prompt(cls):
+    def get_evaluator_prompt(
+        cls,
+    ) -> Callable[[dict, Optional[Dataset], bool], dict]:
         """Return a function that builds evaluator prompts for NPOV entries.
 
         The returned function has signature func(entry, fewshot_examples=None, use_true_label=False).
         """
 
         def npov_evaluator_prompt(
-            entry, fewshot_examples=None, use_true_label=False
-        ):
+            entry: dict,
+            fewshot_examples: Optional[Dataset] = None,
+            use_true_label: bool = False,
+        ) -> dict:
             preamble = "<start_of_turn>user\nBelow are examples where an expert linguist identifies when the neutral natural language rewritings of arguments used to answer a user query contains additional arguments not present in the original list.<end_of_turn>\n"
 
             template = "<start_of_turn>user\nUser query: {user_query}\n{perspective_1_name} arguments provided: {perspective_1}\n{perspective_2_name} arguments provided: {perspective_2}\nNeutral point-of-view answer to user query, rewriting provided arguments in natural language:{npov_response}\nExpert linguist review: the rewriting of the provided arguments contains additional arguments not present in the original list (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
@@ -458,7 +469,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         return npov_evaluator_prompt
 
     @staticmethod
-    def _rm_prompt(entry):
+    def _rm_prompt(entry: dict) -> dict:
         """Format a reward model prompt for an NPOV entry.
 
         Args:
@@ -491,7 +502,11 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         return entry
 
     @staticmethod
-    def _writer_prompt(entry, SFT=False, fewshot_examples=None):
+    def _writer_prompt(
+        entry: dict,
+        SFT: bool = False,
+        fewshot_examples: Optional[Dataset] = None,
+    ) -> dict:
         """Format a prompt for the NPOV writer task, optionally with few-shot examples.
 
         Args:
@@ -558,8 +573,11 @@ class NPOVTaskProcessor(BaseTaskProcessor):
 
     @classmethod
     def get_formatting_prompts_and_response_template(
-        cls, eos_token, fewshot_examples=None, model_repo_id=None
-    ):
+        cls,
+        eos_token: str,
+        fewshot_examples: Optional[Dataset] = None,
+        model_repo_id: Optional[str] = None,
+    ) -> Tuple[Callable[[Any], list[str]], str]:
         """Return a formatting function and response template for SFT training.
 
         Args:
@@ -582,7 +600,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         if response_template is None:
             raise Exception("Response template not specified for model!")
 
-        def formatting_prompts_func(entry):
+        def formatting_prompts_func(entry: dict) -> list[str]:
             template = (
                 "User query: {user_query}\n"
                 "{perspective_1_name} arguments provided: {perspective_1}\n"
@@ -651,7 +669,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         return formatting_prompts_func, response_template
 
     @staticmethod
-    def _process_data_for_sft(split_data):
+    def _process_data_for_sft(split_data: Dataset) -> Dataset:
         """Preprocess NPOV SFT dataset by selecting and renaming relevant columns.
 
         Args:
@@ -681,8 +699,13 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         return split_data
 
     def _function_to_map_synthetic_halls_llm(
-        self, entry, fewshot_examples, client, gemini_model, generation_config
-    ):
+        self,
+        entry: dict,
+        fewshot_examples: Dataset,
+        client: genai.Client,
+        gemini_model: str,
+        generation_config: types.GenerateContentConfig,
+    ) -> dict:
         """Call Gemini LLM to generate a synthetic hallucinated NPOV response.
 
         Args:
@@ -712,7 +735,9 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         }
 
     @staticmethod
-    def _rm_synthetic_hall_llm(entry, fewshot_examples=None):
+    def _rm_synthetic_hall_llm(
+        entry: dict, fewshot_examples: Optional[Dataset] = None
+    ) -> str:
         """Generate a prompt for LLM-based synthetic hallucination creation for NPOV entries.
 
         Args:
@@ -776,7 +801,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         return prompt
 
     @staticmethod
-    def _data_augmentation(data):
+    def _data_augmentation(data: Dataset) -> dict:
         """Augment NPOV dataset by adding new perspectives and generating argument combinations.
 
         Args:
@@ -800,7 +825,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
 
         def _extract_perspective_arguments(
             topic: str, perspective_col: str, perspective_name: str
-        ):
+        ) -> set[str]:
             """
             Extract unique arguments for a given topic and perspective (pro or con).
             """
@@ -819,7 +844,9 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             return arguments
 
         # Load new perspectives from local CSV
-        new_perspectives = pd.read_csv("src/task_processors/npov_new_perspectives.csv")
+        new_perspectives = pd.read_csv(
+            "src/task_processors/npov_new_perspectives.csv"
+        )
 
         for topic in topics:
             user_query = data.filter(lambda x: x["topic"] == topic)[

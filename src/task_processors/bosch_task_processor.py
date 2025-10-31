@@ -1,7 +1,9 @@
 import random
+from typing import Any, Callable, Optional, Tuple
 
+import evaluate
 import nltk
-from datasets import DatasetDict, concatenate_datasets, load_dataset
+from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
 from google import genai
 from google.genai import types
 
@@ -12,7 +14,7 @@ nltk.download("punkt_tab")
 
 
 class BoschTaskProcessor(BaseTaskProcessor):
-    def _load_data(self):
+    def _load_data(self) -> DatasetDict:
         data = load_dataset(
             self.args.hf_repo,
             data_files={
@@ -24,7 +26,7 @@ class BoschTaskProcessor(BaseTaskProcessor):
 
         return data
 
-    def _preprocess_data(self, data):
+    def _preprocess_data(self, data: DatasetDict) -> DatasetDict:
         # Filter unanswerable samples.
         data = data.filter(lambda entry: entry.get("Answerable"))
         data = data.remove_columns("Answerable")
@@ -70,7 +72,7 @@ class BoschTaskProcessor(BaseTaskProcessor):
 
         return data
 
-    def _make_sft_data(self, data):
+    def _make_sft_data(self, data: DatasetDict) -> DatasetDict:
         """For the Bosch task, we SFT on the non-hallucinated samples of the validation split."""
 
         sft_data = data["test"].filter(
@@ -84,7 +86,9 @@ class BoschTaskProcessor(BaseTaskProcessor):
 
         return sft_data
 
-    def _make_organic_hallucinations_data(self, data):
+    def _make_organic_hallucinations_data(
+        self, data: DatasetDict
+    ) -> DatasetDict:
         organic_hallucinations_data = DatasetDict(
             {"train": data["test"], "test": data["validation"]}
         )
@@ -95,7 +99,9 @@ class BoschTaskProcessor(BaseTaskProcessor):
 
         return organic_hallucinations_data
 
-    def _make_structured_hallucinations_data(self, data):
+    def _make_structured_hallucinations_data(
+        self, data: DatasetDict
+    ) -> DatasetDict:
         """Create structured synthetic hallucinations data for reward model training."""
 
         args = self.args
@@ -110,9 +116,13 @@ class BoschTaskProcessor(BaseTaskProcessor):
             self._rm_prompt
         )
         # Apply the map that creates structured hallucinations.
+        rouge_metric = evaluate.load("rouge")
+
         synthetic_hallucinations_struct = to_become_hallus.map(
-            self._synthetic_hall_structured
+            self._synthetic_hall_structured,
+            fn_kwargs=dict(rouge_metric=rouge_metric),
         )
+
         # Write the RM prompts with the modified entries.
         synthetic_hallucinations_struct = synthetic_hallucinations_struct.map(
             self._rm_prompt
@@ -124,16 +134,28 @@ class BoschTaskProcessor(BaseTaskProcessor):
         # Create dataset with same test split as organic.
         # TODO: take the change of splits into account!
         organic = self._make_organic_hallucinations_data(data)
+        organic_test_split = organic["test"]
+        # Add placeholder columns so that in the train split you can store
+        # information about what sentence in context was erased
+        organic_test_split = organic_test_split.add_column(
+            "erased_context", [""] * len(organic_test_split)
+        )
+        organic_test_split = organic_test_split.add_column(
+            "rouge1_score", [0.0] * len(organic_test_split)
+        )
+
         synthetic_hallucinations_struct_data = DatasetDict(
             {
                 "train": synthetic_hallucinations_struct_train_data,
-                "test": organic["test"],
+                "test": organic_test_split,
             }
         )
 
         return synthetic_hallucinations_struct_data
 
-    def _make_llm_hallucinations_data(self, data, organic_hallucinations_data):
+    def _make_llm_hallucinations_data(
+        self, data: DatasetDict, organic_hallucinations_data: DatasetDict
+    ) -> DatasetDict:
         """Generate synthetic hallucinations using LLM and return DatasetDict for reward model training."""
 
         args = self.args
@@ -191,8 +213,13 @@ class BoschTaskProcessor(BaseTaskProcessor):
         return synthetic_hallucinations_llm_data
 
     def _function_to_map_synthetic_halls_llm(
-        self, entry, fewshot_examples, client, gemini_model, generation_config
-    ):
+        self,
+        entry: dict,
+        fewshot_examples: Dataset,
+        client: genai.Client,
+        gemini_model: str,
+        generation_config: types.GenerateContentConfig,
+    ) -> dict:
         """Call Gemini LLM to generate a synthetic hallucinated Bosch response.
 
         Args:
@@ -220,7 +247,9 @@ class BoschTaskProcessor(BaseTaskProcessor):
             "label": 0,
         }
 
-    def _make_perl_data(self, data, sft_data, seed=12345):
+    def _make_perl_data(
+        self, data: DatasetDict, sft_data: DatasetDict, seed: int = 12345
+    ) -> DatasetDict:
         perl_data = DatasetDict(
             {
                 "train": data["validation"],
@@ -230,7 +259,7 @@ class BoschTaskProcessor(BaseTaskProcessor):
 
         return perl_data
 
-    def _make_autorater_data(self, data):
+    def _make_autorater_data(self, data: DatasetDict) -> Dataset:
         """For the autorater, we want to measure its ability on all samples, so we just merge all of them and save as a single test split."""
 
         autorater_dataset = concatenate_datasets(
@@ -239,13 +268,15 @@ class BoschTaskProcessor(BaseTaskProcessor):
 
         return autorater_dataset
 
-    def _make_evaluation_data(self, data):
+    def _make_evaluation_data(self, data: DatasetDict) -> DatasetDict:
         evaluation_data = DatasetDict({"test": data["train"]})
 
         return evaluation_data
 
     @staticmethod
-    def _flip_entries(data, data_to_flip):
+    def _flip_entries(
+        data: DatasetDict, data_to_flip: DatasetDict
+    ) -> DatasetDict:
         invert_class_hall = {"Yes": "No", "No": "Yes"}
 
         for split in data.keys():
@@ -265,7 +296,7 @@ class BoschTaskProcessor(BaseTaskProcessor):
         return data
 
     @staticmethod
-    def _rm_prompt(entry):
+    def _rm_prompt(entry: dict) -> dict:
         """Format a reward model prompt for a Bosch entry.
 
         Args:
@@ -281,8 +312,11 @@ class BoschTaskProcessor(BaseTaskProcessor):
 
     @classmethod
     def get_formatting_prompts_and_response_template(
-        cls, eos_token, fewshot_examples=None, model_repo_id=None
-    ):
+        cls,
+        eos_token: str,
+        fewshot_examples: Optional[Dataset] = None,
+        model_repo_id: Optional[str] = None,
+    ) -> Tuple[Callable[[Any], list[str]], str]:
         """Return a formatting function and response template for Bosch SFT.
 
         For Bosch the response template is fixed and the formatting function
@@ -292,7 +326,7 @@ class BoschTaskProcessor(BaseTaskProcessor):
 
         response_template = "\nAnswer to user's question:\n"
 
-        def formatting_prompts_func(entry):
+        def formatting_prompts_func(entry: dict) -> list[str]:
             template = (
                 "You are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information given.\n"
                 "User question:\n{question}"
@@ -422,12 +456,16 @@ class BoschTaskProcessor(BaseTaskProcessor):
         return prompt
 
     @classmethod
-    def get_evaluator_prompt(cls):
+    def get_evaluator_prompt(
+        cls,
+    ) -> Callable[[dict, Optional[Dataset], bool], dict]:
         """Return a function that builds evaluator prompts for Bosch entries."""
 
         def bosch_evaluator_prompt(
-            entry, fewshot_examples=None, use_true_label=False
-        ):
+            entry: dict,
+            fewshot_examples: Optional[Dataset] = None,
+            use_true_label: bool = False,
+        ) -> dict:
             preamble = '<start_of_turn>user\nYou are an expert linguist and fact-checker responsible for determining when an answer contains information not supported by a source text.\n\nIn this task:\n1. A user asks a question about their car\n2. You receive an excerpt from the car\'s manual\n3. You examine a proposed answer to the user\'s question\n\nYour ONLY job is to determine: Does the proposed answer contain ANY statements, claims, instructions, or implications that are NOT explicitly supported by the manual excerpt?\n\nImportant evaluation criteria:\n- If the answer makes ANY claim not directly supported by the manual, respond with "Yes"\n- If the answer contains any logical implication not explicitly appearing in the manual excerpt, valid or not, respond with "Yes"\n- If the answer only rephrases information from the manual without adding new claims, respond with "No"\n- If the answer is FULLY supported by the manual, but truncated at the last sentence (due to word limit), answer "No"\n- Introduction sentences such as "Follow these steps:" and conclusions such as "I hope these helps!" are allowed. If all other sentences are supported by the context, answer "No"\n- Ignore differences in tone, style, or level of detail if the underlying information is supported\n- Focus solely on faithfulness to the source, not helpfulness or completeness\n\nProvide ONLY "Yes" or "No" as your final answer.\n<end_of_turn>\n'
 
             template = "<start_of_turn>user\nQuestion: {question}\n\nManual excerpt: {context}\n\nProposed answer: {response}\n\nAnalysis:\n1. Compare each statement in the proposed answer to the manual excerpt\n2. Identify any claims in the answer not explicitly supported by the manual\n3. Consider whether the answer introduces new information not present in the manual\n\nDoes the proposed answer state anything not supported by the information in the manual? (Yes/No):\n<end_of_turn>\n<start_of_turn>model\n{ans}\n"
@@ -464,7 +502,7 @@ class BoschTaskProcessor(BaseTaskProcessor):
         return bosch_evaluator_prompt
 
     @staticmethod
-    def _synthetic_hall_structured(entry):
+    def _synthetic_hall_structured(entry: dict, rouge_metric: Any) -> dict:
         """Create a structured synthetic hallucination in Bosch data by removing sentences from the context.
 
         Args:
@@ -476,25 +514,43 @@ class BoschTaskProcessor(BaseTaskProcessor):
         """
 
         # Break response into sentences and filter out small ones
-        tok = nltk.sent_tokenize(entry["Context"])
+        sentences_context = nltk.sent_tokenize(entry["Context"])
+        sentences_response = nltk.sent_tokenize(entry["response"])
 
-        # Randomly select sentences in the context.
-        # One if there are less than 5 sentences, 2 otherwise.
-        num_to_sample = 1 if len(tok) < 5 else 2
-        rand = random.sample(tok, num_to_sample)
-        rand_idx = [tok.index(r) for r in rand]
+        # Pick a random sentence in generation
+        random_sentence_response = random.sample(sentences_response, 1)
 
-        # Erase that sentence
-        for r_idx in rand_idx:
-            tok[r_idx] = ""
+        # Compute the ROUGE-1 score between this and sentences in context
+        # and pick sentence in context with maximal ROUGE-1 score to erase
+        best_idx = 0
+        max_rouge = 0
+        for idx_context, sentence_context in enumerate(sentences_context):
+            rouge_results = rouge_metric.compute(
+                predictions=random_sentence_response,
+                references=[sentence_context],
+            )
+            if rouge_results["rouge1"] > max_rouge:
+                best_idx = idx_context
+                max_rouge = rouge_results["rouge1"]
 
-        # Join everything back together
-        new_context = " ".join(tok)
+        # Store information about erased sentence
+        entry["erased_context"] = sentences_context[best_idx]
+        entry["rouge1_score"] = max_rouge
 
-        # Update response and labels
+        # Erase the chosen sentence and join everything back together
+        sentences_context[best_idx] = ""
+        new_context = " ".join(sentences_context)
         entry["Context"] = new_context
         entry["class_hall"] = "Yes"
         entry["label"] = 0
+        entry["prompt"] = (
+            "You are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information giver. Do not add to your answer any information other than those present in the manual excerpt.\n"
+            + "User question:\n"
+            + entry["Question"]
+            + "\nManual information:\n"
+            + entry["Context"]
+            + "\nAnswer to user's question:\n"
+        )
 
         # Important: you need to retokenize these later!
         return entry
