@@ -1,0 +1,89 @@
+#!/bin/bash
+
+# Core Parameters
+USER="leobianco"
+SEED=130104
+MODEL_REPO_ID="google/gemma-2-2b-it"
+REWARD_MODEL_PATH="${USER}/"
+SFT_MODEL_PATH="${USER}/"
+
+# Training Parameters
+TOTAL_EPISODES=10000
+LEARNING_RATE=2e-5
+LR_SCHEDULER_TYPE="cosine"
+WARMUP_RATIO=0.05
+KL_COEFF=1e-4
+RESPONSE_LENGTH=150
+RLOO_K=2
+NUM_PPO_EPOCHS=4
+NUM_MINIBATCHES=16
+PER_DEVICE_BATCH_SIZE=1
+LOCAL_ROLLOUT_FORWARD_BATCH_SIZE=8
+TEMPERATURE=0.1
+SAVE_STEPS=25
+NUM_SAMPLE_GENERATIONS=10
+MISSING_EOS_PENALTY=1.0
+
+# Infrastructure Parameters
+DEEPSPEED_CONFIG="scripts/deepspeed_config.yaml"
+SHUTDOWN=false
+
+# Parameters derived from above
+TASK_NAME="$1"
+TIMESTAMP=$(date '+%y%m%d%H%M')
+MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
+RUN_IDENTIFIER="${USER}/${TASK_NAME}_PERL_${MODEL_NAME}_S${SEED}_eps${TOTAL_EPISODES}_lr${LEARNING_RATE}_kl${KL_COEFF}_${TIMESTAMP}"
+
+# Checks
+if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ]; then
+    echo "Invalid task name" 
+    echo "$TASK_NAME"
+    exit 1
+fi
+
+accelerate launch \
+  --config_file="${DEEPSPEED_CONFIG}" \
+  src/perl.py \
+  -- \
+  --task_name "$TASK_NAME" \
+  --seed "$SEED" \
+  --report_to "wandb" \
+  --run_name "$RUN_IDENTIFIER" \
+  --logging_steps 1 \
+  --output_dir "./checkpoints/${TASK_NAME}/perl/${RUN_IDENTIFIER}" \
+  --overwrite_output_dir True \
+  --push_to_hub True \
+  --hub_model_id "$RUN_IDENTIFIER" \
+  --dataset_repo_id "${USER}/${TASK_NAME}_perl" \
+  --model_repo_id "${MODEL_REPO_ID}" \
+  --stop_token "eos" \
+  --do_train True \
+  --save_strategy "steps" \
+  --save_steps "$SAVE_STEPS" \
+  --save_only_model True \
+  --total_episodes "$TOTAL_EPISODES" \
+  --learning_rate "$LEARNING_RATE" \
+  --lr_scheduler_type "$LR_SCHEDULER_TYPE" \
+  --warmup_ratio "$WARMUP_RATIO" \
+  --response_length "$RESPONSE_LENGTH" \
+  --weight_decay 0.0 \
+  --gradient_accumulation_steps 1 \
+  --per_device_eval_batch_size "$PER_DEVICE_BATCH_SIZE" \
+  --eval_accumulation_steps 1 \
+  --reward_model_path "${REWARD_MODEL_PATH}" \
+  --sft_model_path "${SFT_MODEL_PATH}" \
+  --kl_coef "$KL_COEFF" \
+  --rloo_k "$RLOO_K" \
+  --num_ppo_epochs "$NUM_PPO_EPOCHS" \
+  --num_mini_batches "$NUM_MINIBATCHES" \
+  --per_device_train_batch_size "$PER_DEVICE_BATCH_SIZE" \
+  --local_rollout_forward_batch_size "$LOCAL_ROLLOUT_FORWARD_BATCH_SIZE" \
+  --missing_eos_penalty "$MISSING_EOS_PENALTY" \
+  --temperature "$TEMPERATURE" \
+  --num_sample_generations "$NUM_SAMPLE_GENERATIONS"
+
+if [ "$SHUTDOWN" = true ]; then
+  echo "Shutting down the VM..."
+  sudo shutdown -h now
+fi
+
