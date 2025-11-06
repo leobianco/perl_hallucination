@@ -105,10 +105,10 @@ class BoschTaskProcessor(BaseTaskProcessor):
         """Create structured synthetic hallucinations data for reward model training."""
 
         args = self.args
-        # Use validation split for both non-hallucinated and hallucinated (TO BE CORRECTED).
+
         to_become_hallus, non_hallucinated_data_rest = (
             self._split_nonhallucinated_for_synthetic(
-                data["validation"], args.num_synth_hallus, args.seed
+                data["test"], args.num_synth_hallus, args.seed
             )
         )
         # Build RM prompts for the non-hallucinated data.
