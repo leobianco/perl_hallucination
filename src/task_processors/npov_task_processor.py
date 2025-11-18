@@ -296,7 +296,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         concat_data = concatenate_datasets(
             [data["train"], data["validation"], data["test"]]
         )
-        concat_data.filter(
+        concat_data = concat_data.filter(
             lambda entry: entry["has synthetic hallucination"] == "No"
         )
         return concat_data
