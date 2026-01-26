@@ -1,24 +1,46 @@
 from typing import Any, Callable, Optional, Tuple
 
-from datasets import Dataset, DatasetDict
+from datasets import Dataset, DatasetDict, load_dataset, concatenate_datasets
 
 from src.task_processors.base_task_processor import BaseTaskProcessor
 
 
 class RagtruthTaskProcessor(BaseTaskProcessor):
     def _load_data(self) -> DatasetDict:
-        pass
+        data = load_dataset(self.args.hf_repo)
+        return data
 
     def _preprocess_data(self, data: DatasetDict) -> DatasetDict:
-        pass
+        processed = {}
+
+        for split in data.keys():
+            split_data = data[split]
+            split_data = split_data.map(self._create_hallucination_labels)
+            split_data = split_data.rename_column("response", "completion")
+            processed[split] = split_data
+
+        processed = DatasetDict(processed)
+
+        return processed
 
     def _make_sft_data(self, data: DatasetDict) -> DatasetDict:
-        pass
+        sft_data = {}
+        for split in data.keys():
+            sft_data[split] = data.filter(
+                lambda entry: entry["label"] == 1
+            )
+        sft_data = DatasetDict(sft_data)
+
+        return sft_data
 
     def _make_organic_hallucinations_data(
         self, data: DatasetDict
     ) -> DatasetDict:
-        pass
+        # We just need to make the RM prompt by concatenating the prompt
+        # in the dataset with the response
+        rm_organic_data = data.map(self._rm_prompt)
+
+        return rm_organic_data
 
     def _make_structured_hallucinations_data(
         self, data: DatasetDict
@@ -36,10 +58,36 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
         pass
 
     def _make_autorater_data(self, data: DatasetDict) -> Dataset:
-        pass
+        """For the autorater, we want to measure its ability on all samples, so we just merge all of them and save as a single test split."""
+
+        autorater_dataset = concatenate_datasets(
+            [data["train"], data["test"]]
+        )
+
+        return autorater_dataset
 
     def _make_evaluation_data(self, data: DatasetDict) -> DatasetDict:
         pass
+
+    @staticmethod
+    def _create_hallucination_labels(entry):
+        entry['label'] = 1 if len(entry['labels'])==0 else 0
+        return entry
+
+    @staticmethod
+    def _rm_prompt(entry: dict) -> dict:
+        """Format a reward model prompt for a RAGTruth entry.
+
+        Args:
+            entry (dict): Entry with 'prompt' and 'completion' fields.
+
+        Returns:
+            dict: Entry with updated 'prompt' field.
+        """
+
+        entry["prompt"] += entry["completion"]
+
+        return entry
 
     @classmethod
     def get_formatting_prompts_and_response_template(
