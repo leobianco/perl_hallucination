@@ -1,3 +1,4 @@
+from copy import deepcopy
 from typing import Any, Callable, Optional, Tuple
 
 from datasets import Dataset, DatasetDict, load_dataset, concatenate_datasets
@@ -25,10 +26,12 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
         return processed
 
     def _make_sft_data(self, data: DatasetDict) -> DatasetDict:
-        sft_data = {}
-        for split in data.keys():
-            sft_data[split] = data.filter(lambda entry: entry["label"] == 1)
-        sft_data = DatasetDict(sft_data)
+        sft_data = deepcopy(data)
+
+        for split in sft_data.keys():
+            sft_data[split] = sft_data[split].filter(
+                lambda entry: entry["label"] == 1
+            )
 
         return sft_data
 
@@ -56,12 +59,12 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
     ) -> DatasetDict:
         xsum_val = load_dataset("EdinburghNLP/xsum", split="validation")
         xsum_val = xsum_val.rename_column("document", "context")
-        xsum_val = xsum_val.rename_column("response", "completion")
+        xsum_val = xsum_val.rename_column("summary", "completion")
         xsum_val = xsum_val.map(self._xsum_to_prompt)
         xsum_val = xsum_val.select_columns(["prompt"])
 
         # TODO: make the hard coded 250 a parameter set by user
-        perl_data = xsum_val.shuffle(seed=seed).select(250)
+        perl_data = xsum_val.shuffle(seed=seed).select(range(250))
 
         return perl_data
 

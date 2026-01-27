@@ -226,18 +226,18 @@ class BaseTaskProcessor(abc.ABC):
 
         data = self._load_data()
         data = self._preprocess_data(data)
-        data.push_to_hub(repo_id=args.task_name + "_processed")
+        data.push_to_hub(repo_id=args.hf_repo + "_processed")
 
         autorater_data = self._make_autorater_data(data)
         autorater_data.push_to_hub(
-            repo_id=args.task_name + "_autorater", split="test"
+            repo_id=args.hf_repo + "_autorater", split="test"
         )
 
         organic_hallucinations_data = self._make_organic_hallucinations_data(
             data
         )
         organic_hallucinations_data.push_to_hub(
-            repo_id=args.task_name + "_rm_organic"
+            repo_id=args.hf_repo + "_rm_organic"
         )
 
         if args.synthetic_hallus_struct:
@@ -245,7 +245,7 @@ class BaseTaskProcessor(abc.ABC):
                 self._make_structured_hallucinations_data(data)
             )
             structured_hallucinations_data.push_to_hub(
-                repo_id=args.task_name + "_rm_synthetic_struct"
+                repo_id=args.hf_repo + "_rm_synthetic_struct"
             )
 
         if args.synthetic_hallus_llm:
@@ -253,14 +253,14 @@ class BaseTaskProcessor(abc.ABC):
                 data, organic_hallucinations_data
             )
             llm_hallucinations_data.push_to_hub(
-                repo_id=args.task_name + "_rm_synthetic_llm"
+                repo_id=args.hf_repo + "_rm_synthetic_llm"
             )
 
         sft_data = self._make_sft_data(data)
-        sft_data.push_to_hub(repo_id=args.task_name + "_sft")
+        sft_data.push_to_hub(repo_id=args.hf_repo + "_sft")
 
         perl_data = self._make_perl_data(data, sft_data, seed=args.seed)
-        perl_data.push_to_hub(repo_id=args.task_name + "_perl")
+        perl_data.push_to_hub(repo_id=args.hf_repo + "_perl")
 
         evaluation_data = self._make_evaluation_data(data)
-        evaluation_data.push_to_hub(repo_id=args.task_name + "_final_test_set")
+        evaluation_data.push_to_hub(repo_id=args.hf_repo + "_final_test_set")
