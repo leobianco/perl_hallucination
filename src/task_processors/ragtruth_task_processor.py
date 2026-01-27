@@ -16,6 +16,7 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
         for split in data.keys():
             split_data = data[split]
             split_data = split_data.map(self._create_hallucination_labels)
+            split_data = split_data.rename_column("source_info", "context")
             split_data = split_data.rename_column("response", "completion")
             processed[split] = split_data
 
@@ -54,6 +55,8 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
         self, data: DatasetDict, sft_data: DatasetDict, seed: int = 12345
     ) -> DatasetDict:
         xsum_val = load_dataset("EdinburghNLP/xsum", split="validation")
+        xsum_val = xsum_val.rename_column("document", "context")
+        xsum_val = xsum_val.rename_column("response", "completion")
         xsum_val = xsum_val.map(self._xsum_to_prompt)
         xsum_val = xsum_val.select_columns(["prompt"])
 
@@ -71,6 +74,7 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
 
     def _make_evaluation_data(self, data: DatasetDict) -> DatasetDict:
         xsum_test = load_dataset("EdinburghNLP/xsum", split="test")
+        xsum_test = xsum_test.rename_column("document", "context")
         xsum_test = xsum_test.map(self._xsum_to_prompt)
         xsum_test = xsum_test.select_columns(["prompt"])
 
@@ -79,6 +83,7 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
     @staticmethod
     def _create_hallucination_labels(entry):
         entry["label"] = 1 if len(entry["labels"]) == 0 else 0
+        entry["class_hall"] = "No" if len(entry["labels"]) == 0 else "Yes"
         return entry
 
     @staticmethod
@@ -98,13 +103,13 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
 
     @staticmethod
     def _xsum_to_prompt(entry: dict) -> dict:
-        template = """Summarize the following news within {x} words:\n{source_info}\n\noutput:"""
+        template = """Summarize the following news within {x} words:\n{context}\n\noutput:"""
 
         # The RAGTruth paper states x = min(200, word_num_of_news//4)
-        word_num_of_news = len(entry["document"].split())
+        word_num_of_news = len(entry["context"].split())
 
         entry["prompt"] = template.format(
-            x=min(200, word_num_of_news // 4), source_info=entry["document"]
+            x=min(200, word_num_of_news // 4), context=entry["context"]
         )
 
         return entry
@@ -118,16 +123,26 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
     ) -> Tuple[Callable[[Any], list[str]], str]:
         """Provide a simple formatting function and response template for Ragtruth.
 
-        This is a placeholder until a full implementation is available. It returns
-        a function that expects an example and returns it unchanged, and a
-        minimal response template matching the old behavior.
+        It returns a function that expects an example and returns it unchanged, and a minimal response template matching the old behavior.
         """
 
         response_template = "\n\noutput:\n"
 
-        def formatting_prompts_func(example):
-            # No-op formatting for now
-            return example
+        def formatting_prompts_func(entry: dict) -> list[str]:
+            template = "{context}\n{completion}{eos_token}"
+
+            output_texts = []
+
+            for i in range(len(entry["context"])):
+                formatted_prompt = template.format(
+                    context=entry["context"][i],
+                    completion=entry["completion"][i],
+                    eos_token=eos_token,
+                )
+
+                output_texts.append(formatted_prompt)
+
+            return output_texts
 
         return formatting_prompts_func, response_template
 
@@ -144,15 +159,11 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
         ) -> dict:
             preamble = 'You are an expert evaluator specializing in detecting hallucinations in text summarization. Your task is to determine whether a summary contains any information not present in the original text.\n\nIn this evaluation:\n1. You will be given an original text that was meant to be summarized\n2. You will examine a summary generated from that text\n3. You must determine if the summary contains ANY information, statements, claims, or implications that are NOT supported by the original text\n\nEvaluation guidelines:\n- A hallucination occurs when the summary includes facts, details, or conclusions absent from the original text\n- Reasonable paraphrasing and reorganization of information is acceptable\n- Focus only on factual accuracy, not on style, tone, or format\n- Be vigilant about subtle additions that might seem plausible but aren\'t in the source\n\nYour response must be ONLY "Yes" (hallucination detected) or "No" (no hallucination detected).\n'
 
-            template = """\n\nOriginal text to be summarized: {user_query}\n{response}\n\nEvaluation process:\n1. Read the original text carefully\n2. Examine each claim or statement in the summary (output)\n3. Verify that every piece of information in the summary (output) is supported by the original text\n4. Check for subtle additions, expansions, or assumptions not justified by the original\n\nDoes the summary (output) contain ANY information not present in or directly inferable from the original text? (Yes/No):{ans}\n"""
-
-            response = (
-                entry["response"] if use_true_label else entry["completion"]
-            )
+            template = """\n\nOriginal text to be summarized: {context}\n{completion}\n\nEvaluation process:\n1. Read the original text carefully\n2. Examine each claim or statement in the summary (output)\n3. Verify that every piece of information in the summary (output) is supported by the original text\n4. Check for subtle additions, expansions, or assumptions not justified by the original\n\nDoes the summary (output) contain ANY information not present in or directly inferable from the original text? (Yes/No):{ans}\n"""
 
             formatted_prompt = template.format(
-                user_query=entry["user_query"],
-                response=response,
+                context=entry["context"],
+                completion=entry["completion"],
                 ans="",
             )
 
@@ -161,8 +172,8 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
             if fewshot_examples is not None:
                 for fewshot_example in fewshot_examples:
                     fewshot_prompt = template.format(
-                        user_query=fewshot_example["user_query"],
-                        response=fewshot_example["response"],
+                        context=fewshot_example["context"],
+                        completion=fewshot_example["completion"],
                         ans=fewshot_example["class_hall"],
                     )
                     prompt += fewshot_prompt
