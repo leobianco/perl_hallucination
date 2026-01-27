@@ -26,9 +26,7 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
     def _make_sft_data(self, data: DatasetDict) -> DatasetDict:
         sft_data = {}
         for split in data.keys():
-            sft_data[split] = data.filter(
-                lambda entry: entry["label"] == 1
-            )
+            sft_data[split] = data.filter(lambda entry: entry["label"] == 1)
         sft_data = DatasetDict(sft_data)
 
         return sft_data
@@ -55,23 +53,32 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
     def _make_perl_data(
         self, data: DatasetDict, sft_data: DatasetDict, seed: int = 12345
     ) -> DatasetDict:
-        pass
+        xsum_val = load_dataset("EdinburghNLP/xsum", split="validation")
+        xsum_val = xsum_val.map(self._xsum_to_prompt)
+        xsum_val = xsum_val.select_columns(["prompt"])
+
+        # TODO: make the hard coded 250 a parameter set by user
+        perl_data = xsum_val.shuffle(seed=seed).select(250)
+
+        return perl_data
 
     def _make_autorater_data(self, data: DatasetDict) -> Dataset:
         """For the autorater, we want to measure its ability on all samples, so we just merge all of them and save as a single test split."""
 
-        autorater_dataset = concatenate_datasets(
-            [data["train"], data["test"]]
-        )
+        autorater_dataset = concatenate_datasets([data["train"], data["test"]])
 
         return autorater_dataset
 
     def _make_evaluation_data(self, data: DatasetDict) -> DatasetDict:
-        pass
+        xsum_test = load_dataset("EdinburghNLP/xsum", split="test")
+        xsum_test = xsum_test.map(self._xsum_to_prompt)
+        xsum_test = xsum_test.select_columns(["prompt"])
+
+        return xsum_test
 
     @staticmethod
     def _create_hallucination_labels(entry):
-        entry['label'] = 1 if len(entry['labels'])==0 else 0
+        entry["label"] = 1 if len(entry["labels"]) == 0 else 0
         return entry
 
     @staticmethod
@@ -86,6 +93,19 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
         """
 
         entry["prompt"] += entry["completion"]
+
+        return entry
+
+    @staticmethod
+    def _xsum_to_prompt(entry: dict) -> dict:
+        template = """Summarize the following news within {x} words:\n{source_info}\n\noutput:"""
+
+        # The RAGTruth paper states x = min(200, word_num_of_news//4)
+        word_num_of_news = len(entry["document"].split())
+
+        entry["prompt"] = template.format(
+            x=min(200, word_num_of_news // 4), source_info=entry["document"]
+        )
 
         return entry
 
@@ -122,7 +142,7 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
             fewshot_examples: Optional[Dataset] = None,
             use_true_label: bool = False,
         ) -> dict:
-            preamble = 'You are an expert evaluator specializing in detecting hallucinations in text summarization. Your task is to determine whether a summary contains any information not present in the original text.\n\nIn this evaluation:\n1. You will be given an original text that was meant to be summarized\n2. You will examine a summary generated from that text\3. You must determine if the summary contains ANY information, statements, claims, or implications that are NOT supported by the original text\n\nEvaluation guidelines:\n- A hallucination occurs when the summary includes facts, details, or conclusions absent from the original text\n- Reasonable paraphrasing and reorganization of information is acceptable\n- Focus only on factual accuracy, not on style, tone, or format\n- Be vigilant about subtle additions that might seem plausible but aren\'t in the source\n\nYour response must be ONLY "Yes" (hallucination detected) or "No" (no hallucination detected).\n'
+            preamble = 'You are an expert evaluator specializing in detecting hallucinations in text summarization. Your task is to determine whether a summary contains any information not present in the original text.\n\nIn this evaluation:\n1. You will be given an original text that was meant to be summarized\n2. You will examine a summary generated from that text\n3. You must determine if the summary contains ANY information, statements, claims, or implications that are NOT supported by the original text\n\nEvaluation guidelines:\n- A hallucination occurs when the summary includes facts, details, or conclusions absent from the original text\n- Reasonable paraphrasing and reorganization of information is acceptable\n- Focus only on factual accuracy, not on style, tone, or format\n- Be vigilant about subtle additions that might seem plausible but aren\'t in the source\n\nYour response must be ONLY "Yes" (hallucination detected) or "No" (no hallucination detected).\n'
 
             template = """\n\nOriginal text to be summarized: {user_query}\n{response}\n\nEvaluation process:\n1. Read the original text carefully\n2. Examine each claim or statement in the summary (output)\n3. Verify that every piece of information in the summary (output) is supported by the original text\n4. Check for subtle additions, expansions, or assumptions not justified by the original\n\nDoes the summary (output) contain ANY information not present in or directly inferable from the original text? (Yes/No):{ans}\n"""
 
