@@ -1011,32 +1011,34 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
         self.dataset_prompts = self.dataset_prompts.add_column(
             "completion", generations
         )
-        if "conciseness" in self.dataset_prompts.column_names:
-            self.dataset_prompts = self.dataset_prompts.remove_columns(
-                "conciseness"
-            )
-        conciseness: list[float] = []
-        completions = self.dataset_prompts["completion"]
-        contexts = self.dataset_prompts["Context"]
-        for completion, context in zip(completions, contexts):
-            context_length = len(context) if context else 0
-            completion_length = len(completion) if completion else 0
-            ratio = (
-                float(completion_length) / float(context_length)
-                if context_length
-                else 0.0
-            )
-            conciseness.append(ratio)
-        self.dataset_prompts = self.dataset_prompts.add_column(
-            "conciseness", conciseness
-        )
+
+        # OLD CONCISENESS CALCULATION
+        # if "conciseness" in self.dataset_prompts.column_names:
+        #     self.dataset_prompts = self.dataset_prompts.remove_columns(
+        #         "conciseness"
+        #     )
+        # conciseness: list[float] = []
+        # completions = self.dataset_prompts["completion"]
+        # contexts = self.dataset_prompts["context"]
+        # for completion, context in zip(completions, contexts):
+        #     context_length = len(context) if context else 0
+        #     completion_length = len(completion) if completion else 0
+        #     ratio = (
+        #         float(completion_length) / float(context_length)
+        #         if context_length
+        #         else 0.0
+        #     )
+        #     conciseness.append(ratio)
+        # self.dataset_prompts = self.dataset_prompts.add_column(
+        #     "conciseness", conciseness
+        # )
+
         try:
             name_for_saving = self.args.writer_model_lora.split(
                 f"{self.args.user}/"
             )[1]
         except Exception:
             name_for_saving = self.args.writer_model_lora.split("/")[1]
-
         name_for_saving = "eval_" + name_for_saving + "_gens"
         name_for_saving += f"_T{str(float(self.args.temperature))}"
         name_for_saving += f"_wfs{self.args.writer_num_fewshot}"

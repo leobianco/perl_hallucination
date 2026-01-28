@@ -16,9 +16,11 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
 
         for split in data.keys():
             split_data = data[split]
-            split_data = split_data.map(self._create_hallucination_labels)
             split_data = split_data.rename_column("source_info", "context")
             split_data = split_data.rename_column("response", "completion")
+            split_data = split_data.rename_column("labels", "annotations")
+            split_data = split_data.filter(self._filter_large_entries)
+            split_data = split_data.map(self._create_hallucination_labels)
             processed[split] = split_data
 
         processed = DatasetDict(processed)
@@ -60,6 +62,7 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
         xsum_val = load_dataset("EdinburghNLP/xsum", split="validation")
         xsum_val = xsum_val.rename_column("document", "context")
         xsum_val = xsum_val.rename_column("summary", "completion")
+        xsum_val = xsum_val.filter(self._filter_large_entries)
         xsum_val = xsum_val.map(self._xsum_to_prompt)
         xsum_val = xsum_val.select_columns(["prompt"])
 
@@ -78,6 +81,8 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
     def _make_evaluation_data(self, data: DatasetDict) -> DatasetDict:
         xsum_test = load_dataset("EdinburghNLP/xsum", split="test")
         xsum_test = xsum_test.rename_column("document", "context")
+        xsum_test = xsum_test.rename_column("summary", "completion")
+        xsum_test = xsum_test.filter(self._filter_large_entries)
         xsum_test = xsum_test.map(self._xsum_to_prompt)
         xsum_test = xsum_test.select_columns(["prompt"])
 
@@ -85,8 +90,8 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
 
     @staticmethod
     def _create_hallucination_labels(entry):
-        entry["label"] = 1 if len(entry["labels"]) == 0 else 0
-        entry["class_hall"] = "No" if len(entry["labels"]) == 0 else "Yes"
+        entry["label"] = 1 if len(entry["annotations"]) == 0 else 0
+        entry["class_hall"] = "No" if len(entry["annotations"]) == 0 else "Yes"
         return entry
 
     @staticmethod
@@ -103,6 +108,16 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
         entry["prompt"] += entry["completion"]
 
         return entry
+
+    @staticmethod
+    def _filter_large_entries(entry: dict) -> dict:
+        is_short = (
+            True
+            if len(entry["context"] + entry["completion"]) < 15000
+            else False
+        )
+
+        return is_short
 
     @staticmethod
     def _xsum_to_prompt(entry: dict) -> dict:
