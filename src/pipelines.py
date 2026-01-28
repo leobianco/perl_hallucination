@@ -605,7 +605,7 @@ class EvaluationPipeline(Pipeline):
         # Initialize scores: load from checkpoint if exists, else from dataset or None
         if os.path.exists(checkpoint_path):
             print(f"Loading scores from checkpoint: {checkpoint_path}")
-            scores = torch.load(checkpoint_path)
+            scores = torch.load(checkpoint_path, weights_only=False)
             # If checkpoint is shorter than dataset (e.g. dataset updated), pad with None
             if len(scores) < len(dataset):
                 scores = list(scores) + [None] * (len(dataset) - len(scores))
@@ -1008,6 +1008,10 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
             outputs = llm.generate(self.prompts, sampling_params)
 
         generations = [output.outputs[0].text for output in outputs]
+        if "completion" in self.dataset_prompts.column_names:
+            self.dataset_prompts = self.dataset_prompts.remove_columns(
+                "completion"
+            )
         self.dataset_prompts = self.dataset_prompts.add_column(
             "completion", generations
         )

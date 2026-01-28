@@ -64,7 +64,6 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
         xsum_val = xsum_val.rename_column("summary", "completion")
         xsum_val = xsum_val.filter(self._filter_large_entries)
         xsum_val = xsum_val.map(self._xsum_to_prompt)
-        xsum_val = xsum_val.select_columns(["prompt"])
 
         # TODO: make the hard coded 250 a parameter set by user
         perl_data = xsum_val.shuffle(seed=seed).select(range(250))
@@ -84,7 +83,6 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
         xsum_test = xsum_test.rename_column("summary", "completion")
         xsum_test = xsum_test.filter(self._filter_large_entries)
         xsum_test = xsum_test.map(self._xsum_to_prompt)
-        xsum_test = xsum_test.select_columns(["prompt"])
 
         return xsum_test
 
