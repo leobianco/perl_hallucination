@@ -26,6 +26,7 @@ WARMUP_RATIO=0.1
 # Infrastructure Parameters
 PRECISION="BF16"
 EVAL_STEPS=5
+EVAL_ON_START="True"
 DEEPSPEED_CONFIG="scripts/deepspeed_config.yaml"
 
 # Parameters derived from above
@@ -96,7 +97,7 @@ accelerate launch \
   --per_device_train_batch_size "$BATCH_SIZE" \
   --gradient_accumulation_steps 1 \
   --do_eval True \
-  --eval_on_start True \
+  --eval_on_start "$EVAL_ON_START" \
   --eval_strategy "steps" \
   --eval_steps "$EVAL_STEPS" \
   --per_device_eval_batch_size "$BATCH_SIZE" \
