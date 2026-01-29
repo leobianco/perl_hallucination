@@ -111,7 +111,7 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
     def _filter_large_entries(entry: dict) -> dict:
         is_short = (
             True
-            if len(entry["context"] + entry["completion"]) < 15000
+            if len(entry["context"] + entry["completion"]) < 5000
             else False
         )
 

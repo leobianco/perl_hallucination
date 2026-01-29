@@ -18,7 +18,7 @@ TOP_K=40
 # Dataset Parameters
 DATASET_PROMPTS="${USER}/ragtruth_final_test_set"
 DATASET_PROMPTS_SPLIT="test"
-DATASET_LABELS="${USER}/ragtruth_sft"
+DATASET_LABELS="${USER}/ragtruth_autorater"
 DATASET_LABELS_SPLIT="test"
 
 # Parameters derived from above
