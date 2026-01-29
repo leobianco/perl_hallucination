@@ -29,6 +29,9 @@ EVAL_STEPS=5
 EVAL_ON_START="True"
 DEEPSPEED_CONFIG="scripts/deepspeed_config.yaml"
 
+# Google Sheets integration
+GSHEETS_NAME="The Great Final Push (Connected)"
+
 # Parameters derived from above
 TASK_NAME="$1"
 DATASET_REPO_ID="${USER}/${TASK_NAME}_rm"
@@ -106,4 +109,5 @@ accelerate launch \
   --peft_type "LORA" \
   --lora_r "$LORA_RANK" \
   --lora_alpha "$LORA_ALPHA" \
-  --lora_dropout "$LORA_DROPOUT" 
+  --lora_dropout "$LORA_DROPOUT" \
+  --gsheets_name "$GSHEETS_NAME"

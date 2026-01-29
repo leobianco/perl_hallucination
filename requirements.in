@@ -5,6 +5,7 @@ deepspeed
 evaluate
 google-auth
 google-genai
+gspread
 peft
 torch
 transformers

@@ -66,6 +66,10 @@ from src.utils import (
     compute_best_roc_threshold,
     create_lora_argument_parser,
     get_task_processor,
+    setup_gsheets,
+    add_row_to_gsheets,
+    find_insertion_index_rm,
+    update_gsheets_rm,
 )
 
 
@@ -374,6 +378,15 @@ class RewardModelPipeline(Pipeline):
     def run_and_save(self) -> None:
         self.trainer.train()
         self.model.push_to_hub(self.training_args.hub_model_id)
+        if self.args.gsheets_name:
+            ws_rm = setup_gsheets(self.args.gsheets_name, "RM")
+            update_gsheets_rm(
+                ws_rm,
+                self.args,
+                self._lora_args,
+                self.training_args,
+                self.trainer,
+            )
 
 
 class PERLPipeline(Pipeline):
