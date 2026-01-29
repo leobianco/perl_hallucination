@@ -4,8 +4,6 @@ Argument dataclasses for script configuration, helper functions for LoRA argumen
 """
 
 import argparse
-import glob
-import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Sequence, Union
 
@@ -434,24 +432,26 @@ def find_insertion_index_rm(ws, data):
     1. lora_r (ascending)
     2. lr (ascending) - for ties on lora_r
     3. batch (ascending) - for ties on both lora_r and lr
+    4. epoch (ascending) - for ties on lora_r, lr, and batch
     
     Args:
         ws: The worksheet object
-        data: List containing [Dataset, Model, Hallu. type, batch, lr, lora_r]
+        data: List containing [Dataset, Model, Hallu. type, batch, lr, lora_r, epoch]
     
     Returns:
         int: The index where the new row should be inserted
     """
     # Get all rows from the worksheet (including header)
     all_rows = ws.get_all_values()
-    
+ 
     # Extract the values we're matching on
     target_dataset = data[0]
     target_model = data[1]
     target_hallu_type = data[2]
-    target_batch = data[3]
-    target_lr = data[4]
-    target_lora_r = data[5]
+    target_batch = data[8]
+    target_lr = data[9]
+    target_lora_r = data[10]
+    target_epoch = data[7]
     
     # Start from row 2 (skip header at row 1)
     insertion_index = len(all_rows) + 1  # Default to end if no match found
@@ -463,9 +463,10 @@ def find_insertion_index_rm(ws, data):
             row[2] == target_hallu_type):
             
             # Convert to appropriate types for comparison
-            row_lora_r = int(row[5]) if row[5] else 0
-            row_lr = float(row[4]) if row[4] else 0.0
-            row_batch = int(row[3]) if row[3] else 0
+            row_lora_r = int(row[10]) if row[10] else 0
+            row_lr = float(row[9]) if row[9] else 0.0
+            row_batch = int(row[8]) if row[8] else 0
+            row_epoch = int(row[7]) if row[7] else 0
             
             # Compare based on sorting criteria
             # Insert before this row if our new row should come first
@@ -480,6 +481,10 @@ def find_insertion_index_rm(ws, data):
                     if target_batch < row_batch:
                         insertion_index = i
                         break
+                    elif target_batch == row_batch:
+                        if target_epoch < row_epoch:
+                            insertion_index = i
+                            break
     
     # If we found matching rows but never broke, insert after all matching rows
     # If no matching rows found, insertion_index stays at end
