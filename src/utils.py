@@ -35,7 +35,7 @@ class ScriptArguments:
     dataset_repo_id: str
     model_repo_id: str
     num_fewshot: Optional[int] = None
-    gsheets_name: str
+    gsheets_name: Optional[str] = ""
 
 
 @dataclass
