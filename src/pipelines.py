@@ -234,7 +234,9 @@ class SFTPipeline(Pipeline):
 
     def run_and_save(self) -> None:
         self.trainer.train()
-        self.trainer.push_to_hub()
+
+        if self.trainer.is_world_process_zero():
+            self.trainer.push_to_hub()
 
 
 class RewardModelPipeline(Pipeline):
@@ -377,16 +379,18 @@ class RewardModelPipeline(Pipeline):
 
     def run_and_save(self) -> None:
         self.trainer.train()
-        self.model.push_to_hub(self.training_args.hub_model_id)
-        if self.args.gsheets_name:
-            ws_rm = setup_gsheets(self.args.gsheets_name, "RM")
-            update_gsheets_rm(
-                ws_rm,
-                self.args,
-                self._lora_args,
-                self.training_args,
-                self.trainer,
-            )
+
+        if self.trainer.is_world_process_zero():
+            self.model.push_to_hub(self.training_args.hub_model_id)
+            if self.args.gsheets_name:
+                ws_rm = setup_gsheets(self.args.gsheets_name, "RM")
+                update_gsheets_rm(
+                    ws_rm,
+                    self.args,
+                    self._lora_args,
+                    self.training_args,
+                    self.trainer,
+                )
 
 
 class PERLPipeline(Pipeline):
@@ -466,7 +470,9 @@ class PERLPipeline(Pipeline):
     def run_and_save(self) -> None:
         if self.training_args.do_train:
             self.trainer.train()
-            self.trainer.push_to_hub()
+
+            if self.trainer.is_world_process_zero():
+                self.trainer.push_to_hub()
 
         # Was getting errors with this (TODO: fix)
         # name_for_saving = self.training_args.run_name.split("/")[1]

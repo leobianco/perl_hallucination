@@ -464,7 +464,7 @@ def find_insertion_index_rm(ws, data):
             
             # Convert to appropriate types for comparison
             row_lora_r = int(row[10]) if row[10] else 0
-            row_lr = float(row[9]) if row[9] else 0.0
+            row_lr = float(row[9].replace(',', '.')) if row[9] else 0.0
             row_batch = int(row[8]) if row[8] else 0
             row_epoch = int(row[7]) if row[7] else 0
             
@@ -514,12 +514,6 @@ def update_gsheets_rm(
     Dataset, Model, Hallu.type, numeric training params, and WandB URL.
     """
     try:
-        update_flag = getattr(args, "update_gsheets", False)
-        if isinstance(update_flag, str):
-            update_flag = update_flag.lower() in ("true", "1", "yes")
-        if not update_flag:
-            return
-
         sheet_name = getattr(args, "gsheets_name", None)
         if not sheet_name:
             return
