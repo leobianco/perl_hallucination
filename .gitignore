@@ -185,3 +185,6 @@ logs/
 
 # Linting results
 errors.err
+
+# Hyperparameter search scripts
+scripts/hyperparameter_search/
