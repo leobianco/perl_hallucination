@@ -732,7 +732,7 @@ def update_gsheets_sft(
             int(batch),
             float(lr),
             int(lora_r),
-            float(eval_loss_value),
+            float(eval_loss_value) or "",
             "",  # Temperature during evaluation
             "",  # Hallucination rate during evaluation
             wandb_url or "",
