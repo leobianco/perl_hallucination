@@ -21,7 +21,7 @@ annotated-doc==0.0.4
     # via fastapi
 annotated-types==0.7.0
     # via pydantic
-anthropic==0.71.0
+anthropic==0.77.0
     # via vllm
 anyio==4.12.1
     # via
@@ -98,7 +98,7 @@ datasets==4.5.0
     #   trl
 decorator==5.2.1
     # via ipython
-deepspeed==0.18.4
+deepspeed @ git+https://github.com/leobianco/DeepSpeed.git@5c42b23cc2cc22961bbfc74280ca7d4f44952a35#egg=DeepSpeed
     # via -r requirements.in
 depyf==0.20.0
     # via vllm
@@ -152,7 +152,7 @@ filelock==3.20.3
     #   torch
     #   transformers
     #   vllm
-flashinfer-python==0.5.3
+flashinfer-python==0.6.1
     # via vllm
 fonttools==4.61.1
     # via matplotlib
@@ -175,7 +175,11 @@ gitpython==3.1.46
 google-auth==2.48.0
     # via
     #   -r requirements.in
+    #   google-auth-oauthlib
     #   google-genai
+    #   gspread
+google-auth-oauthlib==1.2.4
+    # via gspread
 google-genai==1.60.0
     # via -r requirements.in
 grpcio==1.76.0
@@ -184,6 +188,8 @@ grpcio==1.76.0
     #   vllm
 grpcio-reflection==1.76.0
     # via vllm
+gspread==6.2.1
+    # via -r requirements.in
 h11==0.16.0
     # via
     #   httpcore
@@ -279,7 +285,7 @@ mcp==1.26.0
     # via vllm
 mdurl==0.1.2
     # via markdown-it-py
-mistral-common==1.8.8
+mistral-common==1.9.0
     # via vllm
 model-hosting-container-standards==0.1.13
     # via vllm
@@ -381,6 +387,8 @@ nvidia-nvshmem-cu12==3.3.20
     # via torch
 nvidia-nvtx-cu12==12.8.90
     # via torch
+oauthlib==3.3.1
+    # via requests-oauthlib
 openai==2.16.0
     # via vllm
 openai-harmony==0.0.8
@@ -437,13 +445,13 @@ propcache==0.4.1
     # via
     #   aiohttp
     #   yarl
-protobuf==6.33.4
+protobuf==6.33.5
     # via
     #   grpcio-reflection
     #   ray
     #   vllm
     #   wandb
-psutil==7.2.1
+psutil==7.2.2
     # via
     #   accelerate
     #   deepspeed
@@ -560,15 +568,18 @@ requests==2.32.5
     #   huggingface-hub
     #   mistral-common
     #   ray
+    #   requests-oauthlib
     #   tiktoken
     #   transformers
     #   vllm
     #   wandb
+requests-oauthlib==2.0.0
+    # via google-auth-oauthlib
 rich==14.3.1
     # via
     #   rich-toolkit
     #   typer
-rich-toolkit==0.17.1
+rich-toolkit==0.17.2
     # via
     #   fastapi-cli
     #   fastapi-cloud-cli
@@ -593,20 +604,24 @@ scipy==1.17.0
     # via scikit-learn
 sentencepiece==0.2.1
     # via vllm
-sentry-sdk==2.50.0
+sentry-sdk==2.51.0
     # via
     #   fastapi-cloud-cli
     #   wandb
 setproctitle==1.3.7
     # via vllm
 setuptools==80.10.2
-    # via model-hosting-container-standards
+    # via
+    #   model-hosting-container-standards
+    #   torch
+    #   vllm
 shellingham==1.5.4
     # via typer
 six==1.17.0
     # via
     #   python-dateutil
     #   rouge-score
+    #   vllm
 smmap==5.0.2
     # via gitdb
 sniffio==1.3.1
@@ -700,12 +715,10 @@ typing-extensions==4.15.0
     #   anthropic
     #   anyio
     #   apache-tvm-ffi
-    #   blake3
     #   fastapi
     #   google-genai
     #   grpcio
     #   huggingface-hub
-    #   ipython
     #   mcp
     #   mistral-common
     #   nvidia-cutlass-dsl
@@ -739,15 +752,15 @@ uvicorn==0.40.0
     #   mcp
 uvloop==0.22.1
     # via uvicorn
-vllm==0.14.1
+vllm==0.15.0
     # via -r requirements.in
-wandb==0.24.0
+wandb==0.24.1
     # via -r requirements.in
 watchfiles==1.1.1
     # via
     #   uvicorn
     #   vllm
-wcwidth==0.5.0
+wcwidth==0.5.2
     # via prompt-toolkit
 websockets==15.0.1
     # via
