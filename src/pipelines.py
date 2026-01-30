@@ -69,7 +69,8 @@ from src.utils import (
     find_insertion_index_rm,
     get_task_processor,
     setup_gsheets,
-    update_gsheets_evaluation_generation_SFT,
+    update_gsheets_evaluation_generation,
+    update_gsheets_perl,
     update_gsheets_rm,
     update_gsheets_sft,
 )
@@ -479,9 +480,19 @@ class PERLPipeline(Pipeline):
         )
 
     def run_and_save(self) -> None:
-        if self.training_args.do_train:
-            self.trainer.train()
-            self.trainer.push_to_hub()
+        self.trainer.train()
+        self.trainer.push_to_hub()
+
+        if self.trainer.is_world_process_zero():
+            if self.args.gsheets_name:
+                ws_perl = setup_gsheets(self.args.gsheets_name, "PERL")
+                update_gsheets_perl(
+                    ws_perl,
+                    self.args,
+                    self._lora_args,
+                    self.training_args,
+                    self.trainer,
+                )
 
         # Was getting errors with this (TODO: fix)
         # name_for_saving = self.training_args.run_name.split("/")[1]
@@ -1082,12 +1093,18 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
 
         if self.args.gsheets_name:
             if "SFT" in self.args.writer_model_lora:
-                ws_eval_gen_sft = setup_gsheets(self.args.gsheets_name, "SFT")
-                update_gsheets_evaluation_generation_SFT(
-                    ws_eval_gen_sft,
-                    self.args,
-                    name_for_saving,
-                )
+                ws_eval_gen = setup_gsheets(self.args.gsheets_name, "SFT")
+            elif "PERL" in self.args.writer_model_lora:
+                ws_eval_gen = setup_gsheets(self.args.gsheets_name, "PERL")
+            else:
+                print("Failed to open the sheet!")
+                return
+            
+            update_gsheets_evaluation_generation(
+                ws_eval_gen,
+                self.args,
+                name_for_saving,
+            )
 
 
 class EvaluationScoringPipeline(EvaluationPipeline):

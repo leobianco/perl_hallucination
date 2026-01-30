@@ -28,6 +28,9 @@ MISSING_EOS_PENALTY=1.0
 DEEPSPEED_CONFIG="scripts/deepspeed_config.yaml"
 SHUTDOWN=false
 
+# Google Sheets integration
+GSHEETS_NAME="The Great Final Push (Connected)"
+
 # Parameters derived from above
 TASK_NAME="$1"
 TIMESTAMP=$(date '+%y%m%d%H%M')
@@ -80,7 +83,8 @@ accelerate launch \
   --local_rollout_forward_batch_size "$LOCAL_ROLLOUT_FORWARD_BATCH_SIZE" \
   --missing_eos_penalty "$MISSING_EOS_PENALTY" \
   --temperature "$TEMPERATURE" \
-  --num_sample_generations "$NUM_SAMPLE_GENERATIONS"
+  --num_sample_generations "$NUM_SAMPLE_GENERATIONS" \
+  --gsheets_name "$GSHEETS_NAME"
 
 if [ "$SHUTDOWN" = true ]; then
   echo "Shutting down the VM..."

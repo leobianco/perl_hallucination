@@ -532,10 +532,11 @@ def find_insertion_index_sft(ws, data):
     # Extract the values we're matching on
     target_dataset = data[0]
     target_model = data[1]
+    target_seed = data[2]
+    target_epoch = data[3]
     target_batch = data[4]
     target_lr = data[5]
     target_lora_r = data[6]
-    target_epoch = data[3]
 
     # Start from row 2 (skip header at row 1)
     insertion_index = len(all_rows) + 1  # Default to end if no match found
@@ -546,10 +547,11 @@ def find_insertion_index_sft(ws, data):
         # Check if this row matches our Dataset, Model, and Hallu. type
         if row[0] == target_dataset and row[1] == target_model:
             # Convert to appropriate types for comparison
-            row_lora_r = int(row[6]) if row[6] else 0
-            row_lr = float(row[5].replace(",", ".")) if row[5] else 0.0
-            row_batch = int(row[4]) if row[4] else 0
+            row_seed = int(row[2]) if row[2] else 0
             row_epoch = int(row[3]) if row[3] else 0
+            row_batch = int(row[4]) if row[4] else 0
+            row_lr = float(row[5].replace(",", ".")) if row[5] else 0.0
+            row_lora_r = int(row[6]) if row[6] else 0
 
             # Compare based on sorting criteria
             # Insert before this row if our new row should come first
@@ -568,6 +570,10 @@ def find_insertion_index_sft(ws, data):
                         if target_epoch < row_epoch:
                             insertion_index = i
                             break
+                        elif target_epoch == row_epoch:
+                            if target_seed < row_seed:
+                                insertion_index = i
+                                break
 
     # If we found matching rows but never broke, insert after all matching rows
     # If no matching rows found, insertion_index stays at end
@@ -582,59 +588,100 @@ def find_insertion_index_sft(ws, data):
     return insertion_index
 
 
-def find_insertion_index_evaluation_generation(ws, data):
+def find_insertion_index_perl(ws, data):
     """
     Find the correct index to insert a new row while maintaining sort order.
 
-    This helper also attempts to find an *existing* row matching columns
-    A,B,C,D,F,G (with types: str,str,int,int,float,int). It returns a
-    tuple: (insertion_index, matching_row_index_or_None).
+    Sort order (within matching Dataset/Model/Hallu.type):
+    1. lora_r (ascending)
+    2. lr (ascending) - for ties on lora_r
+    3. batch (ascending) - for ties on both lora_r and lr
+    4. epoch (ascending) - for ties on lora_r, lr, and batch
 
     Args:
         ws: The worksheet object
-        data: List containing [Dataset, Model, seed, epochs, lr, lora_r]
+        data: List containing [Dataset, Model, Hallu. type, batch, lr, lora_r, epoch]
 
     Returns:
-        (int): insertion index
+        int: The index where the new row should be inserted
     """
     # Get all rows from the worksheet (including header)
     all_rows = ws.get_all_values()
-    match_row = None
 
-    # Extract the target values we're matching on
+    # Extract the values we're matching on
     target_dataset = data[0]
     target_model = data[1]
-    target_seed = data[2]
-    target_epochs = data[3]
-    target_lr = data[4]
-    target_lora_r = data[5]
+    target_reward_model = data[2]
+    target_hallu_type = data[3]
+    target_reference_model = data[4]
 
-    for i, row in enumerate(all_rows[1:], start=2):
-        try:
-            colA = str(row[0]).strip()
-            colB = str(row[1]).strip()
-            colC = int(row[2]) if row[2] != "" else None
-            colD = int(row[3]) if row[3] != "" else None
-            colF = float(row[5].replace(",", ".")) if row[5] != "" else None
-            colG = int(row[6]) if row[6] != "" else None
-        except Exception:
-            colA = colB = colC = colD = colF = colG = None
+    # Extract the values we are ordering on
+    target_seed = data[5]
+    target_batch = data[6]
+    target_episodes = data[7]
+    target_lr = data[8]
+    target_kl_coeff = data[9]
 
+    # Start from row 2 (skip header at row 1)
+    insertion_index = len(all_rows) + 1  # Default to end if no match found
+
+    for i, row in enumerate(
+        all_rows[1:], start=2
+    ):  # Start enumeration at 2 (row index)
+        # Check if this row matches our Dataset, Model, and Hallu. type
         if (
-            colA == str(target_dataset)
-            and colB == str(target_model)
-            and colC == int(target_seed)
-            and colD == int(target_epochs)
-            and (colF == float(target_lr))
-            and colG == int(target_lora_r)
+            row[0] == target_dataset
+            and row[1] == target_model
+            and row[2] == target_reward_model
+            and row[3] == target_hallu_type
+            and row[4] == target_reference_model
         ):
-            match_row = i
-            # We can return early since we found the exact matching row
-            return match_row
+            # Convert to appropriate types for comparison
+            row_seed = int(row[5]) if row[5] else 0
+            row_batch = int(row[6]) if row[6] else 0
+            row_episodes = int(row[7]) if row[7] else 0
+            row_lr = float(row[8].replace(",", ".")) if row[8] else 0.0
+            row_kl_coeff = float(row[9].replace(",", ".")) if row[9] else 0.0
 
-    print("No matching row found!")
+            # Compare based on sorting criteria
+            # Insert before this row if our new row should come first
+            if target_kl_coeff < row_kl_coeff:
+                insertion_index = i
+                break
+            elif target_kl_coeff == row_kl_coeff:
+                if target_lr < row_lr:
+                    insertion_index = i
+                    break
+                elif target_lr == row_lr:
+                    if target_episodes < row_episodes:
+                        insertion_index = i
+                        break
+                    elif target_episodes == row_episodes:
+                        if target_batch < row_batch:
+                            insertion_index = i
+                            break
+                        elif target_batch == row_batch:
+                            if target_seed < row_seed:
+                                insertion_index = i
+                                break
 
-    return None
+    # If we found matching rows but never broke, insert after all matching rows
+    # If no matching rows found, insertion_index stays at end
+    if insertion_index == len(all_rows) + 1:
+        # Find the last row with matching Dataset/Model/Hallu.type
+        for i in range(len(all_rows), 1, -1):  # Count backwards from end
+            row = all_rows[i - 1]
+            if (
+                row[0] == target_dataset
+                and row[1] == target_model
+                and row[2] == target_reward_model
+                and row[3] == target_hallu_type
+                and row[4] == target_reference_model
+            ):
+                insertion_index = i + 1
+                break
+
+    return insertion_index
 
 
 def update_gsheets_rm(
@@ -769,6 +816,8 @@ def update_gsheets_sft(
         except Exception:
             wandb_url = None
 
+        unique_id = training_args.hub_model_id.split("_")[-1]
+
         try:
             log_hist = getattr(trainer.state, "log_history", [])
             last_eval_loss = None
@@ -795,6 +844,7 @@ def update_gsheets_sft(
             "",  # Hallucination rate during evaluation
             wandb_url or "",
             "",  # Generations link
+            unique_id,
             "",  # Comments
             "In Progress",
         ]
@@ -810,13 +860,12 @@ def update_gsheets_sft(
         print("Failed to prepare or insert GSheets row:", e)
 
 
-def update_gsheets_evaluation_generation_sft(
+def update_gsheets_perl(
     ws: Any,
     args: ScriptArguments,
-    name_for_saving: str,
-    # lora_args: argparse.Namespace,
-    # training_args: TrainingArguments,
-    # trainer: Any,
+    lora_args: argparse.Namespace,
+    training_args: TrainingArguments,
+    trainer: Any,
 ):
     """Build experiment metadata from pipeline args and insert into GSheets."""
     try:
@@ -826,15 +875,91 @@ def update_gsheets_evaluation_generation_sft(
 
         task_map = {"npov": "NPOV", "bosch": "Bosch", "ragtruth": "RAGTruth"}
         dataset_value = task_map.get(args.task_name, args.task_name)
-        model_repo = args.writer_model_base.split("/")[0]
+
+        model_repo = args.model_repo_id.split("/")[0]
         model_map = {"google": "Gemma", "mistralai": "Mistral"}
         model_value = model_map.get(model_repo, model_repo)
 
-        exp_name = args.writer_model_lora
-        seed = int(re.search(r"S(\d+)", exp_name).group(1))
-        epochs = int(re.search(r"epo(\d+)", exp_name).group(1))
-        lr = float(re.search(r"lr([\d.e-]+)", exp_name).group(1))
-        lora_r = int(re.search(r"r(\d+)", exp_name).group(1))
+        reward_model_value = training_args.reward_model_path.split("/")[-1]
+
+        is_structured_hallus = re.search(
+            r"STRUCT_([^_]+)", reward_model_value
+        ).group(1)
+        hallu_type_value = (
+            "Organic" if is_structured_hallus == "false" else "Structured"
+        )
+
+        reference_model_value = training_args.sft_model_path.split("/")[-1]
+
+        seed = int(training_args.seed)
+        batch = int(training_args.per_device_train_batch_size)
+        episodes = int(training_args.total_episodes)
+        lr = float(training_args.learning_rate)
+        kl_coeff = float(training_args.kl_coef)
+        temperature = float(training_args.temperature)
+
+        sft_r = re.search(r"_r_([^_]+)", reference_model_value).group(1)
+        rm_r = re.search(r"_r_([^_]+)", reward_model_value).group(1)
+        eos_penalty = training_args.missing_eos_penalty
+
+        wandb_url = None
+        try:
+            if getattr(wandb, "run", None) is not None:
+                try:
+                    wandb_url = wandb.run.get_url()
+                except Exception:
+                    wandb_url = None
+        except Exception:
+            wandb_url = None
+
+        unique_id = training_args.hub_model_id.split("_")[-1]
+
+        row = [
+            dataset_value,
+            model_value,
+            reward_model_value,
+            hallu_type_value,
+            reference_model_value,
+            seed,
+            batch,
+            episodes,
+            lr,
+            kl_coeff,
+            temperature,
+            sft_r,
+            rm_r,
+            eos_penalty,
+            "",  # % Hallucination
+            wandb_url or "",
+            "",  # Generations link
+            unique_id,
+            "",  # Comments
+            "In Progress",
+        ]
+
+        # Find the index in which to add this new row
+        index = find_insertion_index_perl(ws, row)
+
+        add_row_to_gsheets(ws, row, index)
+
+        return None
+
+    except Exception as e:
+        print("Failed to prepare or insert GSheets row:", e)
+
+
+def update_gsheets_evaluation_generation(
+    ws: Any,
+    args: ScriptArguments,
+    name_for_saving: str,
+):
+    """Build experiment metadata from pipeline args and insert into GSheets."""
+    try:
+        sheet_name = getattr(args, "gsheets_name", None)
+        if not sheet_name:
+            return
+
+        unique_id = args.writer_model_lora.split("_")[-1]
 
         hf_url = (
             "https://huggingface.co/datasets/"
@@ -842,24 +967,16 @@ def update_gsheets_evaluation_generation_sft(
             + "/"
             + name_for_saving
         )
+        
+        if ws.title=="SFT":
+            # Column M, with unique ids, is the 13th column
+            cell = ws.find(unique_id, in_column=13)
+            ws.update(range_name=f"L{cell.row}", values=[[hf_url]])
 
-        data = [dataset_value, model_value, seed, epochs, lr, lora_r]
-
-        # Find insertion index and check for an existing matching row
-        try:
-            match_row = find_insertion_index_evaluation_generation(ws, data)
-        except Exception as e:
-            print("Failed to determine insertion/matching row:", e)
-            match_row = None
-
-        if match_row is not None:
-            try:
-                ws.update_cell(match_row, 12, hf_url)
-                print(f"Updated existing row {match_row} with HF dataset URL")
-            except Exception as e:
-                print("Failed to update GSheets cell:", e)
-        else:
-            print("Failed to match row and add generations link to table!")
+        elif ws.title=="PERL":
+            # Column R, with unique ids, is the 18th column
+            cell = ws.find(unique_id, in_column=18)
+            ws.update(range_name=f"Q{cell.row}", values=[[hf_url]])
 
         return None
 
