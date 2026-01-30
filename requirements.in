@@ -10,6 +10,7 @@ peft
 torch
 transformers
 git+https://github.com/leobianco/trl.git@my-trl-0.19.0#egg=trl
+git+https://github.com/leobianco/DeepSpeed.git@master#egg=DeepSpeed
 wandb
 huggingface-hub
 ipython
