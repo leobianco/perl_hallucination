@@ -70,6 +70,7 @@ from src.utils import (
     get_task_processor,
     setup_gsheets,
     update_gsheets_rm,
+    update_gsheets_sft,
 )
 
 
@@ -237,6 +238,15 @@ class SFTPipeline(Pipeline):
 
         if self.trainer.is_world_process_zero():
             self.trainer.push_to_hub()
+            if self.args.gsheets_name:
+                ws_sft = setup_gsheets(self.args.gsheets_name, "SFT")
+                update_gsheets_sft(
+                    ws_sft,
+                    self.args,
+                    self._lora_args,
+                    self.training_args,
+                    self.trainer,
+                )
 
 
 class RewardModelPipeline(Pipeline):

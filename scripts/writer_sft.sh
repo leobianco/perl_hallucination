@@ -21,6 +21,9 @@ SAVE_STEPS=200
 # Infrastructure Parameters
 DEEPSPEED_CONFIG="scripts/deepspeed_config.yaml"
 
+# Google Sheets integration
+GSHEETS_NAME="The Great Final Push (Connected)"
+
 # Parameters derived from above
 TASK_NAME="$1"
 MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
@@ -69,4 +72,5 @@ accelerate launch \
   --task_type "CAUSAL_LM" \
   --lora_r "$LORA_RANK" \
   --lora_alpha "$LORA_ALPHA" \
-  --lora_dropout "$LORA_DROPOUT"
+  --lora_dropout "$LORA_DROPOUT" \
+  --gsheets_name "$GSHEETS_NAME"

@@ -427,23 +427,23 @@ def add_row_to_gsheets(
 def find_insertion_index_rm(ws, data):
     """
     Find the correct index to insert a new row while maintaining sort order.
-    
+
     Sort order (within matching Dataset/Model/Hallu.type):
     1. lora_r (ascending)
     2. lr (ascending) - for ties on lora_r
     3. batch (ascending) - for ties on both lora_r and lr
     4. epoch (ascending) - for ties on lora_r, lr, and batch
-    
+
     Args:
         ws: The worksheet object
         data: List containing [Dataset, Model, Hallu. type, batch, lr, lora_r, epoch]
-    
+
     Returns:
         int: The index where the new row should be inserted
     """
     # Get all rows from the worksheet (including header)
     all_rows = ws.get_all_values()
- 
+
     # Extract the values we're matching on
     target_dataset = data[0]
     target_model = data[1]
@@ -452,22 +452,25 @@ def find_insertion_index_rm(ws, data):
     target_lr = data[9]
     target_lora_r = data[10]
     target_epoch = data[7]
-    
+
     # Start from row 2 (skip header at row 1)
     insertion_index = len(all_rows) + 1  # Default to end if no match found
-    
-    for i, row in enumerate(all_rows[1:], start=2):  # Start enumeration at 2 (row index)
+
+    for i, row in enumerate(
+        all_rows[1:], start=2
+    ):  # Start enumeration at 2 (row index)
         # Check if this row matches our Dataset, Model, and Hallu. type
-        if (row[0] == target_dataset and 
-            row[1] == target_model and 
-            row[2] == target_hallu_type):
-            
+        if (
+            row[0] == target_dataset
+            and row[1] == target_model
+            and row[2] == target_hallu_type
+        ):
             # Convert to appropriate types for comparison
             row_lora_r = int(row[10]) if row[10] else 0
-            row_lr = float(row[9].replace(',', '.')) if row[9] else 0.0
+            row_lr = float(row[9].replace(",", ".")) if row[9] else 0.0
             row_batch = int(row[8]) if row[8] else 0
             row_epoch = int(row[7]) if row[7] else 0
-            
+
             # Compare based on sorting criteria
             # Insert before this row if our new row should come first
             if target_lora_r < row_lora_r:
@@ -485,19 +488,94 @@ def find_insertion_index_rm(ws, data):
                         if target_epoch < row_epoch:
                             insertion_index = i
                             break
-    
+
     # If we found matching rows but never broke, insert after all matching rows
     # If no matching rows found, insertion_index stays at end
     if insertion_index == len(all_rows) + 1:
         # Find the last row with matching Dataset/Model/Hallu.type
         for i in range(len(all_rows), 1, -1):  # Count backwards from end
-            row = all_rows[i-1]
-            if (row[0] == target_dataset and 
-                row[1] == target_model and 
-                row[2] == target_hallu_type):
+            row = all_rows[i - 1]
+            if (
+                row[0] == target_dataset
+                and row[1] == target_model
+                and row[2] == target_hallu_type
+            ):
                 insertion_index = i + 1
                 break
-    
+
+    return insertion_index
+
+
+def find_insertion_index_sft(ws, data):
+    """
+    Find the correct index to insert a new row while maintaining sort order.
+
+    Sort order (within matching Dataset/Model/Hallu.type):
+    1. lora_r (ascending)
+    2. lr (ascending) - for ties on lora_r
+    3. batch (ascending) - for ties on both lora_r and lr
+    4. epoch (ascending) - for ties on lora_r, lr, and batch
+
+    Args:
+        ws: The worksheet object
+        data: List containing [Dataset, Model, Hallu. type, batch, lr, lora_r, epoch]
+
+    Returns:
+        int: The index where the new row should be inserted
+    """
+    # Get all rows from the worksheet (including header)
+    all_rows = ws.get_all_values()
+
+    # Extract the values we're matching on
+    target_dataset = data[0]
+    target_model = data[1]
+    target_batch = data[4]
+    target_lr = data[5]
+    target_lora_r = data[6]
+    target_epoch = data[3]
+
+    # Start from row 2 (skip header at row 1)
+    insertion_index = len(all_rows) + 1  # Default to end if no match found
+
+    for i, row in enumerate(
+        all_rows[1:], start=2
+    ):  # Start enumeration at 2 (row index)
+        # Check if this row matches our Dataset, Model, and Hallu. type
+        if row[0] == target_dataset and row[1] == target_model:
+            # Convert to appropriate types for comparison
+            row_lora_r = int(row[6]) if row[6] else 0
+            row_lr = float(row[5].replace(",", ".")) if row[5] else 0.0
+            row_batch = int(row[4]) if row[4] else 0
+            row_epoch = int(row[3]) if row[3] else 0
+
+            # Compare based on sorting criteria
+            # Insert before this row if our new row should come first
+            if target_lora_r < row_lora_r:
+                insertion_index = i
+                break
+            elif target_lora_r == row_lora_r:
+                if target_lr < row_lr:
+                    insertion_index = i
+                    break
+                elif target_lr == row_lr:
+                    if target_batch < row_batch:
+                        insertion_index = i
+                        break
+                    elif target_batch == row_batch:
+                        if target_epoch < row_epoch:
+                            insertion_index = i
+                            break
+
+    # If we found matching rows but never broke, insert after all matching rows
+    # If no matching rows found, insertion_index stays at end
+    if insertion_index == len(all_rows) + 1:
+        # Find the last row with matching Dataset/Model/Hallu.type
+        for i in range(len(all_rows), 1, -1):  # Count backwards from end
+            row = all_rows[i - 1]
+            if row[0] == target_dataset and row[1] == target_model:
+                insertion_index = i + 1
+                break
+
     return insertion_index
 
 
@@ -589,6 +667,68 @@ def update_gsheets_rm(
 
         # Find the index in which to add this new row
         index = find_insertion_index_rm(ws, row)
+
+        add_row_to_gsheets(ws, row, index)
+
+        return None
+
+    except Exception as e:
+        print("Failed to prepare or insert GSheets row:", e)
+
+
+def update_gsheets_sft(
+    ws: Any,
+    args: ScriptArguments,
+    lora_args: argparse.Namespace,
+    training_args: TrainingArguments,
+    trainer: Any,
+):
+    """Build experiment metadata from pipeline args and insert into GSheets."""
+    try:
+        sheet_name = getattr(args, "gsheets_name", None)
+        if not sheet_name:
+            return
+
+        task_map = {"npov": "NPOV", "bosch": "Bosch", "ragtruth": "RAGTruth"}
+        dataset_value = task_map.get(args.task_name, args.task_name)
+        model_repo = args.model_repo_id.split("/")[0]
+        model_map = {"google": "Gemma", "mistralai": "Mistral"}
+        model_value = model_map.get(model_repo, model_repo)
+
+        seed = int(training_args.seed)
+        epochs = int(training_args.num_train_epochs)
+        batch = int(training_args.per_device_train_batch_size)
+        lr = float(training_args.learning_rate)
+        lora_r = int(getattr(lora_args, "lora_r", 0))
+
+        wandb_url = None
+        try:
+            if getattr(wandb, "run", None) is not None:
+                try:
+                    wandb_url = wandb.run.get_url()
+                except Exception:
+                    wandb_url = None
+        except Exception:
+            wandb_url = None
+
+        row = [
+            dataset_value,
+            model_value,
+            int(seed),
+            int(epochs),
+            int(batch),
+            float(lr),
+            int(lora_r),
+            "",  # Temperature during evaluation
+            "",  # Hallucination rate during evaluation
+            wandb_url or "",
+            "",  # Generations link
+            "",  # Comments
+            "In Progress",
+        ]
+
+        # Find the index in which to add this new row
+        index = find_insertion_index_sft(ws, row)
 
         add_row_to_gsheets(ws, row, index)
 
