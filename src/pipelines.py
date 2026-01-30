@@ -69,6 +69,7 @@ from src.utils import (
     find_insertion_index_rm,
     get_task_processor,
     setup_gsheets,
+    update_gsheets_evaluation_generation_SFT,
     update_gsheets_rm,
     update_gsheets_sft,
 )
@@ -1078,6 +1079,15 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
             f"Pushing dataset with generations to {self.args.user}/{name_for_saving}"
         )
         self.dataset_prompts.push_to_hub(f"{self.args.user}/{name_for_saving}")
+
+        if self.args.gsheets_name:
+            if "SFT" in self.args.writer_model_lora:
+                ws_eval_gen_sft = setup_gsheets(self.args.gsheets_name, "SFT")
+                update_gsheets_evaluation_generation_SFT(
+                    ws_eval_gen_sft,
+                    self.args,
+                    name_for_saving,
+                )
 
 
 class EvaluationScoringPipeline(EvaluationPipeline):

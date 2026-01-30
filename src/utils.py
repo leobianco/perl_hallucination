@@ -4,6 +4,7 @@ Argument dataclasses for script configuration, helper functions for LoRA argumen
 """
 
 import argparse
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Sequence, Union
 
@@ -222,6 +223,8 @@ class EvalArguments:
             "help": "Number of few-shot examples to prepend to each prompt. If zero, no few-shot examples are prepended."
         },
     )
+
+    gsheets_name: Optional[str] = ""
 
 
 def hallucination_rate_from_score_file(
@@ -579,6 +582,61 @@ def find_insertion_index_sft(ws, data):
     return insertion_index
 
 
+def find_insertion_index_evaluation_generation(ws, data):
+    """
+    Find the correct index to insert a new row while maintaining sort order.
+
+    This helper also attempts to find an *existing* row matching columns
+    A,B,C,D,F,G (with types: str,str,int,int,float,int). It returns a
+    tuple: (insertion_index, matching_row_index_or_None).
+
+    Args:
+        ws: The worksheet object
+        data: List containing [Dataset, Model, seed, epochs, lr, lora_r]
+
+    Returns:
+        (int): insertion index
+    """
+    # Get all rows from the worksheet (including header)
+    all_rows = ws.get_all_values()
+    match_row = None
+
+    # Extract the target values we're matching on
+    target_dataset = data[0]
+    target_model = data[1]
+    target_seed = data[2]
+    target_epochs = data[3]
+    target_lr = data[4]
+    target_lora_r = data[5]
+
+    for i, row in enumerate(all_rows[1:], start=2):
+        try:
+            colA = str(row[0]).strip()
+            colB = str(row[1]).strip()
+            colC = int(row[2]) if row[2] != "" else None
+            colD = int(row[3]) if row[3] != "" else None
+            colF = float(row[5].replace(",", ".")) if row[5] != "" else None
+            colG = int(row[6]) if row[6] != "" else None
+        except Exception:
+            colA = colB = colC = colD = colF = colG = None
+
+        if (
+            colA == str(target_dataset)
+            and colB == str(target_model)
+            and colC == int(target_seed)
+            and colD == int(target_epochs)
+            and (colF == float(target_lr))
+            and colG == int(target_lora_r)
+        ):
+            match_row = i
+            # We can return early since we found the exact matching row
+            return match_row
+
+    print("No matching row found!")
+
+    return None
+
+
 def update_gsheets_rm(
     ws: Any,
     args: ScriptArguments,
@@ -745,6 +803,63 @@ def update_gsheets_sft(
         index = find_insertion_index_sft(ws, row)
 
         add_row_to_gsheets(ws, row, index)
+
+        return None
+
+    except Exception as e:
+        print("Failed to prepare or insert GSheets row:", e)
+
+
+def update_gsheets_evaluation_generation_sft(
+    ws: Any,
+    args: ScriptArguments,
+    name_for_saving: str,
+    # lora_args: argparse.Namespace,
+    # training_args: TrainingArguments,
+    # trainer: Any,
+):
+    """Build experiment metadata from pipeline args and insert into GSheets."""
+    try:
+        sheet_name = getattr(args, "gsheets_name", None)
+        if not sheet_name:
+            return
+
+        task_map = {"npov": "NPOV", "bosch": "Bosch", "ragtruth": "RAGTruth"}
+        dataset_value = task_map.get(args.task_name, args.task_name)
+        model_repo = args.writer_model_base.split("/")[0]
+        model_map = {"google": "Gemma", "mistralai": "Mistral"}
+        model_value = model_map.get(model_repo, model_repo)
+
+        exp_name = args.writer_model_lora
+        seed = int(re.search(r"S(\d+)", exp_name).group(1))
+        epochs = int(re.search(r"epo(\d+)", exp_name).group(1))
+        lr = float(re.search(r"lr([\d.e-]+)", exp_name).group(1))
+        lora_r = int(re.search(r"r(\d+)", exp_name).group(1))
+
+        hf_url = (
+            "https://huggingface.co/datasets/"
+            + args.user
+            + "/"
+            + name_for_saving
+        )
+
+        data = [dataset_value, model_value, seed, epochs, lr, lora_r]
+
+        # Find insertion index and check for an existing matching row
+        try:
+            match_row = find_insertion_index_evaluation_generation(ws, data)
+        except Exception as e:
+            print("Failed to determine insertion/matching row:", e)
+            match_row = None
+
+        if match_row is not None:
+            try:
+                ws.update_cell(match_row, 12, hf_url)
+                print(f"Updated existing row {match_row} with HF dataset URL")
+            except Exception as e:
+                print("Failed to update GSheets cell:", e)
+        else:
+            print("Failed to match row and add generations link to table!")
 
         return None
 

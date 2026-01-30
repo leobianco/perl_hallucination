@@ -15,14 +15,17 @@ TEMPERATURE=0.1
 TOP_P=0.9
 TOP_K=40
 
-# Dataset Parameters
-DATASET_PROMPTS="${USER}/ragtruth_final_test_set"
-DATASET_PROMPTS_SPLIT="test"
-DATASET_LABELS="${USER}/ragtruth_autorater"
-DATASET_LABELS_SPLIT="test"
-
 # Parameters derived from above
 TASK_NAME="$1"
+
+# Dataset Parameters
+DATASET_PROMPTS="${USER}/${TASK_NAME}_final_test_set"
+DATASET_PROMPTS_SPLIT="test"
+DATASET_LABELS="${USER}/${TASK_NAME}_autorater"
+DATASET_LABELS_SPLIT="test"
+
+# Google Sheets integration
+GSHEETS_NAME="The Great Final Push (Connected)"
 
 # Checks
 if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ]; then
@@ -52,7 +55,8 @@ if [ "$2" == "generate" ]; then
         --temperature "$TEMPERATURE" \
         --top_p "$TOP_P" \
         --top_k "$TOP_K" \
-        --writer_num_fewshot $WRITER_NUM_FEWSHOT
+        --writer_num_fewshot $WRITER_NUM_FEWSHOT \
+        --gsheets_name "$GSHEETS_NAME"
 elif [ "$2" == "score" ]; then
     DATASET_WITH_COMPLETIONS="${USER}/eval_${RUN_IDENTIFIER#*/}_gens_T${TEMPERATURE}_wfs${WRITER_NUM_FEWSHOT}"
     echo "Running in scoring mode..."
