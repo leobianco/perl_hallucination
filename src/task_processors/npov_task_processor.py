@@ -282,6 +282,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
                 "prompt",
             ]
         )
+        train_data = train_data.rename_column("npov_response", "completion")
 
         perl_data = DatasetDict(
             {
@@ -511,7 +512,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
 
         Args:
             entry (dict): Entry with user query, perspectives, and NPOV response.
-            SFT (bool, optional): If True, include the NPOV response in the prompt. Defaults to False.
+            SFT (bool, optional): If True, include the NPOV response in the prompt. Defaults to False. DEPRECATED
             fewshot_examples (datasets.Dataset, optional): Few-shot examples to prepend. Defaults to None.
 
         Returns:
@@ -668,8 +669,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
 
         return formatting_prompts_func, response_template
 
-    @staticmethod
-    def _process_data_for_sft(split_data: Dataset) -> Dataset:
+    def _process_data_for_sft(self, split_data: Dataset) -> Dataset:
         """Preprocess NPOV SFT dataset by selecting and renaming relevant columns.
 
         Args:
@@ -695,6 +695,13 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         split_data = split_data.rename_column(
             "npov_response_combined", "npov_response"
         )
+
+        split_data = split_data.map(
+            self._writer_prompt,
+            fn_kwargs=dict(SFT=False, fewshot_examples=None),
+        )
+
+        split_data = split_data.rename_column("npov_response", "completion")
 
         return split_data
 

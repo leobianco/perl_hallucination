@@ -711,6 +711,19 @@ def update_gsheets_sft(
         except Exception:
             wandb_url = None
 
+        try:
+            log_hist = getattr(trainer.state, "log_history", [])
+            last_eval_loss = None
+            for entry in reversed(log_hist):
+                if last_eval_loss is None and "eval_loss" in entry:
+                    last_eval_loss = entry.get("eval_loss")
+                if last_eval_loss is not None:
+                    break
+            if last_eval_loss is not None:
+                eval_loss_value = float(last_eval_loss)
+        except Exception:
+            pass
+
         row = [
             dataset_value,
             model_value,
@@ -719,6 +732,7 @@ def update_gsheets_sft(
             int(batch),
             float(lr),
             int(lora_r),
+            float(eval_loss_value),
             "",  # Temperature during evaluation
             "",  # Hallucination rate during evaluation
             wandb_url or "",
