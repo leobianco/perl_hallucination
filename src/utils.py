@@ -5,8 +5,8 @@ Argument dataclasses for script configuration, helper functions for LoRA argumen
 
 import argparse
 import os
-import socket
 import re
+import socket
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -1052,6 +1052,16 @@ def orchestrator_run_experiment(
     if script_args:
         command.extend(script_args)
 
+    base_path = working_dir if working_dir else os.getcwd()
+    script_path = os.path.join(base_path, script_name)
+
+    script_content = ""
+    try:
+        with open(script_path, "r") as f:
+            script_content = f.read()
+    except Exception as e:
+        script_content = f"Could not read script file: {e}"
+
     print(f"Starting {script_name} with args {script_args} at {datetime.now()}")
     print("=" * 80)
     start_time = datetime.now()
@@ -1077,7 +1087,9 @@ def orchestrator_run_experiment(
                 f"Machine: {hostname}\n"
                 f"Duration: {readable_duration}\n"
                 f"Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"Finished: {end_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                f"Finished: {end_time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"--- SCRIPT CONTENT ---\n"
+                f"{script_content}\n\n"
             )
 
             email_content = f"Subject: {subject}\n\n{message}"
