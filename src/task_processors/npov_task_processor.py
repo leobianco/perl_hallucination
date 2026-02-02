@@ -1,3 +1,4 @@
+from copy import deepcopy
 from itertools import combinations
 from typing import Any, Callable, Optional, Tuple
 
@@ -94,8 +95,12 @@ class NPOVTaskProcessor(BaseTaskProcessor):
     def _make_organic_hallucinations_data(
         self, data: DatasetDict
     ) -> DatasetDict:
+        organic_hallucination_data = deepcopy(data)
+
         # Filter out synthetic hallucinations from train set
-        data["train"] = data["train"].filter(
+        organic_hallucination_data["train"] = organic_hallucination_data[
+            "train"
+        ].filter(
             lambda x: not (
                 x["class_hall"] == "Yes"
                 and x["has synthetic hallucination"] == "Yes"
@@ -103,7 +108,9 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         )
 
         # Filter out synthetic hallucinations from validation set
-        data["validation"] = data["validation"].filter(
+        organic_hallucination_data["validation"] = organic_hallucination_data[
+            "validation"
+        ].filter(
             lambda x: not (
                 x["class_hall"] == "Yes"
                 and x["has synthetic hallucination"] == "Yes"
@@ -113,8 +120,8 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         # Put in splits and save
         dataset = DatasetDict(
             {
-                "train": data["train"],
-                "test": data["validation"],
+                "train": organic_hallucination_data["train"],
+                "test": organic_hallucination_data["validation"],
             }
         )
 
@@ -136,8 +143,9 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         Returns:
             DatasetDict: A HuggingFace DatasetDict with "train" and "test" splits containing the filtered data.
         """
+        synthetic_hallucination_data = deepcopy(data)
 
-        data["train"] = data["train"].filter(
+        synthetic_hallucination_data["train"] = synthetic_hallucination_data["train"].filter(
             lambda x: not (
                 x["class_hall"] == "Yes"
                 and x["has synthetic hallucination"] == "No"
@@ -145,7 +153,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         )
 
         # Filter out synthetic hallucinations from validation set
-        data["validation"] = data["validation"].filter(
+        synthetic_hallucination_data["validation"] = synthetic_hallucination_data["validation"].filter(
             lambda x: not (
                 x["class_hall"] == "Yes"
                 and x["has synthetic hallucination"] == "Yes"
@@ -155,8 +163,8 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         # Put in splits and save
         dataset = DatasetDict(
             {
-                "train": data["train"],
-                "test": data["validation"],
+                "train": synthetic_hallucination_data["train"],
+                "test": synthetic_hallucination_data["validation"],
             }
         )
 
@@ -168,6 +176,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         """Generate synthetic hallucinations using LLM and return DatasetDict for reward model training."""
 
         args = self.args
+        data_processed = deepcopy(data)
 
         # Fewshot examples of organic hallucinations to help LLM generation
         n_fewshot_examples_synth_llm = args.synth_llm_num_fewshot
@@ -179,7 +188,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         )
 
         # Filter out synthetic hallucinations from validation set
-        data["validation"] = data["validation"].filter(
+        data_processed["validation"] = data_processed["validation"].filter(
             lambda x: not (
                 x["class_hall"] == "Yes"
                 and x["has synthetic hallucination"] == "Yes"
@@ -188,7 +197,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
 
         # Get non-hallucinations
         train_non = (
-            data["train"]
+            data_processed["train"]
             .filter(lambda x: x["class_hall"] == "No")
             .shuffle(seed=args.seed)
         )
@@ -232,7 +241,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         synthetic_hallucinations_llm_data = DatasetDict(
             {
                 "train": synthetic_hallucinations_llm_train_data,
-                "test": data["validation"],
+                "test": data_processed["validation"],
             }
         )
 

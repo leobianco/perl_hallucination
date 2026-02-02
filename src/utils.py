@@ -967,16 +967,45 @@ def update_gsheets_evaluation_generation(
             + "/"
             + name_for_saving
         )
-        
-        if ws.title=="SFT":
+
+        if ws.title == "SFT":
             # Column M, with unique ids, is the 13th column
             cell = ws.find(unique_id, in_column=13)
             ws.update(range_name=f"L{cell.row}", values=[[hf_url]])
 
-        elif ws.title=="PERL":
+        elif ws.title == "PERL":
             # Column R, with unique ids, is the 18th column
             cell = ws.find(unique_id, in_column=18)
             ws.update(range_name=f"Q{cell.row}", values=[[hf_url]])
+
+        return None
+
+    except Exception as e:
+        print("Failed to prepare or insert GSheets row:", e)
+
+
+def update_gsheets_evaluation_scoring(
+    ws: Any,
+    args: ScriptArguments,
+    hallucination_rate: float,
+):
+    """Build experiment metadata from pipeline args and insert into GSheets."""
+    try:
+        sheet_name = getattr(args, "gsheets_name", None)
+        if not sheet_name:
+            return
+
+        unique_id = args.writer_model_lora.split("_")[-1]
+
+        if ws.title == "SFT":
+            # Column M, with unique ids, is the 13th column
+            cell = ws.find(unique_id, in_column=13)
+            ws.update(range_name=f"J{cell.row}", values=[[hallucination_rate]])
+
+        elif ws.title == "PERL":
+            # Column R, with unique ids, is the 18th column
+            cell = ws.find(unique_id, in_column=18)
+            ws.update(range_name=f"O{cell.row}", values=[[hallucination_rate]])
 
         return None
 

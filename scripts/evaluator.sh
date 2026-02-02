@@ -3,12 +3,12 @@
 # Core Parameters
 USER="leobianco"
 SEED=12345
-RUN_IDENTIFIER="leobianco/ragtruth_SFT_google_S130104_epo1_lr3e-3_r8_2601280928"
-BASE_MODEL="google/gemma-2-2b-it"
+RUN_IDENTIFIER="leobianco/npov_SFT_mistralai_S130104_epo25_lr5e-5_r8_2601301204"
+BASE_MODEL="mistralai/Mistral-7B-Instruct-v0.3"
 EVALUATOR_MODEL="gemini-2.0-flash"
 USE_GEMINI="True"
-THRESHOLD=0.991
-EVALUATOR_NUM_FEWSHOT=1
+THRESHOLD=0.9995
+EVALUATOR_NUM_FEWSHOT=2
 WRITER_NUM_FEWSHOT=0
 MAX_TOKENS=150
 TEMPERATURE=0.1
@@ -73,7 +73,8 @@ elif [ "$2" == "score" ]; then
         --evaluator_num_fewshot $EVALUATOR_NUM_FEWSHOT \
         --evaluate_evaluator False \
         --threshold $THRESHOLD \
-        --dataset_with_completions "$DATASET_WITH_COMPLETIONS"
+        --dataset_with_completions "$DATASET_WITH_COMPLETIONS" \
+        --gsheets_name "$GSHEETS_NAME"
 elif [ "$2" == "autoratereval" ]; then
     echo "Running in autoratereval mode..."
     python3 -m src.evaluator \

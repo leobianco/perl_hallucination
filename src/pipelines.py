@@ -70,6 +70,7 @@ from src.utils import (
     get_task_processor,
     setup_gsheets,
     update_gsheets_evaluation_generation,
+    update_gsheets_evaluation_scoring,
     update_gsheets_perl,
     update_gsheets_rm,
     update_gsheets_sft,
@@ -1099,7 +1100,7 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
             else:
                 print("Failed to open the sheet!")
                 return
-            
+
             update_gsheets_evaluation_generation(
                 ws_eval_gen,
                 self.args,
@@ -1180,8 +1181,24 @@ class EvaluationScoringPipeline(EvaluationPipeline):
         # Compute simple rate and push dataset updated
         t = torch.nn.Threshold(self.args.threshold, 0, inplace=False)
         classifs = torch.ceil(t(scores)).clamp(0, 1)
+        hallucination_rate = 1.0 - classifs.float().mean().item()
         self.val_data = self.val_data.add_column("scores", scores.tolist())
         self.val_data = self.val_data.add_column(
             "classifications", classifs.tolist()
         )
         self.val_data.push_to_hub(self.args.dataset_with_completions)
+
+        if self.args.gsheets_name:
+            if "SFT" in self.args.writer_model_lora:
+                ws_eval_score = setup_gsheets(self.args.gsheets_name, "SFT")
+            elif "PERL" in self.args.writer_model_lora:
+                ws_eval_score = setup_gsheets(self.args.gsheets_name, "PERL")
+            else:
+                print("Failed to open the sheet!")
+                return
+
+            update_gsheets_evaluation_scoring(
+                ws_eval_score,
+                self.args,
+                hallucination_rate,
+            )
