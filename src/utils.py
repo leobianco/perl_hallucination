@@ -1018,6 +1018,21 @@ def update_gsheets_evaluation_scoring(
         print("Failed to prepare or insert GSheets row:", e)
 
 
+def format_duration(td):
+    total_seconds = int(td.total_seconds())
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    parts = []
+    if hours > 0:
+        parts.append(f"{hours}h")
+    if minutes > 0:
+        parts.append(f"{minutes}m")
+    parts.append(f"{seconds}s")
+
+    return " ".join(parts)
+
+
 def orchestrator_run_experiment(
     script_name,
     script_args=None,
@@ -1046,22 +1061,30 @@ def orchestrator_run_experiment(
 
         end_time = datetime.now()
         duration = end_time - start_time
+        readable_duration = format_duration(duration)
+
         hostname = socket.gethostname()
 
         if notify_email:
-            if return_code == 0:
-                subject = f"✓ {script_name} Completed"
-                message = f"Status: SUCCESS\nStarted: {start_time}\nFinished: {end_time}\nDuration: {duration}\nMachine: {hostname}"
-            else:
-                subject = f"✗ {script_name} Failed"
-                message = f"Status: FAILED\nStarted: {start_time}\nFinished: {end_time}\nDuration: {duration}\nMachine: {hostname}"
+            status_icon = "✅" if return_code == 0 else "❌"
+            status_text = "SUCCESS" if return_code == 0 else "FAILED"
+
+            subject = (
+                f"{status_icon} {status_text} - {script_name} @ {hostname}"
+            )
+            message = (
+                f"Status: {status_text}\n"
+                f"Machine: {hostname}\n"
+                f"Duration: {readable_duration}\n"
+                f"Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"Finished: {end_time.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
 
             email_content = f"Subject: {subject}\n\n{message}"
+
             subprocess.run(
                 ["msmtp", notify_email], input=email_content, text=True
             )
-            print(f"\n{'=' * 80}")
-            print(f"Email sent to {notify_email}")
 
         return return_code
 
