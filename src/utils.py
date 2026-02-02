@@ -1037,32 +1037,75 @@ def orchestrator_run_experiment(
         command.extend(script_args)
 
     print(f"Starting {script_name} with args {script_args} at {datetime.now()}")
+    print(
+        f"Working directory: {working_dir if working_dir else 'current directory'}"
+    )
     print("=" * 80)
     start_time = datetime.now()
 
     try:
-        return_code = subprocess.call(command, cwd=working_dir)
+        # Run process - let stdout go to terminal, but capture stderr
+        process = subprocess.Popen(
+            command,
+            stdout=None,  # stdout goes directly to terminal
+            stderr=subprocess.PIPE,  # only capture stderr
+            text=True,
+            cwd=working_dir,
+        )
+
+        # Wait for completion and get stderr
+        _, stderr = process.communicate()
+        return_code = process.returncode
 
         end_time = datetime.now()
         duration = end_time - start_time
 
-        if notify_email:
-            if return_code == 0:
-                subject = f"✓ {script_name} Completed"
-                message = f"Status: SUCCESS\nStarted: {start_time}\nFinished: {end_time}\nDuration: {duration}"
-            else:
-                subject = f"✗ {script_name} Failed"
-                message = f"Status: FAILED\nStarted: {start_time}\nFinished: {end_time}\nDuration: {duration}"
+        # Prepare email
+        if return_code == 0:
+            subject = f"✓ {script_name} Completed"
+            message = f"""
+Script: {script_name}
+Arguments: {" ".join(script_args) if script_args else "None"}
+Status: SUCCESS
+Started: {start_time}
+Finished: {end_time}
+Duration: {duration}
+"""
+        else:
+            subject = f"✗ {script_name} Failed"
+            message = f"""
+Script: {script_name}
+Arguments: {" ".join(script_args) if script_args else "None"}
+Status: FAILED
+Started: {start_time}
+Finished: {end_time}
+Duration: {duration}
 
+Error output:
+{stderr if stderr else "(no error output captured)"}
+"""
+
+        # Send email
+        if notify_email:
             email_content = f"Subject: {subject}\n\n{message}"
             subprocess.run(
                 ["msmtp", notify_email], input=email_content, text=True
             )
             print(f"\n{'=' * 80}")
-            print(f"Email sent to {notify_email}")
+            print(f"Finished {script_name}. Email sent to {notify_email}")
+        else:
+            print(f"\n{'=' * 80}")
+            print(f"Finished {script_name}.")
 
         return return_code
 
     except Exception as e:
-        print(f"Error: {e}")
-        return 1
+        print(f"Error running script {script_name}: {e}")
+        if notify_email:
+            email_content = (
+                f"Subject: ✗ {script_name} Error\n\nError occurred: {e}"
+            )
+            subprocess.run(
+                ["msmtp", notify_email], input=email_content, text=True
+            )
+        return 0
