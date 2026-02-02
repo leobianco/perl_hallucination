@@ -599,7 +599,9 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             (callable, str): formatting function and response template string.
         """
 
-        # Choose response template based on model company
+        # Choose response template based on model company.
+        # This is because of the different tokenizers leading to different
+        # strings that can be found.
         response_template = None
         if model_repo_id is not None:
             model_company = model_repo_id.split("/")[0]
@@ -607,6 +609,11 @@ class NPOVTaskProcessor(BaseTaskProcessor):
                 response_template = "\nNeutral point-of-view answer to user query, rewriting provided arguments in natural language:\n"
             elif model_company == "mistralai":
                 response_template = "point-of-view answer to user query, rewriting provided arguments in natural language:\n"
+            elif model_company == "Qwen":
+                response_template = "\nNeutral point-of-view answer to user query, rewriting provided arguments in natural language:\n"
+            else:
+                response_template = None
+
         if response_template is None:
             raise Exception("Response template not specified for model!")
 

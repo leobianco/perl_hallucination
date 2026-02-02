@@ -3,7 +3,7 @@
 # Core Parameters
 USER="leobianco"
 SEED=12345
-RUN_IDENTIFIER="leobianco/npov_SFT_mistralai_S130104_epo25_lr5e-5_r8_2601301204"
+RUN_IDENTIFIER="leobianco/npov_SFT_mistralai_S130104_epo25_lr1e-4_r8_2601301136"
 BASE_MODEL="mistralai/Mistral-7B-Instruct-v0.3"
 EVALUATOR_MODEL="gemini-2.0-flash"
 USE_GEMINI="True"
