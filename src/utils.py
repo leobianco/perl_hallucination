@@ -4,8 +4,10 @@ Argument dataclasses for script configuration, helper functions for LoRA argumen
 """
 
 import argparse
+import os
 import re
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, Optional, Sequence, Union
@@ -1016,7 +1018,11 @@ def update_gsheets_evaluation_scoring(
 
 
 def orchestrator_run_experiment(
-    script_name, script_args=None, notify_email=None, working_dir=None
+    script_name,
+    script_args=None,
+    notify_email=None,
+    working_dir=None,
+    log_dir="logs/orchestrator",
 ):
     """Run a shell script with arguments and send email notification when done
 
@@ -1038,52 +1044,109 @@ def orchestrator_run_experiment(
     )
     start_time = datetime.now()
 
+    # Create log directory if it doesn't exist
+    if working_dir:
+        full_log_dir = os.path.join(working_dir, log_dir)
+    else:
+        full_log_dir = log_dir
+    os.makedirs(full_log_dir, exist_ok=True)
+
+    # Create log filename with timestamp
+    timestamp = start_time.strftime("%Y%m%d_%H%M%S")
+    script_basename = os.path.basename(script_name).replace(".sh", "")
+    log_file = os.path.join(full_log_dir, f"{script_basename}_{timestamp}.log")
+
     try:
-        result = subprocess.run(
+        # Run process with real-time output
+        process = subprocess.Popen(
             command,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             cwd=working_dir,
         )
 
+        # Capture output while displaying it in real-time
+        stdout_lines = []
+        stderr_lines = []
+
+        # Read stdout in real-time
+        while True:
+            output = process.stdout.readline()
+            if output == "" and process.poll() is not None:
+                break
+            if output:
+                print(output.strip())  # Display in real-time
+                stdout_lines.append(output)
+
+        # Get any remaining stderr
+        stderr_output = process.stderr.read()
+        if stderr_output:
+            print(stderr_output, file=sys.stderr)
+            stderr_lines.append(stderr_output)
+
+        # Wait for process to complete
+        return_code = process.wait()
+
         end_time = datetime.now()
         duration = end_time - start_time
 
-        # Get only last 50 lines of output
-        stdout_lines = result.stdout.strip().split('\n')
-        last_lines = '\n'.join(stdout_lines[-50:]) if stdout_lines else ''
+        # Combine output
+        full_stdout = "".join(stdout_lines)
+        full_stderr = "".join(stderr_lines)
 
-        stderr_lines = result.stderr.strip().split('\n')
-        last_error_lines = '\n'.join(stderr_lines[-50:]) if stderr_lines else ''
+        # Save full output to log file
+        with open(log_file, "w") as f:
+            f.write(f"Script: {script_name}\n")
+            f.write(
+                f"Arguments: {' '.join(script_args) if script_args else 'None'}\n"
+            )
+            f.write(f"Started: {start_time}\n")
+            f.write(f"Finished: {end_time}\n")
+            f.write(f"Duration: {duration}\n")
+            f.write(f"Return Code: {return_code}\n")
+            f.write("\n" + "=" * 80 + "\n")
+            f.write("STDOUT:\n")
+            f.write("=" * 80 + "\n")
+            f.write(full_stdout)
+            f.write("\n" + "=" * 80 + "\n")
+            f.write("STDERR:\n")
+            f.write("=" * 80 + "\n")
+            f.write(full_stderr)
+
+        # Get last few lines for email
+        last_stdout = "\n".join(stdout_lines[-30:]) if stdout_lines else ""
 
         # Prepare email
-        if result.returncode == 0:
+        if return_code == 0:
             subject = f"✓ {script_name} Completed"
             message = f"""
 Script: {script_name}
 Arguments: {" ".join(script_args) if script_args else "None"}
-Working Directory: {working_dir if working_dir else "current directory"}
 Status: SUCCESS
 Started: {start_time}
 Finished: {end_time}
 Duration: {duration}
 
-Last 50 lines of output:
-{last_lines}
+Log file: {log_file}
+
+Last 30 lines of output:
+{last_stdout}
 """
         else:
             subject = f"✗ {script_name} Failed"
             message = f"""
 Script: {script_name}
 Arguments: {" ".join(script_args) if script_args else "None"}
-Working Directory: {working_dir if working_dir else "current directory"}
 Status: FAILED
 Started: {start_time}
 Finished: {end_time}
 Duration: {duration}
 
-Last 50 lines of error:
-{last_error_lines}
+Log file: {log_file}
+
+Error output:
+{full_stderr}
 """
 
         # Send email if email address provided
@@ -1092,11 +1155,11 @@ Last 50 lines of error:
             subprocess.run(
                 ["msmtp", notify_email], input=email_content, text=True
             )
-            print(f"Finished {script_name}. Email sent.")
+            print(f"\nFinished {script_name}. Email sent. Full log: {log_file}")
         else:
-            print(f"Finished {script_name}. No email sent.")
+            print(f"\nFinished {script_name}. Full log: {log_file}")
 
-        return result.returncode
+        return return_code
 
     except Exception as e:
         print(f"Error running script {script_name}: {e}")

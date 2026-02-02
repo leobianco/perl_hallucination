@@ -22,9 +22,8 @@ if __name__ == "__main__":
     root_dir = project_root
 
     orchestrator_run_experiment(
-        "scripts/reward_model.sh",
+        "scripts/hyperparameter_search/reward_model.sh",
         script_args=["npov"],
         notify_email=email,
         working_dir=project_root,
-        log_dir="logs",
     )
