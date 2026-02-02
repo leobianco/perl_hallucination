@@ -5,7 +5,9 @@ Argument dataclasses for script configuration, helper functions for LoRA argumen
 
 import argparse
 import re
+import subprocess
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Dict, Optional, Sequence, Union
 
 import gspread
@@ -1011,3 +1013,98 @@ def update_gsheets_evaluation_scoring(
 
     except Exception as e:
         print("Failed to prepare or insert GSheets row:", e)
+
+
+def orchestrator_run_experiment(
+    script_name, script_args=None, notify_email=None, working_dir=None
+):
+    """Run a shell script with arguments and send email notification when done
+
+    Args:
+        script_name: Name/path of the shell script (e.g., 'scripts/experiment.sh')
+        script_args: List of arguments to pass to the script (e.g., ['arg1', 'arg2'])
+        notify_email: Email address to notify (optional)
+        working_dir: Directory to run the script from (e.g., '/home/user/project')
+    """
+
+    # Build the command
+    command = [f"./{script_name}"]
+    if script_args:
+        command.extend(script_args)
+
+    print(f"Starting {script_name} with args {script_args} at {datetime.now()}")
+    print(
+        f"Working directory: {working_dir if working_dir else 'current directory'}"
+    )
+    start_time = datetime.now()
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            cwd=working_dir,
+        )
+
+        end_time = datetime.now()
+        duration = end_time - start_time
+
+        # Get only last 50 lines of output
+        stdout_lines = result.stdout.strip().split('\n')
+        last_lines = '\n'.join(stdout_lines[-50:]) if stdout_lines else ''
+
+        stderr_lines = result.stderr.strip().split('\n')
+        last_error_lines = '\n'.join(stderr_lines[-50:]) if stderr_lines else ''
+
+        # Prepare email
+        if result.returncode == 0:
+            subject = f"✓ {script_name} Completed"
+            message = f"""
+Script: {script_name}
+Arguments: {" ".join(script_args) if script_args else "None"}
+Working Directory: {working_dir if working_dir else "current directory"}
+Status: SUCCESS
+Started: {start_time}
+Finished: {end_time}
+Duration: {duration}
+
+Last 50 lines of output:
+{last_lines}
+"""
+        else:
+            subject = f"✗ {script_name} Failed"
+            message = f"""
+Script: {script_name}
+Arguments: {" ".join(script_args) if script_args else "None"}
+Working Directory: {working_dir if working_dir else "current directory"}
+Status: FAILED
+Started: {start_time}
+Finished: {end_time}
+Duration: {duration}
+
+Last 50 lines of error:
+{last_error_lines}
+"""
+
+        # Send email if email address provided
+        if notify_email:
+            email_content = f"Subject: {subject}\n\n{message}"
+            subprocess.run(
+                ["msmtp", notify_email], input=email_content, text=True
+            )
+            print(f"Finished {script_name}. Email sent.")
+        else:
+            print(f"Finished {script_name}. No email sent.")
+
+        return result.returncode
+
+    except Exception as e:
+        print(f"Error running script {script_name}: {e}")
+        if notify_email:
+            email_content = (
+                f"Subject: ✗ {script_name} Error\n\nError occurred: {e}"
+            )
+            subprocess.run(
+                ["msmtp", notify_email], input=email_content, text=True
+            )
+        return 1

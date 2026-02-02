@@ -3,8 +3,8 @@
 # Core Parameters
 USER="leobianco"
 SEED=12345
-RUN_IDENTIFIER="leobianco/npov_SFT_mistralai_S130104_epo25_lr1e-4_r8_2601301136"
-BASE_MODEL="mistralai/Mistral-7B-Instruct-v0.3"
+RUN_IDENTIFIER="leobianco/npov_SFT_Qwen_S130104_epo25_lr5e-4_r8_2602021245"
+BASE_MODEL="Qwen/Qwen2.5-3B-Instruct"
 EVALUATOR_MODEL="gemini-2.0-flash"
 USE_GEMINI="True"
 THRESHOLD=0.9995
