@@ -5,6 +5,7 @@ Argument dataclasses for script configuration, helper functions for LoRA argumen
 
 import argparse
 import os
+import socket
 import re
 import subprocess
 import sys
@@ -1045,7 +1046,7 @@ def orchestrator_run_experiment(
 
         end_time = datetime.now()
         duration = end_time - start_time
-        hostname = os.environ.get("HOSTNAME")
+        hostname = socket.gethostname()
 
         if notify_email:
             if return_code == 0:
