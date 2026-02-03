@@ -392,7 +392,7 @@ class RewardModelPipeline(Pipeline):
 
     def run_and_save(self) -> None:
         self.trainer.train()
-        self.model.push_to_hub(self.training_args.hub_model_id)
+        self.trainer.push_to_hub()
 
         if self.trainer.is_world_process_zero():
             if self.args.gsheets_name:
