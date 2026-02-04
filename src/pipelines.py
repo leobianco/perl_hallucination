@@ -282,6 +282,7 @@ class RewardModelPipeline(Pipeline):
             lora_dropout=self._lora_args.lora_dropout,
             task_type=self._lora_args.task_type,
             peft_type=self._lora_args.peft_type,
+            modules_to_save=["score"],  # last layer of SequenceClassification
         )
 
         data_collator = DataCollatorWithPadding(tokenizer=self.tokenizer)
@@ -335,15 +336,14 @@ class RewardModelPipeline(Pipeline):
             attn_implementation="eager",
         )
 
+        # To stabilize training
+        with torch.no_grad():
+            self.model.score.weight.mul_(0.1)
+
         if "pad_token" not in self.tokenizer.special_tokens_map.keys():
             self.model.config.pad_token_id = self.tokenizer.pad_token_id
 
         self.model = get_peft_model(self.model, self._lora_config)
-
-        # adjust score parameters
-        self.model.score.requires_grad_()
-        with torch.no_grad():
-            self.model.score.weight.mul_(0.1)
 
     def setup_trainer(self) -> None:
         metric = evaluate.load("roc_auc")
@@ -444,13 +444,17 @@ class PERLPipeline(Pipeline):
         id2label = {0: "Yes", 1: "No"}
         label2id = {"Yes": 0, "No": 1}
 
-        self.reward_model = AutoModelForSequenceClassification.from_pretrained(
-            self.training_args.reward_model_path,
+        reward_model_base = AutoModelForSequenceClassification.from_pretrained(
+            self.args.model_repo_id,
             num_labels=2,
             id2label=id2label,
             label2id=label2id,
             attn_implementation="eager",
             torch_dtype=torch.bfloat16,
+        )
+
+        self.reward_model = PeftModel.from_pretrained(
+            reward_model_base, self.training_args.reward_model_path
         )
 
         self.ref_policy = AutoModelForCausalLM.from_pretrained(
