@@ -350,9 +350,10 @@ class RewardModelPipeline(Pipeline):
 
         def compute_metrics(eval_preds):
             logits = eval_preds.predictions
-            yes_scores = np.exp(logits)[:, 0]
-            no_scores = np.exp(logits)[:, 1]
-            scores = no_scores / (yes_scores + no_scores)
+            logits_max = np.max(logits, axis=-1, keepdims=True)
+            exp_logits = np.exp(logits - logits_max)
+            probs = exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)
+            scores = probs[:, 1]
             label_ids = eval_preds.label_ids
             metrics = metric.compute(
                 references=label_ids, prediction_scores=scores
@@ -548,9 +549,10 @@ class EvaluationPipeline(Pipeline):
     ) -> torch.Tensor:
         with torch.no_grad():
             outputs = evaluator(**tokenized_prompts, use_cache=False)
-            score_yes = torch.exp(outputs.logits[:, -1, yes_token_id])
-            score_no = torch.exp(outputs.logits[:, -1, no_token_id])
-            score_batch = score_no / (score_yes + score_no)
+            last_token_logits = outputs.logits[:, -1, :]
+            relevant_logits = last_token_logits[:, [yes_token_id, no_token_id]]
+            probs = torch.softmax(relevant_logits, dim=-1)
+            score_batch = probs[:, 1]
         return score_batch
 
     def evaluator_score(
