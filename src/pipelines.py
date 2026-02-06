@@ -444,17 +444,13 @@ class PERLPipeline(Pipeline):
         id2label = {0: "Yes", 1: "No"}
         label2id = {"Yes": 0, "No": 1}
 
-        reward_model_base = AutoModelForSequenceClassification.from_pretrained(
-            self.args.model_repo_id,
+        self.reward_model = AutoModelForSequenceClassification.from_pretrained(
+            self.training_args.reward_model_path,
             num_labels=2,
             id2label=id2label,
             label2id=label2id,
             attn_implementation="eager",
             torch_dtype=torch.bfloat16,
-        )
-
-        self.reward_model = PeftModel.from_pretrained(
-            reward_model_base, self.training_args.reward_model_path
         )
 
         self.ref_policy = AutoModelForCausalLM.from_pretrained(
