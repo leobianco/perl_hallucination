@@ -336,14 +336,14 @@ class RewardModelPipeline(Pipeline):
             attn_implementation="eager",
         )
 
-        # To stabilize training
-        with torch.no_grad():
-            self.model.score.weight.mul_(0.1)
-
         if "pad_token" not in self.tokenizer.special_tokens_map.keys():
             self.model.config.pad_token_id = self.tokenizer.pad_token_id
 
         self.model = get_peft_model(self.model, self._lora_config)
+
+        # To stabilize training
+        with torch.no_grad():
+            self.model.score.weight.mul_(0.1)
 
     def setup_trainer(self) -> None:
         metric = evaluate.load("roc_auc")
