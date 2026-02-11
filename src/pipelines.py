@@ -342,6 +342,7 @@ class RewardModelPipeline(Pipeline):
         self.model = get_peft_model(self.model, self._lora_config)
 
         # To stabilize training
+        self.model.score.requires_grad_()
         with torch.no_grad():
             self.model.score.weight.mul_(0.1)
 
