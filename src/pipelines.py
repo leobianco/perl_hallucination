@@ -491,9 +491,7 @@ class PERLPipeline(Pipeline):
                 update_gsheets_perl(
                     ws_perl,
                     self.args,
-                    self._lora_args,
                     self.training_args,
-                    self.trainer,
                 )
 
         # Was getting errors with this (TODO: fix)

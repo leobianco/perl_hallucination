@@ -709,7 +709,7 @@ def update_gsheets_rm(
         task_map = {"npov": "NPOV", "bosch": "Bosch", "ragtruth": "RAGTruth"}
         dataset_value = task_map.get(args.task_name, args.task_name)
         model_repo = args.model_repo_id.split("/")[0]
-        model_map = {"google": "Gemma", "mistralai": "Mistral"}
+        model_map = {"google": "Gemma", "mistralai": "Mistral", "Qwen": "Qwen"}
         model_value = model_map.get(model_repo, model_repo)
 
         try:
@@ -802,7 +802,7 @@ def update_gsheets_sft(
         task_map = {"npov": "NPOV", "bosch": "Bosch", "ragtruth": "RAGTruth"}
         dataset_value = task_map.get(args.task_name, args.task_name)
         model_repo = args.model_repo_id.split("/")[0]
-        model_map = {"google": "Gemma", "mistralai": "Mistral"}
+        model_map = {"google": "Gemma", "mistralai": "Mistral", "Qwen": "Qwen"}
         model_value = model_map.get(model_repo, model_repo)
 
         seed = int(training_args.seed)
@@ -868,9 +868,7 @@ def update_gsheets_sft(
 def update_gsheets_perl(
     ws: Any,
     args: ScriptArguments,
-    lora_args: argparse.Namespace,
     training_args: TrainingArguments,
-    trainer: Any,
 ):
     """Build experiment metadata from pipeline args and insert into GSheets."""
     try:
@@ -882,7 +880,7 @@ def update_gsheets_perl(
         dataset_value = task_map.get(args.task_name, args.task_name)
 
         model_repo = args.model_repo_id.split("/")[0]
-        model_map = {"google": "Gemma", "mistralai": "Mistral"}
+        model_map = {"google": "Gemma", "mistralai": "Mistral", "Qwen": "Qwen"}
         model_value = model_map.get(model_repo, model_repo)
 
         reward_model_value = training_args.reward_model_path.split("/")[-1]
