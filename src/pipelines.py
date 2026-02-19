@@ -308,12 +308,29 @@ class RewardModelPipeline(Pipeline):
 
         # Tokenize and cast labels
         def encode(examples):
-            return self.tokenizer(
+            tokenized = self.tokenizer(
                 examples["prompt"],
                 padding=True,
                 truncation=True,
                 return_tensors="pt",
             )
+
+            if "google" in self.args.model_repo_id:
+                special_token_id = 107  # token_id of <end_of_turn>
+            elif "mistralai" in self.args.model_repo_id:
+                special_token_id = self.tokenizer.eos_token_id
+            elif "Qwen" in self.args.model_repo_id:
+                special_token_id = self.tokenizer.eos_token_id
+            else:
+                raise Exception("Provide a valid model_repo_id! (Tokenizer)")
+
+            # Append EOS token to input_ids
+            tokenized["input_ids"] = torch.cat([tokenized["input_ids"], torch.tensor([special_token_id], dtype=int)])
+            
+            # Extend attention mask with 1s for the new EOS token
+            tokenized["attention_mask"] = torch.cat([tokenized["attention_mask"], torch.tensor([special_token_id], dtype=int)])
+
+            return tokenized
 
         for split in self.data.keys():
             self.data[split] = self.data[split].map(encode, batched=True)
