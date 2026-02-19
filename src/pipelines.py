@@ -315,6 +315,8 @@ class RewardModelPipeline(Pipeline):
                 return_tensors="pt",
             )
 
+            batch_size = tokenized["input_ids"].shape[0]
+    
             if "google" in self.args.model_repo_id:
                 special_token_id = 107  # token_id of <end_of_turn>
             elif "mistralai" in self.args.model_repo_id:
@@ -325,10 +327,12 @@ class RewardModelPipeline(Pipeline):
                 raise Exception("Provide a valid model_repo_id! (Tokenizer)")
 
             # Append EOS token to input_ids
-            tokenized["input_ids"] = torch.cat([tokenized["input_ids"], torch.tensor([special_token_id], dtype=int)])
+            eos_ids = torch.full((batch_size, 1), special_token_id)
+            tokenized["input_ids"] = torch.cat([tokenized["input_ids"], eos_ids], dim=1)
             
             # Extend attention mask with 1s for the new EOS token
-            tokenized["attention_mask"] = torch.cat([tokenized["attention_mask"], torch.tensor([special_token_id], dtype=int)])
+            eos_mask = torch.ones((batch_size, 1), dtype=tokenized["attention_mask"].dtype)
+            tokenized["attention_mask"] = torch.cat([tokenized["attention_mask"], eos_mask], dim=1)
 
             return tokenized
 
