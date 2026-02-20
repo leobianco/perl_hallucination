@@ -252,8 +252,12 @@ class BoschTaskProcessor(BaseTaskProcessor):
     ) -> DatasetDict:
         perl_data = DatasetDict(
             {
-                "train": data["validation"],
-                "test": data["test"].select(range(10)),
+                "train": data["validation"].rename_column(
+                    "response", "completion"
+                ),
+                "test": data["test"]
+                .select(range(10))
+                .rename_column("response", "completion"),
             }
         )
 
