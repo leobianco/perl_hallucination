@@ -308,37 +308,24 @@ class RewardModelPipeline(Pipeline):
 
         # Tokenize and cast labels
         def encode(examples):
-            # 1. Tokenize as usual
             tokenized = self.tokenizer(
                 examples["prompt"],
                 padding=True,
                 truncation=True,
                 return_tensors="pt",
             )
+
+            batch_size = tokenized["input_ids"].shape[0]
+    
+            # Append EOS token to input_ids
+            eos_ids = torch.full((batch_size, 1), self.tokenizer.eos_token_id)
+            tokenized["input_ids"] = torch.cat([tokenized["input_ids"], eos_ids], dim=1)
             
-            input_ids = tokenized["input_ids"]
-            attention_mask = tokenized["attention_mask"]
-            
-            for i in range(input_ids.shape[0]):
-                # Add BOS token
-                non_pad_indices = (input_ids[i] != self.tokenizer.pad_token_id).nonzero(as_tuple=True)[0]
-                
-                if len(non_pad_indices) > 0:
-                    first_content_idx = non_pad_indices[0].item()
-                    
-                    if first_content_idx > 0:
-                        input_ids[i, first_content_idx - 1] = self.tokenizer.bos_token_id
-                        attention_mask[i, first_content_idx - 1] = 1
-                    else:
-                        input_ids[i] = torch.cat([torch.tensor([self.tokenizer.bos_token_id]), input_ids[i][:-1]])
-                
-                # Append EOS to the end
-                last_content_idx = non_pad_indices[-1].item()
-                if last_content_idx < input_ids.shape[1] - 1:
-                    input_ids[i, last_content_idx + 1] = self.tokenizer.eos_token_id
-                    attention_mask[i, last_content_idx + 1] = 1
-                    
-            return {"input_ids": input_ids, "attention_mask": attention_mask}
+            # Extend attention mask with 1s for the new EOS token
+            eos_mask = torch.ones((batch_size, 1), dtype=tokenized["attention_mask"].dtype)
+            tokenized["attention_mask"] = torch.cat([tokenized["attention_mask"], eos_mask], dim=1)
+
+            return tokenized
 
         for split in self.data.keys():
             self.data[split] = self.data[split].map(encode, batched=True)
