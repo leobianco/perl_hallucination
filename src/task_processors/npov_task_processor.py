@@ -101,9 +101,11 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         organic_hallucination_data["train"] = organic_hallucination_data[
             "train"
         ].filter(
-            lambda x: not (
-                x["class_hall"] == "Yes"
-                and x["has synthetic hallucination"] == "Yes"
+            lambda x: (
+                not (
+                    x["class_hall"] == "Yes"
+                    and x["has synthetic hallucination"] == "Yes"
+                )
             )
         )
 
@@ -111,9 +113,11 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         organic_hallucination_data["validation"] = organic_hallucination_data[
             "validation"
         ].filter(
-            lambda x: not (
-                x["class_hall"] == "Yes"
-                and x["has synthetic hallucination"] == "Yes"
+            lambda x: (
+                not (
+                    x["class_hall"] == "Yes"
+                    and x["has synthetic hallucination"] == "Yes"
+                )
             )
         )
 
@@ -145,18 +149,26 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         """
         synthetic_hallucination_data = deepcopy(data)
 
-        synthetic_hallucination_data["train"] = synthetic_hallucination_data["train"].filter(
-            lambda x: not (
-                x["class_hall"] == "Yes"
-                and x["has synthetic hallucination"] == "No"
+        synthetic_hallucination_data["train"] = synthetic_hallucination_data[
+            "train"
+        ].filter(
+            lambda x: (
+                not (
+                    x["class_hall"] == "Yes"
+                    and x["has synthetic hallucination"] == "No"
+                )
             )
         )
 
         # Filter out synthetic hallucinations from validation set
-        synthetic_hallucination_data["validation"] = synthetic_hallucination_data["validation"].filter(
-            lambda x: not (
-                x["class_hall"] == "Yes"
-                and x["has synthetic hallucination"] == "Yes"
+        synthetic_hallucination_data["validation"] = (
+            synthetic_hallucination_data["validation"].filter(
+                lambda x: (
+                    not (
+                        x["class_hall"] == "Yes"
+                        and x["has synthetic hallucination"] == "Yes"
+                    )
+                )
             )
         )
 
@@ -189,9 +201,11 @@ class NPOVTaskProcessor(BaseTaskProcessor):
 
         # Filter out synthetic hallucinations from validation set
         data_processed["validation"] = data_processed["validation"].filter(
-            lambda x: not (
-                x["class_hall"] == "Yes"
-                and x["has synthetic hallucination"] == "Yes"
+            lambda x: (
+                not (
+                    x["class_hall"] == "Yes"
+                    and x["has synthetic hallucination"] == "Yes"
+                )
             )
         )
 
@@ -431,9 +445,9 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             fewshot_examples: Optional[Dataset] = None,
             use_true_label: bool = False,
         ) -> dict:
-            preamble = "<start_of_turn>user\nBelow are examples where an expert linguist identifies when the neutral natural language rewritings of arguments used to answer a user query contains additional arguments not present in the original list.<end_of_turn>\n"
+            preamble = "<start_of_turn>user\nYou are an expert linguist identifying when the answer to a user's query contains arguments that were NOT provided.<end_of_turn>\n"
 
-            template = "<start_of_turn>user\nUser query: {user_query}\n{perspective_1_name} arguments provided: {perspective_1}\n{perspective_2_name} arguments provided: {perspective_2}\nNeutral point-of-view answer to user query, rewriting provided arguments in natural language:{npov_response}\nExpert linguist review: the rewriting of the provided arguments contains additional arguments not present in the original list (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
+            template = "<start_of_turn>user\nUser query: {user_query}\n{perspective_1_name} arguments provided: {perspective_1}\n{perspective_2_name} arguments provided: {perspective_2}\nNeutral point-of-view answer to user query, rewriting provided arguments in natural language:{npov_response}\nExpert linguist review: does the answer contain additional arguments that were NOT provided? (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
 
             response = (
                 entry["npov_response"]
@@ -489,6 +503,8 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             dict: Entry with a new 'prompt' field containing the formatted prompt.
         """
 
+        preamble = """You will be given an user's question on a sensitive topic, along with arguments for and against it. Your task is to provide a neutral point-of-view answer to the user's question, using the arguments given. Use all the arguments given, and do not add to your answer any argument other than those provided.\n"""
+
         template = (
             "User query: {user_query}\n"
             "{perspective_1_name} arguments provided: {perspective_1}\n"
@@ -507,14 +523,14 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             npov_response=entry["npov_response"],
         )
 
-        entry["prompt"] = formatted_prompt
+        entry["prompt"] = preamble + formatted_prompt
 
         return entry
 
     @staticmethod
     def _writer_prompt(
         entry: dict,
-        SFT: bool = False,
+        SFT: bool = False,  # TODO: remove this arg, use prompt-completion
         fewshot_examples: Optional[Dataset] = None,
     ) -> dict:
         """Format a prompt for the NPOV writer task, optionally with few-shot examples.
@@ -527,6 +543,8 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         Returns:
             dict: Entry with a new 'prompt' field.
         """
+
+        preamble = """You will be given an user's question on a sensitive topic, along with arguments for and against it. Your task is to provide a neutral point-of-view answer to the user's question, using the arguments given. Use all the arguments given, and do not add to your answer any argument other than those provided.\n"""
 
         template = (
             "User query: {user_query}\n"
@@ -550,6 +568,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
 
         prompt = ""
 
+        # Deprecated, TODO: remove this later
         if fewshot_examples is not None:
             preamble = (
                 "Your task is to answer an user's query"
@@ -575,12 +594,13 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             prompt += formatted_prompt
 
         else:
-            prompt += formatted_prompt
+            prompt += preamble + formatted_prompt
 
         entry["prompt"] = prompt
 
         return entry
 
+    # Deprecated, TODO: remove this later
     @classmethod
     def get_formatting_prompts_and_response_template(
         cls,
@@ -757,6 +777,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             "has synthetic hallucination": "Yes",
         }
 
+    # Deprecated, TODO: remove this later
     @staticmethod
     def _rm_synthetic_hall_llm(
         entry: dict, fewshot_examples: Optional[Dataset] = None
