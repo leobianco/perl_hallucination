@@ -316,14 +316,20 @@ class RewardModelPipeline(Pipeline):
             )
 
             batch_size = tokenized["input_ids"].shape[0]
-    
+
             # Append EOS token to input_ids
             eos_ids = torch.full((batch_size, 1), self.tokenizer.eos_token_id)
-            tokenized["input_ids"] = torch.cat([tokenized["input_ids"], eos_ids], dim=1)
-            
+            tokenized["input_ids"] = torch.cat(
+                [tokenized["input_ids"], eos_ids], dim=1
+            )
+
             # Extend attention mask with 1s for the new EOS token
-            eos_mask = torch.ones((batch_size, 1), dtype=tokenized["attention_mask"].dtype)
-            tokenized["attention_mask"] = torch.cat([tokenized["attention_mask"], eos_mask], dim=1)
+            eos_mask = torch.ones(
+                (batch_size, 1), dtype=tokenized["attention_mask"].dtype
+            )
+            tokenized["attention_mask"] = torch.cat(
+                [tokenized["attention_mask"], eos_mask], dim=1
+            )
 
             return tokenized
 
