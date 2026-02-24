@@ -313,7 +313,6 @@ class RewardModelPipeline(Pipeline):
                 examples["prompt"],
                 padding=True,
                 truncation=True,
-                max_length=self.tokenizer.model_max_length - 2, # room BOS/EOS
                 return_tensors="pt",
             )
             
