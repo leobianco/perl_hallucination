@@ -503,9 +503,12 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             dict: Entry with a new 'prompt' field containing the formatted prompt.
         """
 
-        preamble = """You will be given an user's question, along with arguments for and against it. Your task is to answer the user's question in natural language using the arguments given. Use all the arguments given, and do not add to your answer any argument other than those provided.\n"""
-
         template = (
+            "You will be given an user's question, along with arguments for "
+            "and against it. Your task is to answer the user's question in "
+            "natural language using the arguments given. Use all the arguments "
+            "given, and do not add to your answer any argument other than "
+            "those provided.\n"
             "User query: {user_query}\n"
             "{perspective_1_name} arguments provided: {perspective_1}\n"
             "{perspective_2_name} arguments provided: {perspective_2}\n"
@@ -523,8 +526,8 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             npov_response=entry["npov_response"],
         )
 
-        entry["prompt"] = preamble + formatted_prompt
-        
+        entry["prompt"] = formatted_prompt
+
         return entry
 
     @staticmethod
