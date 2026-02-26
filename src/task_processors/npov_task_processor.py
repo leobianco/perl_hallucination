@@ -524,7 +524,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         )
 
         entry["prompt"] = preamble + formatted_prompt
-
+        
         return entry
 
     @staticmethod
@@ -702,10 +702,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             "npov_response_combined", "npov_response"
         )
 
-        split_data = split_data.map(
-            self._writer_prompt,
-            fn_kwargs=dict(SFT=False, fewshot_examples=None),
-        )
+        split_data = split_data.map(self._writer_prompt)
 
         split_data = split_data.rename_column("npov_response", "completion")
 
