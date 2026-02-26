@@ -509,7 +509,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             "User query: {user_query}\n"
             "{perspective_1_name} arguments provided: {perspective_1}\n"
             "{perspective_2_name} arguments provided: {perspective_2}\n"
-            "Neutral point-of-view answer to user query, rewriting provided"
+            "Answer to user query, rewriting provided"
             " arguments in natural language:\n"
             "{npov_response}"
         )
@@ -550,7 +550,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             "User query: {user_query}\n"
             "{perspective_1_name} arguments provided: {perspective_1}\n"
             "{perspective_2_name} arguments provided: {perspective_2}\n"
-            "Neutral point-of-view answer to user query, rewriting provided"
+            "Answer to user query, rewriting provided"
             " arguments in natural language:\n"
             "{npov_response}"
         )
