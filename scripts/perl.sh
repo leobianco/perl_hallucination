@@ -13,7 +13,7 @@ LEARNING_RATE=2e-5
 LR_SCHEDULER_TYPE="cosine"
 WARMUP_RATIO=0.05
 KL_COEFF=1e-4
-RESPONSE_LENGTH=256
+RESPONSE_LENGTH=300
 RLOO_K=2
 NUM_PPO_EPOCHS=4
 NUM_MINIBATCHES=16
@@ -51,6 +51,7 @@ accelerate launch \
   --task_name "$TASK_NAME" \
   --seed "$SEED" \
   --report_to "wandb" \
+  --exp_name "$RUN_IDENTIFIER" \
   --run_name "$RUN_IDENTIFIER" \
   --logging_steps 1 \
   --output_dir "./checkpoints/${TASK_NAME}/perl/${RUN_IDENTIFIER}" \

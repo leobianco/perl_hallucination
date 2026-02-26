@@ -901,7 +901,7 @@ def update_gsheets_perl(
         kl_coeff = float(training_args.kl_coef)
         temperature = float(training_args.temperature)
 
-        sft_r = re.search(r"_r_([^_]+)", reference_model_value).group(1)
+        sft_r = re.search(r"_r([^_]+)", reference_model_value).group(1)
         rm_r = re.search(r"_r_([^_]+)", reward_model_value).group(1)
         eos_penalty = training_args.missing_eos_penalty
 

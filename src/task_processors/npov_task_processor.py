@@ -503,7 +503,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             dict: Entry with a new 'prompt' field containing the formatted prompt.
         """
 
-        preamble = """You will be given an user's question on a sensitive topic, along with arguments for and against it. Your task is to provide a neutral point-of-view answer to the user's question, using the arguments given. Use all the arguments given, and do not add to your answer any argument other than those provided.\n"""
+        preamble = """You will be given an user's question, along with arguments for and against it. Your task is to answer the user's question in natural language using the arguments given. Use all the arguments given, and do not add to your answer any argument other than those provided.\n"""
 
         template = (
             "User query: {user_query}\n"
@@ -544,7 +544,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             dict: Entry with a new 'prompt' field.
         """
 
-        preamble = """You will be given an user's question on a sensitive topic, along with arguments for and against it. Your task is to provide a neutral point-of-view answer to the user's question, using the arguments given. Use all the arguments given, and do not add to your answer any argument other than those provided.\n"""
+        preamble = """You will be given an user's question, along with arguments for and against it. Your task is to answer the user's question in natural language using the arguments given. Use all the arguments given, and do not add to your answer any argument other than those provided.\n"""
 
         template = (
             "User query: {user_query}\n"
@@ -566,37 +566,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             npov_response=npov_response,
         )
 
-        prompt = ""
-
-        # Deprecated, TODO: remove this later
-        if fewshot_examples is not None:
-            preamble = (
-                "Your task is to answer an user's query"
-                " by rewriting the provided arguments in natural language. Do not "
-                "generate arguments other than those provided. "
-                f"We provide {fewshot_examples.num_rows} example(s) of what is "
-                "expected, then it is your turn.\n"
-            )
-
-            prompt += preamble
-
-            for fewshot_example in fewshot_examples:
-                fewshot_prompt = template.format(
-                    user_query=fewshot_example["user_query"],
-                    perspective_1_name=fewshot_example["perspective_1_name"],
-                    perspective_1=fewshot_example["perspective_1"],
-                    perspective_2_name=fewshot_example["perspective_2_name"],
-                    perspective_2=fewshot_example["perspective_2"],
-                    npov_response=fewshot_example["npov_response"],
-                )
-                prompt += fewshot_prompt + "\n"
-
-            prompt += formatted_prompt
-
-        else:
-            prompt += preamble + formatted_prompt
-
-        entry["prompt"] = prompt
+        entry["prompt"] = preamble + formatted_prompt
 
         return entry
 
