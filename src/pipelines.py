@@ -671,7 +671,10 @@ class EvaluationPipeline(Pipeline):
             elif len(scores) > len(dataset):
                 scores = list(scores)[: len(dataset)]
         elif "scores" in dataset.column_names:
-            scores = list(dataset["scores"])
+            # scores = list(dataset["scores"])
+            # In the case of re-scoring, erase existing scores
+            dataset = dataset.remove_columns("scores")
+            scores = [None] * len(dataset)
         else:
             scores = [None] * len(dataset)
 
@@ -681,7 +684,7 @@ class EvaluationPipeline(Pipeline):
         start_time = time.time()
         save_frequency = 50  # Save progress every 50 entries
         server_retry_wait = 20  # seconds to wait between server error retries
-        server_max_retries = 3  # number of times to retry on server error
+        server_max_retries = 6  # number of times to retry on server error
         entries_to_score = [
             i for i, score in enumerate(scores) if score is None
         ]
@@ -726,11 +729,13 @@ class EvaluationPipeline(Pipeline):
                             or "overloaded" in error_str
                             or "overcharged" in error_str
                             or "server" in error_str
+                            or "429" in error_str
                         ) and retry_count < server_max_retries - 1:
+                            wait_time = server_retry_wait * (2**retry_count)
                             print(
-                                f"Server unavailable/overloaded at entry {idx}, attempt {retry_count + 1}/{server_max_retries}. Waiting {server_retry_wait} seconds before retrying..."
+                                f"Server unavailable/overloaded at entry {idx}, attempt {retry_count + 1}/{server_max_retries}. Waiting {wait_time} seconds before retrying..."
                             )
-                            time.sleep(server_retry_wait)
+                            time.sleep(wait_time)
                             retry_count += 1
                             continue
                         else:
@@ -758,20 +763,21 @@ class EvaluationPipeline(Pipeline):
             raise e
 
         # Final save after all scoring is done
-        dataset = (
-            dataset.remove_columns("scores")
-            if "scores" in dataset.column_names
-            else dataset
-        )
-        dataset = dataset.add_column("scores", scores)
-        if (
-            hasattr(script_args, "dataset_with_completions")
-            and script_args.dataset_with_completions
-        ):
-            try:
-                dataset.push_to_hub(script_args.dataset_with_completions)
-            except Exception as e:
-                print(f"Warning: Could not save final progress to hub: {e}")
+        # dataset = (
+        #     dataset.remove_columns("scores")
+        #     if "scores" in dataset.column_names
+        #     else dataset
+        # )
+        # dataset = dataset.add_column("scores", scores)
+        # if (
+        #     hasattr(script_args, "dataset_with_completions")
+        #     and script_args.dataset_with_completions
+        # ):
+        #     try:
+        #         dataset.push_to_hub(script_args.dataset_with_completions)
+        #     except Exception as e:
+        #         print(f"Warning: Could not save final progress to hub: {e}")
+
         # Remove local checkpoint after successful push
         if os.path.exists(checkpoint_path):
             os.remove(checkpoint_path)
@@ -829,6 +835,7 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
 
         self.data = self.data.map(
             prompt_fn,
+            load_from_cache_file=False,
             fn_kwargs={
                 "fewshot_examples": fewshot_examples,
                 "use_true_label": True,
@@ -1168,7 +1175,9 @@ class EvaluationScoringPipeline(EvaluationPipeline):
                 label_data, n_yes, n_no, self.args.seed
             )
         self.val_data = self.val_data.map(
-            prompt_fn, fn_kwargs={"fewshot_examples": fewshot_examples}
+            prompt_fn,
+            load_from_cache_file=False,
+            fn_kwargs={"fewshot_examples": fewshot_examples},
         )
 
     def setup_model(self):
@@ -1201,10 +1210,17 @@ class EvaluationScoringPipeline(EvaluationPipeline):
         t = torch.nn.Threshold(self.args.threshold, 0, inplace=False)
         classifs = torch.ceil(t(scores)).clamp(0, 1)
         hallucination_rate = 1.0 - classifs.float().mean().item()
+
+        if "scores" in self.val_data.column_names:
+            self.val_data = self.val_data.remove_columns("scores")
         self.val_data = self.val_data.add_column("scores", scores.tolist())
+
+        if "classifications" in self.val_data.column_names:
+            self.val_data = self.val_data.remove_columns("classifications")
         self.val_data = self.val_data.add_column(
             "classifications", classifs.tolist()
         )
+
         self.val_data.push_to_hub(self.args.dataset_with_completions)
 
         if self.args.gsheets_name:

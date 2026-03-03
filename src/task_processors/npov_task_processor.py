@@ -57,7 +57,9 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             split_data = split_data.map(self._change_omission_labels)
             split_data = split_data.map(self._hallucination_labels_to_numerical)
             split_data = split_data.map(self._omission_labels_to_numerical)
-            split_data = split_data.map(self._rm_prompt)
+            split_data = split_data.map(
+                self._rm_prompt, load_from_cache_file=False
+            )
             split_data = split_data.rename_column("class_hall_num", "label")
             processed[split] = split_data
 
@@ -289,8 +291,12 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         train_data = train_data.shuffle(seed=seed)
         test_data = test_data.shuffle(seed=seed)
 
-        train_data = train_data.map(self._writer_prompt)
-        test_data = test_data.map(self._writer_prompt)
+        train_data = train_data.map(
+            self._writer_prompt, load_from_cache_file=False
+        )
+        test_data = test_data.map(
+            self._writer_prompt, load_from_cache_file=False
+        )
 
         # The columns across splits must match.
         train_data = train_data.select_columns(
@@ -445,7 +451,9 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             fewshot_examples: Optional[Dataset] = None,
             use_true_label: bool = False,
         ) -> dict:
-            preamble = "<start_of_turn>user\nYou are an expert linguist identifying when the answer to a user's query contains arguments that were NOT provided.<end_of_turn>\n"
+            preamble = "<start_of_turn>user\nYou are an expert linguist. You will be given: (1) a user query, (2) a set of arguments for and against the topic of that query, and (3) an answer in natural language that aims to rewrite those provided arguments. Your task is to determine whether the answer introduces any arguments that were NOT present in the provided arguments. Answer Yes if the answer contains at least one argument not found in the provided arguments. Answer No if every argument in the answer can be traced back to the provided arguments, even if some provided arguments were omitted. You will first be given a few examples to illustrate the task, and then it will be your turn to classify.<end_of_turn>\n"
+
+            # preamble = "<start_of_turn>user\nBelow are examples where an expert identifies when the neutral natural language rewriting of arguments used to answer a user query contains additional arguments not present in the original list.<end_of_turn>\n"
 
             template = "<start_of_turn>user\nUser query: {user_query}\n{perspective_1_name} arguments provided: {perspective_1}\n{perspective_2_name} arguments provided: {perspective_2}\nNeutral point-of-view answer to user query, rewriting provided arguments in natural language:{npov_response}\nExpert linguist review: does the answer contain additional arguments that were NOT provided? (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
 
@@ -705,7 +713,9 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             "npov_response_combined", "npov_response"
         )
 
-        split_data = split_data.map(self._writer_prompt)
+        split_data = split_data.map(
+            self._writer_prompt, load_from_cache_file=False
+        )
 
         split_data = split_data.rename_column("npov_response", "completion")
 
