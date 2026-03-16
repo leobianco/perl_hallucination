@@ -1,5 +1,6 @@
 from copy import deepcopy
 from itertools import combinations
+import random
 from typing import Any, Callable, Optional, Tuple
 
 import pandas as pd
@@ -285,7 +286,14 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             datasets.DatasetDict: DatasetDict with 'train' and 'test' splits for PERL.
         """
 
-        train_data = data["validation"]
+        # Augment training data using balanced sampling, skipping new perspectives
+        augmented_train_data = self._data_augmentation(
+            data["validation"], 
+            target_total_samples=10000, 
+            use_new_perspectives=False
+        )
+        train_data = Dataset.from_dict(augmented_train_data)
+        
         test_data = sft_data["test"]
 
         train_data = train_data.shuffle(seed=seed)
@@ -337,15 +345,14 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         args = self.args
 
         # Augment the test split
-        augmented_data = self._data_augmentation(data["test"])
+        augmented_data = self._data_augmentation(data["test"], target_total_samples=10000)
         augmented_dataset = Dataset.from_dict(augmented_data)
         augmented_dataset = augmented_dataset.map(self._writer_prompt)
 
-        # Create capped final test set (10k samples)
-        # TODO: this can be enhanced to keep topics balanced.
+        # Create capped final test set
         capped_final_test_set = augmented_dataset.shuffle(
             seed=args.seed
-        ).select(range(10000))
+        )
 
         evaluation_data = DatasetDict(
             {
@@ -825,11 +832,19 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         return prompt
 
     @staticmethod
-    def _data_augmentation(data: Dataset) -> dict:
+    def _data_augmentation(
+        data: Dataset, 
+        target_total_samples: Optional[int] = 10000,
+        use_new_perspectives: bool = True
+    ) -> dict:
         """Augment NPOV dataset by adding new perspectives and generating argument combinations.
 
         Args:
             data (datasets.Dataset): The NPOV dataset split to augment.
+            target_total_samples (int, optional): Target total number of samples to return, 
+                                                   using balanced sampling. Defaults to 10000.
+            use_new_perspectives (bool, optional): Whether to load and include new perspectives from local CSV.
+                                                   Defaults to True.
 
         Returns:
             dict: Dictionary with augmented data fields for new argument combinations.
@@ -839,13 +854,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
         p1_name = data[0]["perspective_1_name"]
         p2_name = data[0]["perspective_2_name"]
 
-        all_topics = []
-        all_user_queries = []
-        all_p1_arguments = []
-        all_p2_arguments = []
-        all_p1_names = []
-        all_p2_names = []
-        result = {}
+        samples_by_topic = {}
 
         def _extract_perspective_arguments(
             topic: str, perspective_col: str, perspective_name: str
@@ -867,12 +876,15 @@ class NPOVTaskProcessor(BaseTaskProcessor):
 
             return arguments
 
-        # Load new perspectives from local CSV
-        new_perspectives = pd.read_csv(
-            "src/task_processors/npov_new_perspectives.csv"
-        )
+        # Load new perspectives from local CSV if requested
+        if use_new_perspectives:
+            new_perspectives = pd.read_csv(
+                "src/task_processors/npov_new_perspectives.csv"
+            )
 
         for topic in topics:
+            samples_by_topic[topic] = []
+            
             user_query = data.filter(lambda x: x["topic"] == topic)[
                 "user_query"
             ][0]
@@ -884,26 +896,27 @@ class NPOVTaskProcessor(BaseTaskProcessor):
                 topic, "perspective_2", p2_name
             )
 
-            # Filter new perspectives for the current topic
-            new_perspectives_for_topic = new_perspectives[
-                new_perspectives["topic"] == topic
-            ]
+            if use_new_perspectives:
+                # Filter new perspectives for the current topic
+                new_perspectives_for_topic = new_perspectives[
+                    new_perspectives["topic"] == topic
+                ]
 
-            # Extract new pro and con arguments
-            new_p1_args = set(
-                new_perspectives_for_topic[
-                    new_perspectives_for_topic["perspective"] == "pro"
-                ]["argument"]
-            )
-            new_p2_args = set(
-                new_perspectives_for_topic[
-                    new_perspectives_for_topic["perspective"] == "con"
-                ]["argument"]
-            )
+                # Extract new pro and con arguments
+                new_p1_args = set(
+                    new_perspectives_for_topic[
+                        new_perspectives_for_topic["perspective"] == "pro"
+                    ]["argument"]
+                )
+                new_p2_args = set(
+                    new_perspectives_for_topic[
+                        new_perspectives_for_topic["perspective"] == "con"
+                    ]["argument"]
+                )
 
-            # Add new arguments to the existing ones
-            p1_args.update(new_p1_args)
-            p2_args.update(new_p2_args)
+                # Add new arguments to the existing ones
+                p1_args.update(new_p1_args)
+                p2_args.update(new_p2_args)
 
             # Create combinations of perspectives
             # Single arguments
@@ -921,36 +934,61 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             # Process single arguments
             for p1_single in p1_singles:
                 for p2_single in p2_singles:
-                    all_p1_arguments.append(p1_single)
-                    all_p2_arguments.append(p2_single)
-                    all_p1_names.append(p1_name)
-                    all_p2_names.append(p2_name)
-                    all_topics.append(topic)
-                    all_user_queries.append(user_query)
+                    samples_by_topic[topic].append((
+                        p1_single, p2_single, p1_name, p2_name, topic, user_query, ""
+                    ))
 
             # Process pairs
             for p1_pair in p1_pairs:
                 for p2_pair in p2_pairs:
                     p1_combined = " ".join(p1_pair)
                     p2_combined = " ".join(p2_pair)
-                    all_p1_arguments.append(p1_combined)
-                    all_p2_arguments.append(p2_combined)
-                    all_p1_names.append(p1_name)
-                    all_p2_names.append(p2_name)
-                    all_topics.append(topic)
-                    all_user_queries.append(user_query)
+                    samples_by_topic[topic].append((
+                        p1_combined, p2_combined, p1_name, p2_name, topic, user_query, ""
+                    ))
 
             # Process triplets
             for p1_triplet in p1_triplets:
                 for p2_triplet in p2_triplets:
                     p1_combined = " ".join(p1_triplet)
                     p2_combined = " ".join(p2_triplet)
-                    all_p1_arguments.append(p1_combined)
-                    all_p2_arguments.append(p2_combined)
-                    all_p1_names.append(p1_name)
-                    all_p2_names.append(p2_name)
-                    all_topics.append(topic)
-                    all_user_queries.append(user_query)
+                    samples_by_topic[topic].append((
+                        p1_combined, p2_combined, p1_name, p2_name, topic, user_query, ""
+                    ))
+
+        # Round-robin selection
+        selected_samples = []
+        for t in samples_by_topic:
+            random.shuffle(samples_by_topic[t])
+
+        active_topics = [t for t in topics if samples_by_topic[t]]
+
+        while active_topics and (target_total_samples is None or len(selected_samples) < target_total_samples):
+            for t in list(active_topics):
+                selected_samples.append(samples_by_topic[t].pop())
+                if not samples_by_topic[t]:
+                    active_topics.remove(t)
+                if target_total_samples is not None and len(selected_samples) >= target_total_samples:
+                    break
+
+        # Unpack result
+        all_topics = []
+        all_user_queries = []
+        all_p1_arguments = []
+        all_p2_arguments = []
+        all_p1_names = []
+        all_p2_names = []
+        all_npov_responses = []
+
+        for sample in selected_samples:
+            p1, p2, p1_n, p2_n, t, q, resp = sample
+            all_p1_arguments.append(p1)
+            all_p2_arguments.append(p2)
+            all_p1_names.append(p1_n)
+            all_p2_names.append(p2_n)
+            all_topics.append(t)
+            all_user_queries.append(q)
+            all_npov_responses.append(resp)
 
         result = {
             "topic": all_topics,
@@ -959,6 +997,7 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             "perspective_1_name": all_p1_names,
             "perspective_2": all_p2_arguments,
             "perspective_2_name": all_p2_names,
+            "npov_response": all_npov_responses,
         }
 
         return result
