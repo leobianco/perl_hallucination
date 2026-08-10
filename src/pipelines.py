@@ -598,29 +598,65 @@ class EvaluationPipeline(Pipeline):
         """Converts a Gemini API response to a normalized score.
 
         Args:
-            response (google.genai.types.GenerateContentResponse): Gemini API response.
+            response (google.genai.types.GenerateContentResponse): Gemini API
+              response.
 
         Returns:
-            float: Normalized score for the response.
+            float: Normalized score in [0.0, 1.0] for the response (P(No
+            hallucination)).
         """
-        if not response.candidates:
-            return 0.0
+        if not response or not response.candidates:
+            return 0.5
 
         candidate = response.candidates[0]
         text = response.text.strip() if response.text else ""
+        clean_text = text.strip('"\'` \n\r\t')
 
-        if candidate.avg_logprobs is not None:
+        # 1. Check if token logprobs are available in candidate.logprobs_result
+        if (
+            hasattr(candidate, "logprobs_result")
+            and candidate.logprobs_result is not None
+        ):
+            chosen = getattr(
+                candidate.logprobs_result, "chosen_candidates", None
+            )
+            if chosen and len(chosen) > 0:
+                top_cands = getattr(chosen[0], "top_candidates", None)
+                if top_cands:
+                    logp_no = None
+                    logp_yes = None
+                    for cand in top_cands:
+                        cand_token = (
+                            getattr(cand, "token", "")
+                            .strip()
+                            .strip('"\'`')
+                            .lower()
+                        )
+                        if cand_token == "no":
+                            logp_no = getattr(cand, "logprob", None)
+                        elif cand_token == "yes":
+                            logp_yes = getattr(cand, "logprob", None)
+                    if logp_no is not None and logp_yes is not None:
+                        p_no = float(np.exp(logp_no))
+                        p_yes = float(np.exp(logp_yes))
+                        denom = p_no + p_yes
+                        if denom > 0:
+                            return float(p_no / denom)
+
+        # 2. Check avg_logprobs if available
+        if getattr(candidate, "avg_logprobs", None) is not None:
             avg_logprob = candidate.avg_logprobs
-            if text == "No":
+            if clean_text.lower().startswith("no"):
                 return float(np.exp(avg_logprob))
-            elif text == "Yes":
+            elif clean_text.lower().startswith("yes"):
                 return float(1.0 - np.exp(avg_logprob))
 
-        # Fallback based on text response if logprobs are missing
-        if text == "No":
+        # 3. Fallback based on text classification
+        if clean_text.lower().startswith("no"):
             return 1.0
-        elif text == "Yes":
+        elif clean_text.lower().startswith("yes"):
             return 0.0
+
         return 0.5
 
     def gemini_score_dataset(
@@ -649,15 +685,19 @@ class EvaluationPipeline(Pipeline):
         # Prepare local checkpoint directory
         checkpoint_dir = os.path.join("checkpoints", "eval")
         os.makedirs(checkpoint_dir, exist_ok=True)
-        # Use only the dataset name after the slash for checkpoint filename
         if (
             hasattr(script_args, "dataset_with_completions")
             and script_args.dataset_with_completions
-            and "/" in script_args.dataset_with_completions
         ):
-            dataset_name = script_args.dataset_with_completions.split("/", 1)[1]
+            dataset_name = script_args.dataset_with_completions.split("/")[-1]
+        elif (
+            hasattr(script_args, "dataset_labels")
+            and script_args.dataset_labels
+        ):
+            dataset_name = script_args.dataset_labels.split("/")[-1]
         else:
-            dataset_name = str(getattr(script_args, "dataset_with_completions", "eval"))
+            dataset_name = "eval"
+
         checkpoint_path = os.path.join(
             checkpoint_dir,
             f"{dataset_name}_scores_checkpoint.pt",
@@ -714,7 +754,8 @@ class EvaluationPipeline(Pipeline):
                                 response_mime_type="text/x.enum",
                                 response_schema=schema,
                                 temperature=0,
-                                max_output_tokens=1,
+                                max_output_tokens=10,
+                                response_logprobs=True,
                                 seed=script_args.seed,
                             ),
                         )

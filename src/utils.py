@@ -372,29 +372,112 @@ def compute_best_roc_threshold(
 ) -> Dict[str, float]:
     """Compute the best ROC threshold and related metrics.
 
-    Given ground truth labels and prediction scores, compute the ROC curve, find the best threshold (maximizing TPR-FPR), and return threshold, TPR, FPR, and accuracy.
+    Given ground truth labels and prediction scores, compute the ROC curve,
+    find the best finite threshold (maximizing TPR-FPR), and return threshold,
+    TPR, FPR, and accuracy.
 
     Args:
         labels (array-like): Ground truth binary labels.
         scores (array-like): Prediction scores.
 
     Returns:
-        dict: Dictionary with keys 'best_threshold', 'tpr_at_best_threshold', 'fpr_at_best_threshold', and 'accuracy_at_best_threshold'.
+        dict: Dictionary with keys 'best_threshold', 'tpr_at_best_threshold',
+          'fpr_at_best_threshold', and 'accuracy_at_best_threshold'.
     """
 
     fpr, tpr, thresholds = roc_curve(labels, scores)
-    threshold_idx = np.argmax(tpr - fpr)
-    threshold = thresholds[threshold_idx]
+    finite_mask = np.isfinite(thresholds)
+    if np.any(finite_mask):
+        valid_indices = np.where(finite_mask)[0]
+        best_sub_idx = np.argmax(tpr[valid_indices] - fpr[valid_indices])
+        threshold_idx = valid_indices[best_sub_idx]
+    else:
+        threshold_idx = 0
+    threshold = float(thresholds[threshold_idx])
     classif_at_threshold = [0 if score < threshold else 1 for score in scores]
     accuracy = accuracy_score(labels, classif_at_threshold)
     metrics = {
         "best_threshold": threshold,
-        "tpr_at_best_threshold": tpr[threshold_idx],
-        "fpr_at_best_threshold": fpr[threshold_idx],
-        "accuracy_at_best_threshold": accuracy,
+        "tpr_at_best_threshold": float(tpr[threshold_idx]),
+        "fpr_at_best_threshold": float(fpr[threshold_idx]),
+        "accuracy_at_best_threshold": float(accuracy),
     }
 
     return metrics
+
+
+def recompute_autorater_metrics(
+    ground_truth_filepath: str,
+    scores_filepath: str,
+    output_metrics_filepath: Optional[str] = None,
+) -> Dict[str, float]:
+    """Recomputes autorater evaluation metrics from saved ground truth and scores files.
+
+    Args:
+        ground_truth_filepath (str): Path to ground truth file (one int per
+          line).
+        scores_filepath (str): Path to scores file (one float per line).
+        output_metrics_filepath (Optional[str]): Optional path to save the
+          recomputed metrics.
+
+    Returns:
+        Dict[str, float]: Computed metrics dictionary (AUC, Threshold, TPR, FPR,
+        Accuracy, Precision).
+    """
+    from sklearn.metrics import precision_score, roc_auc_score
+
+    with open(ground_truth_filepath, "r") as f:
+        ground_truth = [int(line.strip()) for line in f if line.strip()]
+
+    with open(scores_filepath, "r") as f:
+        scores = [float(line.strip()) for line in f if line.strip()]
+
+    if len(ground_truth) != len(scores):
+        raise ValueError(
+            f"Length mismatch: {len(ground_truth)} ground truth vs {len(scores)} scores"
+        )
+
+    scores_arr = np.array(scores)
+    labels_arr = np.array(ground_truth)
+
+    try:
+        auc = float(roc_auc_score(labels_arr, scores_arr))
+    except Exception:
+        auc = 0.5
+
+    roc_metrics = compute_best_roc_threshold(labels_arr, scores_arr)
+    threshold = roc_metrics["best_threshold"]
+    tpr = roc_metrics["tpr_at_best_threshold"]
+    fpr = roc_metrics["fpr_at_best_threshold"]
+    accuracy = roc_metrics["accuracy_at_best_threshold"]
+
+    classif_at_threshold = [0 if s < threshold else 1 for s in scores_arr]
+    try:
+        precision = float(
+            precision_score(labels_arr, classif_at_threshold, zero_division=0)
+        )
+    except Exception:
+        precision = 0.0
+
+    results = {
+        "auc": auc,
+        "threshold": threshold,
+        "tpr": tpr,
+        "fpr": fpr,
+        "accuracy": accuracy,
+        "precision": precision,
+    }
+
+    if output_metrics_filepath:
+        with open(output_metrics_filepath, "w") as f:
+            f.write(f"AUC: {auc:.5f}\n")
+            f.write(f"Threshold: {threshold:.5f}\n")
+            f.write(f"TPR (recall): {tpr:.5f}\n")
+            f.write(f"FPR: {fpr:.5f}\n")
+            f.write(f"Accuracy: {accuracy:.5f}\n")
+            f.write(f"Precision: {precision:.5f}\n")
+
+    return results
 
 
 def get_task_processor(task_name: str) -> type[BaseTaskProcessor]:

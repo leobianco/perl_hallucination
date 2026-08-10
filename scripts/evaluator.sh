@@ -15,14 +15,14 @@ TEMPERATURE=0.1
 TOP_P=0.9
 TOP_K=40
 
-# Dataset Parameters
-DATASET_PROMPTS="${USER}/bosch_final_test_set"
-DATASET_PROMPTS_SPLIT="test"
-DATASET_LABELS="${USER}/bosch_autorater"
-DATASET_LABELS_SPLIT="test"
-
 # Parameters derived from above
 TASK_NAME="$1"
+
+# Dataset Parameters
+DATASET_PROMPTS="${USER}/${TASK_NAME}_final_test_set"
+DATASET_PROMPTS_SPLIT="test"
+DATASET_LABELS="${USER}/${TASK_NAME}_autorater"
+DATASET_LABELS_SPLIT="test"
 
 # Checks
 if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ]; then
