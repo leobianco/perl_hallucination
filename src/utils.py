@@ -194,15 +194,20 @@ class EvalArguments:
     )
 
     evaluator_model: str = field(
-        default="gemini-3.5-flash",
+        default="gemini-2.0-flash",
         metadata={
-            "help": "The model name or path to the model to use as evaluator (e.g. gemini-3.5-flash or google/gemma-4-26B-A4B-it)."
+            "help": (
+                "The model name or path to the model to use as evaluator (e.g."
+                " gemini-2.0-flash or google/gemma-4-26B-A4B-it)."
+            )
         },
     )
 
     use_gemini: bool = field(
         default=True,
-        metadata={"help": "Using the Gemini API (e.g. gemini-3.5-flash) as evaluator"},
+        metadata={
+            "help": "Using the Gemini API (e.g. gemini-2.0-flash) as evaluator"
+        },
     )
 
     gemini_api_key: Optional[str] = field(

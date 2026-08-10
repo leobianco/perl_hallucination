@@ -698,7 +698,7 @@ class EvaluationPipeline(Pipeline):
         """
         model = (
             getattr(script_args, "evaluator_model", None)
-            or "gemini-3.5-flash"
+            or "gemini-2.0-flash"
         )
         schema = {"type": "STRING", "enum": ["No", "Yes"]}
         print(f"Calling the Gemini API with model {model}...")
