@@ -26,12 +26,16 @@ class ScriptArguments:
         dataset_repo_id (str): Dataset repository identifier.
         model_repo_id (str): Model repository identifier.
         num_fewshot (Optional[int]): Number of few-shot examples to use.
+        reward_model_path (Optional[str]): Path to the reward model checkpoint.
+        sft_model_path (Optional[str]): Path to the SFT model adapter checkpoint.
     """
 
     task_name: str
     dataset_repo_id: str
     model_repo_id: str
     num_fewshot: Optional[int] = None
+    reward_model_path: Optional[str] = None
+    sft_model_path: Optional[str] = None
 
 
 @dataclass

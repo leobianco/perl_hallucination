@@ -413,8 +413,17 @@ class PERLPipeline(Pipeline):
         id2label = {0: "Yes", 1: "No"}
         label2id = {"Yes": 0, "No": 1}
 
+        reward_model_path = (
+            self.args.reward_model_path
+            or getattr(self.training_args, "reward_model_path", None)
+        )
+        sft_model_path = (
+            self.args.sft_model_path
+            or getattr(self.training_args, "sft_model_path", None)
+        )
+
         self.reward_model = AutoModelForSequenceClassification.from_pretrained(
-            self.training_args.reward_model_path,
+            reward_model_path,
             num_labels=2,
             id2label=id2label,
             label2id=label2id,
@@ -424,7 +433,7 @@ class PERLPipeline(Pipeline):
         self.reward_model.eval()
 
         self.reward_tokenizer = AutoTokenizer.from_pretrained(
-            self.training_args.reward_model_path,
+            reward_model_path,
             padding_side="right",
         )
         if self.reward_tokenizer.pad_token is None:
@@ -443,7 +452,7 @@ class PERLPipeline(Pipeline):
             policy_base.config.pad_token_id = self.tokenizer.pad_token_id
 
         self.policy = PeftModel.from_pretrained(
-            policy_base, self.training_args.sft_model_path, is_trainable=True
+            policy_base, sft_model_path, is_trainable=True
         )
         self.policy.to(torch.bfloat16)
 
