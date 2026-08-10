@@ -11,7 +11,7 @@ REWARD_MODEL_PATH="${USER}/"
 NUM_TRAIN_EPOCHS=1
 LEARNING_RATE=2e-5
 LR_SCHEDULER_TYPE="cosine"
-WARMUP_RATIO=0.05
+WARMUP_STEPS=24
 BETA=1e-4
 MAX_COMPLETION_LENGTH=150
 NUM_GENERATIONS=2
@@ -59,7 +59,7 @@ accelerate launch \
   --num_train_epochs "$NUM_TRAIN_EPOCHS" \
   --learning_rate "$LEARNING_RATE" \
   --lr_scheduler_type "$LR_SCHEDULER_TYPE" \
-  --warmup_ratio "$WARMUP_RATIO" \
+  --warmup_steps "$WARMUP_STEPS" \
   --max_completion_length "$MAX_COMPLETION_LENGTH" \
   --weight_decay 0.0 \
   --gradient_accumulation_steps 1 \
