@@ -729,6 +729,7 @@ class EvaluationPipeline(Pipeline):
         ]
         print(f"Found {len(entries_to_score)} entries that need scoring...")
 
+        use_logprobs = True
         try:
             for n, idx in enumerate(
                 tqdm(entries_to_score, desc="Scoring with Gemini API")
@@ -747,23 +748,33 @@ class EvaluationPipeline(Pipeline):
                 retry_count = 0
                 while retry_count < server_max_retries:
                     try:
+                        config_kwargs = {
+                            "response_mime_type": "text/x.enum",
+                            "response_schema": schema,
+                            "temperature": 0,
+                            "max_output_tokens": 10,
+                            "seed": script_args.seed,
+                        }
+                        if use_logprobs:
+                            config_kwargs["response_logprobs"] = True
+
                         response = client.models.generate_content(
                             model=model,
                             contents=dataset[idx]["evaluator_prompt"],
-                            config=types.GenerateContentConfig(
-                                response_mime_type="text/x.enum",
-                                response_schema=schema,
-                                temperature=0,
-                                max_output_tokens=10,
-                                response_logprobs=True,
-                                seed=script_args.seed,
-                            ),
+                            config=types.GenerateContentConfig(**config_kwargs),
                         )
                         scores[idx] = self.gemini_score_response(response)
                         query_count += 1
                         break  # Success, break out of retry loop
                     except Exception as e:
                         error_str = str(e).lower()
+                        if "logprob" in error_str and use_logprobs:
+                            print(
+                                "Notice: Logprobs is not supported for this model/endpoint. "
+                                "Falling back to text classification."
+                            )
+                            use_logprobs = False
+                            continue
                         if (
                             "unavailable" in error_str
                             or "overloaded" in error_str
