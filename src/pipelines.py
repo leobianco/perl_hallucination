@@ -423,6 +423,17 @@ class PERLPipeline(Pipeline):
         self.reward_model.to(torch.bfloat16)
         self.reward_model.eval()
 
+        self.reward_tokenizer = AutoTokenizer.from_pretrained(
+            self.training_args.reward_model_path,
+            padding_side="right",
+        )
+        if self.reward_tokenizer.pad_token is None:
+            self.reward_tokenizer.pad_token = self.reward_tokenizer.eos_token
+        if self.reward_tokenizer.pad_token_id is not None:
+            self.reward_model.config.pad_token_id = (
+                self.reward_tokenizer.pad_token_id
+            )
+
         policy_base = AutoModelForCausalLM.from_pretrained(
             self.args.model_repo_id,
             torch_dtype=torch.bfloat16,
@@ -438,7 +449,7 @@ class PERLPipeline(Pipeline):
 
     def setup_trainer(self) -> None:
         reward_model = self.reward_model
-        reward_tokenizer = self.tokenizer
+        reward_tokenizer = self.reward_tokenizer
 
         # Custom reward function that computes scalar reward as the probability of label 1 ("No" hallucination)
         def reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[float]:
