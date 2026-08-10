@@ -3,9 +3,9 @@
 # Core Parameters
 USER="leobianco"
 SEED=12345
-RUN_IDENTIFIER="google/gemma-2-2b-it"
-BASE_MODEL="google/gemma-2-2b-it"
-EVALUATOR_MODEL="gemini-2.0-flash"
+RUN_IDENTIFIER="google/gemma-4-E2B-it"
+BASE_MODEL="google/gemma-4-E2B-it"
+EVALUATOR_MODEL="gemini-3.5-flash"
 USE_GEMINI="True"
 THRESHOLD=0.991
 EVALUATOR_NUM_FEWSHOT=2

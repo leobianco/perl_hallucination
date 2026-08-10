@@ -47,8 +47,44 @@ class LLMSynthScriptArguments:
     num_organic_hallus_to_keep: Optional[int] = 0
 
 
+@dataclass
+class LoraArguments:
+    """Arguments for LoRA and PEFT configuration.
+
+    Attributes:
+        task_type (str): Task type for PEFT (e.g., CAUSAL_LM, SEQ_CLS).
+        peft_type (str): PEFT method type (e.g., LORA).
+        lora_r (int): LoRA attention dimension (rank).
+        lora_alpha (int): LoRA alpha parameter for scaling.
+        lora_dropout (float): LoRA dropout probability.
+    """
+
+    task_type: str = field(
+        default="CAUSAL_LM",
+        metadata={
+            "help": "Task type for PEFT (e.g., CAUSAL_LM, SEQ_CLS). Default: CAUSAL_LM"
+        },
+    )
+    peft_type: str = field(
+        default="LORA",
+        metadata={"help": "PEFT method type. Default: LORA"},
+    )
+    lora_r: int = field(
+        default=8,
+        metadata={"help": "LoRA attention dimension (rank). Default: 8"},
+    )
+    lora_alpha: int = field(
+        default=16,
+        metadata={"help": "LoRA alpha parameter for scaling. Default: 16"},
+    )
+    lora_dropout: float = field(
+        default=0.0,
+        metadata={"help": "LoRA dropout probability. Default: 0.0"},
+    )
+
+
 def create_lora_argument_parser() -> argparse.ArgumentParser:
-    """Create an argument parser for LoRA and PEFT configuration. This is a workaround the fact that the original LoraConfig is not compatible with HfArgumentParser due to the use of complex type hints.
+    """Create an argument parser for LoRA and PEFT configuration.
 
     Returns:
         argparse.ArgumentParser: Configured argument parser for LoRA/PEFT arguments.
@@ -154,15 +190,15 @@ class EvalArguments:
     )
 
     evaluator_model: str = field(
-        default="google/gemma-2-27b-it",
+        default="gemini-3.5-flash",
         metadata={
-            "help": "The model name or path to the model to use as evaluator."
+            "help": "The model name or path to the model to use as evaluator (e.g. gemini-3.5-flash or google/gemma-4-26B-A4B-it)."
         },
     )
 
     use_gemini: bool = field(
         default=True,
-        metadata={"help": "Using the latest Gemini model as evaluator"},
+        metadata={"help": "Using the Gemini API (e.g. gemini-3.5-flash) as evaluator"},
     )
 
     gemini_api_key: Optional[str] = field(

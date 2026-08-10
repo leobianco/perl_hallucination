@@ -4,7 +4,7 @@ absl-py==2.3.1
     # via
     #   -r requirements.in
     #   rouge-score
-accelerate==1.11.0
+accelerate==1.12.0
     # via
     #   -r requirements.in
     #   peft
@@ -148,7 +148,7 @@ google-auth==2.42.0
     # via
     #   -r requirements.in
     #   google-genai
-google-genai==1.46.0
+google-genai==1.50.0
     # via -r requirements.in
 h11==0.16.0
     # via
@@ -353,7 +353,7 @@ parso==0.8.5
     # via jedi
 partial-json-parser==0.2.1.1.post6
     # via vllm
-peft==0.17.1
+peft==0.18.0
     # via -r requirements.in
 pexpect==4.9.0
     # via ipython
@@ -598,7 +598,7 @@ traitlets==5.14.3
     # via
     #   ipython
     #   matplotlib-inline
-transformers==4.57.1
+transformers==5.14.0
     # via
     #   -r requirements.in
     #   compressed-tensors
@@ -610,7 +610,7 @@ triton==3.4.0
     # via
     #   torch
     #   xgrammar
-trl @ git+https://github.com/leobianco/trl.git@4722ab706eab07111eba1ca026bb363be6010a33#egg=trl
+trl==1.0.0
     # via -r requirements.in
 typer==0.20.0
     # via

@@ -21,6 +21,7 @@ from typing import Any, Optional
 import evaluate
 import matplotlib.pyplot as plt
 import numpy as np
+import scipy.special
 import torch
 from datasets import (
     Dataset,
@@ -49,12 +50,10 @@ from transformers import (
     set_seed,
 )
 from trl import (
-    DataCollatorForCompletionOnlyLM,
     RLOOConfig,
     RLOOTrainer,
     SFTConfig,
     SFTTrainer,
-    TrlParser,
 )
 from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
@@ -62,6 +61,7 @@ from vllm.lora.request import LoRARequest
 from src.utils import (
     EvalArguments,
     LLMSynthScriptArguments,
+    LoraArguments,
     ScriptArguments,
     compute_best_roc_threshold,
     create_lora_argument_parser,
@@ -98,8 +98,8 @@ class Pipeline(abc.ABC):
         raise NotImplementedError()
 
     def setup_tokenizer(self) -> None:
-        """
-        Default tokenizer loading uses self.args.model_repo_id or training args.
+        """Default tokenizer loading uses self.args.model_repo_id or training args.
+
         Subclasses may override if they need a different tokenizer setup.
         """
         model_repo = getattr(self.args, "model_repo_id", None) or getattr(
@@ -113,9 +113,12 @@ class Pipeline(abc.ABC):
             padding_side="left",
         )
 
-        # Some models don't have pad token
-        if "pad_token" not in self.tokenizer.special_tokens_map.keys():
-            self.tokenizer.pad_token = self.tokenizer.unk_token
+        # Set pad token if not present
+        if self.tokenizer.pad_token_id is None:
+            if self.tokenizer.eos_token_id is not None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            elif self.tokenizer.unk_token_id is not None:
+                self.tokenizer.pad_token = self.tokenizer.unk_token
 
     @abc.abstractmethod
     def load_data(self) -> None:
@@ -144,7 +147,7 @@ class SFTPipeline(Pipeline):
     def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
         parser_lora = create_lora_argument_parser()
         lora_args, remaining_args = parser_lora.parse_known_args()
-        parser = TrlParser((ScriptArguments, SFTConfig))
+        parser = HfArgumentParser((ScriptArguments, SFTConfig))
         script_args, training_args = parser.parse_args_into_dataclasses(
             remaining_args
         )
@@ -162,7 +165,6 @@ class SFTPipeline(Pipeline):
         }
 
     def process_data(self) -> None:
-        # task-specific processor
         # lora config created from parsed args
         self._lora_config = LoraConfig(
             task_type=self._lora_args.task_type,
@@ -194,38 +196,28 @@ class SFTPipeline(Pipeline):
             )
         )
 
-        response_template_ids = self.tokenizer.encode(
-            response_template, add_special_tokens=False
-        )
-        self.data_collator = DataCollatorForCompletionOnlyLM(
-            response_template_ids, tokenizer=self.tokenizer
-        )
-
-        # expose formatting func for trainer
         self.formatting_prompts_func = formatting_prompts_func
+        self.response_template = response_template
 
     def setup_model(self) -> None:
         model = AutoModelForCausalLM.from_pretrained(
             self.args.model_repo_id,
-            attn_implementation="eager",
             torch_dtype=torch.bfloat16,
         )
 
-        # If pad token was added, need to resize embeddings.
-        if "pad_token" not in self.tokenizer.special_tokens_map.keys():
+        # Ensure pad token is set
+        if self.tokenizer.pad_token_id is not None:
             model.config.pad_token_id = self.tokenizer.pad_token_id
 
         self.model = get_peft_model(model, self._lora_config)
 
     def setup_trainer(self) -> None:
         self.trainer = SFTTrainer(
-            self.model,
+            model=self.model,
             args=self.training_args,
-            # data_collator=self.data_collator,
             train_dataset=self.data["train"],
             eval_dataset=self.data["test"],
             processing_class=self.tokenizer,
-            # formatting_func=self.formatting_prompts_func,
         )
 
     def run_and_save(self) -> None:
@@ -313,27 +305,30 @@ class RewardModelPipeline(Pipeline):
             id2label=id2label,
             label2id=label2id,
             torch_dtype=self.torch_dtype,
-            attn_implementation="eager",
         )
 
-        if "pad_token" not in self.tokenizer.special_tokens_map.keys():
+        if self.tokenizer.pad_token_id is not None:
             self.model.config.pad_token_id = self.tokenizer.pad_token_id
 
         self.model = get_peft_model(self.model, self._lora_config)
 
-        # adjust score parameters
-        self.model.score.requires_grad_()
-        with torch.no_grad():
-            self.model.score.weight.mul_(0.1)
+        # Adjust score parameters
+        score_head = getattr(self.model, "score", None)
+        if score_head is None and hasattr(self.model, "base_model"):
+            score_head = getattr(self.model.base_model, "score", None)
+        if score_head is not None and hasattr(score_head, "weight"):
+            score_head.requires_grad_()
+            with torch.no_grad():
+                score_head.weight.mul_(0.1)
 
     def setup_trainer(self) -> None:
         metric = evaluate.load("roc_auc")
 
         def compute_metrics(eval_preds):
             logits = eval_preds.predictions
-            yes_scores = np.exp(logits)[:, 0]
-            no_scores = np.exp(logits)[:, 1]
-            scores = no_scores / (yes_scores + no_scores)
+            # Numerically stable softmax: probability of label 1 ("No" hallucination) is the reward score
+            probs = scipy.special.softmax(logits, axis=-1)
+            scores = probs[:, 1]
             label_ids = eval_preds.label_ids
             metrics = metric.compute(
                 references=label_ids, prediction_scores=scores
@@ -379,8 +374,8 @@ class RewardModelPipeline(Pipeline):
 class PERLPipeline(Pipeline):
     """Pipeline for PERL training (perl.py).
 
-    This pipeline loads tokenized perl datasets, sets up policy, reference policy,
-    reward model, and uses RLOOTrainer to run RL training.
+    This pipeline loads datasets, initializes policy and reward model,
+    and uses RLOOTrainer with standard upstream TRL to run RL training.
     """
 
     def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
@@ -394,21 +389,9 @@ class PERLPipeline(Pipeline):
         self.data = load_dataset(self.args.dataset_repo_id)
 
     def process_data(self) -> None:
-        def encode(examples):
-            return self.tokenizer(
-                examples["prompt"],
-                padding=True,
-                truncation=True,
-                return_tensors="pt",
-            )
-
-        for split in self.data.keys():
-            self.data[split] = self.data[split].map(
-                encode,
-                remove_columns=self.data[split].column_names,
-                batched=True,
-            )
-            self.data[split].set_format("torch")
+        # In modern TRL RLOOTrainer, datasets only need a 'prompt' column
+        # with raw text or standard format, and tokenization is handled by processing_class.
+        pass
 
     def setup_model(self) -> None:
         id2label = {0: "Yes", 1: "No"}
@@ -419,35 +402,48 @@ class PERLPipeline(Pipeline):
             num_labels=2,
             id2label=id2label,
             label2id=label2id,
-            attn_implementation="eager",
             torch_dtype=torch.bfloat16,
         )
-
-        self.ref_policy = AutoModelForCausalLM.from_pretrained(
-            self.training_args.sft_model_path,
-            attn_implementation="eager",
-            torch_dtype=torch.bfloat16,
-        )
+        self.reward_model.eval()
 
         policy_base = AutoModelForCausalLM.from_pretrained(
             self.args.model_repo_id,
-            attn_implementation="eager",
             torch_dtype=torch.bfloat16,
         )
+
+        if self.tokenizer.pad_token_id is not None:
+            policy_base.config.pad_token_id = self.tokenizer.pad_token_id
 
         self.policy = PeftModel.from_pretrained(
             policy_base, self.training_args.sft_model_path, is_trainable=True
         )
 
     def setup_trainer(self) -> None:
+        reward_model = self.reward_model
+        reward_tokenizer = self.tokenizer
+
+        # Custom reward function that computes scalar reward as the probability of label 1 ("No" hallucination)
+        def reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[float]:
+            texts = [p + c for p, c in zip(prompts, completions)]
+            inputs = reward_tokenizer(
+                texts,
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+            ).to(reward_model.device)
+            with torch.no_grad():
+                logits = reward_model(**inputs).logits
+                # Probability of label 1 ("No" hallucination = non-hallucinated score)
+                probs = torch.softmax(logits, dim=-1)[:, 1]
+            return probs.cpu().tolist()
+
         self.trainer = RLOOTrainer(
-            config=self.training_args,
-            processing_class=self.tokenizer,
-            ref_policy=self.ref_policy,
-            policy=self.policy,
-            reward_model=self.reward_model,
+            model=self.policy,
+            reward_funcs=reward_fn,
+            args=self.training_args,
             train_dataset=self.data["train"],
-            eval_dataset=self.data["test"],
+            eval_dataset=self.data.get("test", None),
+            processing_class=self.tokenizer,
         )
 
     def run_and_save(self) -> None:
@@ -455,20 +451,10 @@ class PERLPipeline(Pipeline):
             self.trainer.train()
             self.trainer.push_to_hub()
 
-        # Was getting errors with this (TODO: fix)
-        # name_for_saving = self.training_args.run_name.split("/")[1]
-        # filepath = os.path.join("logs", name_for_saving, "logs.txt")
-        # os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        # with open(filepath, "w") as f:
-        #     for d in self.trainer.state.log_history:
-        #         f.write(str(d) + "\n----------\n")
-        # print(f"Logs saved to {filepath}")
-
 
 class EvaluationPipeline(Pipeline):
-    """Base class for evaluator flows. Provides helper methods previously
-    implemented in `evaluator_utils.py` so evaluation pipelines can call
-    them as instance methods and share configuration/state.
+    """Base class for evaluator flows. Provides helper methods for autorater
+    evaluation, completion generation, and scoring.
     """
 
     def setup_trainer(self) -> None:
@@ -477,7 +463,7 @@ class EvaluationPipeline(Pipeline):
 
     def get_fewshot_examples(
         self, data: Dataset, n_yes: int, n_no: int, seed: int
-    ) -> Dataset:
+    ) -> Optional[Dataset]:
         if n_yes == 0 and n_no == 0:
             return None
         positive_examples = (
@@ -508,9 +494,10 @@ class EvaluationPipeline(Pipeline):
     ) -> torch.Tensor:
         with torch.no_grad():
             outputs = evaluator(**tokenized_prompts, use_cache=False)
-            score_yes = torch.exp(outputs.logits[:, -1, yes_token_id])
-            score_no = torch.exp(outputs.logits[:, -1, no_token_id])
-            score_batch = score_no / (score_yes + score_no)
+            score_yes = outputs.logits[:, -1, yes_token_id]
+            score_no = outputs.logits[:, -1, no_token_id]
+            # Numerically stable score computation: sigmoid(score_no - score_yes) = P(No)
+            score_batch = torch.sigmoid(score_no - score_yes)
         return score_batch
 
     def evaluator_score(
@@ -555,15 +542,25 @@ class EvaluationPipeline(Pipeline):
         Returns:
             float: Normalized score for the response.
         """
+        if not response.candidates:
+            return 0.0
 
-        if response.candidates[0].avg_logprobs is None:
-            return 0
-        if response.text == "No":
-            return np.exp(response.candidates[0].avg_logprobs)
-        elif response.text == "Yes":
-            return 1 - np.exp(response.candidates[0].avg_logprobs)
-        else:
-            raise Exception("Invalid response")
+        candidate = response.candidates[0]
+        text = response.text.strip() if response.text else ""
+
+        if candidate.avg_logprobs is not None:
+            avg_logprob = candidate.avg_logprobs
+            if text == "No":
+                return float(np.exp(avg_logprob))
+            elif text == "Yes":
+                return float(1.0 - np.exp(avg_logprob))
+
+        # Fallback based on text response if logprobs are missing
+        if text == "No":
+            return 1.0
+        elif text == "Yes":
+            return 0.0
+        return 0.5
 
     def gemini_score_dataset(
         self,
@@ -581,22 +578,25 @@ class EvaluationPipeline(Pipeline):
         Returns:
             torch.Tensor: Scores for each entry in the dataset.
         """
-
-        model = "gemini-2.0-flash-001"
+        model = (
+            getattr(script_args, "evaluator_model", None)
+            or "gemini-3.5-flash"
+        )
         schema = {"type": "STRING", "enum": ["No", "Yes"]}
-        print("Calling the Gemini API...")
+        print(f"Calling the Gemini API with model {model}...")
 
         # Prepare local checkpoint directory
         checkpoint_dir = os.path.join("checkpoints", "eval")
         os.makedirs(checkpoint_dir, exist_ok=True)
         # Use only the dataset name after the slash for checkpoint filename
         if (
-            script_args.dataset_with_completions
+            hasattr(script_args, "dataset_with_completions")
+            and script_args.dataset_with_completions
             and "/" in script_args.dataset_with_completions
         ):
             dataset_name = script_args.dataset_with_completions.split("/", 1)[1]
         else:
-            dataset_name = str(script_args.dataset_with_completions)
+            dataset_name = str(getattr(script_args, "dataset_with_completions", "eval"))
         checkpoint_path = os.path.join(
             checkpoint_dir,
             f"{dataset_name}_scores_checkpoint.pt",
@@ -667,6 +667,7 @@ class EvaluationPipeline(Pipeline):
                             or "overloaded" in error_str
                             or "overcharged" in error_str
                             or "server" in error_str
+                            or "resource_exhausted" in error_str
                         ) and retry_count < server_max_retries - 1:
                             print(
                                 f"Server unavailable/overloaded at entry {idx}, attempt {retry_count + 1}/{server_max_retries}. Waiting {server_retry_wait} seconds before retrying..."
@@ -781,7 +782,6 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
         if not self.args.use_gemini:
             self.evaluator = AutoModelForCausalLM.from_pretrained(
                 self.args.evaluator_model,
-                attn_implementation="eager",
                 torch_dtype=torch.bfloat16,
             )
             self.evaluator.eval()
@@ -808,10 +808,20 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
         ground_truth = self.data["label"]
 
         # Save evaluator prompts
+        eval_model_name = (
+            self.args.evaluator_model.split("/")[-1]
+            if self.args.evaluator_model
+            else "gemini"
+        )
+        dataset_name = (
+            self.args.dataset_labels.split("/")[-1]
+            if self.args.dataset_labels
+            else "labels"
+        )
         name_for_saving = (
-            f"eval_autorater_{self.args.evaluator_model.split('/')[-1]}"
+            f"eval_autorater_{eval_model_name}"
             + f"_autorater_num_fewshot_{self.args.evaluator_num_fewshot}"
-            + f"_data_{self.args.dataset_labels.split('/')[-1]}"
+            + f"_data_{dataset_name}"
             + f"_seed_{self.args.seed}"
         )
 
@@ -1077,7 +1087,6 @@ class EvaluationScoringPipeline(EvaluationPipeline):
             # Use causal LM evaluator and set eval mode
             self.evaluator = AutoModelForCausalLM.from_pretrained(
                 self.args.evaluator_model,
-                attn_implementation="eager",
                 torch_dtype=torch.bfloat16,
             )
             self.evaluator.eval()

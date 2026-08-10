@@ -179,7 +179,7 @@ class BoschTaskProcessor(BaseTaskProcessor):
         ).select(range(n_fewshot_examples_synth_llm))
 
         client = genai.Client(api_key=args.gemini_api_key)
-        gemini_model = "gemini-2.0-flash-001"
+        gemini_model = "gemini-3.5-flash"
         generation_config = types.GenerateContentConfig(
             temperature=args.synth_llm_temperature,
             seed=args.seed,

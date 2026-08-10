@@ -3,7 +3,7 @@
 # Core Parameters
 USER="leobianco"
 SEED=130104
-MODEL_REPO_ID="google/gemma-2-2b-it"
+MODEL_REPO_ID="google/gemma-4-E2B-it"
 
 # Training Parameters
 BATCH_SIZE=4
