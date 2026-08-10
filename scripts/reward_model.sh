@@ -3,7 +3,7 @@
 # Core Parameters
 USER="leobianco"
 SEED=12345
-MODEL_REPO_ID="google/gemma-4-E2B-it"
+MODEL_REPO_ID="google/gemma-3-1b-it"
 
 # Dataset Parameters
 ORGANIC=true
@@ -77,7 +77,6 @@ accelerate launch \
   --run_name "$RUN_IDENTIFIER" \
   --logging_steps 1 \
   --output_dir "./checkpoints/${TASK_NAME}/reward_model/${RUN_IDENTIFIER}" \
-  --overwrite_output_dir True \
   --push_to_hub True \
   --hub_model_id "$RUN_IDENTIFIER" \
   --dataset_repo_id "${DATASET_REPO_ID}" \

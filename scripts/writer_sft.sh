@@ -42,7 +42,6 @@ accelerate launch \
   --run_name "$RUN_IDENTIFIER" \
   --logging_steps 1 \
   --output_dir "./checkpoints/${TASK_NAME}/writer_sft/${RUN_IDENTIFIER}" \
-  --overwrite_output_dir True \
   --push_to_hub True \
   --hub_model_id "$RUN_IDENTIFIER" \
   --seed "$SEED" \
