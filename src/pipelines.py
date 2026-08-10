@@ -470,7 +470,18 @@ class PERLPipeline(Pipeline):
                 return_tensors="pt",
             ).to(reward_model.device)
             with torch.no_grad():
-                logits = reward_model(**inputs).logits
+                # If DeepSpeed ZeRO-3 is active, gather parameters for forward pass
+                is_zero3 = any(
+                    hasattr(p, "ds_id") for p in reward_model.parameters()
+                )
+                if is_zero3:
+                    import deepspeed
+                    with deepspeed.zero.GatheredParameters(
+                        list(reward_model.parameters()), modifier_rank=None
+                    ):
+                        logits = reward_model(**inputs).logits
+                else:
+                    logits = reward_model(**inputs).logits
                 # Probability of label 1 ("No" hallucination = non-hallucinated score)
                 probs = torch.softmax(logits, dim=-1)[:, 1]
             return probs.cpu().tolist()
