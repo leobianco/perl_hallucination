@@ -210,6 +210,7 @@ class SFTPipeline(Pipeline):
             model.config.pad_token_id = self.tokenizer.pad_token_id
 
         self.model = get_peft_model(model, self._lora_config)
+        self.model.to(torch.bfloat16)
 
     def setup_trainer(self) -> None:
         self.trainer = SFTTrainer(
@@ -311,15 +312,30 @@ class RewardModelPipeline(Pipeline):
             self.model.config.pad_token_id = self.tokenizer.pad_token_id
 
         self.model = get_peft_model(self.model, self._lora_config)
+        self.model.to(self.torch_dtype)
 
-        # Adjust score parameters
+        # Adjust score parameters and ensure all modules_to_save heads
+        # match torch_dtype
         score_head = getattr(self.model, "score", None)
         if score_head is None and hasattr(self.model, "base_model"):
             score_head = getattr(self.model.base_model, "score", None)
-        if score_head is not None and hasattr(score_head, "weight"):
-            score_head.requires_grad_()
-            with torch.no_grad():
-                score_head.weight.mul_(0.1)
+        if score_head is not None:
+            score_head.to(self.torch_dtype)
+            if hasattr(score_head, "modules_to_save"):
+                for mod in score_head.modules_to_save.values():
+                    if hasattr(mod, "weight") and mod.weight is not None:
+                        mod.to(self.torch_dtype)
+                        mod.requires_grad_()
+                        with torch.no_grad():
+                            mod.weight.mul_(0.1)
+            elif (
+                hasattr(score_head, "weight")
+                and score_head.weight is not None
+            ):
+                score_head.to(self.torch_dtype)
+                score_head.requires_grad_()
+                with torch.no_grad():
+                    score_head.weight.mul_(0.1)
 
     def setup_trainer(self) -> None:
         metric = evaluate.load("roc_auc")
@@ -404,6 +420,7 @@ class PERLPipeline(Pipeline):
             label2id=label2id,
             torch_dtype=torch.bfloat16,
         )
+        self.reward_model.to(torch.bfloat16)
         self.reward_model.eval()
 
         policy_base = AutoModelForCausalLM.from_pretrained(
@@ -417,6 +434,7 @@ class PERLPipeline(Pipeline):
         self.policy = PeftModel.from_pretrained(
             policy_base, self.training_args.sft_model_path, is_trainable=True
         )
+        self.policy.to(torch.bfloat16)
 
     def setup_trainer(self) -> None:
         reward_model = self.reward_model
