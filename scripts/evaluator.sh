@@ -5,12 +5,12 @@ USER="leobianco"
 SEED=12345
 RUN_IDENTIFIER="google/gemma-4-E2B-it"
 BASE_MODEL="google/gemma-4-E2B-it"
-EVALUATOR_MODEL="gemini-2.0-flash"
+EVALUATOR_MODEL="gemini-3.5-flash"
 USE_GEMINI="True"
 THRESHOLD=0.991
 EVALUATOR_NUM_FEWSHOT=2
-WRITER_NUM_FEWSHOT=1
-MAX_TOKENS=150
+WRITER_NUM_FEWSHOT=0
+MAX_TOKENS=250
 TEMPERATURE=0.1
 TOP_P=0.9
 TOP_K=40
@@ -30,6 +30,9 @@ if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" !
     echo "$TASK_NAME"
     exit 1
 fi
+
+export GOOGLE_CLOUD_LOCATION="${GOOGLE_CLOUD_LOCATION:-us}"
+export GOOGLE_GENAI_USE_VERTEXAI="${GOOGLE_GENAI_USE_VERTEXAI:-true}"
 
 if [ -z "${GEMINI_API_KEY}" ] && [ -z "${GOOGLE_CLOUD_PROJECT}" ] && [ "${GOOGLE_GENAI_USE_VERTEXAI}" != "true" ]; then
     echo "Please set either GEMINI_API_KEY (for AI Studio) or GOOGLE_CLOUD_PROJECT / GOOGLE_GENAI_USE_VERTEXAI (for Vertex AI) before running this script."

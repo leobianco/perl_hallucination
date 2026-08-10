@@ -601,7 +601,7 @@ class EvaluationPipeline(Pipeline):
         )
         if use_vertex:
             project = os.environ.get("GOOGLE_CLOUD_PROJECT")
-            location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+            location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us")
             print(
                 f"Initializing Google GenAI Client using Vertex AI (project={project}, location={location})..."
             )
