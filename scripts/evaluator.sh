@@ -31,7 +31,7 @@ if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" !
     exit 1
 fi
 
-export GOOGLE_CLOUD_LOCATION="${GOOGLE_CLOUD_LOCATION:-us}"
+export GOOGLE_CLOUD_LOCATION="${GOOGLE_CLOUD_LOCATION:-us-central1}"
 export GOOGLE_GENAI_USE_VERTEXAI="${GOOGLE_GENAI_USE_VERTEXAI:-true}"
 
 if [ -z "${GEMINI_API_KEY}" ] && [ -z "${GOOGLE_CLOUD_PROJECT}" ] && [ "${GOOGLE_GENAI_USE_VERTEXAI}" != "true" ]; then
