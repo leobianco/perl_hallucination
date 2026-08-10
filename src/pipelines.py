@@ -460,7 +460,7 @@ class PERLPipeline(Pipeline):
         reward_model = self.reward_model
         reward_tokenizer = self.reward_tokenizer
 
-        # Custom reward function that computes scalar reward as the probability of label 1 ("No" hallucination)
+        # Custom reward function that computes scalar reward as the probability of label 1 ("No" hallucination).
         def reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[float]:
             texts = [p + c for p, c in zip(prompts, completions)]
             inputs = reward_tokenizer(
@@ -470,18 +470,30 @@ class PERLPipeline(Pipeline):
                 return_tensors="pt",
             ).to(reward_model.device)
             with torch.no_grad():
-                # If DeepSpeed ZeRO-3 is active, gather parameters for forward pass
+                # Under DeepSpeed ZeRO Stage 3, all model parameters instantiated
+                # in the process are partitioned into 1-D flat slices across GPUs.
+                # Note on TRL's `ds3_gather_for_generation`: TRL's built-in flag
+                # only gathers the policy model (`self.model`) during `generate()`.
+                # Because `reward_model` is an auxiliary model called inside this
+                # custom `reward_fn` callable, TRL does not manage or gather its
+                # weights automatically.
+                # If parameters are partitioned (detected via `ds_id`), we must
+                # explicitly gather them across all ranks with `GatheredParameters`
+                # (`modifier_rank=None`) so embedding and linear layers
+                # reconstruct their 2-D shapes for inference.
                 is_zero3 = any(
                     hasattr(p, "ds_id") for p in reward_model.parameters()
                 )
                 if is_zero3:
                     import deepspeed
+
                     with deepspeed.zero.GatheredParameters(
                         list(reward_model.parameters()), modifier_rank=None
                     ):
                         logits = reward_model(**inputs).logits
                 else:
                     logits = reward_model(**inputs).logits
+
                 # Probability of label 1 ("No" hallucination = non-hallucinated score)
                 probs = torch.softmax(logits, dim=-1)[:, 1]
             return probs.cpu().tolist()
