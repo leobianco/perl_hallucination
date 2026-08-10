@@ -31,8 +31,8 @@ if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" !
     exit 1
 fi
 
-if [ -z "${GEMINI_API_KEY}" ]; then
-    echo "GEMINI_API_KEY environment variable is not set. Please export it before running this script."
+if [ -z "${GEMINI_API_KEY}" ] && [ -z "${GOOGLE_CLOUD_PROJECT}" ] && [ "${GOOGLE_GENAI_USE_VERTEXAI}" != "true" ]; then
+    echo "Please set either GEMINI_API_KEY (for AI Studio) or GOOGLE_CLOUD_PROJECT / GOOGLE_GENAI_USE_VERTEXAI (for Vertex AI) before running this script."
     exit 1
 fi
 

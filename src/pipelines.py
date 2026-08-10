@@ -592,6 +592,27 @@ class EvaluationPipeline(Pipeline):
             del tokenized_prompts
         return scores
 
+    def create_gemini_client(self) -> genai.Client:
+        """Initializes Google GenAI Client supporting Vertex AI or API Key."""
+        use_vertex = (
+            os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower()
+            in ("true", "1")
+            or bool(os.environ.get("GOOGLE_CLOUD_PROJECT"))
+        )
+        if use_vertex:
+            project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+            location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+            print(
+                f"Initializing Google GenAI Client using Vertex AI (project={project}, location={location})..."
+            )
+            return genai.Client(
+                vertexai=True, project=project, location=location
+            )
+        elif getattr(self.args, "gemini_api_key", None):
+            return genai.Client(api_key=self.args.gemini_api_key)
+        else:
+            return genai.Client()
+
     def gemini_score_response(
         self, response: types.GenerateContentResponse
     ) -> float:
@@ -902,7 +923,7 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
     def run_and_save(self) -> None:
         # Score using evaluator (either gemini or local model)
         if self.args.use_gemini:
-            client = genai.Client(api_key=self.args.gemini_api_key)
+            client = self.create_gemini_client()
             scores = self.gemini_score_dataset(client, self.data, self.args)
         else:
             # Tokenize in batches and compute scores using tokenizer token ids for Yes/No
@@ -1207,7 +1228,7 @@ class EvaluationScoringPipeline(EvaluationPipeline):
     def run_and_save(self):
         # Score dataset using tokenizer and evaluator (support gemini)
         if self.args.use_gemini:
-            client = genai.Client(api_key=self.args.gemini_api_key)
+            client = self.create_gemini_client()
             scores = self.gemini_score_dataset(client, self.val_data, self.args)
         else:
             yes_token_id = self.tokenizer.convert_tokens_to_ids("Yes")
