@@ -800,7 +800,7 @@ class EvaluationPipeline(Pipeline):
                         error_str = str(e).lower()
                         if "logprob" in error_str and use_logprobs:
                             print(
-                                "Notice: Logprobs not supported or conflicting for this model/endpoint. "
+                                f"\nNotice: Logprobs request failed with error: {e}. "
                                 "Falling back to text classification."
                             )
                             use_logprobs = False
