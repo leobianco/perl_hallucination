@@ -4,8 +4,8 @@
 USER="leobianco"
 SEED=130104
 MODEL_REPO_ID="google/gemma-4-E2B-it"
-REWARD_MODEL_PATH="${USER}/"
 SFT_MODEL_PATH="${USER}/"
+REWARD_MODEL_PATH="${USER}/"
 
 # Training Parameters
 NUM_TRAIN_EPOCHS=1
@@ -48,7 +48,6 @@ accelerate launch \
   --run_name "$RUN_IDENTIFIER" \
   --logging_steps 1 \
   --output_dir "./checkpoints/${TASK_NAME}/perl/${RUN_IDENTIFIER}" \
-  --overwrite_output_dir True \
   --push_to_hub True \
   --hub_model_id "$RUN_IDENTIFIER" \
   --dataset_repo_id "${USER}/${TASK_NAME}_perl" \
