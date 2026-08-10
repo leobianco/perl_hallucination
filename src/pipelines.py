@@ -769,15 +769,24 @@ class EvaluationPipeline(Pipeline):
                 retry_count = 0
                 while retry_count < server_max_retries:
                     try:
-                        config_kwargs = {
-                            "response_mime_type": "text/x.enum",
-                            "response_schema": schema,
-                            "temperature": 0,
-                            "max_output_tokens": 10,
-                            "seed": script_args.seed,
-                        }
                         if use_logprobs:
-                            config_kwargs["response_logprobs"] = True
+                            # When requesting logprobs, do not pass response_mime_type="text/x.enum"
+                            # as structured enum decoding can conflict with logprobs on Vertex AI
+                            config_kwargs = {
+                                "temperature": 0,
+                                "max_output_tokens": 10,
+                                "response_logprobs": True,
+                                "logprobs": 5,
+                                "seed": script_args.seed,
+                            }
+                        else:
+                            config_kwargs = {
+                                "response_mime_type": "text/x.enum",
+                                "response_schema": schema,
+                                "temperature": 0,
+                                "max_output_tokens": 10,
+                                "seed": script_args.seed,
+                            }
 
                         response = client.models.generate_content(
                             model=model,
@@ -791,7 +800,7 @@ class EvaluationPipeline(Pipeline):
                         error_str = str(e).lower()
                         if "logprob" in error_str and use_logprobs:
                             print(
-                                "Notice: Logprobs is not supported for this model/endpoint. "
+                                "Notice: Logprobs not supported or conflicting for this model/endpoint. "
                                 "Falling back to text classification."
                             )
                             use_logprobs = False
