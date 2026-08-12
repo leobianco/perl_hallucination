@@ -113,11 +113,14 @@ class Pipeline(abc.ABC):
 
   def _configure_warmup_steps(self) -> None:
     """Compute and set warmup_steps from warmup_ratio to avoid HF deprecation warnings."""
-    if (
-        getattr(self.args, "warmup_ratio", None) is not None
-        and self.args.warmup_ratio > 0
-        and self.training_args is not None
-    ):
+    if self.training_args is None:
+      return
+
+    warmup_ratio = getattr(self.training_args, "warmup_ratio", 0.0)
+    if warmup_ratio is None or warmup_ratio <= 0:
+      warmup_ratio = getattr(self.args, "warmup_ratio", 0.0) or 0.0
+
+    if warmup_ratio > 0:
       if getattr(self.training_args, "warmup_steps", 0) <= 0:
         train_dataset = (
             self.data["train"]
@@ -143,7 +146,7 @@ class Pipeline(abc.ABC):
           )
           total_steps = max(1, int(steps_per_epoch * epochs))
           self.training_args.warmup_steps = max(
-              1, int(total_steps * self.args.warmup_ratio)
+              1, int(total_steps * warmup_ratio)
           )
       if hasattr(self.training_args, "warmup_ratio"):
         self.training_args.warmup_ratio = 0.0
