@@ -54,6 +54,9 @@ accelerate launch \
   --model_repo_id "${MODEL_REPO_ID}" \
   --do_train True \
   --save_strategy "$SAVE_STRATEGY" \
+  --load_best_model_at_end True \
+  --metric_for_best_model "rewards/reward_fn/mean" \
+  --greater_is_better True \
   --save_total_limit 1 \
   --save_only_model True \
   --num_train_epochs "$NUM_TRAIN_EPOCHS" \
