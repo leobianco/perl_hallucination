@@ -6,7 +6,8 @@ SEED=130104
 MODEL_REPO_ID="google/gemma-4-E2B-it"
 
 # Training Parameters
-BATCH_SIZE=4
+BATCH_SIZE=16
+AUTO_FIND_BATCH_SIZE=True
 NUM_TRAIN_EPOCHS=1
 LEARNING_RATE=3e-3
 WEIGHT_DECAY=0.0
@@ -58,6 +59,7 @@ accelerate launch \
   --weight_decay "$WEIGHT_DECAY" \
   --num_fewshot "$NUM_FEWSHOT" \
   --per_device_train_batch_size "$BATCH_SIZE" \
+  --auto_find_batch_size "$AUTO_FIND_BATCH_SIZE" \
   --gradient_accumulation_steps 1 \
   --do_eval True \
   --eval_on_start True \

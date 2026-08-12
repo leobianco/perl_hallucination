@@ -1,0 +1,86 @@
+# ==============================================================================
+# W&B Sweep Configuration: SSFO Baseline (Stage 3 DPO Preference Tuning)
+# Reference: "SSFO: Self-Supervised Faithfulness Optimization for RAG"
+#
+# Launch Instructions:
+# 1. Ensure SSFO synthetic preference dataset has been generated:
+#      ./scripts/ssfo_baseline.sh npov generate_data
+#
+# 2. Initialize the sweep on W&B:
+#      wandb sweep scripts/sweep_ssfo.yaml
+#    This returns a sweep ID formatted as: <entity>/<project>/<sweep_id>
+#
+# 3. Start a sweep agent to execute runs:
+#      wandb agent <entity>/<project>/<sweep_id>
+#    (Optional: add --count <N> to run a fixed number of trials)
+# ==============================================================================
+
+program: src/dpo.py
+method: bayes
+metric:
+  name: eval/loss
+  goal: minimize
+
+command:
+  - ${env}
+  - accelerate
+  - launch
+  - --config_file=scripts/deepspeed_config.yaml
+  - ${program}
+  - --
+  - --report_to=wandb
+  - --task_name=npov
+  - --dataset_repo_id=leobianco/npov_ssfo_preference
+  - --model_repo_id=google/gemma-4-E4B
+  - --sft_model_path=leobianco/
+  - --do_train=True
+  - --bf16=True
+  - --do_eval=True
+  - --eval_strategy=epoch
+  - --save_strategy=no
+  - --max_length=512
+  - --max_prompt_length=384
+  - --per_device_train_batch_size=8
+  - --per_device_eval_batch_size=8
+  - --auto_find_batch_size=True
+  - --lr_scheduler_type=cosine
+  - --peft_type=LORA
+  - --task_type=CAUSAL_LM
+  - ${args}
+
+parameters:
+  seed:
+    values:
+      - 42
+      - 12345
+      - 130104
+  num_train_epochs:
+    values:
+      - 1
+      - 2
+      - 3
+  learning_rate:
+    distribution: log_uniform_values
+    min: 0.000001
+    max: 0.00005
+  beta:
+    distribution: log_uniform_values
+    min: 0.01
+    max: 0.5
+  lora_r:
+    values:
+      - 4
+      - 8
+      - 16
+      - 32
+  lora_alpha:
+    values:
+      - 8
+      - 16
+      - 32
+      - 64
+  warmup_ratio:
+    values:
+      - 0.0
+      - 0.05
+      - 0.1

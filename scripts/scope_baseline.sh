@@ -21,7 +21,7 @@ TASK_NAME="$1"
 STAGE="${2:-all}"  # "sft", "generate_data", "dpo", or "all"
 
 # SFT Training Parameters (Stage 1)
-SFT_BATCH_SIZE=4
+SFT_BATCH_SIZE=16
 SFT_NUM_EPOCHS=1
 SFT_LR=3e-3
 SFT_LORA_R=8
@@ -39,7 +39,7 @@ MAX_NEW_TOKENS=150
 
 # DPO Training Parameters (Stage 3)
 DPO_BETA=0.1
-DPO_BATCH_SIZE=2
+DPO_BATCH_SIZE=8
 DPO_NUM_EPOCHS=1
 DPO_LR=5e-6
 DPO_LORA_R=8
@@ -95,6 +95,7 @@ if [ "$STAGE" == "all" ] || [ "$STAGE" == "sft" ]; then
     --num_train_epochs "$SFT_NUM_EPOCHS" \
     --learning_rate "$SFT_LR" \
     --per_device_train_batch_size "$SFT_BATCH_SIZE" \
+    --auto_find_batch_size True \
     --peft_type "LORA" \
     --task_type "CAUSAL_LM" \
     --lora_r "$SFT_LORA_R" \
@@ -157,6 +158,7 @@ if [ "$STAGE" == "all" ] || [ "$STAGE" == "dpo" ]; then
     --num_train_epochs "$DPO_NUM_EPOCHS" \
     --learning_rate "$DPO_LR" \
     --per_device_train_batch_size "$DPO_BATCH_SIZE" \
+    --auto_find_batch_size True \
     --peft_type "LORA" \
     --task_type "CAUSAL_LM" \
     --lora_r "$DPO_LORA_R" \

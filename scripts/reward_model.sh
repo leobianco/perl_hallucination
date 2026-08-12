@@ -13,7 +13,8 @@ NUM_ORGANIC_HALLUS_TO_KEEP=0
 NUM_STRUCT_HALLUS_TO_KEEP=0
 
 # Training Parameters
-BATCH_SIZE=4
+BATCH_SIZE=16
+AUTO_FIND_BATCH_SIZE=True
 NUM_TRAIN_EPOCHS=3
 LEARNING_RATE=1e-3
 WEIGHT_DECAY=0.0
@@ -93,6 +94,7 @@ accelerate launch \
   --warmup_ratio "$WARMUP_RATIO" \
   --weight_decay "$WEIGHT_DECAY" \
   --per_device_train_batch_size "$BATCH_SIZE" \
+  --auto_find_batch_size "$AUTO_FIND_BATCH_SIZE" \
   --gradient_accumulation_steps 1 \
   --do_eval True \
   --eval_on_start True \

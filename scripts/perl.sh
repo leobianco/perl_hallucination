@@ -17,7 +17,8 @@ MAX_COMPLETION_LENGTH=150
 NUM_GENERATIONS=2
 NUM_ITERATIONS=1
 STEPS_PER_GENERATION=16
-PER_DEVICE_BATCH_SIZE=1
+PER_DEVICE_BATCH_SIZE=4
+AUTO_FIND_BATCH_SIZE=True
 TEMPERATURE=0.1
 SAVE_STEPS=25
 
@@ -72,6 +73,7 @@ accelerate launch \
   --num_iterations "$NUM_ITERATIONS" \
   --steps_per_generation "$STEPS_PER_GENERATION" \
   --per_device_train_batch_size "$PER_DEVICE_BATCH_SIZE" \
+  --auto_find_batch_size "$AUTO_FIND_BATCH_SIZE" \
   --temperature "$TEMPERATURE"
 
 if [ "$SHUTDOWN" = true ]; then

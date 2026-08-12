@@ -1,0 +1,70 @@
+# ==============================================================================
+# W&B Sweep Configuration: Parameter-Efficient Reinforcement Learning (PE-RL / RLOO)
+#
+# Launch Instructions:
+# 1. Initialize the sweep on W&B:
+#      wandb sweep scripts/sweep_perl.yaml
+#    This returns a sweep ID formatted as: <entity>/<project>/<sweep_id>
+#
+# 2. Start a sweep agent to execute runs:
+#      wandb agent <entity>/<project>/<sweep_id>
+#    (Optional: add --count <N> to run a fixed number of trials)
+# ==============================================================================
+
+program: src/perl.py
+method: bayes
+metric:
+  name: objective/rl
+  goal: maximize
+
+command:
+  - ${env}
+  - accelerate
+  - launch
+  - --config_file=scripts/deepspeed_config.yaml
+  - ${program}
+  - --
+  - --report_to=wandb
+  - --task_name=npov
+  - --dataset_repo_id=leobianco/npov_perl
+  - --model_repo_id=google/gemma-4-E2B-it
+  - --sft_model_path=leobianco/
+  - --reward_model_path=leobianco/
+  - --do_train=True
+  - --save_only_model=True
+  - --save_strategy=no
+  - --lr_scheduler_type=cosine
+  - --warmup_steps=24
+  - --max_completion_length=150
+  - --num_generations=2
+  - --num_iterations=1
+  - --steps_per_generation=16
+  - --per_device_train_batch_size=4
+  - --per_device_eval_batch_size=4
+  - --auto_find_batch_size=True
+  - ${args}
+
+parameters:
+  seed:
+    values:
+      - 42
+      - 12345
+      - 130104
+  num_train_epochs:
+    values:
+      - 1
+      - 2
+      - 3
+  learning_rate:
+    distribution: log_uniform_values
+    min: 0.000001
+    max: 0.00005
+  beta:
+    distribution: log_uniform_values
+    min: 0.00001
+    max: 0.001
+  temperature:
+    values:
+      - 0.05
+      - 0.1
+      - 0.3

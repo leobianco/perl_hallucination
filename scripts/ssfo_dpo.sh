@@ -8,7 +8,8 @@ SFT_MODEL_PATH="${USER}/"
 
 # Training Parameters
 BETA=0.1
-BATCH_SIZE=2
+BATCH_SIZE=8
+AUTO_FIND_BATCH_SIZE=True
 NUM_TRAIN_EPOCHS=1
 LEARNING_RATE=5e-6
 WEIGHT_DECAY=0.0
@@ -66,6 +67,7 @@ accelerate launch \
   --warmup_ratio "$WARMUP_RATIO" \
   --weight_decay "$WEIGHT_DECAY" \
   --per_device_train_batch_size "$BATCH_SIZE" \
+  --auto_find_batch_size "$AUTO_FIND_BATCH_SIZE" \
   --gradient_accumulation_steps 1 \
   --do_eval True \
   --eval_strategy "epoch" \
