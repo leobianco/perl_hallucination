@@ -15,31 +15,58 @@ from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 try:
   from transformers import (
+      AutoConfig,
       AutoModel,
       AutoModelForSequenceClassification,
       PreTrainedModel,
   )
   from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 except ImportError:
+  AutoConfig = None
   AutoModel = None
   AutoModelForSequenceClassification = None
   PreTrainedModel = nn.Module
   SequenceClassifierOutputWithPast = None
 
-# Attempt to import Gemma 4 specific classes from transformers
+# Robustly resolve Gemma4Config
+Gemma4Config = None
 try:
-  from transformers.models.gemma4 import (
-      Gemma4Config,
+  from transformers.models.gemma4.configuration_gemma4 import Gemma4Config
+except (ImportError, AttributeError):
+  try:
+    from transformers.models.gemma4 import Gemma4Config
+  except (ImportError, AttributeError):
+    try:
+      from transformers import Gemma4Config
+    except (ImportError, AttributeError):
+      pass
+
+if Gemma4Config is None and AutoConfig is not None:
+  try:
+    if hasattr(AutoConfig, "_model_mapping") and "gemma4" in AutoConfig._model_mapping:
+      Gemma4Config = AutoConfig._model_mapping["gemma4"]
+  except Exception:
+    pass
+
+# Robustly resolve Gemma4Model and Gemma4PreTrainedModel
+Gemma4Model = None
+Gemma4PreTrainedModel = PreTrainedModel
+try:
+  from transformers.models.gemma4.modeling_gemma4 import (
       Gemma4Model,
       Gemma4PreTrainedModel,
   )
 except (ImportError, AttributeError):
   try:
-    from transformers import Gemma4Config
+    from transformers.models.gemma4 import (
+        Gemma4Model,
+        Gemma4PreTrainedModel,
+    )
   except (ImportError, AttributeError):
-    Gemma4Config = None
-  Gemma4Model = None
-  Gemma4PreTrainedModel = PreTrainedModel
+    try:
+      from transformers import Gemma4Model, Gemma4PreTrainedModel
+    except (ImportError, AttributeError):
+      pass
 
 
 class Gemma4ForSequenceClassification(Gemma4PreTrainedModel):
@@ -239,24 +266,35 @@ def register_gemma4_for_sequence_classification(
 
   Args:
       model_name_or_path (Optional[str]): Model name, repository ID, or path.
-        If provided, registration only proceeds if the model name indicates
-        Gemma 4. If None, registers Gemma4Config into the AutoModel mapping.
 
   Returns:
       bool: True if registration succeeded or was already registered, False otherwise.
   """
+  global Gemma4Config
   if AutoModelForSequenceClassification is None:
     return False
 
-  # If a specific model was provided, only register if it's a Gemma 4 model
-  if model_name_or_path is not None:
-    name_lower = str(model_name_or_path).lower()
-    if "gemma-4" not in name_lower and "gemma4" not in name_lower:
-      return False
+  # Try to discover Gemma4Config if not already imported
+  if Gemma4Config is None:
+    try:
+      from transformers.models.gemma4.configuration_gemma4 import Gemma4Config
+    except Exception:
+      try:
+        from transformers.models.gemma4 import Gemma4Config
+      except Exception:
+        try:
+          from transformers import Gemma4Config
+        except Exception:
+          try:
+            if hasattr(AutoConfig, "_model_mapping") and "gemma4" in AutoConfig._model_mapping:
+              Gemma4Config = AutoConfig._model_mapping["gemma4"]
+          except Exception:
+            pass
+
+  if Gemma4Config is None:
+    return False
 
   config_cls = Gemma4Config
-  if config_cls is None:
-    return False
 
   try:
     # Check if already registered in model mapping (e.g. by an upstream transformers release)
@@ -264,11 +302,43 @@ def register_gemma4_for_sequence_classification(
       mapping = AutoModelForSequenceClassification._model_mapping
       if config_cls in mapping:
         return True
+      try:
+        mapping.register(config_cls, Gemma4ForSequenceClassification)
+      except Exception:
+        mapping[config_cls] = Gemma4ForSequenceClassification
 
-    AutoModelForSequenceClassification.register(
-        config_cls, Gemma4ForSequenceClassification
-    )
+    try:
+      AutoModelForSequenceClassification.register(
+          config_cls, Gemma4ForSequenceClassification, exist_ok=True
+      )
+    except TypeError:
+      try:
+        AutoModelForSequenceClassification.register(
+            config_cls, Gemma4ForSequenceClassification
+        )
+      except Exception:
+        pass
+
+    # Direct registration into modeling_auto mappings if present
+    try:
+      from transformers.models.auto.modeling_auto import (
+          MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING,
+      )
+
+      MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING[config_cls] = (
+          Gemma4ForSequenceClassification
+      )
+      if hasattr(MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING, "_extra_content"):
+        MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING._extra_content[config_cls] = (
+            Gemma4ForSequenceClassification
+        )
+    except Exception:
+      pass
+
     return True
   except Exception:
     return False
 
+
+# Register on module import so it is available globally
+register_gemma4_for_sequence_classification()

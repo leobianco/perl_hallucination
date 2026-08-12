@@ -320,13 +320,27 @@ class RewardModelPipeline(Pipeline):
     id2label = {0: "Yes", 1: "No"}
     label2id = {"Yes": 0, "No": 1}
 
-    self.model = AutoModelForSequenceClassification.from_pretrained(
-        self.args.model_repo_id,
-        num_labels=2,
-        id2label=id2label,
-        label2id=label2id,
-        torch_dtype=self.torch_dtype,
-    )
+    try:
+      self.model = AutoModelForSequenceClassification.from_pretrained(
+          self.args.model_repo_id,
+          num_labels=2,
+          id2label=id2label,
+          label2id=label2id,
+          torch_dtype=self.torch_dtype,
+      )
+    except ValueError as e:
+      if "Gemma4Config" in str(e) or "gemma-4" in str(
+          self.args.model_repo_id
+      ).lower() or "gemma4" in str(self.args.model_repo_id).lower():
+        self.model = Gemma4ForSequenceClassification.from_pretrained(
+            self.args.model_repo_id,
+            num_labels=2,
+            id2label=id2label,
+            label2id=label2id,
+            torch_dtype=self.torch_dtype,
+        )
+      else:
+        raise
 
     if self.tokenizer.pad_token_id is not None:
       self.model.config.pad_token_id = self.tokenizer.pad_token_id
@@ -434,13 +448,31 @@ class PERLPipeline(Pipeline):
     )
 
     register_gemma4_for_sequence_classification(reward_model_path)
-    self.reward_model = AutoModelForSequenceClassification.from_pretrained(
-        reward_model_path,
-        num_labels=2,
-        id2label=id2label,
-        label2id=label2id,
-        torch_dtype=torch.bfloat16,
-    )
+    try:
+      self.reward_model = AutoModelForSequenceClassification.from_pretrained(
+          reward_model_path,
+          num_labels=2,
+          id2label=id2label,
+          label2id=label2id,
+          torch_dtype=torch.bfloat16,
+      )
+    except ValueError as e:
+      if "Gemma4Config" in str(e) or (
+          reward_model_path
+          and (
+              "gemma-4" in str(reward_model_path).lower()
+              or "gemma4" in str(reward_model_path).lower()
+          )
+      ):
+        self.reward_model = Gemma4ForSequenceClassification.from_pretrained(
+            reward_model_path,
+            num_labels=2,
+            id2label=id2label,
+            label2id=label2id,
+            torch_dtype=torch.bfloat16,
+        )
+      else:
+        raise
     self.reward_model.to(torch.bfloat16)
     self.reward_model.eval()
 
