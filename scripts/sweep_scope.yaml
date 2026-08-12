@@ -29,6 +29,8 @@ command:
   - ${program}
   - --
   - --report_to=wandb
+  - --logging_steps=1
+  - --logging_strategy=steps
   - --task_name=npov
   - --dataset_repo_id=leobianco/npov_scope_preference
   - --model_repo_id=google/gemma-4-E4B
