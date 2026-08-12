@@ -18,8 +18,9 @@ from __future__ import annotations
 
 import abc
 import os
+import sys
 import time
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from datasets import (
     Dataset,
@@ -77,6 +78,12 @@ from trl import (
 )
 from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
+
+
+def _clean_cli_args(cli_args: Sequence[str] | None = None) -> list[str]:
+  """Filter out stray '--' tokens from arguments before passing to argparse."""
+  raw = list(cli_args) if cli_args else sys.argv[1:]
+  return [arg for arg in raw if arg != "--"]
 
 
 class Pipeline(abc.ABC):
@@ -155,11 +162,13 @@ class SFTPipeline(Pipeline):
   """Pipeline for supervised fine-tuning (writer_sft.py)."""
 
   def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
+    clean_args = _clean_cli_args(cli_args)
     parser_lora = create_lora_argument_parser()
-    lora_args, remaining_args = parser_lora.parse_known_args()
+    lora_args, remaining_args = parser_lora.parse_known_args(clean_args)
+    clean_remaining = [a for a in remaining_args if a != "--"]
     parser = HfArgumentParser((ScriptArguments, SFTConfig))
     script_args, training_args = parser.parse_args_into_dataclasses(
-        remaining_args
+        clean_remaining
     )
 
     self.args = script_args
@@ -249,14 +258,16 @@ class RewardModelPipeline(Pipeline):
   """Pipeline for reward model training (reward_model.py)."""
 
   def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
+    clean_args = _clean_cli_args(cli_args)
     parser_lora = create_lora_argument_parser()
-    lora_args, remaining_args = parser_lora.parse_known_args()
+    lora_args, remaining_args = parser_lora.parse_known_args(clean_args)
 
     parser = HfArgumentParser(
         (ScriptArguments, LLMSynthScriptArguments, TrainingArguments)
     )
+    clean_remaining = [a for a in remaining_args if a != "--"]
     script_args, llm_synth_args, training_args = (
-        parser.parse_args_into_dataclasses(remaining_args)
+        parser.parse_args_into_dataclasses(clean_remaining)
     )
 
     self.args = script_args
@@ -422,8 +433,9 @@ class PERLPipeline(Pipeline):
   """
 
   def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
+    clean_args = _clean_cli_args(cli_args)
     parser = HfArgumentParser((ScriptArguments, RLOOConfig))
-    script_args, training_args = parser.parse_args_into_dataclasses()
+    script_args, training_args = parser.parse_args_into_dataclasses(clean_args)
     self.args = script_args
     self.training_args = training_args
     set_seed(training_args.seed)
@@ -565,11 +577,13 @@ class DPOPipeline(Pipeline):
   """
 
   def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
+    clean_args = _clean_cli_args(cli_args)
     parser_lora = create_lora_argument_parser()
-    lora_args, remaining_args = parser_lora.parse_known_args()
+    lora_args, remaining_args = parser_lora.parse_known_args(clean_args)
+    clean_remaining = [a for a in remaining_args if a != "--"]
     parser = HfArgumentParser((ScriptArguments, DPOConfig))
     script_args, training_args = parser.parse_args_into_dataclasses(
-        remaining_args
+        clean_remaining
     )
 
     self.args = script_args

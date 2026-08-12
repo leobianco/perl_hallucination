@@ -75,7 +75,6 @@ if [ "$STAGE" == "all" ] || [ "$STAGE" == "sft" ]; then
   accelerate launch \
     --config_file="${DEEPSPEED_CONFIG}" \
     src/writer_sft.py \
-    -- \
     --task_name "$TASK_NAME" \
     --report_to "wandb" \
     --run_name "$SFT_RUN_IDENTIFIER" \
@@ -132,7 +131,6 @@ if [ "$STAGE" == "all" ] || [ "$STAGE" == "dpo" ]; then
   accelerate launch \
     --config_file="${DEEPSPEED_CONFIG}" \
     src/dpo.py \
-    -- \
     --task_name "$TASK_NAME" \
     --report_to "wandb" \
     --run_name "$DPO_RUN_IDENTIFIER" \

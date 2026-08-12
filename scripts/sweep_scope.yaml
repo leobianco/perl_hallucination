@@ -27,7 +27,6 @@ command:
   - launch
   - --config_file=scripts/deepspeed_config.yaml
   - ${program}
-  - --
   - --report_to=wandb
   - --logging_steps=1
   - --logging_strategy=steps

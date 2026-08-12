@@ -71,7 +71,6 @@ fi
 accelerate launch \
   --config_file="${DEEPSPEED_CONFIG}" \
   src/reward_model.py \
-  -- \
   --task_name "$TASK_NAME" \
   --seed "$SEED" \
   --report_to "wandb" \

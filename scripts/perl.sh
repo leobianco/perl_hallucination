@@ -42,7 +42,6 @@ fi
 accelerate launch \
   --config_file="${DEEPSPEED_CONFIG}" \
   src/perl.py \
-  -- \
   --task_name "$TASK_NAME" \
   --seed "$SEED" \
   --report_to "wandb" \
