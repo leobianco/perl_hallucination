@@ -425,7 +425,7 @@ class EvalArguments:
   )
 
   bertscore_model: str = field(
-      default="microsoft/deberta-v3-large",
+      default="roberta-large",
       metadata={"help": "Model identifier for BERTScore embeddings."},
   )
 

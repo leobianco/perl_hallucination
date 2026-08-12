@@ -2045,7 +2045,7 @@ class EvaluationScoringPipeline(EvaluationPipeline):
     if getattr(self.args, "compute_generation_metrics", True):
       evaluator = GenerationMetricsEvaluator(
           bertscore_model=getattr(
-              self.args, "bertscore_model", "microsoft/deberta-v3-large"
+              self.args, "bertscore_model", "roberta-large"
           ),
           compute_bertscore_metric=getattr(
               self.args, "compute_bertscore", True

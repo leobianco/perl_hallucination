@@ -35,11 +35,10 @@ This codebase uses a **4-pillar evaluation framework**:
 ## Underlying Models Used
 
 ### 1. BERTScore Model
-* **Default Model**: `microsoft/deberta-v3-large`
-* **Configuration Flag**: `--bertscore_model "microsoft/deberta-v3-large"`
-* **Why DeBERTa-v3-large?**
-  * In the BERTScore literature (Zhang et al., ICLR 2020), `microsoft/deberta-v3-large` achieves the highest empirical correlation with human judgments for semantic similarity and factual consistency in English.
-  * Unlike standard BERT, DeBERTa uses **disentangled attention** (separate vectors for content and relative position) and enhanced mask decoding, making it significantly more sensitive to subtle semantic deviations, entity substitutions, and omissions.
+* **Default Model**: `roberta-large` (with seamless fallback and support for `microsoft/deberta-v3-large`)
+* **Configuration Flag**: `--bertscore_model "roberta-large"`
+* **Why RoBERTa-large / DeBERTa-v3-large?**
+  * In the BERTScore literature (Zhang et al., ICLR 2020), `roberta-large` is the canonical reference model with proven cross-domain robustness, full safetensors distribution, and fast evaluation. `microsoft/deberta-v3-large` can also be specified if desired.
 * **How It Works**:
   1. Computes contextual token embeddings for both the generated completion and the reference.
   2. Calculates pairwise cosine similarity between all token embeddings.
