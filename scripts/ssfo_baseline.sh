@@ -87,6 +87,14 @@ if [ "$STAGE" == "all" ] || [ "$STAGE" == "sft" ]; then
     --model_repo_id "${MODEL_REPO_ID}" \
     --do_train True \
     --bf16 True \
+    --do_eval True \
+    --eval_strategy "epoch" \
+    --save_strategy "epoch" \
+    --load_best_model_at_end True \
+    --metric_for_best_model "loss" \
+    --greater_is_better False \
+    --save_total_limit 1 \
+    --warmup_ratio 0.1 \
     --num_train_epochs "$SFT_NUM_EPOCHS" \
     --learning_rate "$SFT_LR" \
     --per_device_train_batch_size "$SFT_BATCH_SIZE" \
@@ -144,6 +152,14 @@ if [ "$STAGE" == "all" ] || [ "$STAGE" == "dpo" ]; then
     --sft_model_path "${SFT_MODEL_PATH}" \
     --do_train True \
     --bf16 True \
+    --do_eval True \
+    --eval_strategy "epoch" \
+    --save_strategy "epoch" \
+    --load_best_model_at_end True \
+    --metric_for_best_model "loss" \
+    --greater_is_better False \
+    --save_total_limit 1 \
+    --warmup_ratio 0.1 \
     --beta "$DPO_BETA" \
     --max_length "$MAX_LENGTH" \
     --max_prompt_length "$MAX_PROMPT_LENGTH" \

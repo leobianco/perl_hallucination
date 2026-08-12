@@ -86,7 +86,12 @@ accelerate launch \
   --do_train True \
   --fp16 "$FP16" \
   --bf16 "$BF16" \
-  --save_strategy "epoch" \
+  --save_strategy "steps" \
+  --save_steps "$EVAL_STEPS" \
+  --load_best_model_at_end True \
+  --metric_for_best_model "roc_auc" \
+  --greater_is_better True \
+  --save_total_limit 1 \
   --num_train_epochs "$NUM_TRAIN_EPOCHS" \
   --learning_rate "$LEARNING_RATE" \
   --lr_scheduler_type "$LR_SCHEDULER_TYPE" \

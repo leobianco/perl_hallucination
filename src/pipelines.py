@@ -106,9 +106,47 @@ class Pipeline(abc.ABC):
     self.setup_tokenizer()
     self.load_data()
     self.process_data()
+    self._configure_warmup_steps()
     self.setup_model()
     self.setup_trainer()
     self.run_and_save()
+
+  def _configure_warmup_steps(self) -> None:
+    """Compute and set warmup_steps from warmup_ratio to avoid HF deprecation warnings."""
+    if (
+        getattr(self.args, "warmup_ratio", None) is not None
+        and self.args.warmup_ratio > 0
+        and self.training_args is not None
+    ):
+      if getattr(self.training_args, "warmup_steps", 0) <= 0:
+        train_dataset = (
+            self.data["train"]
+            if isinstance(self.data, dict) and "train" in self.data
+            else None
+        )
+        if train_dataset is not None:
+          train_size = len(train_dataset)
+          batch_size = getattr(
+              self.training_args, "per_device_train_batch_size", 1
+          )
+          grad_accum = getattr(
+              self.training_args, "gradient_accumulation_steps", 1
+          )
+          epochs = getattr(self.training_args, "num_train_epochs", 1)
+          world_size = getattr(self.training_args, "world_size", 1)
+          if world_size <= 0:
+            world_size = (
+                torch.cuda.device_count() if torch.cuda.is_available() else 1
+            )
+          steps_per_epoch = max(
+              1, int(train_size / (batch_size * world_size * grad_accum))
+          )
+          total_steps = max(1, int(steps_per_epoch * epochs))
+          self.training_args.warmup_steps = max(
+              1, int(total_steps * self.args.warmup_ratio)
+          )
+      if hasattr(self.training_args, "warmup_ratio"):
+        self.training_args.warmup_ratio = 0.0
 
   @abc.abstractmethod
   def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
@@ -422,7 +460,13 @@ class RewardModelPipeline(Pipeline):
 
   def run_and_save(self) -> None:
     self.trainer.train()
-    self.model.push_to_hub(self.training_args.hub_model_id)
+    if getattr(self.training_args, "output_dir", None):
+      self.trainer.save_model(self.training_args.output_dir)
+    if (
+        getattr(self.training_args, "push_to_hub", False)
+        and getattr(self.training_args, "hub_model_id", None)
+    ):
+      self.model.push_to_hub(self.training_args.hub_model_id)
 
 
 class PERLPipeline(Pipeline):

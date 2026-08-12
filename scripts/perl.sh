@@ -11,7 +11,7 @@ REWARD_MODEL_PATH="${USER}/"
 NUM_TRAIN_EPOCHS=1
 LEARNING_RATE=2e-5
 LR_SCHEDULER_TYPE="cosine"
-WARMUP_STEPS=24
+WARMUP_RATIO=0.1
 BETA=1e-4
 MAX_COMPLETION_LENGTH=150
 NUM_GENERATIONS=2
@@ -20,7 +20,7 @@ STEPS_PER_GENERATION=16
 PER_DEVICE_BATCH_SIZE=4
 AUTO_FIND_BATCH_SIZE=True
 TEMPERATURE=0.1
-SAVE_STEPS=25
+SAVE_STRATEGY="epoch"
 
 # Infrastructure Parameters
 DEEPSPEED_CONFIG="scripts/deepspeed_config.yaml"
@@ -53,13 +53,13 @@ accelerate launch \
   --dataset_repo_id "${USER}/${TASK_NAME}_perl" \
   --model_repo_id "${MODEL_REPO_ID}" \
   --do_train True \
-  --save_strategy "steps" \
-  --save_steps "$SAVE_STEPS" \
+  --save_strategy "$SAVE_STRATEGY" \
+  --save_total_limit 1 \
   --save_only_model True \
   --num_train_epochs "$NUM_TRAIN_EPOCHS" \
   --learning_rate "$LEARNING_RATE" \
   --lr_scheduler_type "$LR_SCHEDULER_TYPE" \
-  --warmup_steps "$WARMUP_STEPS" \
+  --warmup_ratio "$WARMUP_RATIO" \
   --max_completion_length "$MAX_COMPLETION_LENGTH" \
   --weight_decay 0.0 \
   --gradient_accumulation_steps 1 \

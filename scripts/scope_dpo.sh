@@ -7,11 +7,11 @@ MODEL_REPO_ID="google/gemma-4-E4B"
 SFT_MODEL_PATH="${USER}/"
 
 # Training Parameters
-BETA=0.1
 BATCH_SIZE=8
 AUTO_FIND_BATCH_SIZE=True
 NUM_TRAIN_EPOCHS=1
 LEARNING_RATE=5e-6
+BETA=0.1
 WEIGHT_DECAY=0.0
 LORA_RANK=8
 LORA_ALPHA=16
@@ -20,7 +20,8 @@ LR_SCHEDULER_TYPE="cosine"
 WARMUP_RATIO=0.1
 MAX_LENGTH=512
 MAX_PROMPT_LENGTH=384
-SAVE_STEPS=100
+EVAL_STRATEGY="epoch"
+SAVE_STRATEGY="epoch"
 
 # Infrastructure Parameters
 DEEPSPEED_CONFIG="scripts/deepspeed_config.yaml"
@@ -55,11 +56,16 @@ accelerate launch \
   --sft_model_path "${SFT_MODEL_PATH}" \
   --do_train True \
   --bf16 True \
+  --do_eval True \
+  --eval_strategy "$EVAL_STRATEGY" \
+  --save_strategy "$SAVE_STRATEGY" \
+  --load_best_model_at_end True \
+  --metric_for_best_model "loss" \
+  --greater_is_better False \
+  --save_total_limit 1 \
   --beta "$BETA" \
   --max_length "$MAX_LENGTH" \
   --max_prompt_length "$MAX_PROMPT_LENGTH" \
-  --save_strategy "steps" \
-  --save_steps "$SAVE_STEPS" \
   --num_train_epochs "$NUM_TRAIN_EPOCHS" \
   --learning_rate "$LEARNING_RATE" \
   --lr_scheduler_type "$LR_SCHEDULER_TYPE" \
@@ -68,8 +74,6 @@ accelerate launch \
   --per_device_train_batch_size "$BATCH_SIZE" \
   --auto_find_batch_size "$AUTO_FIND_BATCH_SIZE" \
   --gradient_accumulation_steps 1 \
-  --do_eval True \
-  --eval_strategy "epoch" \
   --per_device_eval_batch_size "$BATCH_SIZE" \
   --eval_accumulation_steps 1 \
   --peft_type "LORA" \

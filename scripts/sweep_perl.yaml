@@ -33,9 +33,10 @@ command:
   - --reward_model_path=leobianco/
   - --do_train=True
   - --save_only_model=True
-  - --save_strategy=no
+  - --save_strategy=epoch
+  - --save_total_limit=1
   - --lr_scheduler_type=cosine
-  - --warmup_steps=24
+  - --warmup_ratio=0.1
   - --max_completion_length=150
   - --num_generations=2
   - --num_iterations=1

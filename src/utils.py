@@ -31,6 +31,8 @@ class ScriptArguments:
       sft_model_path (Optional[str]): Path to the SFT model adapter checkpoint.
       sft_data_fraction (Optional[float]): Fraction of SFT training data to use
         (e.g. 0.5 for SCOPE Stage 1).
+      warmup_ratio (Optional[float]): Ratio of total training steps used for a
+        linear warmup.
   """
 
   task_name: str
@@ -40,6 +42,7 @@ class ScriptArguments:
   reward_model_path: Optional[str] = None
   sft_model_path: Optional[str] = None
   sft_data_fraction: Optional[float] = None
+  warmup_ratio: Optional[float] = None
 
 
 @dataclass
