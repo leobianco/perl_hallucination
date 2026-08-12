@@ -14,7 +14,7 @@
 program: src/perl.py
 method: bayes
 metric:
-  name: objective/rl
+  name: rewards/reward_fn/mean
   goal: maximize
 
 command:
@@ -27,6 +27,7 @@ command:
   - --logging_steps=1
   - --logging_strategy=steps
   - --task_name=npov
+  - --seed=130104
   - --dataset_repo_id=leobianco/npov_perl
   - --model_repo_id=google/gemma-4-E2B-it
   - --sft_model_path=leobianco/
@@ -36,7 +37,7 @@ command:
   - --save_strategy=no
   - --lr_scheduler_type=cosine
   - --warmup_ratio=0.1
-  - --max_completion_length=150
+  - --max_completion_length=256
   - --num_generations=2
   - --num_iterations=1
   - --steps_per_generation=16
@@ -46,26 +47,20 @@ command:
   - ${args}
 
 parameters:
-  seed:
-    values:
-      - 42
-      - 12345
-      - 130104
   num_train_epochs:
     values:
-      - 1
-      - 2
-      - 3
+      - 0.2
   learning_rate:
     distribution: log_uniform_values
-    min: 0.000001
-    max: 0.00005
+    min: 0.000005
+    max: 0.0001
   beta:
     distribution: log_uniform_values
-    min: 0.00001
-    max: 0.001
+    min: 0.0001
+    max: 0.05
   temperature:
     values:
-      - 0.05
-      - 0.1
       - 0.3
+      - 0.6
+      - 0.8
+      - 1.0

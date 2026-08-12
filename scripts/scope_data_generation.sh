@@ -13,7 +13,7 @@ SAMPLING_MODE="bernoulli"
 TEMPERATURE=0.7
 TOP_P=0.9
 TOP_K=50
-MAX_NEW_TOKENS=150
+MAX_NEW_TOKENS=256
 MAX_SAMPLES=""
 
 # Parameters derived from above

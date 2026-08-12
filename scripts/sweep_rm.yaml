@@ -27,6 +27,7 @@ command:
   - --logging_steps=1
   - --logging_strategy=steps
   - --task_name=npov
+  - --seed=130104
   - --dataset_repo_id=leobianco/npov_rm_organic
   - --model_repo_id=google/gemma-3-1b-it
   - --num_organic_hallus_to_keep=0
@@ -47,17 +48,12 @@ command:
   - ${args}
 
 parameters:
-  seed:
-    values:
-      - 42
-      - 12345
-      - 130104
   num_train_epochs:
     values:
       - 1
-      - 2
       - 3
       - 5
+      - 15
   learning_rate:
     distribution: log_uniform_values
     min: 0.0001
