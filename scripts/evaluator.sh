@@ -72,7 +72,9 @@ elif [ "$2" == "score" ]; then
         --evaluator_num_fewshot $EVALUATOR_NUM_FEWSHOT \
         --evaluate_evaluator False \
         --threshold $THRESHOLD \
-        --dataset_with_completions "$DATASET_WITH_COMPLETIONS"
+        --dataset_with_completions "$DATASET_WITH_COMPLETIONS" \
+        --log_to_wandb "${LOG_TO_WANDB:-False}" \
+        --wandb_project "${WANDB_PROJECT:-new_perl_eval}"
 elif [ "$2" == "autoratereval" ]; then
     echo "Running in autoratereval mode..."
     python3 -m src.evaluator \

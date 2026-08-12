@@ -17,4 +17,4 @@ nltk
 scikit-learn
 vllm
 rouge-score
-
+bert-score

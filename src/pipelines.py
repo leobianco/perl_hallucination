@@ -41,6 +41,7 @@ from sklearn.metrics import (
     precision_score,
     roc_auc_score,
 )
+from src.metrics import GenerationMetricsEvaluator
 from src.models import (
     Gemma4ForSequenceClassification,
     register_gemma4_for_sequence_classification,
@@ -1963,4 +1964,37 @@ class EvaluationScoringPipeline(EvaluationPipeline):
     self.val_data = self.val_data.add_column(
         "classifications", classifs.tolist()
     )
+
+    # Compute comprehensive generation metrics (ROUGE, BERTScore, lengths, distinct-n, repetition, PPL)
+    if getattr(self.args, "compute_generation_metrics", True):
+      evaluator = GenerationMetricsEvaluator(
+          bertscore_model=getattr(
+              self.args, "bertscore_model", "microsoft/deberta-v3-large"
+          ),
+          compute_bertscore_metric=getattr(
+              self.args, "compute_bertscore", True
+          ),
+          compute_perplexity_metric=getattr(
+              self.args, "compute_perplexity", False
+          ),
+      )
+      self.val_data, summary = evaluator.evaluate_dataset(
+          self.val_data,
+          prompt_column="prompt",
+          completion_column="completion",
+          reference_column=getattr(self.args, "reference_column", None),
+      )
+      dataset_name = self.args.dataset_with_completions.split("/")[-1]
+      evaluator.save_and_log_results(
+          self.val_data,
+          summary,
+          output_dir=os.path.join("logs", "eval"),
+          dataset_name=dataset_name,
+          autorater_scores=scores.tolist(),
+          threshold=self.args.threshold,
+          log_to_wandb=getattr(self.args, "log_to_wandb", False),
+          wandb_project=getattr(self.args, "wandb_project", "new_perl_eval"),
+          wandb_run_name=getattr(self.args, "wandb_run_name", None),
+      )
+
     self.val_data.push_to_hub(self.args.dataset_with_completions)

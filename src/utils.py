@@ -389,6 +389,65 @@ class EvalArguments:
       },
   )
 
+  compute_generation_metrics: bool = field(
+      default=True,
+      metadata={
+          "help": (
+              "Whether to compute full generation quality metrics (ROUGE,"
+              " BERTScore, lengths, distinct-n, repetition, perplexity)."
+          )
+      },
+  )
+
+  compute_bertscore: bool = field(
+      default=True,
+      metadata={"help": "Whether to compute BERTScore F1 metric."},
+  )
+
+  bertscore_model: str = field(
+      default="microsoft/deberta-v3-large",
+      metadata={"help": "Model identifier for BERTScore embeddings."},
+  )
+
+  compute_perplexity: bool = field(
+      default=False,
+      metadata={"help": "Whether to compute conditional perplexity."},
+  )
+
+  fluency_model: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Pre-trained causal LM model identifier for fluency perplexity."
+          )
+      },
+  )
+
+  reference_column: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Name of reference/ground truth column in dataset. If None,"
+              " auto-detected."
+          )
+      },
+  )
+
+  log_to_wandb: bool = field(
+      default=False,
+      metadata={"help": "Whether to log evaluation metrics and tables to WandB."},
+  )
+
+  wandb_project: str = field(
+      default="new_perl_eval",
+      metadata={"help": "WandB project name for evaluation logging."},
+  )
+
+  wandb_run_name: Optional[str] = field(
+      default=None,
+      metadata={"help": "Optional WandB run name."},
+  )
+
 
 def hallucination_rate_from_score_file(
     filepath: str, threshold: float
