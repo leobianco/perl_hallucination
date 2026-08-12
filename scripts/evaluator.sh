@@ -1,16 +1,18 @@
 #!/bin/bash
 
 # Core Parameters
-USER="leobianco"
-SEED=12345
+USER="${USER:-leobianco}"
+SEED="${SEED:-12345}"
 RUN_IDENTIFIER="google/gemma-4-E2B-it"
 BASE_MODEL="google/gemma-4-E2B-it"
 EVALUATOR_MODEL="gemini-2.5-flash"
 USE_GEMINI="True"
+RUN_AUTORATER="${RUN_AUTORATER:-True}"
 THRESHOLD=0.991
 EVALUATOR_NUM_FEWSHOT=2
 WRITER_NUM_FEWSHOT=0
 MAX_TOKENS=250
+MAX_EVAL_SAMPLES="${MAX_EVAL_SAMPLES:-1000}"
 TEMPERATURE=0.0
 TOP_P=1.0
 TOP_K=0
@@ -30,12 +32,6 @@ if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" !
     echo "$TASK_NAME"
     exit 1
 fi
-
-# Subsampling parameter (default: 1000 samples randomly sampled via SEED; set -1 or 0 for full 10k)
-MAX_EVAL_SAMPLES="${MAX_EVAL_SAMPLES:-1000}"
-
-# Autorater toggle (set RUN_AUTORATER=False to skip Gemini/autorater scoring)
-RUN_AUTORATER="${RUN_AUTORATER:-True}"
 
 export GOOGLE_CLOUD_LOCATION="${GOOGLE_CLOUD_LOCATION:-us-central1}"
 export GOOGLE_GENAI_USE_VERTEXAI="${GOOGLE_GENAI_USE_VERTEXAI:-true}"
