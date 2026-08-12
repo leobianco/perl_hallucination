@@ -11,6 +11,20 @@ To evaluate the quality of the autorater model:
 ./scripts/evaluator.sh npov autoratereval
 """
 
+# Patch transformers heterogeneity configuration to allow global attribute access in vLLM
+try:
+    import transformers
+    from transformers.configuration_utils import PretrainedConfig
+
+    PretrainedConfig.allow_global_per_layer_attribute_access = True
+    from transformers.integrations.heterogeneity.configuration_utils import (
+        HeterogeneousPretrainedConfig,
+    )
+
+    HeterogeneousPretrainedConfig.allow_global_per_layer_attribute_access = True
+except Exception:
+    pass
+
 from transformers import HfArgumentParser, set_seed
 
 from src.pipelines import (

@@ -23,6 +23,20 @@ import sys
 import time
 from typing import Any, Optional, Sequence
 
+# Patch transformers heterogeneity configuration to allow global attribute access in vLLM
+try:
+  import transformers
+  from transformers.configuration_utils import PretrainedConfig
+
+  PretrainedConfig.allow_global_per_layer_attribute_access = True
+  from transformers.integrations.heterogeneity.configuration_utils import (
+      HeterogeneousPretrainedConfig,
+  )
+
+  HeterogeneousPretrainedConfig.allow_global_per_layer_attribute_access = True
+except Exception:
+  pass
+
 from datasets import (
     Dataset,
     Value,
@@ -1869,13 +1883,19 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
             allow_patterns=["*.json", "*.safetensors"],
         )
 
-    # Instantiate vLLM LLM (use bfloat16 dtype)
-    llm = LLM(
-        model=self.vllm_model,
-        enable_lora=self.enable_lora,
-        max_lora_rank=64,
-        dtype="bfloat16",
-    )
+    # Instantiate vLLM LLM (use bfloat16 dtype and allow global attribute access)
+    llm_kwargs = {
+        "model": self.vllm_model,
+        "enable_lora": self.enable_lora,
+        "max_lora_rank": 64,
+        "dtype": "bfloat16",
+        "hf_overrides": {"allow_global_per_layer_attribute_access": True},
+    }
+    try:
+      llm = LLM(**llm_kwargs)
+    except TypeError:
+      llm_kwargs.pop("hf_overrides", None)
+      llm = LLM(**llm_kwargs)
 
     # Run generation
     if self.enable_lora and lora_path is not None:
