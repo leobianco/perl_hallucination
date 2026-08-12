@@ -135,8 +135,16 @@ Enable WandB logging by passing `LOG_TO_WANDB=True` or `--log_to_wandb True`:
 
 ### Running Evaluation via Script
 ```bash
-# Basic scoring (computes ROUGE, BERTScore, lengths, distinct-n, repetition rate)
+# Fast evaluation on 1,000 subsampled test samples (default):
+./scripts/evaluator.sh npov generate
 ./scripts/evaluator.sh npov score
+
+# Skip Gemini autorater (compute only ROUGE, BERTScore, length, diversity, fluency):
+RUN_AUTORATER=False ./scripts/evaluator.sh npov score
+
+# Full 10k evaluation for final results:
+MAX_EVAL_SAMPLES=-1 ./scripts/evaluator.sh npov generate
+MAX_EVAL_SAMPLES=-1 ./scripts/evaluator.sh npov score
 
 # Scoring with Weights & Biases logging enabled:
 LOG_TO_WANDB=True WANDB_PROJECT="my_perl_project" ./scripts/evaluator.sh npov score
@@ -148,6 +156,8 @@ python3 -m src.evaluator \
     --task_name "npov" \
     --user "leobianco" \
     --dataset_with_completions "leobianco/eval_npov_gens" \
+    --max_eval_samples 1000 \
+    --run_autorater True \
     --evaluator_model "gemini-2.5-flash" \
     --use_gemini True \
     --threshold 0.991 \

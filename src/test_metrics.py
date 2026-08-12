@@ -45,6 +45,18 @@ class MockDataset:
     new_data[column_name] = values
     return MockDataset(new_data)
 
+  def select(self, indices: Any):
+    new_data = {k: [v[i] for i in indices] for k, v in self._data.items()}
+    return MockDataset(new_data)
+
+  def shuffle(self, seed: int = 42):
+    import random
+
+    indices = list(range(len(self)))
+    r = random.Random(seed)
+    r.shuffle(indices)
+    return self.select(indices)
+
 
 class MockTokenizer:
   """Mock tokenizer for testing length and perplexity."""
@@ -243,6 +255,26 @@ class TestMetrics(unittest.TestCase):
 
     mock_wandb.init.assert_called_once()
     mock_wandb.log.assert_called()
+
+  def test_subsampling(self):
+    """Test subsampling logic with mock dataset."""
+    data = {
+        "prompt": [f"Prompt {i}" for i in range(50)],
+        "completion": [f"Completion {i}" for i in range(50)],
+    }
+    dataset = MockDataset(data)
+
+    def subsample(data_obj, max_samples, seed=42):
+      if max_samples is not None and max_samples > 0 and len(data_obj) > max_samples:
+        return data_obj.shuffle(seed=seed).select(range(max_samples))
+      return data_obj
+
+    subsampled = subsample(dataset, 10, 42)
+    self.assertEqual(len(subsampled), 10)
+
+    # When max_eval_samples is -1 or None, should not subsample
+    full = subsample(dataset, -1, 42)
+    self.assertEqual(len(full), 50)
 
 
 if __name__ == "__main__":

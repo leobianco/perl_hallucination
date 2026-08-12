@@ -1267,6 +1267,21 @@ class EvaluationPipeline(Pipeline):
     # Evaluation pipelines do not have trainers
     pass
 
+  def _subsample_dataset(self, dataset: Dataset) -> Dataset:
+    """Subsamples dataset to max_eval_samples using seed if specified."""
+    max_samples = getattr(self.args, "max_eval_samples", None)
+    if (
+        max_samples is not None
+        and max_samples > 0
+        and len(dataset) > max_samples
+    ):
+      print(
+          f"Subsampling evaluation dataset from {len(dataset)} to"
+          f" {max_samples} samples (seed={self.args.seed})..."
+      )
+      return dataset.shuffle(seed=self.args.seed).select(range(max_samples))
+    return dataset
+
   def get_fewshot_examples(
       self, data: Dataset, n_yes: int, n_no: int, seed: int
   ) -> Optional[Dataset]:
@@ -1613,6 +1628,7 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
     self.data = load_dataset(
         self.args.dataset_labels, split=self.args.dataset_labels_split
     )
+    self.data = self._subsample_dataset(self.data)
 
   def process_data(self) -> None:
     # Map the evaluator prompt onto the dataset
@@ -1791,6 +1807,7 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
     self.dataset_prompts = load_dataset(
         self.args.dataset_prompts, split=self.args.dataset_prompts_split
     )
+    self.dataset_prompts = self._subsample_dataset(self.dataset_prompts)
 
   def process_data(self) -> None:
     # Prepare prompts and fewshot if requested
@@ -1916,6 +1933,7 @@ class EvaluationScoringPipeline(EvaluationPipeline):
     self.val_data = load_dataset(
         self.args.dataset_with_completions, split="test"
     )
+    self.val_data = self._subsample_dataset(self.val_data)
 
   def process_data(self):
     if not getattr(self.args, "run_autorater", True):

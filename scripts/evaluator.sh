@@ -31,6 +31,9 @@ if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" !
     exit 1
 fi
 
+# Subsampling parameter (default: 1000 samples randomly sampled via SEED; set -1 or 0 for full 10k)
+MAX_EVAL_SAMPLES="${MAX_EVAL_SAMPLES:-1000}"
+
 # Autorater toggle (set RUN_AUTORATER=False to skip Gemini/autorater scoring)
 RUN_AUTORATER="${RUN_AUTORATER:-True}"
 
@@ -43,11 +46,12 @@ if [ "$RUN_AUTORATER" == "True" ] && [ -z "${GEMINI_API_KEY}" ] && [ -z "${GOOGL
 fi
 
 if [ "$2" == "generate" ]; then
-    echo "Running in generation mode..."
+    echo "Running in generation mode (max_eval_samples=$MAX_EVAL_SAMPLES)..."
     python3 -m src.evaluator \
         --task_name "$TASK_NAME" \
         --user "$USER" \
         --seed "$SEED" \
+        --max_eval_samples "$MAX_EVAL_SAMPLES" \
         --dataset_labels "$DATASET_LABELS" \
         --dataset_labels_split "$DATASET_LABELS_SPLIT" \
         --dataset_prompts "$DATASET_PROMPTS" \
@@ -61,11 +65,12 @@ if [ "$2" == "generate" ]; then
         --writer_num_fewshot $WRITER_NUM_FEWSHOT
 elif [ "$2" == "score" ]; then
     DATASET_WITH_COMPLETIONS="${USER}/eval_${RUN_IDENTIFIER#*/}_gens_T${TEMPERATURE}_wfs${WRITER_NUM_FEWSHOT}"
-    echo "Running in scoring mode (run_autorater=$RUN_AUTORATER)..."
+    echo "Running in scoring mode (run_autorater=$RUN_AUTORATER, max_eval_samples=$MAX_EVAL_SAMPLES)..."
     python3 -m src.evaluator \
         --task_name "$TASK_NAME" \
         --user "$USER" \
         --seed "$SEED" \
+        --max_eval_samples "$MAX_EVAL_SAMPLES" \
         --dataset_labels "$DATASET_LABELS" \
         --dataset_labels_split "$DATASET_LABELS_SPLIT" \
         --writer_model_lora "${RUN_IDENTIFIER}" \
@@ -80,11 +85,12 @@ elif [ "$2" == "score" ]; then
         --log_to_wandb "${LOG_TO_WANDB:-False}" \
         --wandb_project "${WANDB_PROJECT:-new_perl_eval}"
 elif [ "$2" == "autoratereval" ]; then
-    echo "Running in autoratereval mode..."
+    echo "Running in autoratereval mode (max_eval_samples=$MAX_EVAL_SAMPLES)..."
     python3 -m src.evaluator \
         --task_name "$TASK_NAME" \
         --user "$USER" \
         --seed "$SEED" \
+        --max_eval_samples "$MAX_EVAL_SAMPLES" \
         --dataset_labels "$DATASET_LABELS" \
         --dataset_labels_split "$DATASET_LABELS_SPLIT" \
         --writer_model_lora "${RUN_IDENTIFIER}" \

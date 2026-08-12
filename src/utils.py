@@ -338,6 +338,16 @@ class EvalArguments:
 
   seed: int = field(default=12345)
 
+  max_eval_samples: Optional[int] = field(
+      default=1000,
+      metadata={
+          "help": (
+              "Maximum number of samples to evaluate (subsampling). Set to -1"
+              " or 0 to evaluate full dataset."
+          )
+      },
+  )
+
   eval_batch_size: int = field(default=1)
 
   max_tokens: int = field(default=128)
