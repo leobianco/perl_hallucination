@@ -99,6 +99,32 @@ class BaseTaskProcessor(abc.ABC):
         """
         raise NotImplementedError()
 
+    def _make_scope_sft_splits(
+        self,
+        sft_data: DatasetDict,
+        split_ratio: float = 0.5,
+        seed: int = 12345,
+    ) -> Tuple[Dataset, Dataset]:
+        """Split the SFT training data into two halves for SCOPE.
+
+        - D1 (first half): used for training the initial SFT checkpoint.
+        - D2 (second half): used for generating SCOPE synthetic preference data.
+
+        Args:
+            sft_data: SFT dataset(s).
+            split_ratio: Fraction of training samples allocated to D1 (default: 0.5).
+            seed: Random seed for shuffling.
+
+        Returns:
+            Tuple of (d1_dataset, d2_dataset).
+        """
+        train_data = sft_data["train"].shuffle(seed=seed)
+        n_total = len(train_data)
+        n_d1 = int(n_total * split_ratio)
+        d1 = train_data.select(range(n_d1))
+        d2 = train_data.select(range(n_d1, n_total))
+        return d1, d2
+
     @abc.abstractmethod
     def _make_autorater_data(self, data: DatasetDict) -> Dataset:
         """Prepare dataset for the autorater (combined test set or similar).

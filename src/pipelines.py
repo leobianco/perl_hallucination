@@ -41,7 +41,10 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 from src.utils import (
+    DpoScriptArguments,
     EvalArguments,
+    ScopeDataGenArguments,
+    SsfoDataGenArguments,
     LLMSynthScriptArguments,
     LoraArguments,
     ScriptArguments,
@@ -62,6 +65,8 @@ from transformers import (
     set_seed,
 )
 from trl import (
+    DPOConfig,
+    DPOTrainer,
     RLOOConfig,
     RLOOTrainer,
     SFTConfig,
@@ -502,6 +507,373 @@ class PERLPipeline(Pipeline):
     if self.training_args.do_train:
       self.trainer.train()
       self.trainer.push_to_hub()
+
+
+class DPOPipeline(Pipeline):
+  """Pipeline for Direct Preference Optimization (DPO) preference tuning.
+
+  This pipeline loads a preference dataset (containing 'prompt', 'chosen', and
+  'rejected' columns), initializes the policy model from the SFT checkpoint
+  (using
+  LoRA adapters), and fine-tunes using TRL's DPOTrainer.
+  """
+
+  def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
+    parser_lora = create_lora_argument_parser()
+    lora_args, remaining_args = parser_lora.parse_known_args()
+    parser = HfArgumentParser((ScriptArguments, DPOConfig))
+    script_args, training_args = parser.parse_args_into_dataclasses(
+        remaining_args
+    )
+
+    self.args = script_args
+    self.training_args = training_args
+    set_seed(training_args.seed)
+    self._lora_args = lora_args
+
+  def load_data(self) -> None:
+    data = load_dataset(self.args.dataset_repo_id)
+    if isinstance(data, (DatasetDict, dict)):
+      self.data = {
+          "train": data["train"],
+          "test": data.get("test", data.get("validation", None)),
+      }
+    else:
+      self.data = {
+          "train": load_dataset(self.args.dataset_repo_id, split="train"),
+          "test": load_dataset(self.args.dataset_repo_id, split="test"),
+      }
+
+  def process_data(self) -> None:
+    self._lora_config = LoraConfig(
+        task_type=self._lora_args.task_type,
+        peft_type=self._lora_args.peft_type,
+        r=self._lora_args.lora_r,
+        lora_alpha=self._lora_args.lora_alpha,
+        lora_dropout=self._lora_args.lora_dropout,
+    )
+
+  def setup_model(self) -> None:
+    sft_model_path = self.args.sft_model_path or getattr(
+        self.training_args, "sft_model_path", None
+    )
+
+    base_model = AutoModelForCausalLM.from_pretrained(
+        self.args.model_repo_id,
+        torch_dtype=torch.bfloat16,
+    )
+    if self.tokenizer.pad_token_id is not None:
+      base_model.config.pad_token_id = self.tokenizer.pad_token_id
+
+    if sft_model_path:
+      # In SCOPE, the policy is initialized at the SFT model p_{\theta_0}, and
+      # the reference model is also p_{\theta_0}.
+      # By loading and merging the SFT adapter into the base weights, then applying
+      # a fresh LoRA adapter for DPO, DPOTrainer's adapter disabling automatically
+      # evaluates the exact SFT reference model without extra memory overhead.
+      sft_peft = PeftModel.from_pretrained(base_model, sft_model_path)
+      merged_base = sft_peft.merge_and_unload()
+      self.model = get_peft_model(merged_base, self._lora_config)
+    else:
+      self.model = get_peft_model(base_model, self._lora_config)
+
+    self.model.to(torch.bfloat16)
+    self.ref_model = None
+
+  def setup_trainer(self) -> None:
+    self.trainer = DPOTrainer(
+        model=self.model,
+        ref_model=self.ref_model,
+        args=self.training_args,
+        train_dataset=self.data["train"],
+        eval_dataset=self.data.get("test", None),
+        processing_class=self.tokenizer,
+    )
+
+  def run_and_save(self) -> None:
+    if self.training_args.do_train:
+      self.trainer.train()
+      self.trainer.push_to_hub()
+
+
+class ScopeDataGenerationPipeline(Pipeline):
+  """Pipeline for generating synthetic preference datasets for SCOPE.
+
+  Implements noisy decoding (Section 3 / Algorithm 1 of the SCOPE paper)
+  by sampling mixed tokens between the fine-tuned SFT checkpoint and the
+  pre-trained base model.
+  """
+
+  def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
+    parser = HfArgumentParser(ScopeDataGenArguments)
+    script_args = parser.parse_args_into_dataclasses()[0]
+    self.args = script_args
+    set_seed(self.args.seed)
+
+  def setup_tokenizer(self) -> None:
+    self.tokenizer = AutoTokenizer.from_pretrained(
+        self.args.model_repo_id,
+        padding_side="left",
+    )
+    if self.tokenizer.pad_token_id is None:
+      if self.tokenizer.eos_token_id is not None:
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+      elif self.tokenizer.unk_token_id is not None:
+        self.tokenizer.pad_token = self.tokenizer.unk_token
+
+  def load_data(self) -> None:
+    dataset = load_dataset(self.args.dataset_repo_id)
+    self.raw_dataset = dataset
+
+  def _extract_prompt_and_chosen(self, entry: dict) -> Tuple[str, str]:
+    """Extract standard prompt and chosen completion from dataset entry."""
+    task_name = self.args.task_name
+    if "prompt" in entry and "chosen" in entry:
+      return entry["prompt"], entry["chosen"]
+    if "prompt" in entry and "completion" in entry:
+      return entry["prompt"], entry["completion"]
+    if "prompt" in entry and "npov_response" in entry:
+      return entry["prompt"], entry["npov_response"]
+
+    # Fallback to task processor prompt formatting
+    processor_cls = get_task_processor(task_name)
+    if task_name == "npov":
+      prompt = processor_cls._writer_prompt(entry, SFT=False)["prompt"]
+      chosen = entry.get("npov_response", entry.get("completion", ""))
+      return prompt, chosen
+    elif task_name == "bosch":
+      prompt = (
+          "You are a helpful assistant to car related questions. You will be"
+          " given an user's question, and the relevant part of the car"
+          " manual. Your task is to answer the user's question using the"
+          " information giver. Do not add to your answer any information other"
+          " than those present in the manual excerpt.\nUser"
+          f" question:\n{entry.get('Question', '')}\nManual"
+          f" information:\n{entry.get('Context', '')}\nAnswer to user's"
+          " question:\n"
+      )
+      chosen = entry.get("response", entry.get("completion", ""))
+      return prompt, chosen
+    elif task_name == "ragtruth":
+      prompt = entry.get("prompt", entry.get("user_query", ""))
+      chosen = entry.get("completion", entry.get("response", ""))
+      return prompt, chosen
+    else:
+      prompt = entry.get("prompt", str(entry))
+      chosen = entry.get("chosen", entry.get("completion", ""))
+      return prompt, chosen
+
+  def process_data(self) -> None:
+    train_split = (
+        self.raw_dataset["train"]
+        if isinstance(self.raw_dataset, (DatasetDict, dict))
+        else self.raw_dataset
+    )
+    shuffled_train = train_split.shuffle(seed=self.args.seed)
+    n_total = len(shuffled_train)
+    n_d1 = int(n_total * self.args.split_ratio)
+    # SCOPE uses D2 (second half) for preference generation
+    d2_split = shuffled_train.select(range(n_d1, n_total))
+
+    if self.args.max_samples is not None and self.args.max_samples > 0:
+      d2_split = d2_split.select(
+          range(min(len(d2_split), self.args.max_samples))
+      )
+
+    self.d2_split = d2_split
+
+  def setup_model(self) -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    self.device = device
+
+    print(f"Loading base pre-trained model: {self.args.model_repo_id}...")
+    self.base_model = AutoModelForCausalLM.from_pretrained(
+        self.args.model_repo_id,
+        torch_dtype=torch.bfloat16,
+    ).to(device)
+    self.base_model.eval()
+
+    print(f"Loading SFT model from: {self.args.sft_model_path}...")
+    sft_base = AutoModelForCausalLM.from_pretrained(
+        self.args.model_repo_id,
+        torch_dtype=torch.bfloat16,
+    ).to(device)
+    self.sft_model = PeftModel.from_pretrained(
+        sft_base, self.args.sft_model_path
+    ).to(device)
+    self.sft_model.eval()
+
+  def setup_trainer(self) -> None:
+    pass
+
+  def _generate_unfaithful_sample(
+      self,
+      prompt: str,
+  ) -> str:
+    """Generate a dispreferred sample using SCOPE noisy decoding (Algorithm 1)."""
+    tokenizer = self.tokenizer
+    device = self.device
+    alpha = self.args.alpha
+    temperature = self.args.temperature
+    top_p = self.args.top_p
+    top_k = self.args.top_k
+    max_new_tokens = self.args.max_new_tokens
+    sampling_mode = self.args.sampling_mode
+
+    prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+    if tokenizer.bos_token_id is not None:
+      base_input_ids = torch.tensor([[tokenizer.bos_token_id]], device=device)
+    else:
+      base_input_ids = prompt_ids[:, :1]
+
+    generated_tokens = []
+    past_key_values_sft = None
+    past_key_values_base = None
+    cur_sft_input = prompt_ids
+    cur_base_input = base_input_ids
+
+    eos_token_ids = {tokenizer.eos_token_id}
+    if getattr(tokenizer, "pad_token_id", None) is not None:
+      eos_token_ids.add(tokenizer.pad_token_id)
+    if hasattr(tokenizer, "additional_special_tokens_ids"):
+      eos_token_ids.update(tokenizer.additional_special_tokens_ids)
+
+    with torch.no_grad():
+      for _ in range(max_new_tokens):
+        sft_out = self.sft_model(
+            input_ids=cur_sft_input,
+            past_key_values=past_key_values_sft,
+            use_cache=True,
+        )
+        base_out = self.base_model(
+            input_ids=cur_base_input,
+            past_key_values=past_key_values_base,
+            use_cache=True,
+        )
+
+        past_key_values_sft = sft_out.past_key_values
+        past_key_values_base = base_out.past_key_values
+
+        logits_sft = sft_out.logits[:, -1, :].clone()
+        logits_base = base_out.logits[:, -1, :].clone()
+
+        if temperature > 0 and temperature != 1.0:
+          logits_sft = logits_sft / temperature
+          logits_base = logits_base / temperature
+
+        if sampling_mode == "bernoulli":
+          # Algorithm 1: alpha_t ~ Bernoulli(alpha)
+          alpha_t = torch.bernoulli(torch.tensor([alpha], device=device)).item()
+          selected_logits = logits_base if (alpha_t == 1.0) else logits_sft
+          probs = torch.softmax(selected_logits, dim=-1)
+        elif sampling_mode == "prob_mix":
+          probs_sft = torch.softmax(logits_sft, dim=-1)
+          probs_base = torch.softmax(logits_base, dim=-1)
+          probs = (1.0 - alpha) * probs_sft + alpha * probs_base
+        elif sampling_mode == "logit_mix":
+          mixed_logits = (1.0 - alpha) * logits_sft + alpha * logits_base
+          probs = torch.softmax(mixed_logits, dim=-1)
+        else:
+          probs = torch.softmax(logits_sft, dim=-1)
+
+        if top_k > 0 and top_k < probs.size(-1):
+          top_k_probs, top_k_indices = torch.topk(probs, top_k, dim=-1)
+          probs = torch.zeros_like(probs).scatter_(
+              -1, top_k_indices, top_k_probs
+          )
+          probs = probs / probs.sum(dim=-1, keepdim=True)
+
+        if top_p < 1.0:
+          sorted_probs, sorted_indices = torch.sort(
+              probs, descending=True, dim=-1
+          )
+          cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+          sorted_indices_to_remove = cumulative_probs > top_p
+          sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
+              ..., :-1
+          ].clone()
+          sorted_indices_to_remove[..., 0] = 0
+          sorted_probs[sorted_indices_to_remove] = 0.0
+          probs = torch.zeros_like(probs).scatter_(
+              -1, sorted_indices, sorted_probs
+          )
+          probs = probs / probs.sum(dim=-1, keepdim=True)
+
+        next_token = torch.multinomial(probs, num_samples=1)
+        token_id = next_token.item()
+
+        if token_id in eos_token_ids:
+          break
+        token_str = tokenizer.decode([token_id])
+        if "<end_of_turn>" in token_str or "<eos>" in token_str:
+          break
+
+        generated_tokens.append(token_id)
+        cur_sft_input = next_token
+        cur_base_input = next_token
+
+    return tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+
+  def run_and_save(self) -> None:
+    prompts = []
+    chosens = []
+    rejecteds = []
+
+    print(
+        "Generating synthetic dispreferred completions for"
+        f" {len(self.d2_split)} samples..."
+    )
+    for entry in tqdm(self.d2_split, desc="SCOPE noisy decoding"):
+      prompt, chosen = self._extract_prompt_and_chosen(entry)
+      rejected = self._generate_unfaithful_sample(prompt)
+      prompts.append(prompt)
+      chosens.append(chosen)
+      rejecteds.append(rejected)
+
+    pref_dict = {
+        "prompt": prompts,
+        "chosen": chosens,
+        "rejected": rejecteds,
+    }
+    train_dataset = Dataset.from_dict(pref_dict)
+
+    # Process test split if available
+    test_split = None
+    if (
+        isinstance(self.raw_dataset, (DatasetDict, dict))
+        and "test" in self.raw_dataset
+    ):
+      test_prompts, test_chosens, test_rejecteds = [], [], []
+      for entry in self.raw_dataset["test"]:
+        prompt, chosen = self._extract_prompt_and_chosen(entry)
+        test_prompts.append(prompt)
+        test_chosens.append(chosen)
+        test_rejecteds.append(chosen)
+      test_split = Dataset.from_dict({
+          "prompt": test_prompts,
+          "chosen": test_chosens,
+          "rejected": test_rejecteds,
+      })
+
+    if test_split is not None:
+      preference_dataset = DatasetDict(
+          {"train": train_dataset, "test": test_split}
+      )
+    else:
+      preference_dataset = DatasetDict({"train": train_dataset})
+
+    out_repo = (
+        self.args.output_dataset_repo_id
+        or f"{self.args.dataset_repo_id}_scope_preference"
+    )
+    if self.args.output_dir:
+      os.makedirs(self.args.output_dir, exist_ok=True)
+      preference_dataset.save_to_disk(self.args.output_dir)
+      print(f"Preference dataset saved locally to {self.args.output_dir}")
+
+    if self.args.push_to_hub:
+      print(f"Pushing preference dataset to Hub: {out_repo}...")
+      preference_dataset.push_to_hub(out_repo)
 
 
 class EvaluationPipeline(Pipeline):
