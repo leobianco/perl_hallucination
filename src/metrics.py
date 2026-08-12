@@ -752,16 +752,20 @@ class GenerationMetricsEvaluator:
     summary_path = os.path.join(output_dir, f"{dataset_name}_summary.json")
 
     if autorater_scores:
-      hallu_rate = float(
-          sum(1.0 for s in autorater_scores if s < threshold)
-          / len(autorater_scores)
-      )
-      faithful_rate = float(1.0 - hallu_rate)
-      summary["hallucination_rate"] = hallu_rate
-      summary["faithfulness_rate"] = faithful_rate
-      autorater_stats = compute_summary_statistics(autorater_scores)
-      summary["autorater_score_mean"] = autorater_stats["mean"]
-      summary["autorater_score_std"] = autorater_stats["std"]
+      clean_autorater = [
+          float(s) for s in autorater_scores if s is not None
+      ]
+      if clean_autorater:
+        hallu_rate = float(
+            sum(1.0 for s in clean_autorater if s < threshold)
+            / len(clean_autorater)
+        )
+        faithful_rate = float(1.0 - hallu_rate)
+        summary["hallucination_rate"] = hallu_rate
+        summary["faithfulness_rate"] = faithful_rate
+        autorater_stats = compute_summary_statistics(clean_autorater)
+        summary["autorater_score_mean"] = autorater_stats["mean"]
+        summary["autorater_score_std"] = autorater_stats["std"]
 
     with open(summary_path, "w") as f:
       json.dump(summary, f, indent=2)

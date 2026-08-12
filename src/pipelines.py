@@ -1283,6 +1283,31 @@ class EvaluationPipeline(Pipeline):
     # Evaluation pipelines do not have trainers
     pass
 
+  def safe_load_dataset(
+      self, path: str, split: Optional[str] = None
+  ) -> Dataset:
+    """Loads dataset from Hugging Face Hub with parquet snapshot fallback."""
+    try:
+      return load_dataset(path, split=split)
+    except Exception as e:
+      print(
+          f"Notice: Standard load_dataset failed for {path} ({e})."
+          " Falling back to direct parquet download..."
+      )
+      local_dir = snapshot_download(
+          repo_id=path,
+          repo_type="dataset",
+          allow_patterns=["*.parquet"],
+      )
+      parquet_files = sorted(
+          glob.glob(os.path.join(local_dir, "**", "*.parquet"), recursive=True)
+      )
+      if not parquet_files:
+        raise ValueError(
+            f"No parquet files found in dataset {path}"
+        ) from e
+      return Dataset.from_parquet(parquet_files)
+
   def _subsample_dataset(self, dataset: Dataset) -> Dataset:
     """Subsamples dataset to max_eval_samples using seed if specified."""
     max_samples = getattr(self.args, "max_eval_samples", None)
@@ -1597,22 +1622,7 @@ class EvaluationPipeline(Pipeline):
         print(f"Error saving progress locally: {save_error}")
       raise e
 
-    # Final save after all scoring is done
-    dataset = (
-        dataset.remove_columns("scores")
-        if "scores" in dataset.column_names
-        else dataset
-    )
-    dataset = dataset.add_column("scores", scores)
-    if (
-        hasattr(script_args, "dataset_with_completions")
-        and script_args.dataset_with_completions
-    ):
-      try:
-        dataset.push_to_hub(script_args.dataset_with_completions)
-      except Exception as e:
-        print(f"Warning: Could not save final progress to hub: {e}")
-    # Remove local checkpoint after successful push
+    # Clean up local checkpoint after scoring is complete
     if os.path.exists(checkpoint_path):
       os.remove(checkpoint_path)
 
@@ -1641,7 +1651,7 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
     if self.args.dataset_labels is None:
       raise ValueError("dataset_labels is required for autorater evaluation")
 
-    self.data = load_dataset(
+    self.data = self.safe_load_dataset(
         self.args.dataset_labels, split=self.args.dataset_labels_split
     )
     self.data = self._subsample_dataset(self.data)
@@ -1820,7 +1830,7 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
     pass
 
   def load_data(self) -> None:
-    self.dataset_prompts = load_dataset(
+    self.dataset_prompts = self.safe_load_dataset(
         self.args.dataset_prompts, split=self.args.dataset_prompts_split
     )
     self.dataset_prompts = self._subsample_dataset(self.dataset_prompts)
@@ -1837,7 +1847,7 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
         self.args.writer_num_fewshot > 0
         and self.args.dataset_labels is not None
     ):
-      fewshot_data = load_dataset(
+      fewshot_data = self.safe_load_dataset(
           self.args.dataset_labels,
           split=self.args.dataset_labels_split,
       )
@@ -1953,28 +1963,9 @@ class EvaluationScoringPipeline(EvaluationPipeline):
   def load_data(self):
     if self.args.dataset_with_completions is None:
       raise ValueError("dataset_with_completions is required for scoring mode")
-    try:
-      self.full_dataset = load_dataset(
-          self.args.dataset_with_completions, split="test"
-      )
-    except Exception as e:
-      print(
-          f"Notice: Standard load_dataset encountered schema mismatch ({e})."
-          " Loading parquet data directly from HF snapshot..."
-      )
-      local_dir = snapshot_download(
-          repo_id=self.args.dataset_with_completions,
-          repo_type="dataset",
-          allow_patterns=["*.parquet"],
-      )
-      parquet_files = sorted(
-          glob.glob(os.path.join(local_dir, "**", "*.parquet"), recursive=True)
-      )
-      if not parquet_files:
-        raise ValueError(
-            f"No parquet files found in dataset {self.args.dataset_with_completions}"
-        )
-      self.full_dataset = Dataset.from_parquet(parquet_files)
+    self.full_dataset = self.safe_load_dataset(
+        self.args.dataset_with_completions, split="test"
+    )
     max_samples = getattr(self.args, "max_eval_samples", None)
     if (
         max_samples is not None
@@ -2009,7 +2000,7 @@ class EvaluationScoringPipeline(EvaluationPipeline):
         and self.args.evaluator_num_fewshot > 0
         and self.args.dataset_labels
     ):
-      label_data = load_dataset(
+      label_data = self.safe_load_dataset(
           self.args.dataset_labels, split=self.args.dataset_labels_split
       )
       n_yes = self.args.evaluator_num_fewshot // 2
@@ -2054,7 +2045,11 @@ class EvaluationScoringPipeline(EvaluationPipeline):
       # Compute simple rate and push dataset updated
       t = torch.nn.Threshold(self.args.threshold, 0, inplace=False)
       classifs = torch.ceil(t(scores)).clamp(0, 1)
+      if "scores" in self.val_data.column_names:
+        self.val_data = self.val_data.remove_columns("scores")
       self.val_data = self.val_data.add_column("scores", scores.tolist())
+      if "classifications" in self.val_data.column_names:
+        self.val_data = self.val_data.remove_columns("classifications")
       self.val_data = self.val_data.add_column(
           "classifications", classifs.tolist()
       )
@@ -2096,7 +2091,12 @@ class EvaluationScoringPipeline(EvaluationPipeline):
 
     if self.is_subsampled:
       # Merge scored subset columns back into full dataset, preserving all rows
-      final_dataset = self.full_dataset
+      final_dict = (
+          dict(self.full_dataset.to_dict())
+          if hasattr(self.full_dataset, "to_dict")
+          else {col: list(self.full_dataset[col]) for col in self.full_dataset.column_names}
+      )
+      n_total = len(self.full_dataset)
       evaluated_metric_cols = [
           "scores",
           "classifications",
@@ -2114,25 +2114,27 @@ class EvaluationScoringPipeline(EvaluationPipeline):
       for col_name in self.val_data.column_names:
         if (
             col_name in evaluated_metric_cols
-            or col_name not in final_dataset.column_names
+            or col_name not in final_dict
         ):
-          if col_name in final_dataset.column_names:
-            full_col_vals = list(final_dataset[col_name])
+          if col_name in final_dict:
+            full_col_vals = list(final_dict[col_name])
           else:
-            full_col_vals = [None] * len(final_dataset)
+            full_col_vals = [None] * n_total
           for idx_in_val, orig_idx in enumerate(self.eval_indices):
             full_col_vals[orig_idx] = self.val_data[col_name][idx_in_val]
-          if col_name in final_dataset.column_names:
-            final_dataset = final_dataset.remove_columns(col_name)
-          final_dataset = final_dataset.add_column(col_name, full_col_vals)
-      self.full_dataset = final_dataset
+          final_dict[col_name] = full_col_vals
+
+      self.full_dataset = Dataset.from_dict(final_dict)
       print(
           f"Pushing full dataset ({len(self.full_dataset)} total samples,"
           f" {len(self.val_data)} scored) to"
           f" {self.args.dataset_with_completions}"
       )
-      clean_dataset = Dataset.from_dict(self.full_dataset.to_dict())
-      clean_dataset.push_to_hub(self.args.dataset_with_completions)
+      self.full_dataset.push_to_hub(self.args.dataset_with_completions)
     else:
-      clean_dataset = Dataset.from_dict(self.val_data.to_dict())
+      clean_dataset = (
+          Dataset.from_dict(self.val_data.to_dict())
+          if hasattr(self.val_data, "to_dict")
+          else self.val_data
+      )
       clean_dataset.push_to_hub(self.args.dataset_with_completions)

@@ -326,6 +326,52 @@ class TestMetrics(unittest.TestCase):
       self.assertEqual(final_dataset["prompt"][orig_idx], f"Prompt {orig_idx}")
       self.assertEqual(final_dataset["completion"][orig_idx], f"Completion {orig_idx}")
 
+  def test_save_and_log_results_with_none_autorater_scores(self):
+    """Verifies that save_and_log_results handles None in autorater_scores without crashing."""
+    evaluator = GenerationMetricsEvaluator(
+        compute_bertscore_metric=False,
+        compute_perplexity_metric=False,
+    )
+    dataset = MockDataset({
+        "prompt": ["P1", "P2", "P3"],
+        "completion": ["C1", "C2", "C3"],
+        "token_length": [10, 20, 30],
+        "distinct_2": [0.8, 0.9, 1.0],
+        "repetition_rate": [0.0, 0.1, 0.0],
+    })
+    summary = {"avg_score": 0.9}
+    scores_with_none = [0.95, None, 0.88]
+    summary_path = evaluator.save_and_log_results(
+        dataset,
+        summary,
+        output_dir=self.temp_dir,
+        dataset_name="test_none_scores",
+        autorater_scores=scores_with_none,
+        threshold=0.9,
+    )
+    self.assertTrue(os.path.exists(summary_path))
+    with open(summary_path) as f:
+      saved_data = json.load(f)
+    self.assertIn("hallucination_rate", saved_data)
+    self.assertIn("faithfulness_rate", saved_data)
+    self.assertAlmostEqual(saved_data["faithfulness_rate"], 0.5, places=2)
+
+  def test_evaluate_dataset_idempotent_recalculation(self):
+    """Verifies that calling evaluate_dataset multiple times cleanly updates existing metric columns."""
+    evaluator = GenerationMetricsEvaluator(
+        compute_bertscore_metric=False,
+        compute_perplexity_metric=False,
+    )
+    dataset = MockDataset({
+        "prompt": ["P1", "P2"],
+        "completion": ["Hello world", "Another sentence test"],
+        "reference": ["Hello world", "Sentence reference"],
+        "token_length": [999, 999],  # Stale values from prior run
+    })
+    updated_ds, summary = evaluator.evaluate_dataset(dataset)
+    # Stale token_length should be overwritten with accurate values
+    self.assertEqual(updated_ds["token_length"], [2, 3])
+
 
 if __name__ == "__main__":
   unittest.main()
