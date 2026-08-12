@@ -876,6 +876,275 @@ class ScopeDataGenerationPipeline(Pipeline):
       preference_dataset.push_to_hub(out_repo)
 
 
+class SSFODataGenerationPipeline(Pipeline):
+  """Pipeline for generating synthetic preference datasets for SSFO.
+
+  Implements Self-Supervised Faithfulness Optimization (SSFO, arXiv:2508.17225)
+  data generation by contrasting SFT model generations with context (chosen)
+  and without context (rejected / hallucinated).
+  """
+
+  def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
+    parser = HfArgumentParser(SsfoDataGenArguments)
+    script_args = parser.parse_args_into_dataclasses()[0]
+    self.args = script_args
+    set_seed(self.args.seed)
+
+  def setup_tokenizer(self) -> None:
+    self.tokenizer = AutoTokenizer.from_pretrained(
+        self.args.model_repo_id,
+        padding_side="left",
+    )
+    if self.tokenizer.pad_token_id is None:
+      if self.tokenizer.eos_token_id is not None:
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+      elif self.tokenizer.unk_token_id is not None:
+        self.tokenizer.pad_token = self.tokenizer.unk_token
+
+  def load_data(self) -> None:
+    dataset = load_dataset(self.args.dataset_repo_id)
+    self.raw_dataset = dataset
+
+  def _extract_prompts(self, entry: dict) -> Tuple[str, str, str]:
+    """Extract (prompt_with_context, prompt_without_context, ground_truth_chosen) from entry."""
+    task_name = self.args.task_name
+    processor_cls = get_task_processor(task_name)
+
+    if task_name == "npov":
+      prompt_with_context = processor_cls._writer_prompt(entry, SFT=False)[
+          "prompt"
+      ]
+      user_query = entry.get("user_query", "")
+      prompt_without_context = (
+          f"User query: {user_query}\n"
+          "Neutral point-of-view answer to user query in natural language:\n"
+      )
+      ground_truth = entry.get("npov_response", entry.get("completion", ""))
+      return prompt_with_context, prompt_without_context, ground_truth
+
+    elif task_name == "bosch":
+      question = entry.get("Question", "")
+      context = entry.get("Context", "")
+      prompt_with_context = (
+          "You are a helpful assistant to car related questions. You will be"
+          " given an user's question, and the relevant part of the car"
+          " manual. Your task is to answer the user's question using the"
+          " information giver. Do not add to your answer any information other"
+          " than those present in the manual excerpt.\nUser"
+          f" question:\n{question}\nManual"
+          f" information:\n{context}\nAnswer to user's"
+          " question:\n"
+      )
+      prompt_without_context = (
+          "You are a helpful assistant to car related questions. You will be"
+          " given an user's question. Your task is to answer the user's"
+          f" question.\nUser question:\n{question}\nAnswer to user's"
+          " question:\n"
+      )
+      ground_truth = entry.get("response", entry.get("completion", ""))
+      return prompt_with_context, prompt_without_context, ground_truth
+
+    elif task_name == "ragtruth":
+      user_query = entry.get(
+          "user_query", entry.get("query", entry.get("question", ""))
+      )
+      context = entry.get(
+          "context", entry.get("passage", entry.get("document", ""))
+      )
+      if context:
+        prompt_with_context = (
+            f"Context: {context}\nQuestion: {user_query}\nAnswer:\n"
+        )
+        prompt_without_context = f"Question: {user_query}\nAnswer:\n"
+      else:
+        prompt_with_context = entry.get("prompt", "")
+        prompt_without_context = (
+            user_query if user_query else prompt_with_context
+        )
+      ground_truth = entry.get("completion", entry.get("response", ""))
+      return prompt_with_context, prompt_without_context, ground_truth
+
+    else:
+      prompt_with_context = entry.get("prompt", str(entry))
+      prompt_without_context = entry.get(
+          "prompt_no_context", entry.get("query", prompt_with_context)
+      )
+      ground_truth = entry.get("chosen", entry.get("completion", ""))
+      return prompt_with_context, prompt_without_context, ground_truth
+
+  def process_data(self) -> None:
+    train_split = (
+        self.raw_dataset["train"]
+        if isinstance(self.raw_dataset, (DatasetDict, dict))
+        else self.raw_dataset
+    )
+    shuffled_train = train_split.shuffle(seed=self.args.seed)
+    if self.args.max_samples is not None and self.args.max_samples > 0:
+      shuffled_train = shuffled_train.select(
+          range(min(len(shuffled_train), self.args.max_samples))
+      )
+    self.train_split = shuffled_train
+
+  def setup_model(self) -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    self.device = device
+
+    print(
+        f"Loading SFT model from base={self.args.model_repo_id}"
+        f" adapter={self.args.sft_model_path}..."
+    )
+    sft_base = AutoModelForCausalLM.from_pretrained(
+        self.args.model_repo_id,
+        torch_dtype=torch.bfloat16,
+    ).to(device)
+    self.sft_model = PeftModel.from_pretrained(
+        sft_base, self.args.sft_model_path
+    ).to(device)
+    self.sft_model.eval()
+
+  def setup_trainer(self) -> None:
+    pass
+
+  def _generate(self, prompt: str) -> str:
+    """Generate completion from SFT model given a prompt."""
+    tokenizer = self.tokenizer
+    device = self.device
+    temperature = self.args.temperature
+    top_p = self.args.top_p
+    top_k = self.args.top_k
+    max_new_tokens = self.args.max_new_tokens
+
+    prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+    generated_tokens = []
+    past_key_values = None
+    cur_input = prompt_ids
+
+    eos_token_ids = {tokenizer.eos_token_id}
+    if getattr(tokenizer, "pad_token_id", None) is not None:
+      eos_token_ids.add(tokenizer.pad_token_id)
+    if hasattr(tokenizer, "additional_special_tokens_ids"):
+      eos_token_ids.update(tokenizer.additional_special_tokens_ids)
+
+    with torch.no_grad():
+      for _ in range(max_new_tokens):
+        out = self.sft_model(
+            input_ids=cur_input,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+        past_key_values = out.past_key_values
+        logits = out.logits[:, -1, :].clone()
+
+        if temperature > 0 and temperature != 1.0:
+          logits = logits / temperature
+
+        probs = torch.softmax(logits, dim=-1)
+
+        if top_k > 0 and top_k < probs.size(-1):
+          top_k_probs, top_k_indices = torch.topk(probs, top_k, dim=-1)
+          probs = torch.zeros_like(probs).scatter_(
+              -1, top_k_indices, top_k_probs
+          )
+          probs = probs / probs.sum(dim=-1, keepdim=True)
+
+        if top_p < 1.0:
+          sorted_probs, sorted_indices = torch.sort(
+              probs, descending=True, dim=-1
+          )
+          cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+          sorted_indices_to_remove = cumulative_probs > top_p
+          sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
+              ..., :-1
+          ].clone()
+          sorted_indices_to_remove[..., 0] = 0
+          sorted_probs[sorted_indices_to_remove] = 0.0
+          probs = torch.zeros_like(probs).scatter_(
+              -1, sorted_indices, sorted_probs
+          )
+          probs = probs / probs.sum(dim=-1, keepdim=True)
+
+        next_token = torch.multinomial(probs, num_samples=1)
+        token_id = next_token.item()
+
+        if token_id in eos_token_ids:
+          break
+        token_str = tokenizer.decode([token_id])
+        if "<end_of_turn>" in token_str or "<eos>" in token_str:
+          break
+
+        generated_tokens.append(token_id)
+        cur_input = next_token
+
+    return tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+
+  def run_and_save(self) -> None:
+    prompts = []
+    chosens = []
+    rejecteds = []
+
+    print(
+        f"Generating SSFO preference pairs for {len(self.train_split)}"
+        " samples..."
+    )
+    for entry in tqdm(self.train_split, desc="SSFO generation"):
+      prompt_ctx, prompt_no_ctx, gt_chosen = self._extract_prompts(entry)
+
+      if self.args.use_ground_truth_chosen and gt_chosen:
+        chosen = gt_chosen
+      else:
+        chosen = self._generate(prompt_ctx)
+
+      rejected = self._generate(prompt_no_ctx)
+
+      prompts.append(prompt_ctx)
+      chosens.append(chosen)
+      rejecteds.append(rejected)
+
+    pref_dict = {
+        "prompt": prompts,
+        "chosen": chosens,
+        "rejected": rejecteds,
+    }
+    train_dataset = Dataset.from_dict(pref_dict)
+
+    test_split = None
+    if (
+        isinstance(self.raw_dataset, (DatasetDict, dict))
+        and "test" in self.raw_dataset
+    ):
+      test_prompts, test_chosens, test_rejecteds = [], [], []
+      for entry in self.raw_dataset["test"]:
+        p_ctx, _, gt = self._extract_prompts(entry)
+        test_prompts.append(p_ctx)
+        test_chosens.append(gt)
+        test_rejecteds.append(gt)
+      test_split = Dataset.from_dict({
+          "prompt": test_prompts,
+          "chosen": test_chosens,
+          "rejected": test_rejecteds,
+      })
+
+    if test_split is not None:
+      preference_dataset = DatasetDict(
+          {"train": train_dataset, "test": test_split}
+      )
+    else:
+      preference_dataset = DatasetDict({"train": train_dataset})
+
+    out_repo = (
+        self.args.output_dataset_repo_id
+        or f"{self.args.dataset_repo_id}_ssfo_preference"
+    )
+    if self.args.output_dir:
+      os.makedirs(self.args.output_dir, exist_ok=True)
+      preference_dataset.save_to_disk(self.args.output_dir)
+      print(f"Preference dataset saved locally to {self.args.output_dir}")
+
+    if self.args.push_to_hub:
+      print(f"Pushing preference dataset to Hub: {out_repo}...")
+      preference_dataset.push_to_hub(out_repo)
+
+
 class EvaluationPipeline(Pipeline):
   """Base class for evaluator flows.
 
