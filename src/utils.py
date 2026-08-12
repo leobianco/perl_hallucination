@@ -322,6 +322,16 @@ class EvalArguments:
       },
   )
 
+  run_autorater: bool = field(
+      default=True,
+      metadata={
+          "help": (
+              "Whether to run the autorater (Gemini or CausalLM) for"
+              " hallucination scoring. Set False to skip."
+          )
+      },
+  )
+
   gemini_api_key: Optional[str] = field(
       default="", metadata={"help": "API key for calling Gemini"}
   )

@@ -562,7 +562,10 @@ class PERLPipeline(Pipeline):
     reward_model = self.reward_model
     reward_tokenizer = self.reward_tokenizer
 
-    # Custom reward function that computes scalar reward as the probability of label 1 ("No" hallucination).
+    # Custom reward function that computes scalar reward as the logit difference
+    # (log-odds) of label 1 ("No" hallucination) vs label 0 ("Yes" hallucination).
+    # This matches the standard Bradley-Terry reward formulation r(x, y) = z_1 - z_0
+    # and prevents sigmoid saturation/vanishing gradients in RLOO when models are overconfident.
     def reward_fn(
         prompts: list[str], completions: list[str], **kwargs
     ) -> list[float]:
@@ -596,9 +599,9 @@ class PERLPipeline(Pipeline):
         else:
           logits = reward_model(**inputs).logits
 
-        # Probability of label 1 ("No" hallucination = non-hallucinated score)
-        probs = torch.softmax(logits, dim=-1)[:, 1]
-      return probs.cpu().tolist()
+        # Logit difference: r(x, y) = logits[:, 1] - logits[:, 0]
+        rewards = (logits[:, 1] - logits[:, 0]).cpu().tolist()
+      return rewards
 
     self.trainer = RLOOTrainer(
         model=self.policy,
@@ -1899,7 +1902,10 @@ class EvaluationScoringPipeline(EvaluationPipeline):
     set_seed(self.args.seed)
 
   def setup_tokenizer(self):
-    if not self.args.use_gemini:
+    if (
+        getattr(self.args, "run_autorater", True)
+        and not self.args.use_gemini
+    ):
       self.tokenizer = AutoTokenizer.from_pretrained(
           self.args.evaluator_model, padding_side="left"
       )
@@ -1912,6 +1918,9 @@ class EvaluationScoringPipeline(EvaluationPipeline):
     )
 
   def process_data(self):
+    if not getattr(self.args, "run_autorater", True):
+      return
+
     processor_cls = get_task_processor(self.args.task_name)
     prompt_fn = processor_cls.get_evaluator_prompt()
     fewshot_examples = None
@@ -1933,7 +1942,10 @@ class EvaluationScoringPipeline(EvaluationPipeline):
     )
 
   def setup_model(self):
-    if not self.args.use_gemini:
+    if (
+        getattr(self.args, "run_autorater", True)
+        and not self.args.use_gemini
+    ):
       # Use causal LM evaluator and set eval mode
       self.evaluator = AutoModelForCausalLM.from_pretrained(
           self.args.evaluator_model,
@@ -1942,28 +1954,33 @@ class EvaluationScoringPipeline(EvaluationPipeline):
       self.evaluator.eval()
 
   def run_and_save(self):
-    # Score dataset using tokenizer and evaluator (support gemini)
-    if self.args.use_gemini:
-      client = self.create_gemini_client()
-      scores = self.gemini_score_dataset(client, self.val_data, self.args)
-    else:
-      yes_token_id = self.tokenizer.convert_tokens_to_ids("Yes")
-      no_token_id = self.tokenizer.convert_tokens_to_ids("No")
-      scores = self.evaluator_score(
-          self.val_data,
-          self.args,
-          self.tokenizer,
-          self.evaluator,
-          yes_token_id,
-          no_token_id,
+    autorater_score_list = None
+    if getattr(self.args, "run_autorater", True):
+      # Score dataset using tokenizer and evaluator (support gemini)
+      if self.args.use_gemini:
+        client = self.create_gemini_client()
+        scores = self.gemini_score_dataset(client, self.val_data, self.args)
+      else:
+        yes_token_id = self.tokenizer.convert_tokens_to_ids("Yes")
+        no_token_id = self.tokenizer.convert_tokens_to_ids("No")
+        scores = self.evaluator_score(
+            self.val_data,
+            self.args,
+            self.tokenizer,
+            self.evaluator,
+            yes_token_id,
+            no_token_id,
+        )
+      # Compute simple rate and push dataset updated
+      t = torch.nn.Threshold(self.args.threshold, 0, inplace=False)
+      classifs = torch.ceil(t(scores)).clamp(0, 1)
+      self.val_data = self.val_data.add_column("scores", scores.tolist())
+      self.val_data = self.val_data.add_column(
+          "classifications", classifs.tolist()
       )
-    # Compute simple rate and push dataset updated
-    t = torch.nn.Threshold(self.args.threshold, 0, inplace=False)
-    classifs = torch.ceil(t(scores)).clamp(0, 1)
-    self.val_data = self.val_data.add_column("scores", scores.tolist())
-    self.val_data = self.val_data.add_column(
-        "classifications", classifs.tolist()
-    )
+      autorater_score_list = scores.tolist()
+    elif "scores" in self.val_data.column_names:
+      autorater_score_list = list(self.val_data["scores"])
 
     # Compute comprehensive generation metrics (ROUGE, BERTScore, lengths, distinct-n, repetition, PPL)
     if getattr(self.args, "compute_generation_metrics", True):
@@ -1990,7 +2007,7 @@ class EvaluationScoringPipeline(EvaluationPipeline):
           summary,
           output_dir=os.path.join("logs", "eval"),
           dataset_name=dataset_name,
-          autorater_scores=scores.tolist(),
+          autorater_scores=autorater_score_list,
           threshold=self.args.threshold,
           log_to_wandb=getattr(self.args, "log_to_wandb", False),
           wandb_project=getattr(self.args, "wandb_project", "new_perl_eval"),
