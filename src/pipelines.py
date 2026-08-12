@@ -17,6 +17,7 @@ Each pipeline implements the sequence of steps described in the project:
 from __future__ import annotations
 
 import abc
+import glob
 import os
 import random
 import sys
@@ -1952,9 +1953,28 @@ class EvaluationScoringPipeline(EvaluationPipeline):
   def load_data(self):
     if self.args.dataset_with_completions is None:
       raise ValueError("dataset_with_completions is required for scoring mode")
-    self.full_dataset = load_dataset(
-        self.args.dataset_with_completions, split="test"
-    )
+    try:
+      self.full_dataset = load_dataset(
+          self.args.dataset_with_completions, split="test"
+      )
+    except Exception as e:
+      print(
+          f"Notice: Standard load_dataset encountered schema mismatch ({e})."
+          " Loading parquet data directly from HF snapshot..."
+      )
+      local_dir = snapshot_download(
+          repo_id=self.args.dataset_with_completions,
+          repo_type="dataset",
+          allow_patterns=["*.parquet"],
+      )
+      parquet_files = sorted(
+          glob.glob(os.path.join(local_dir, "**", "*.parquet"), recursive=True)
+      )
+      if not parquet_files:
+        raise ValueError(
+            f"No parquet files found in dataset {self.args.dataset_with_completions}"
+        )
+      self.full_dataset = Dataset.from_parquet(parquet_files)
     max_samples = getattr(self.args, "max_eval_samples", None)
     if (
         max_samples is not None
