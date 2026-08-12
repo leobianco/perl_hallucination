@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import abc
 import os
+import random
 import sys
 import time
 from typing import Any, Optional, Sequence
@@ -1930,10 +1931,30 @@ class EvaluationScoringPipeline(EvaluationPipeline):
   def load_data(self):
     if self.args.dataset_with_completions is None:
       raise ValueError("dataset_with_completions is required for scoring mode")
-    self.val_data = load_dataset(
+    self.full_dataset = load_dataset(
         self.args.dataset_with_completions, split="test"
     )
-    self.val_data = self._subsample_dataset(self.val_data)
+    max_samples = getattr(self.args, "max_eval_samples", None)
+    if (
+        max_samples is not None
+        and max_samples > 0
+        and len(self.full_dataset) > max_samples
+    ):
+      print(
+          f"Subsampling evaluation to {max_samples} out of"
+          f" {len(self.full_dataset)} samples (seed={self.args.seed}). Full"
+          " dataset completions will be preserved on hub."
+      )
+      rng = random.Random(self.args.seed)
+      all_indices = list(range(len(self.full_dataset)))
+      rng.shuffle(all_indices)
+      self.eval_indices = all_indices[:max_samples]
+      self.val_data = self.full_dataset.select(self.eval_indices)
+      self.is_subsampled = True
+    else:
+      self.eval_indices = list(range(len(self.full_dataset)))
+      self.val_data = self.full_dataset
+      self.is_subsampled = False
 
   def process_data(self):
     if not getattr(self.args, "run_autorater", True):
@@ -2032,4 +2053,43 @@ class EvaluationScoringPipeline(EvaluationPipeline):
           wandb_run_name=getattr(self.args, "wandb_run_name", None),
       )
 
-    self.val_data.push_to_hub(self.args.dataset_with_completions)
+    if self.is_subsampled:
+      # Merge scored subset columns back into full dataset, preserving all rows
+      final_dataset = self.full_dataset
+      evaluated_metric_cols = [
+          "scores",
+          "classifications",
+          "rouge1_f1",
+          "rouge2_f1",
+          "rougeL_f1",
+          "bertscore_f1",
+          "char_length",
+          "token_length",
+          "distinct_1",
+          "distinct_2",
+          "repetition_rate",
+          "perplexity",
+      ]
+      for col_name in self.val_data.column_names:
+        if (
+            col_name in evaluated_metric_cols
+            or col_name not in final_dataset.column_names
+        ):
+          if col_name in final_dataset.column_names:
+            full_col_vals = list(final_dataset[col_name])
+          else:
+            full_col_vals = [None] * len(final_dataset)
+          for idx_in_val, orig_idx in enumerate(self.eval_indices):
+            full_col_vals[orig_idx] = self.val_data[col_name][idx_in_val]
+          if col_name in final_dataset.column_names:
+            final_dataset = final_dataset.remove_columns(col_name)
+          final_dataset = final_dataset.add_column(col_name, full_col_vals)
+      self.full_dataset = final_dataset
+      print(
+          f"Pushing full dataset ({len(self.full_dataset)} total samples,"
+          f" {len(self.val_data)} scored) to"
+          f" {self.args.dataset_with_completions}"
+      )
+      self.full_dataset.push_to_hub(self.args.dataset_with_completions)
+    else:
+      self.val_data.push_to_hub(self.args.dataset_with_completions)

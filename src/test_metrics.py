@@ -276,6 +276,56 @@ class TestMetrics(unittest.TestCase):
     full = subsample(dataset, -1, 42)
     self.assertEqual(len(full), 50)
 
+  def test_subsampled_scoring_preserves_full_dataset(self):
+    """Verifies that scoring a subsample preserves all un-evaluated rows."""
+    full_data = {
+        "prompt": [f"Prompt {i}" for i in range(100)],
+        "completion": [f"Completion {i}" for i in range(100)],
+        "reference": [f"Reference {i}" for i in range(100)],
+    }
+    full_dataset = MockDataset(full_data)
+
+    # Subsample 10 rows
+    import random
+    rng = random.Random(12345)
+    all_indices = list(range(len(full_dataset)))
+    rng.shuffle(all_indices)
+    eval_indices = all_indices[:10]
+    sub_val_data = full_dataset.select(eval_indices)
+
+    # Evaluate the 10 rows
+    evaluator = GenerationMetricsEvaluator(
+        compute_bertscore_metric=False,
+        compute_perplexity_metric=False,
+    )
+    sub_val_data, summary = evaluator.evaluate_dataset(sub_val_data)
+    sub_scores = [0.99] * 10
+    sub_val_data = sub_val_data.add_column("scores", sub_scores)
+
+    # Merge back into full dataset
+    final_dataset = full_dataset
+    evaluated_cols = ["scores", "rouge1_f1", "rougeL_f1", "token_length"]
+    for col in evaluated_cols:
+      full_col_vals = [None] * len(final_dataset)
+      for idx_in_val, orig_idx in enumerate(eval_indices):
+        full_col_vals[orig_idx] = sub_val_data[col][idx_in_val]
+      final_dataset = final_dataset.add_column(col, full_col_vals)
+
+    # Total rows must remain 100!
+    self.assertEqual(len(final_dataset), 100)
+    # The 10 evaluated rows have valid metric values
+    for orig_idx in eval_indices:
+      self.assertIsNotNone(final_dataset["scores"][orig_idx])
+      self.assertEqual(final_dataset["scores"][orig_idx], 0.99)
+      self.assertIsNotNone(final_dataset["rougeL_f1"][orig_idx])
+    # The remaining 90 rows have None for scores, but keep their original prompt/completion
+    unscored_indices = [i for i in range(100) if i not in eval_indices]
+    self.assertEqual(len(unscored_indices), 90)
+    for orig_idx in unscored_indices:
+      self.assertIsNone(final_dataset["scores"][orig_idx])
+      self.assertEqual(final_dataset["prompt"][orig_idx], f"Prompt {orig_idx}")
+      self.assertEqual(final_dataset["completion"][orig_idx], f"Completion {orig_idx}")
+
 
 if __name__ == "__main__":
   unittest.main()
