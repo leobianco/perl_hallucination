@@ -53,6 +53,8 @@ attrs==26.1.0
     #   aiohttp
     #   jsonschema
     #   referencing
+bert-score==0.3.13
+    # via -r requirements.in
 blake3==1.0.9
     # via vllm
 cachetools==7.1.7
