@@ -1928,7 +1928,8 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
         "Pushing dataset with generations to"
         f" {self.args.user}/{name_for_saving}"
     )
-    self.dataset_prompts.push_to_hub(f"{self.args.user}/{name_for_saving}")
+    clean_dataset = Dataset.from_dict(self.dataset_prompts.to_dict())
+    clean_dataset.push_to_hub(f"{self.args.user}/{name_for_saving}")
 
 
 class EvaluationScoringPipeline(EvaluationPipeline):
@@ -2110,6 +2111,8 @@ class EvaluationScoringPipeline(EvaluationPipeline):
           f" {len(self.val_data)} scored) to"
           f" {self.args.dataset_with_completions}"
       )
-      self.full_dataset.push_to_hub(self.args.dataset_with_completions)
+      clean_dataset = Dataset.from_dict(self.full_dataset.to_dict())
+      clean_dataset.push_to_hub(self.args.dataset_with_completions)
     else:
-      self.val_data.push_to_hub(self.args.dataset_with_completions)
+      clean_dataset = Dataset.from_dict(self.val_data.to_dict())
+      clean_dataset.push_to_hub(self.args.dataset_with_completions)

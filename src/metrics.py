@@ -691,11 +691,23 @@ class GenerationMetricsEvaluator:
       metric_columns["perplexity"] = ppl_scores
 
     # 5. Add columns to dataset
-    updated_dataset = dataset
+    updated_dict = (
+        dict(dataset.to_dict())
+        if hasattr(dataset, "to_dict")
+        else {col: list(dataset[col]) for col in dataset.column_names}
+    )
     for col_name, values in metric_columns.items():
-      if col_name in updated_dataset.column_names:
-        updated_dataset = updated_dataset.remove_columns(col_name)
-      updated_dataset = updated_dataset.add_column(col_name, values)
+      updated_dict[col_name] = values
+
+    try:
+      from datasets import Dataset
+      updated_dataset = Dataset.from_dict(updated_dict)
+    except Exception:
+      updated_dataset = dataset
+      for col_name, values in metric_columns.items():
+        if col_name in updated_dataset.column_names:
+          updated_dataset = updated_dataset.remove_columns(col_name)
+        updated_dataset = updated_dataset.add_column(col_name, values)
 
     # 6. Compute summary statistics
     summary = {}
