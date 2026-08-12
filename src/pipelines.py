@@ -1287,25 +1287,36 @@ class EvaluationPipeline(Pipeline):
       self, path: str, split: Optional[str] = None
   ) -> Dataset:
     """Loads dataset from Hugging Face Hub with parquet snapshot fallback."""
+    target_split = split or "test"
     try:
-      return load_dataset(path, split=split)
+      return load_dataset(path, split=target_split)
     except Exception as e:
       print(
-          f"Notice: Standard load_dataset failed for {path} ({e})."
-          " Falling back to direct parquet download..."
+          f"Notice: Standard load_dataset failed for {path}"
+          f" (split={target_split}): {e}. Falling back to direct parquet"
+          " download..."
       )
       local_dir = snapshot_download(
           repo_id=path,
           repo_type="dataset",
           allow_patterns=["*.parquet"],
       )
-      parquet_files = sorted(
-          glob.glob(os.path.join(local_dir, "**", "*.parquet"), recursive=True)
+      split_parquet_files = sorted(
+          glob.glob(
+              os.path.join(local_dir, "**", f"{target_split}-*.parquet"),
+              recursive=True,
+          )
       )
+      if split_parquet_files:
+        parquet_files = split_parquet_files
+      else:
+        parquet_files = sorted(
+            glob.glob(
+                os.path.join(local_dir, "**", "*.parquet"), recursive=True
+            )
+        )
       if not parquet_files:
-        raise ValueError(
-            f"No parquet files found in dataset {path}"
-        ) from e
+        raise ValueError(f"No parquet files found in dataset {path}") from e
       return Dataset.from_parquet(parquet_files)
 
   def _subsample_dataset(self, dataset: Dataset) -> Dataset:
@@ -1940,7 +1951,10 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
         f" {self.args.user}/{name_for_saving}"
     )
     clean_dataset = Dataset.from_dict(self.dataset_prompts.to_dict())
-    clean_dataset.push_to_hub(f"{self.args.user}/{name_for_saving}")
+    clean_dataset.push_to_hub(
+        f"{self.args.user}/{name_for_saving}",
+        split=self.args.dataset_prompts_split or "test",
+    )
 
 
 class EvaluationScoringPipeline(EvaluationPipeline):
@@ -2130,11 +2144,17 @@ class EvaluationScoringPipeline(EvaluationPipeline):
           f" {len(self.val_data)} scored) to"
           f" {self.args.dataset_with_completions}"
       )
-      self.full_dataset.push_to_hub(self.args.dataset_with_completions)
+      self.full_dataset.push_to_hub(
+          self.args.dataset_with_completions,
+          split="test",
+      )
     else:
       clean_dataset = (
           Dataset.from_dict(self.val_data.to_dict())
           if hasattr(self.val_data, "to_dict")
           else self.val_data
       )
-      clean_dataset.push_to_hub(self.args.dataset_with_completions)
+      clean_dataset.push_to_hub(
+          self.args.dataset_with_completions,
+          split="test",
+      )
