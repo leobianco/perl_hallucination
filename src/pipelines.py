@@ -40,14 +40,17 @@ from sklearn.metrics import (
     precision_score,
     roc_auc_score,
 )
+from src.models import (
+    Gemma4ForSequenceClassification,
+    register_gemma4_for_sequence_classification,
+)
 from src.utils import (
-    DpoScriptArguments,
     EvalArguments,
-    ScopeDataGenArguments,
-    SsfoDataGenArguments,
     LLMSynthScriptArguments,
     LoraArguments,
+    ScopeDataGenArguments,
     ScriptArguments,
+    SsfoDataGenArguments,
     compute_best_roc_threshold,
     create_lora_argument_parser,
     get_task_processor,
@@ -166,8 +169,17 @@ class SFTPipeline(Pipeline):
     self._lora_args = lora_args
 
   def load_data(self) -> None:
+    train_dataset = load_dataset(self.args.dataset_repo_id, split="train")
+    if (
+        getattr(self.args, "sft_data_fraction", None) is not None
+        and 0.0 < self.args.sft_data_fraction < 1.0
+    ):
+      train_dataset = train_dataset.shuffle(seed=self.training_args.seed)
+      num_samples = int(len(train_dataset) * self.args.sft_data_fraction)
+      train_dataset = train_dataset.select(range(num_samples))
+
     self.data = {
-        "train": load_dataset(self.args.dataset_repo_id, split="train"),
+        "train": train_dataset,
         "test": load_dataset(self.args.dataset_repo_id, split="test"),
     }
 
@@ -304,6 +316,7 @@ class RewardModelPipeline(Pipeline):
       self.data[split] = self.data[split].cast(new_features)
 
   def setup_model(self) -> None:
+    register_gemma4_for_sequence_classification(self.args.model_repo_id)
     id2label = {0: "Yes", 1: "No"}
     label2id = {"Yes": 0, "No": 1}
 
@@ -420,6 +433,7 @@ class PERLPipeline(Pipeline):
         self.training_args, "sft_model_path", None
     )
 
+    register_gemma4_for_sequence_classification(reward_model_path)
     self.reward_model = AutoModelForSequenceClassification.from_pretrained(
         reward_model_path,
         num_labels=2,
@@ -1234,7 +1248,8 @@ class EvaluationPipeline(Pipeline):
       project = os.environ.get("GOOGLE_CLOUD_PROJECT")
       location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
       print(
-          f"Initializing Google GenAI Client using Vertex AI (project={project}, location={location})..."
+          "Initializing Google GenAI Client using Vertex AI"
+          f" (project={project}, location={location})..."
       )
       return genai.Client(vertexai=True, project=project, location=location)
     elif getattr(self.args, "gemini_api_key", None):
