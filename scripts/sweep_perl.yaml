@@ -26,6 +26,7 @@ command:
   - --report_to=wandb
   - --logging_steps=1
   - --logging_strategy=steps
+  - --log_completions=True
   - --task_name=npov
   - --seed=130104
   - --dataset_repo_id=leobianco/npov_perl
@@ -35,7 +36,7 @@ command:
   - --do_train=True
   - --do_eval=True
   - --eval_strategy=steps
-  - --eval_steps=10
+  - --eval_steps=50
   - --eval_on_start=True
   - --save_only_model=True
   - --save_strategy=no

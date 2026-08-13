@@ -51,6 +51,7 @@ accelerate launch \
   --report_to "wandb" \
   --run_name "$RUN_IDENTIFIER" \
   --logging_steps 1 \
+  --log_completions True \
   --output_dir "./checkpoints/${TASK_NAME}/perl/${RUN_IDENTIFIER}" \
   --push_to_hub True \
   --hub_model_id "$RUN_IDENTIFIER" \
