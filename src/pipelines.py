@@ -2217,6 +2217,11 @@ class EvaluationScoringPipeline(EvaluationPipeline):
             full_col_vals[orig_idx] = self.val_data[col_name][idx_in_val]
           final_dict[col_name] = full_col_vals
 
+      # Remove any stale reference metric columns from prior runs if not evaluated now
+      for metric_col in ["rouge1_f1", "rouge2_f1", "rougeL_f1", "bertscore_f1"]:
+        if metric_col not in self.val_data.column_names and metric_col in final_dict:
+          final_dict.pop(metric_col, None)
+
       self.full_dataset = Dataset.from_dict(final_dict)
       print(
           f"Pushing full dataset ({len(self.full_dataset)} total samples,"

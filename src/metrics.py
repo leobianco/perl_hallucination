@@ -666,17 +666,39 @@ class GenerationMetricsEvaluator:
         dataset.column_names
     )
     if ref_col is not None and ref_col in dataset.column_names:
-      references = list(dataset[ref_col])
-      rouge_dict = compute_rouge(completions, references)
-      metric_columns["rouge1_f1"] = rouge_dict["rouge1_f1"]
-      metric_columns["rouge2_f1"] = rouge_dict["rouge2_f1"]
-      metric_columns["rougeL_f1"] = rouge_dict["rougeL_f1"]
-
-      if self.compute_bertscore_metric:
-        bs_scores = compute_bertscore(
-            completions, references, model_type=self.bertscore_model
+      raw_references = list(dataset[ref_col])
+      references = [
+          str(r).strip()
+          if (r is not None and not (isinstance(r, float) and math.isnan(r)))
+          else ""
+          for r in raw_references
+      ]
+      has_valid_refs = any(len(r) > 0 for r in references)
+      if has_valid_refs:
+        print(
+            f"Computing reference alignment metrics (ROUGE, BERTScore) against"
+            f" reference column '{ref_col}'..."
         )
-        metric_columns["bertscore_f1"] = bs_scores
+        rouge_dict = compute_rouge(completions, references)
+        metric_columns["rouge1_f1"] = rouge_dict["rouge1_f1"]
+        metric_columns["rouge2_f1"] = rouge_dict["rouge2_f1"]
+        metric_columns["rougeL_f1"] = rouge_dict["rougeL_f1"]
+
+        if self.compute_bertscore_metric:
+          bs_scores = compute_bertscore(
+              completions, references, model_type=self.bertscore_model
+          )
+          metric_columns["bertscore_f1"] = bs_scores
+      else:
+        print(
+            f"Notice: Reference column '{ref_col}' contains only empty/null values."
+            " Skipping ROUGE and BERTScore (no ground-truth reference text available)."
+        )
+    else:
+      print(
+          "Notice: No reference column found in dataset."
+          " Skipping ROUGE and BERTScore (open-ended generation benchmark)."
+      )
 
     # 4. Fluency (Conditional Perplexity)
     if (
