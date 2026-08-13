@@ -14,7 +14,7 @@
 program: src/perl.py
 method: bayes
 metric:
-  name: rewards/reward_fn/mean
+  name: train/rewards/reward_fn/mean
   goal: maximize
 
 command:
