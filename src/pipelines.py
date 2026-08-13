@@ -40,6 +40,7 @@ except Exception:
 
 from datasets import (
     Dataset,
+    DatasetDict,
     Value,
     concatenate_datasets,
     load_dataset,
@@ -2027,10 +2028,9 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
         f" {self.args.user}/{name_for_saving}"
     )
     clean_dataset = Dataset.from_dict(self.dataset_prompts.to_dict())
-    clean_dataset.push_to_hub(
-        f"{self.args.user}/{name_for_saving}",
-        split=self.args.dataset_prompts_split or "test",
-    )
+    split_name = self.args.dataset_prompts_split or "test"
+    dataset_dict = DatasetDict({split_name: clean_dataset})
+    dataset_dict.push_to_hub(f"{self.args.user}/{name_for_saving}")
 
 
 class EvaluationScoringPipeline(EvaluationPipeline):
@@ -2223,17 +2223,13 @@ class EvaluationScoringPipeline(EvaluationPipeline):
           f" {len(self.val_data)} scored) to"
           f" {self.args.dataset_with_completions}"
       )
-      self.full_dataset.push_to_hub(
-          self.args.dataset_with_completions,
-          split="test",
-      )
+      dataset_dict = DatasetDict({"test": self.full_dataset})
+      dataset_dict.push_to_hub(self.args.dataset_with_completions)
     else:
       clean_dataset = (
           Dataset.from_dict(self.val_data.to_dict())
           if hasattr(self.val_data, "to_dict")
           else self.val_data
       )
-      clean_dataset.push_to_hub(
-          self.args.dataset_with_completions,
-          split="test",
-      )
+      dataset_dict = DatasetDict({"test": clean_dataset})
+      dataset_dict.push_to_hub(self.args.dataset_with_completions)
