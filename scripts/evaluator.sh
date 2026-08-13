@@ -18,6 +18,8 @@ TOP_P=1.0
 TOP_K=0
 COMPUTE_BERTSCORE="True"
 BERTSCORE_MODEL="sentence-transformers/all-MiniLM-L6-v2"
+LOG_TO_WANDB="True"
+WANDB_PROJECT="new_perl_eval"
 
 # Parameters derived from above
 TASK_NAME="$1"
