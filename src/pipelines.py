@@ -96,6 +96,11 @@ from trl import (
 from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
 
+try:
+  import wandb
+except ImportError:
+  wandb = None
+
 
 def _clean_cli_args(cli_args: Sequence[str] | None = None) -> list[str]:
   """Filter out stray '--' tokens from arguments before passing to argparse."""
@@ -235,6 +240,21 @@ class SFTPipeline(Pipeline):
     # keep lora config object around for setup_model
     self._lora_args = lora_args
 
+    task = script_args.task_name or "sft"
+    lr = training_args.learning_rate
+    r = getattr(lora_args, "lora_r", None)
+    epochs = getattr(training_args, "num_train_epochs", None)
+    run_name_parts = [f"{task}_SFT", f"lr{lr:.1e}"]
+    if r is not None:
+      run_name_parts.append(f"r{r}")
+    if epochs is not None:
+      run_name_parts.append(f"epo{epochs}")
+    run_name = "_".join(run_name_parts)
+    if not training_args.run_name or "sweep" in str(training_args.run_name).lower():
+      self.training_args.run_name = run_name
+    if wandb is not None and getattr(wandb, "run", None) is not None:
+      wandb.run.name = run_name
+
   def load_data(self) -> None:
     train_dataset = load_dataset(self.args.dataset_repo_id, split="train")
     if (
@@ -333,6 +353,21 @@ class RewardModelPipeline(Pipeline):
     self.training_args = training_args
     self._lora_args = lora_args
     set_seed(training_args.seed)
+
+    task = script_args.task_name or "rm"
+    lr = training_args.learning_rate
+    r = getattr(lora_args, "lora_r", None)
+    epochs = getattr(training_args, "num_train_epochs", None)
+    run_name_parts = [f"{task}_RM", f"lr{lr:.1e}"]
+    if r is not None:
+      run_name_parts.append(f"r{r}")
+    if epochs is not None:
+      run_name_parts.append(f"epo{epochs}")
+    run_name = "_".join(run_name_parts)
+    if not training_args.run_name or "sweep" in str(training_args.run_name).lower():
+      self.training_args.run_name = run_name
+    if wandb is not None and getattr(wandb, "run", None) is not None:
+      wandb.run.name = run_name
 
   def load_data(self) -> None:
     self.data = load_dataset(self.args.dataset_repo_id)
@@ -504,6 +539,25 @@ class PERLPipeline(Pipeline):
     self.training_args = training_args
     set_seed(training_args.seed)
 
+    task = script_args.task_name or "perl"
+    lr = training_args.learning_rate
+    beta = getattr(training_args, "beta", None)
+    temp = getattr(training_args, "temperature", None)
+    epochs = getattr(training_args, "num_train_epochs", None)
+    run_name_parts = [f"{task}_PERL", f"lr{lr:.1e}"]
+    if beta is not None:
+      name_beta = f"{beta:.2g}" if beta >= 0.001 else f"{beta:.1e}"
+      run_name_parts.append(f"beta{name_beta}")
+    if temp is not None:
+      run_name_parts.append(f"T{temp}")
+    if epochs is not None:
+      run_name_parts.append(f"epo{epochs}")
+    run_name = "_".join(run_name_parts)
+    if not training_args.run_name or "sweep" in str(training_args.run_name).lower():
+      self.training_args.run_name = run_name
+    if wandb is not None and getattr(wandb, "run", None) is not None:
+      wandb.run.name = run_name
+
   def load_data(self) -> None:
     self.data = load_dataset(self.args.dataset_repo_id)
 
@@ -659,6 +713,25 @@ class DPOPipeline(Pipeline):
     self.training_args = training_args
     set_seed(training_args.seed)
     self._lora_args = lora_args
+
+    task = script_args.task_name or "dpo"
+    lr = training_args.learning_rate
+    beta = getattr(training_args, "beta", None)
+    r = getattr(lora_args, "lora_r", None)
+    epochs = getattr(training_args, "num_train_epochs", None)
+    run_name_parts = [f"{task}_DPO", f"lr{lr:.1e}"]
+    if beta is not None:
+      name_beta = f"{beta:.2g}" if beta >= 0.001 else f"{beta:.1e}"
+      run_name_parts.append(f"beta{name_beta}")
+    if r is not None:
+      run_name_parts.append(f"r{r}")
+    if epochs is not None:
+      run_name_parts.append(f"epo{epochs}")
+    run_name = "_".join(run_name_parts)
+    if not training_args.run_name or "sweep" in str(training_args.run_name).lower():
+      self.training_args.run_name = run_name
+    if wandb is not None and getattr(wandb, "run", None) is not None:
+      wandb.run.name = run_name
 
   def load_data(self) -> None:
     data = load_dataset(self.args.dataset_repo_id)
