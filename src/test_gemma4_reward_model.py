@@ -157,14 +157,24 @@ class TestGemma4ForSequenceClassification(unittest.TestCase):
     self.assertTrue(output.loss.item() >= 0.0)
 
   def test_reward_scoring_probability(self):
-    """Test PE-RL reward scoring logic: P(label 1 = 'No' hallucination)."""
+    """Test autorater probability scoring logic: P(label 1 = 'No' hallucination)."""
     input_ids = torch.tensor([[10, 20, 30]])
     with torch.no_grad():
       output = self.model(input_ids=input_ids)
       probs = torch.softmax(output.logits, dim=-1)[:, 1]
-    
+
     self.assertEqual(probs.shape, (1,))
     self.assertTrue(0.0 <= probs.item() <= 1.0)
+
+  def test_reward_scoring_logit_diff(self):
+    """Test PE-RL reward scoring logic using logit difference (Label 1 - Label 0)."""
+    input_ids = torch.tensor([[10, 20, 30]])
+    with torch.no_grad():
+      output = self.model(input_ids=input_ids)
+      rewards = output.logits[:, 1] - output.logits[:, 0]
+
+    self.assertEqual(rewards.shape, (1,))
+    self.assertIsInstance(rewards.item(), float)
 
 
 class TestAutoModelRegistration(unittest.TestCase):

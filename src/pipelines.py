@@ -549,7 +549,9 @@ class PERLPipeline(Pipeline):
         )
       else:
         raise
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     self.reward_model.to(torch.bfloat16)
+    self.reward_model.to(device)
     self.reward_model.eval()
 
     self.reward_tokenizer = AutoTokenizer.from_pretrained(
@@ -1693,10 +1695,11 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
   def setup_model(self) -> None:
     # Load evaluator as causal LM and set eval mode
     if not self.args.use_gemini:
+      device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
       self.evaluator = AutoModelForCausalLM.from_pretrained(
           self.args.evaluator_model,
           torch_dtype=torch.bfloat16,
-      )
+      ).to(device)
       self.evaluator.eval()
 
   def run_and_save(self) -> None:
@@ -2031,11 +2034,12 @@ class EvaluationScoringPipeline(EvaluationPipeline):
         getattr(self.args, "run_autorater", True)
         and not self.args.use_gemini
     ):
+      device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
       # Use causal LM evaluator and set eval mode
       self.evaluator = AutoModelForCausalLM.from_pretrained(
           self.args.evaluator_model,
           torch_dtype=torch.bfloat16,
-      )
+      ).to(device)
       self.evaluator.eval()
 
   def run_and_save(self):
