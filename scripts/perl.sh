@@ -21,6 +21,10 @@ PER_DEVICE_BATCH_SIZE=8
 AUTO_FIND_BATCH_SIZE=False
 TEMPERATURE=0.1
 SAVE_STRATEGY="epoch"
+DO_EVAL=True
+EVAL_STRATEGY="steps"
+EVAL_STEPS=10
+EVAL_ON_START=True
 
 # Infrastructure Parameters
 DEEPSPEED_CONFIG="scripts/deepspeed_config.yaml"
@@ -53,6 +57,10 @@ accelerate launch \
   --dataset_repo_id "${USER}/${TASK_NAME}_perl" \
   --model_repo_id "${MODEL_REPO_ID}" \
   --do_train True \
+  --do_eval "$DO_EVAL" \
+  --eval_strategy "$EVAL_STRATEGY" \
+  --eval_steps "$EVAL_STEPS" \
+  --eval_on_start "$EVAL_ON_START" \
   --save_strategy "$SAVE_STRATEGY" \
   --load_best_model_at_end True \
   --metric_for_best_model "rewards/reward_fn/mean" \

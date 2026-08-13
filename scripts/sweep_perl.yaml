@@ -33,6 +33,10 @@ command:
   - --sft_model_path=leobianco/
   - --reward_model_path=leobianco/
   - --do_train=True
+  - --do_eval=True
+  - --eval_strategy=steps
+  - --eval_steps=10
+  - --eval_on_start=True
   - --save_only_model=True
   - --save_strategy=no
   - --lr_scheduler_type=cosine
