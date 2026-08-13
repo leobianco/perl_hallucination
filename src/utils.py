@@ -425,8 +425,8 @@ class EvalArguments:
   )
 
   bertscore_model: str = field(
-      default="roberta-large",
-      metadata={"help": "Model identifier for BERTScore embeddings."},
+      default="sentence-transformers/all-MiniLM-L6-v2",
+      metadata={"help": "Model identifier for semantic similarity embeddings."},
   )
 
   compute_perplexity: bool = field(

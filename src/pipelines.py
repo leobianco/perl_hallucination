@@ -2075,7 +2075,9 @@ class EvaluationScoringPipeline(EvaluationPipeline):
     if getattr(self.args, "compute_generation_metrics", True):
       evaluator = GenerationMetricsEvaluator(
           bertscore_model=getattr(
-              self.args, "bertscore_model", "roberta-large"
+              self.args,
+              "bertscore_model",
+              "sentence-transformers/all-MiniLM-L6-v2",
           ),
           compute_bertscore_metric=getattr(
               self.args, "compute_bertscore", True

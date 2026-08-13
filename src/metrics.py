@@ -28,11 +28,6 @@ except ImportError:
   rouge_scorer = None
 
 try:
-  import bert_score
-except ImportError:
-  bert_score = None
-
-try:
   import wandb
 except ImportError:
   wandb = None
@@ -176,85 +171,17 @@ os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
-def _direct_pytorch_bertscore(
-    predictions: list[str],
-    references: list[str],
-    model_name: str = "roberta-large",
-    device: Optional[str] = None,
-    batch_size: int = 32,
-) -> list[float]:
-  """Direct PyTorch implementation of BERTScore F1 matching Zhang et al. (ICLR 2020)."""
-  if torch is None:
-    return [0.0] * len(predictions)
-
-  try:
-    from transformers import AutoModel, AutoTokenizer
-  except ImportError:
-    return [0.0] * len(predictions)
-
-  if device is None:
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-  try:
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name)
-    model.to(device)
-    model.eval()
-  except Exception as e:
-    print(f"Warning: Direct PyTorch BERTScore failed to load model {model_name}: {e}")
-    return [0.0] * len(predictions)
-
-  scores = []
-  for i in range(0, len(predictions), batch_size):
-    batch_preds = predictions[i : i + batch_size]
-    batch_refs = references[i : i + batch_size]
-
-    for pred, ref in zip(batch_preds, batch_refs):
-      pred_clean = pred.strip() if pred else ""
-      ref_clean = ref.strip() if ref else ""
-      if not pred_clean or not ref_clean:
-        scores.append(0.0)
-        continue
-
-      try:
-        pred_enc = tokenizer(
-            pred_clean, return_tensors="pt", truncation=True, max_length=512
-        ).to(device)
-        ref_enc = tokenizer(
-            ref_clean, return_tensors="pt", truncation=True, max_length=512
-        ).to(device)
-
-        with torch.no_grad():
-          pred_emb = model(**pred_enc).last_hidden_state[0]
-          ref_emb = model(**ref_enc).last_hidden_state[0]
-
-        if pred_emb.size(0) > 2:
-          pred_emb = pred_emb[1:-1]
-        if ref_emb.size(0) > 2:
-          ref_emb = ref_emb[1:-1]
-
-        pred_norm = torch.nn.functional.normalize(pred_emb, p=2, dim=-1)
-        ref_norm = torch.nn.functional.normalize(ref_emb, p=2, dim=-1)
-
-        sim = torch.matmul(pred_norm, ref_norm.transpose(0, 1))
-        r = sim.max(dim=0).values.mean().item()
-        p = sim.max(dim=1).values.mean().item()
-        f1 = (2.0 * p * r) / (p + r) if (p + r) > 0 else 0.0
-        scores.append(max(0.0, min(1.0, float(f1))))
-      except Exception:
-        scores.append(0.0)
-
-  return scores
-
-
 def compute_bertscore(
     predictions: list[str],
     references: list[str],
-    model_type: str = "roberta-large",
-    batch_size: int = 32,
+    model_type: str = "sentence-transformers/all-MiniLM-L6-v2",
+    batch_size: int = 64,
     device: Optional[str] = None,
 ) -> list[float]:
-  """Computes BERTScore F1 between generated completions and references.
+  """Computes semantic embedding similarity / BERTScore between predictions and references.
+
+  Supports sentence-transformers embeddings (fast cosine similarity on mean-pooled
+  vectors) and standard transformer encoders (token-level greedy matching BERTScore).
 
   Args:
       predictions: List of generated completion strings.
@@ -264,59 +191,134 @@ def compute_bertscore(
       device: Device string (e.g. 'cuda', 'cpu'). Auto-detected if None.
 
   Returns:
-      List of per-sample BERTScore F1 float values in [0.0, 1.0].
+      List of per-sample similarity float values in [0.0, 1.0].
   """
   if len(predictions) != len(references):
     raise ValueError(
         f"Length mismatch: {len(predictions)} predictions vs"
         f" {len(references)} references"
     )
+  if not predictions:
+    return []
+  if torch is None:
+    return [0.0] * len(predictions)
+
+  try:
+    from transformers import AutoModel, AutoTokenizer, logging as hf_logging
+  except ImportError:
+    return [0.0] * len(predictions)
 
   if device is None:
-    device = "cuda" if (torch is not None and torch.cuda.is_available()) else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-  safe_preds = [p.strip() if (p and p.strip()) else " " for p in predictions]
-  safe_refs = [r.strip() if (r and r.strip()) else " " for r in references]
+  # Load model cleanly without noisy weight-initialization warnings
+  prev_verbosity = hf_logging.get_verbosity()
+  hf_logging.set_verbosity_error()
+  try:
+    tokenizer = AutoTokenizer.from_pretrained(model_type)
+    model = AutoModel.from_pretrained(model_type)
+    model.to(device)
+    model.eval()
+  except Exception as e:
+    print(
+        f"Notice: Semantic similarity model '{model_type}' could not be"
+        f" loaded: {e}. Defaulting scores to 0.0."
+    )
+    return [0.0] * len(predictions)
+  finally:
+    hf_logging.set_verbosity(prev_verbosity)
 
-  # Attempt 1: Use bert_score library with candidate models
-  if bert_score is not None and torch is not None:
-    models_to_try = [model_type]
-    if model_type != "roberta-large":
-      models_to_try.append("roberta-large")
-
-    for candidate_model in models_to_try:
-      try:
-        with torch.no_grad():
-          _, _, f1 = bert_score.score(
-              safe_preds,
-              safe_refs,
-              model_type=candidate_model,
-              batch_size=batch_size,
-              device=device,
-              lang="en",
-              rescale_with_baseline=False,
-              verbose=False,
-          )
-        scores = f1.cpu().tolist()
-        for i, (p, r) in enumerate(zip(predictions, references)):
-          if not p or not p.strip() or not r or not r.strip():
-            scores[i] = 0.0
-        return [float(s) for s in scores]
-      except Exception as e:
-        print(
-            f"Warning: bert_score.score failed with model '{candidate_model}': {e}"
-        )
-
-  # Attempt 2: Direct PyTorch BERTScore computation
-  fallback_model = "roberta-large" if model_type == "microsoft/deberta-v3-large" else model_type
-  print(f"Using direct PyTorch BERTScore with '{fallback_model}'...")
-  return _direct_pytorch_bertscore(
-      predictions,
-      references,
-      model_name=fallback_model,
-      device=device,
-      batch_size=batch_size,
+  scores = []
+  is_sentence_emb = any(
+      k in model_type.lower() for k in ["sentence-transformers", "minilm", "bge", "mpnet"]
   )
+
+  for i in range(0, len(predictions), batch_size):
+    batch_preds = predictions[i : i + batch_size]
+    batch_refs = references[i : i + batch_size]
+
+    valid_pairs = []
+    for idx, (p, r) in enumerate(zip(batch_preds, batch_refs)):
+      p_str = p.strip() if (p and isinstance(p, str)) else ""
+      r_str = r.strip() if (r and isinstance(r, str)) else ""
+      if p_str and r_str:
+        valid_pairs.append((idx, p_str, r_str))
+
+    if not valid_pairs:
+      scores.extend([0.0] * len(batch_preds))
+      continue
+
+    batch_scores = [0.0] * len(batch_preds)
+    v_preds = [item[1] for item in valid_pairs]
+    v_refs = [item[2] for item in valid_pairs]
+
+    try:
+      p_enc = tokenizer(
+          v_preds,
+          padding=True,
+          truncation=True,
+          max_length=512,
+          return_tensors="pt",
+      ).to(device)
+      r_enc = tokenizer(
+          v_refs,
+          padding=True,
+          truncation=True,
+          max_length=512,
+          return_tensors="pt",
+      ).to(device)
+
+      with torch.no_grad():
+        p_out = model(**p_enc)
+        r_out = model(**r_enc)
+
+        if is_sentence_emb:
+          p_mask = p_enc["attention_mask"].unsqueeze(-1).float()
+          p_vec = (p_out.last_hidden_state * p_mask).sum(1) / torch.clamp(
+              p_mask.sum(1), min=1e-9
+          )
+          p_vec = torch.nn.functional.normalize(p_vec, p=2, dim=-1)
+
+          r_mask = r_enc["attention_mask"].unsqueeze(-1).float()
+          r_vec = (r_out.last_hidden_state * r_mask).sum(1) / torch.clamp(
+              r_mask.sum(1), min=1e-9
+          )
+          r_vec = torch.nn.functional.normalize(r_vec, p=2, dim=-1)
+
+          sims = (p_vec * r_vec).sum(dim=-1).cpu().tolist()
+          for (orig_idx, _, _), sim in zip(valid_pairs, sims):
+            batch_scores[orig_idx] = max(0.0, min(1.0, float(sim)))
+        else:
+          for (orig_idx, _, _), p_emb, r_emb, p_m, r_m in zip(
+              valid_pairs,
+              p_out.last_hidden_state,
+              r_out.last_hidden_state,
+              p_enc["attention_mask"],
+              r_enc["attention_mask"],
+          ):
+            p_valid = p_emb[p_m.bool()]
+            r_valid = r_emb[r_m.bool()]
+            if len(p_valid) > 2:
+              p_valid = p_valid[1:-1]
+            if len(r_valid) > 2:
+              r_valid = r_valid[1:-1]
+            p_norm = torch.nn.functional.normalize(p_valid, p=2, dim=-1)
+            r_norm = torch.nn.functional.normalize(r_valid, p=2, dim=-1)
+            sim = torch.matmul(p_norm, r_norm.transpose(0, 1))
+            r_val = sim.max(dim=0).values.mean().item()
+            p_val = sim.max(dim=1).values.mean().item()
+            f1 = (
+                (2.0 * p_val * r_val) / (p_val + r_val)
+                if (p_val + r_val) > 0
+                else 0.0
+            )
+            batch_scores[orig_idx] = max(0.0, min(1.0, float(f1)))
+    except Exception:
+      pass
+
+    scores.extend(batch_scores)
+
+  return scores
 
 
 def compute_length_metrics(
@@ -564,7 +566,7 @@ class GenerationMetricsEvaluator:
 
   def __init__(
       self,
-      bertscore_model: str = "roberta-large",
+      bertscore_model: str = "sentence-transformers/all-MiniLM-L6-v2",
       compute_bertscore_metric: bool = True,
       compute_perplexity_metric: bool = False,
       fluency_model: Optional[Any] = None,

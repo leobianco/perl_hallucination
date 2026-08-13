@@ -16,6 +16,8 @@ MAX_EVAL_SAMPLES=1000
 TEMPERATURE=0.0
 TOP_P=1.0
 TOP_K=0
+COMPUTE_BERTSCORE="True"
+BERTSCORE_MODEL="sentence-transformers/all-MiniLM-L6-v2"
 
 # Parameters derived from above
 TASK_NAME="$1"
@@ -78,6 +80,8 @@ elif [ "$2" == "score" ]; then
         --evaluate_evaluator False \
         --threshold $THRESHOLD \
         --dataset_with_completions "$DATASET_WITH_COMPLETIONS" \
+        --compute_bertscore "$COMPUTE_BERTSCORE" \
+        --bertscore_model "$BERTSCORE_MODEL" \
         --log_to_wandb "${LOG_TO_WANDB:-False}" \
         --wandb_project "${WANDB_PROJECT:-new_perl_eval}"
 elif [ "$2" == "autoratereval" ]; then

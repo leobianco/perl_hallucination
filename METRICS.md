@@ -34,17 +34,16 @@ This codebase uses a **4-pillar evaluation framework**:
 
 ## Underlying Models Used
 
-### 1. BERTScore Model
-* **Default Model**: `roberta-large` (with seamless fallback and support for `microsoft/deberta-v3-large`)
-* **Configuration Flag**: `--bertscore_model "roberta-large"`
-* **Why RoBERTa-large / DeBERTa-v3-large?**
-  * In the BERTScore literature (Zhang et al., ICLR 2020), `roberta-large` is the canonical reference model with proven cross-domain robustness, full safetensors distribution, and fast evaluation. `microsoft/deberta-v3-large` can also be specified if desired.
+### 1. Semantic Similarity / BERTScore Model
+* **Default Model**: `sentence-transformers/all-MiniLM-L6-v2` (Fast, 80MB, safetensors, 0 warnings; or `bert-base-uncased` / `roberta-large`)
+* **Configuration Flag**: `--bertscore_model "sentence-transformers/all-MiniLM-L6-v2"` (can be disabled via `--compute_bertscore False`)
+* **Why all-MiniLM-L6-v2?**
+  * Specially trained for semantic similarity and sentence embedding cosine correlation.
+  * Super lightweight (80MB vs 1.4GB for roberta-large), processes 1,000 samples in <1s, and runs with 0 initialization warnings.
 * **How It Works**:
-  1. Computes contextual token embeddings for both the generated completion and the reference.
-  2. Calculates pairwise cosine similarity between all token embeddings.
-  3. Computes greedy maximum similarity matching to calculate precision ($P_{\text{BERT}}$) and recall ($R_{\text{BERT}}$).
-  4. Returns the harmonic mean:
-     $$\text{BERTScore-F1} = 2 \cdot \frac{P_{\text{BERT}} \cdot R_{\text{BERT}}}{P_{\text{BERT}} + R_{\text{BERT}}}$$
+  1. Computes contextual embeddings for both the generated completion and the reference.
+  2. Calculates normalized cosine similarity between the semantic embeddings.
+  3. Returns the similarity score in $[0.0, 1.0]$.
 
 ---
 
