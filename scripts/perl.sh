@@ -18,12 +18,14 @@ NUM_GENERATIONS=4
 NUM_ITERATIONS=1
 STEPS_PER_GENERATION=16
 PER_DEVICE_BATCH_SIZE=8
+PER_DEVICE_EVAL_BATCH_SIZE=16
 AUTO_FIND_BATCH_SIZE=False
 TEMPERATURE=0.1
-SAVE_STRATEGY="epoch"
+SAVE_STRATEGY="steps"
+SAVE_STEPS=50
 DO_EVAL=True
 EVAL_STRATEGY="steps"
-EVAL_STEPS=10
+EVAL_STEPS=50
 EVAL_ON_START=True
 
 # Infrastructure Parameters
@@ -63,6 +65,7 @@ accelerate launch \
   --eval_steps "$EVAL_STEPS" \
   --eval_on_start "$EVAL_ON_START" \
   --save_strategy "$SAVE_STRATEGY" \
+  --save_steps "$SAVE_STEPS" \
   --load_best_model_at_end True \
   --metric_for_best_model "rewards/reward_fn/mean" \
   --greater_is_better True \
@@ -75,8 +78,7 @@ accelerate launch \
   --max_completion_length "$MAX_COMPLETION_LENGTH" \
   --weight_decay 0.0 \
   --gradient_accumulation_steps 1 \
-  --per_device_eval_batch_size "$PER_DEVICE_BATCH_SIZE" \
-  --eval_accumulation_steps 1 \
+  --per_device_eval_batch_size "$PER_DEVICE_EVAL_BATCH_SIZE" \
   --reward_model_path "${REWARD_MODEL_PATH}" \
   --sft_model_path "${SFT_MODEL_PATH}" \
   --beta "$BETA" \
