@@ -421,9 +421,39 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             fewshot_examples: Optional[Dataset] = None,
             use_true_label: bool = False,
         ) -> dict:
-            preamble = "<start_of_turn>user\nBelow are examples where an expert linguist identifies when the neutral natural language rewritings of arguments used to answer a user query contains additional arguments not present in the original list.<end_of_turn>\n"
+            header = (
+                "You are an expert fact-checking evaluator. Your task is to"
+                " analyze whether a neutral point-of-view (NPOV) response"
+                " contains any claims or arguments that were NOT provided in"
+                " the original source arguments list.\n\n"
+                "Evaluation Guidelines:\n"
+                "- Answer 'Yes' if the response introduces external claims,"
+                " facts, statistics, or arguments absent from the provided"
+                " lists.\n"
+                "- Answer 'No' if the response only summarizes, paraphrases, and"
+                " synthesizes the provided arguments without adding new"
+                " claims.\n\n"
+            )
 
-            template = "<start_of_turn>user\nUser query: {user_query}\n{perspective_1_name} arguments provided: {perspective_1}\n{perspective_2_name} arguments provided: {perspective_2}\nNeutral point-of-view answer to user query, rewriting provided arguments in natural language:{npov_response}\nExpert linguist review: the rewriting of the provided arguments contains additional arguments not present in the original list (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
+            example_template = (
+                "Example {num}:\n"
+                "User Query: {user_query}\n"
+                "{perspective_1_name} arguments provided: {perspective_1}\n"
+                "{perspective_2_name} arguments provided: {perspective_2}\n"
+                "Neutral point-of-view answer: {npov_response}\n"
+                "Contains additional arguments not present in the provided list"
+                " (Yes/No): {ans}\n\n"
+            )
+
+            task_template = (
+                "Task to Evaluate:\n"
+                "User Query: {user_query}\n"
+                "{perspective_1_name} arguments provided: {perspective_1}\n"
+                "{perspective_2_name} arguments provided: {perspective_2}\n"
+                "Neutral point-of-view answer: {npov_response}\n"
+                "Contains additional arguments not present in the provided list"
+                " (Yes/No):"
+            )
 
             response = (
                 entry["npov_response"]
@@ -431,21 +461,12 @@ class NPOVTaskProcessor(BaseTaskProcessor):
                 else entry["completion"]
             )
 
-            formatted_prompt = template.format(
-                user_query=entry["user_query"],
-                perspective_1_name=entry["perspective_1_name"],
-                perspective_1=entry["perspective_1"],
-                perspective_2_name=entry["perspective_2_name"],
-                perspective_2=entry["perspective_2"],
-                npov_response=response,
-                ans="",
-            )
+            prompt = header
 
-            prompt = preamble
-
-            if fewshot_examples is not None:
-                for fewshot_example in fewshot_examples:
-                    fewshot_prompt = template.format(
+            if fewshot_examples is not None and len(fewshot_examples) > 0:
+                for idx, fewshot_example in enumerate(fewshot_examples):
+                    fewshot_prompt = example_template.format(
+                        num=idx + 1,
                         user_query=fewshot_example["user_query"],
                         perspective_1_name=fewshot_example[
                             "perspective_1_name"
@@ -458,10 +479,17 @@ class NPOVTaskProcessor(BaseTaskProcessor):
                         npov_response=fewshot_example["npov_response"],
                         ans=fewshot_example["class_hall"],
                     )
-                    prompt += fewshot_prompt + "<end_of_turn>\n"
-                prompt += formatted_prompt
-            else:
-                prompt += formatted_prompt
+                    prompt += fewshot_prompt
+
+            formatted_task = task_template.format(
+                user_query=entry["user_query"],
+                perspective_1_name=entry["perspective_1_name"],
+                perspective_1=entry["perspective_1"],
+                perspective_2_name=entry["perspective_2_name"],
+                perspective_2=entry["perspective_2"],
+                npov_response=response,
+            )
+            prompt += formatted_task
 
             entry["evaluator_prompt"] = prompt
             return entry

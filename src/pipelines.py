@@ -1510,15 +1510,15 @@ class EvaluationPipeline(Pipeline):
   def gemini_score_response(
       self, response: types.GenerateContentResponse
   ) -> float:
-    """Converts a Gemini API response to a normalized score.
+    """Converts a Gemini API response to a calibrated probability P(No hallucination / Faithful).
 
     Args:
         response (google.genai.types.GenerateContentResponse): Gemini API
           response.
 
     Returns:
-        float: Normalized score in [0.0, 1.0] for the response (P(No
-        hallucination)).
+        float: Normalized probability in [0.0, 1.0] for the response (P(No
+        hallucination / Faithful)).
     """
     if not response or not response.candidates:
       return 0.5
@@ -1527,31 +1527,63 @@ class EvaluationPipeline(Pipeline):
     text = response.text.strip() if response.text else ""
     clean_text = text.strip("\"'` \n\r\t")
 
-    # 1. Check if token logprobs are available in candidate.logprobs_result
+    # 1. Search candidate logprobs for "No" vs "Yes" tokens
     if (
         hasattr(candidate, "logprobs_result")
         and candidate.logprobs_result is not None
     ):
       chosen = getattr(candidate.logprobs_result, "chosen_candidates", None)
       if chosen and len(chosen) > 0:
-        top_cands = getattr(chosen[0], "top_candidates", None)
-        if top_cands:
-          logp_no = None
-          logp_yes = None
+        for token_cand in chosen:
+          top_cands = getattr(token_cand, "top_candidates", None)
+          if not top_cands:
+            continue
+
+          sum_p_no = 0.0
+          sum_p_yes = 0.0
           for cand in top_cands:
             cand_token = (
-                getattr(cand, "token", "").strip().strip("\"'`").lower()
+                getattr(cand, "token", "")
+                .strip()
+                .strip("\"'`:.,\n\r\t")
+                .lower()
             )
-            if cand_token == "no":
-              logp_no = getattr(cand, "logprob", None)
-            elif cand_token == "yes":
-              logp_yes = getattr(cand, "logprob", None)
-          if logp_no is not None and logp_yes is not None:
-            p_no = float(np.exp(logp_no))
-            p_yes = float(np.exp(logp_yes))
-            denom = p_no + p_yes
-            if denom > 0:
-              return float(p_no / denom)
+            cand_logprob = getattr(cand, "logprob", None)
+            if cand_logprob is None:
+              continue
+            prob = float(np.exp(cand_logprob))
+            if cand_token in ("no", "false", "none"):
+              sum_p_no += prob
+            elif cand_token in ("yes", "true"):
+              sum_p_yes += prob
+
+          # Both "No" and "Yes" found in top candidates: exact relative probability
+          if sum_p_no > 0.0 and sum_p_yes > 0.0:
+            denom = sum_p_no + sum_p_yes
+            return float(sum_p_no / denom)
+
+          # Only "No" in top candidates (Yes is extremely unlikely)
+          if sum_p_no > 0.0 and sum_p_yes == 0.0:
+            return float(min(max(sum_p_no, 0.95), 0.9999))
+
+          # Only "Yes" in top candidates (No is extremely unlikely)
+          if sum_p_yes > 0.0 and sum_p_no == 0.0:
+            return float(max(min(1.0 - sum_p_yes, 0.05), 0.0001))
+
+        # Check chosen token logprob if available
+        first_chosen_token = (
+            getattr(chosen[0], "token", "")
+            .strip()
+            .strip("\"'`:.,\n\r\t")
+            .lower()
+        )
+        first_chosen_logprob = getattr(chosen[0], "logprob", None)
+        if first_chosen_logprob is not None:
+          p = float(np.exp(first_chosen_logprob))
+          if first_chosen_token in ("no", "false"):
+            return float(min(max(p, 0.5), 0.9999))
+          elif first_chosen_token in ("yes", "true"):
+            return float(max(min(1.0 - p, 0.5), 0.0001))
 
     # 2. Check avg_logprobs if available
     if getattr(candidate, "avg_logprobs", None) is not None:
@@ -1587,6 +1619,12 @@ class EvaluationPipeline(Pipeline):
     """
     model = getattr(script_args, "evaluator_model", None) or "gemini-2.0-flash"
     schema = {"type": "STRING", "enum": ["No", "Yes"]}
+    system_instruction = (
+        "You are an expert fact-checking and hallucination evaluator. Respond"
+        " ONLY with 'Yes' if the answer contains any unprovided claims or"
+        " hallucinations, or 'No' if the answer is completely supported by the"
+        " provided context."
+    )
     print(f"Calling the Gemini API with model {model}...")
 
     # Prepare local checkpoint directory
@@ -1646,14 +1684,16 @@ class EvaluationPipeline(Pipeline):
 
           if current_use_logprobs:
             config_kwargs = {
+                "system_instruction": system_instruction,
                 "temperature": 0,
                 "max_output_tokens": 10,
                 "response_logprobs": True,
-                "logprobs": 5,
+                "logprobs": 20,
                 "seed": script_args.seed,
             }
           else:
             config_kwargs = {
+                "system_instruction": system_instruction,
                 "response_mime_type": "text/x.enum",
                 "response_schema": schema,
                 "temperature": 0,
