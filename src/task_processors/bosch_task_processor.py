@@ -10,7 +10,7 @@ from google.genai import types
 from src.task_processors.base_task_processor import BaseTaskProcessor
 
 # Ensure punkt_tab tokenizer is available
-nltk.download("punkt_tab")
+nltk.download("punkt_tab", quiet=True)
 
 
 class BoschTaskProcessor(BaseTaskProcessor):
