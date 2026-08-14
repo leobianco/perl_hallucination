@@ -12,6 +12,7 @@ from typing import Dict, Optional, Sequence, Union
 import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.metrics import accuracy_score, roc_curve
+
 from src.task_processors.base_task_processor import BaseTaskProcessor
 from src.task_processors.bosch_task_processor import BoschTaskProcessor
 from src.task_processors.npov_task_processor import NPOVTaskProcessor
@@ -348,7 +349,17 @@ class EvalArguments:
       },
   )
 
-  eval_batch_size: int = field(default=1)
+  eval_batch_size: int = field(
+      default=32,
+      metadata={"help": "Batch size for local model evaluation."},
+  )
+
+  max_workers: int = field(
+      default=16,
+      metadata={
+          "help": "Number of concurrent worker threads for Gemini API scoring."
+      },
+  )
 
   max_tokens: int = field(default=128)
 
