@@ -1552,6 +1552,10 @@ class EvaluationPipeline(Pipeline):
             denom = p_no + p_yes
             if denom > 0:
               return float(p_no / denom)
+          elif logp_no is not None:
+            return float(np.exp(logp_no))
+          elif logp_yes is not None:
+            return float(1.0 - np.exp(logp_yes))
 
     # 2. Check avg_logprobs if available
     if getattr(candidate, "avg_logprobs", None) is not None:

@@ -466,24 +466,28 @@ class BoschTaskProcessor(BaseTaskProcessor):
             fewshot_examples: Optional[Dataset] = None,
             use_true_label: bool = False,
         ) -> dict:
-            preamble = '<start_of_turn>user\nYou are an expert linguist and fact-checker responsible for determining when an answer contains information not supported by a source text.\n\nIn this task:\n1. A user asks a question about their car\n2. You receive an excerpt from the car\'s manual\n3. You examine a proposed answer to the user\'s question\n\nYour ONLY job is to determine: Does the proposed answer contain ANY statements, claims, instructions, or implications that are NOT explicitly supported by the manual excerpt?\n\nImportant evaluation criteria:\n- If the answer makes ANY claim not directly supported by the manual, respond with "Yes"\n- If the answer contains any logical implication not explicitly appearing in the manual excerpt, valid or not, respond with "Yes"\n- If the answer only rephrases information from the manual without adding new claims, respond with "No"\n- If the answer is FULLY supported by the manual, but truncated at the last sentence (due to word limit), answer "No"\n- Introduction sentences such as "Follow these steps:" and conclusions such as "I hope these helps!" are allowed. If all other sentences are supported by the context, answer "No"\n- Ignore differences in tone, style, or level of detail if the underlying information is supported\n- Focus solely on faithfulness to the source, not helpfulness or completeness\n\nProvide ONLY "Yes" or "No" as your final answer.\n<end_of_turn>\n'
-
-            template = "<start_of_turn>user\nQuestion: {question}\n\nManual excerpt: {context}\n\nProposed answer: {response}\n\nAnalysis:\n1. Compare each statement in the proposed answer to the manual excerpt\n2. Identify any claims in the answer not explicitly supported by the manual\n3. Consider whether the answer introduces new information not present in the manual\n\nDoes the proposed answer state anything not supported by the information in the manual? (Yes/No):\n<end_of_turn>\n<start_of_turn>model\n{ans}\n"
+            template = (
+                "<start_of_turn>user\n"
+                "You are an expert fact-checker evaluating car manual answers.\n\n"
+                "Question: {question}\n\n"
+                "Manual excerpt: {context}\n\n"
+                "Proposed answer: {response}\n\n"
+                "Evaluation criteria:\n"
+                "- If the answer makes ANY claim not directly supported by the manual, respond with 'Yes'.\n"
+                "- If the answer only rephrases information from the manual without adding new claims, respond with 'No'.\n"
+                "- Courtesy intro/outro sentences are allowed if all factual statements are supported.\n\n"
+                "Does the proposed answer state anything not supported by the information in the manual? (Yes/No):<end_of_turn>\n"
+                "<start_of_turn>model\n"
+                "{ans}"
+            )
 
             response = (
                 entry["response"] if use_true_label else entry["completion"]
             )
 
-            formatted_prompt = template.format(
-                question=entry["Question"],
-                context=entry["Context"],
-                response=response,
-                ans="",
-            )
+            prompt = ""
 
-            prompt = preamble
-
-            if fewshot_examples is not None:
+            if fewshot_examples is not None and len(fewshot_examples) > 0:
                 for fewshot_example in fewshot_examples:
                     fewshot_prompt = template.format(
                         question=fewshot_example["Question"],
@@ -492,9 +496,14 @@ class BoschTaskProcessor(BaseTaskProcessor):
                         ans=fewshot_example["class_hall"],
                     )
                     prompt += fewshot_prompt + "<end_of_turn>\n"
-                prompt += formatted_prompt
-            else:
-                prompt += formatted_prompt
+
+            formatted_target = template.format(
+                question=entry["Question"],
+                context=entry["Context"],
+                response=response,
+                ans="",
+            )
+            prompt += formatted_target
 
             entry["evaluator_prompt"] = prompt
             return entry
