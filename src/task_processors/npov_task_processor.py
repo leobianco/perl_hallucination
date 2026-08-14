@@ -421,20 +421,9 @@ class NPOVTaskProcessor(BaseTaskProcessor):
             fewshot_examples: Optional[Dataset] = None,
             use_true_label: bool = False,
         ) -> dict:
-            template = (
-                "<start_of_turn>user\n"
-                "You are an expert fact-checker evaluating neutral point-of-view (NPOV) rewritings.\n\n"
-                "User query: {user_query}\n"
-                "{perspective_1_name} arguments provided: {perspective_1}\n"
-                "{perspective_2_name} arguments provided: {perspective_2}\n\n"
-                "Neutral point-of-view answer:\n{npov_response}\n\n"
-                "Evaluation criteria:\n"
-                "- Answer 'Yes' if the answer introduces ANY external arguments, claims, facts, or perspectives not present in the provided lists.\n"
-                "- Answer 'No' if the answer only summarizes and synthesizes the provided arguments without adding new claims.\n\n"
-                "Expert linguist review: the rewriting of the provided arguments contains additional arguments not present in the original list (Yes/No):<end_of_turn>\n"
-                "<start_of_turn>model\n"
-                "{ans}"
-            )
+            preamble = "<start_of_turn>user\nBelow are examples where an expert linguist identifies when the neutral natural language rewritings of arguments used to answer a user query contains additional arguments not present in the original list.<end_of_turn>\n"
+
+            template = "<start_of_turn>user\nUser query: {user_query}\n{perspective_1_name} arguments provided: {perspective_1}\n{perspective_2_name} arguments provided: {perspective_2}\nNeutral point-of-view answer to user query, rewriting provided arguments in natural language:{npov_response}\nExpert linguist review: the rewriting of the provided arguments contains additional arguments not present in the original list (Yes/No):<end_of_turn>\n<start_of_turn>model\n{ans}"
 
             response = (
                 entry["npov_response"]
@@ -442,9 +431,19 @@ class NPOVTaskProcessor(BaseTaskProcessor):
                 else entry["completion"]
             )
 
-            prompt = ""
+            formatted_prompt = template.format(
+                user_query=entry["user_query"],
+                perspective_1_name=entry["perspective_1_name"],
+                perspective_1=entry["perspective_1"],
+                perspective_2_name=entry["perspective_2_name"],
+                perspective_2=entry["perspective_2"],
+                npov_response=response,
+                ans="",
+            )
 
-            if fewshot_examples is not None and len(fewshot_examples) > 0:
+            prompt = preamble
+
+            if fewshot_examples is not None:
                 for fewshot_example in fewshot_examples:
                     fewshot_prompt = template.format(
                         user_query=fewshot_example["user_query"],
@@ -460,17 +459,9 @@ class NPOVTaskProcessor(BaseTaskProcessor):
                         ans=fewshot_example["class_hall"],
                     )
                     prompt += fewshot_prompt + "<end_of_turn>\n"
-
-            formatted_target = template.format(
-                user_query=entry["user_query"],
-                perspective_1_name=entry["perspective_1_name"],
-                perspective_1=entry["perspective_1"],
-                perspective_2_name=entry["perspective_2_name"],
-                perspective_2=entry["perspective_2"],
-                npov_response=response,
-                ans="",
-            )
-            prompt += formatted_target
+                prompt += formatted_prompt
+            else:
+                prompt += formatted_prompt
 
             entry["evaluator_prompt"] = prompt
             return entry
