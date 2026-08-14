@@ -17,10 +17,13 @@ Each pipeline implements the sequence of steps described in the project:
 from __future__ import annotations
 
 import abc
+import concurrent.futures
 import glob
+import math
 import os
 import random
 import sys
+import threading
 import time
 from typing import Any, Optional, Sequence
 
@@ -647,6 +650,7 @@ class PERLPipeline(Pipeline):
           texts,
           padding=True,
           truncation=True,
+          max_length=512,
           return_tensors="pt",
       ).to(reward_model.device)
       with torch.no_grad():
@@ -1458,9 +1462,14 @@ class EvaluationPipeline(Pipeline):
       yes_token_id: int,
       no_token_id: int,
   ) -> torch.Tensor:
-    iterator = data.iter(batch_size=script_args.eval_batch_size)
-    num_batches = int(data.num_rows / script_args.eval_batch_size)
-    scores = torch.tensor([])
+    batch_size = getattr(script_args, "eval_batch_size", 32)
+    iterator = data.iter(batch_size=batch_size)
+    num_batches = (
+        int(math.ceil(data.num_rows / batch_size))
+        if hasattr(data, "num_rows")
+        else None
+    )
+    all_scores: list[torch.Tensor] = []
     for batch in tqdm(iterator, desc="Evaluator scoring", total=num_batches):
       tokenized_prompts = tokenizer(
           batch["evaluator_prompt"],
@@ -1473,10 +1482,11 @@ class EvaluationPipeline(Pipeline):
       score_batch = self.evaluator_score_batch(
           evaluator, tokenized_prompts, yes_token_id, no_token_id
       )
-      score_batch = score_batch.cpu()
-      scores = torch.cat((scores, score_batch))
+      all_scores.append(score_batch.cpu())
       del tokenized_prompts
-    return scores
+    if not all_scores:
+      return torch.tensor([])
+    return torch.cat(all_scores, dim=0)
 
   def create_gemini_client(self) -> genai.Client:
     """Initializes Google GenAI Client supporting Vertex AI or API Key."""
@@ -1611,97 +1621,110 @@ class EvaluationPipeline(Pipeline):
     else:
       scores = [None] * len(dataset)
 
-    queries_per_minute = 2000
-    time_window = 60
-    query_count = 0
-    start_time = time.time()
+    max_workers = getattr(script_args, "max_workers", 16) or 16
     save_frequency = 50  # Save progress every 50 entries
-    server_retry_wait = 20  # seconds to wait between server error retries
-    server_max_retries = 3  # number of times to retry on server error
+    server_retry_wait = 5  # Base seconds to wait between server error retries
+    server_max_retries = 4  # Number of times to retry on server error
     entries_to_score = [i for i, score in enumerate(scores) if score is None]
-    print(f"Found {len(entries_to_score)} entries that need scoring...")
+    print(
+        f"Found {len(entries_to_score)} entries to score. Scoring concurrently"
+        f" with {max_workers} worker threads..."
+    )
 
-    use_logprobs = True
-    try:
-      for n, idx in enumerate(
-          tqdm(entries_to_score, desc="Scoring with Gemini API")
-      ):
-        elapsed_time = time.time() - start_time
-        if query_count == (queries_per_minute - 1):
-          if elapsed_time < time_window:
-            wait_time = time_window - elapsed_time
-            print(f"Wait {wait_time:.2f} seconds to avoid API rate limit...")
-            time.sleep(wait_time + 1)
-          query_count = 0
-          start_time = time.time()
+    lock = threading.Lock()
+    use_logprobs_flag = [True]
+    completed_count = 0
 
-        retry_count = 0
-        while retry_count < server_max_retries:
-          try:
-            if use_logprobs:
-              # When requesting logprobs, do not pass response_mime_type="text/x.enum"
-              # as structured enum decoding can conflict with logprobs on Vertex AI
-              config_kwargs = {
-                  "temperature": 0,
-                  "max_output_tokens": 10,
-                  "response_logprobs": True,
-                  "logprobs": 5,
-                  "seed": script_args.seed,
-              }
-            else:
-              config_kwargs = {
-                  "response_mime_type": "text/x.enum",
-                  "response_schema": schema,
-                  "temperature": 0,
-                  "max_output_tokens": 10,
-                  "seed": script_args.seed,
-              }
+    def score_single_entry(idx: int) -> tuple[int, float]:
+      prompt_content = dataset[idx]["evaluator_prompt"]
+      retry_count = 0
+      while retry_count < server_max_retries:
+        current_use_logprobs = True
+        try:
+          with lock:
+            current_use_logprobs = use_logprobs_flag[0]
 
-            response = client.models.generate_content(
-                model=model,
-                contents=dataset[idx]["evaluator_prompt"],
-                config=types.GenerateContentConfig(**config_kwargs),
+          if current_use_logprobs:
+            config_kwargs = {
+                "temperature": 0,
+                "max_output_tokens": 10,
+                "response_logprobs": True,
+                "logprobs": 5,
+                "seed": script_args.seed,
+            }
+          else:
+            config_kwargs = {
+                "response_mime_type": "text/x.enum",
+                "response_schema": schema,
+                "temperature": 0,
+                "max_output_tokens": 10,
+                "seed": script_args.seed,
+            }
+
+          response = client.models.generate_content(
+              model=model,
+              contents=prompt_content,
+              config=types.GenerateContentConfig(**config_kwargs),
+          )
+          score = self.gemini_score_response(response)
+          return idx, score
+
+        except Exception as e:
+          error_str = str(e).lower()
+          if "logprob" in error_str and current_use_logprobs:
+            with lock:
+              use_logprobs_flag[0] = False
+            continue
+          if (
+              "unavailable" in error_str
+              or "overloaded" in error_str
+              or "overcharged" in error_str
+              or "server" in error_str
+              or "resource_exhausted" in error_str
+              or "429" in error_str
+              or "503" in error_str
+          ) and retry_count < server_max_retries - 1:
+            backoff = (
+                server_retry_wait * (1.5**retry_count) + random.uniform(0.5, 2.0)
             )
-            scores[idx] = self.gemini_score_response(response)
-            query_count += 1
-            break  # Success, break out of retry loop
-          except Exception as e:
-            error_str = str(e).lower()
-            if "logprob" in error_str and use_logprobs:
-              print(
-                  f"\nNotice: Logprobs request failed with error: {e}. "
-                  "Falling back to text classification."
-              )
-              use_logprobs = False
-              continue
-            if (
-                "unavailable" in error_str
-                or "overloaded" in error_str
-                or "overcharged" in error_str
-                or "server" in error_str
-                or "resource_exhausted" in error_str
-            ) and retry_count < server_max_retries - 1:
-              print(
-                  f"Server unavailable/overloaded at entry {idx}, attempt"
-                  f" {retry_count + 1}/{server_max_retries}. Waiting"
-                  f" {server_retry_wait} seconds before retrying..."
-              )
-              time.sleep(server_retry_wait)
-              retry_count += 1
-              continue
-            else:
-              raise  # Not a server error or max retries reached
+            time.sleep(backoff)
+            retry_count += 1
+            continue
+          else:
+            raise e
 
-        # Save progress periodically to local file
-        if (n + 1) % save_frequency == 0:
-          print(f"\nSaving progress locally after {n + 1} new entries...")
-          try:
-            torch.save(scores, checkpoint_path)
-          except Exception as e:
-            print(f"Warning: Could not save intermediate progress locally: {e}")
+      raise RuntimeError(
+          f"Failed to score entry {idx} after {server_max_retries} attempts."
+      )
+
+    try:
+      with concurrent.futures.ThreadPoolExecutor(
+          max_workers=max_workers
+      ) as executor:
+        future_to_idx = {
+            executor.submit(score_single_entry, idx): idx
+            for idx in entries_to_score
+        }
+        for future in tqdm(
+            concurrent.futures.as_completed(future_to_idx),
+            total=len(entries_to_score),
+            desc="Scoring with Gemini API (parallel)",
+        ):
+          idx, score = future.result()
+          with lock:
+            scores[idx] = score
+            completed_count += 1
+            if completed_count % save_frequency == 0:
+              try:
+                torch.save(scores, checkpoint_path)
+              except Exception as save_err:
+                print(
+                    "Warning: Could not save intermediate progress locally:"
+                    f" {save_err}"
+                )
 
     except Exception as e:
-      print(f"\nError encountered at entry {idx}: {str(e)}")
+      print(f"\nError encountered during parallel scoring: {str(e)}")
       print("Saving current progress locally...")
       try:
         torch.save(scores, checkpoint_path)
@@ -2194,8 +2217,14 @@ class EvaluationScoringPipeline(EvaluationPipeline):
           "scores",
           "classifications",
           "rouge1_f1",
+          "rouge1_precision",
+          "rouge1_recall",
           "rouge2_f1",
+          "rouge2_precision",
+          "rouge2_recall",
           "rougeL_f1",
+          "rougeL_precision",
+          "rougeL_recall",
           "bertscore_f1",
           "char_length",
           "token_length",
@@ -2218,7 +2247,18 @@ class EvaluationScoringPipeline(EvaluationPipeline):
           final_dict[col_name] = full_col_vals
 
       # Remove any stale reference metric columns from prior runs if not evaluated now
-      for metric_col in ["rouge1_f1", "rouge2_f1", "rougeL_f1", "bertscore_f1"]:
+      for metric_col in [
+          "rouge1_f1",
+          "rouge1_precision",
+          "rouge1_recall",
+          "rouge2_f1",
+          "rouge2_precision",
+          "rouge2_recall",
+          "rougeL_f1",
+          "rougeL_precision",
+          "rougeL_recall",
+          "bertscore_f1",
+      ]:
         if metric_col not in self.val_data.column_names and metric_col in final_dict:
           final_dict.pop(metric_col, None)
 

@@ -372,6 +372,33 @@ class TestMetrics(unittest.TestCase):
     # Stale token_length should be overwritten with accurate values
     self.assertEqual(updated_ds["token_length"], [2, 3])
 
+  def test_evaluate_dataset_multi_perspective_context(self):
+    """Verifies that ROUGE & context grounding works on NPOV datasets with perspective_1/2."""
+    evaluator = GenerationMetricsEvaluator(
+        compute_bertscore_metric=False,
+        compute_perplexity_metric=False,
+    )
+    dataset = MockDataset({
+        "prompt": ["Write NPOV response"],
+        "completion": [
+            "Nuclear energy produces zero emissions but waste storage is an"
+            " issue."
+        ],
+        "perspective_1": [
+            "Nuclear energy produces zero greenhouse gas emissions."
+        ],
+        "perspective_1_name": ["pro"],
+        "perspective_2": ["Waste storage is a major hazard."],
+        "perspective_2_name": ["con"],
+    })
+    updated_ds, summary = evaluator.evaluate_dataset(dataset)
+    self.assertIn("rouge1_precision", updated_ds.column_names)
+    self.assertIn("rouge1_recall", updated_ds.column_names)
+    self.assertIn("rougeL_f1", updated_ds.column_names)
+    self.assertGreater(updated_ds["rouge1_precision"][0], 0.0)
+    self.assertGreater(updated_ds["rouge1_recall"][0], 0.0)
+    self.assertGreater(updated_ds["rougeL_f1"][0], 0.0)
+
 
 if __name__ == "__main__":
   unittest.main()

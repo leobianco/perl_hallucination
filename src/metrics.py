@@ -63,19 +63,20 @@ def _lcs_length(seq1: list[str], seq2: list[str]) -> int:
   return dp[n]
 
 
-def _pure_python_rouge_f1(
+def _pure_python_rouge_scores(
     pred_tokens: list[str], ref_tokens: list[str], n: int = 1
-) -> float:
-  """Computes ROUGE-n F1 in pure Python."""
+) -> tuple[float, float, float]:
+  """Computes ROUGE-n (precision, recall, f1) in pure Python."""
   if not pred_tokens or not ref_tokens:
-    return 0.0
+    return 0.0, 0.0, 0.0
   if n == 0:  # ROUGE-L via LCS
     lcs = _lcs_length(pred_tokens, ref_tokens)
     if lcs == 0:
-      return 0.0
-    prec = lcs / len(pred_tokens)
-    rec = lcs / len(ref_tokens)
-    return float(2 * prec * rec / (prec + rec))
+      return 0.0, 0.0, 0.0
+    prec = float(lcs / len(pred_tokens))
+    rec = float(lcs / len(ref_tokens))
+    f1 = float(2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+    return prec, rec, f1
 
   pred_ngrams = [
       tuple(pred_tokens[i : i + n]) for i in range(len(pred_tokens) - n + 1)
@@ -84,7 +85,7 @@ def _pure_python_rouge_f1(
       tuple(ref_tokens[i : i + n]) for i in range(len(ref_tokens) - n + 1)
   ]
   if not pred_ngrams or not ref_ngrams:
-    return 0.0
+    return 0.0, 0.0, 0.0
 
   pred_counts = {}
   for ng in pred_ngrams:
@@ -96,11 +97,12 @@ def _pure_python_rouge_f1(
       overlap += 1
       pred_counts[ng] -= 1
 
-  prec = overlap / len(pred_ngrams)
-  rec = overlap / len(ref_ngrams)
+  prec = float(overlap / len(pred_ngrams))
+  rec = float(overlap / len(ref_ngrams))
   if prec + rec == 0:
-    return 0.0
-  return float(2 * prec * rec / (prec + rec))
+    return prec, rec, 0.0
+  f1 = float(2 * prec * rec / (prec + rec))
+  return prec, rec, f1
 
 
 def compute_rouge(
@@ -108,16 +110,18 @@ def compute_rouge(
     references: list[str],
     use_stemmer: bool = True,
 ) -> dict[str, list[float]]:
-  """Computes ROUGE-1, ROUGE-2, and ROUGE-L F1 scores for prediction-reference pairs.
+  """Computes ROUGE-1, ROUGE-2, and ROUGE-L F1, precision, and recall scores.
 
   Args:
       predictions: List of generated completion strings.
-      references: List of ground-truth reference strings.
+      references: List of ground-truth reference or source context strings.
       use_stemmer: Whether to apply Porter stemmer in ROUGE evaluation.
 
   Returns:
-      Dict mapping metric name to list of per-sample F1 scores:
-      'rouge1_f1', 'rouge2_f1', 'rougeL_f1'.
+      Dict mapping metric name to list of per-sample float scores:
+      'rouge1_f1', 'rouge1_precision', 'rouge1_recall',
+      'rouge2_f1', 'rouge2_precision', 'rouge2_recall',
+      'rougeL_f1', 'rougeL_precision', 'rougeL_recall'.
   """
   if len(predictions) != len(references):
     raise ValueError(
@@ -134,35 +138,62 @@ def compute_rouge(
     except Exception:
       scorer = None
 
-  r1_scores = []
-  r2_scores = []
-  rl_scores = []
+  r1_f1, r1_p, r1_r = [], [], []
+  r2_f1, r2_p, r2_r = [], [], []
+  rl_f1, rl_p, rl_r = [], [], []
 
   for pred, ref in zip(predictions, references):
     pred_clean = pred.strip() if pred else ""
     ref_clean = ref.strip() if ref else ""
     if not pred_clean or not ref_clean:
-      r1_scores.append(0.0)
-      r2_scores.append(0.0)
-      rl_scores.append(0.0)
+      r1_f1.append(0.0)
+      r1_p.append(0.0)
+      r1_r.append(0.0)
+      r2_f1.append(0.0)
+      r2_p.append(0.0)
+      r2_r.append(0.0)
+      rl_f1.append(0.0)
+      rl_p.append(0.0)
+      rl_r.append(0.0)
       continue
 
     if scorer is not None:
       score = scorer.score(ref_clean, pred_clean)
-      r1_scores.append(float(score["rouge1"].fmeasure))
-      r2_scores.append(float(score["rouge2"].fmeasure))
-      rl_scores.append(float(score["rougeL"].fmeasure))
+      r1_f1.append(float(score["rouge1"].fmeasure))
+      r1_p.append(float(score["rouge1"].precision))
+      r1_r.append(float(score["rouge1"].recall))
+      r2_f1.append(float(score["rouge2"].fmeasure))
+      r2_p.append(float(score["rouge2"].precision))
+      r2_r.append(float(score["rouge2"].recall))
+      rl_f1.append(float(score["rougeL"].fmeasure))
+      rl_p.append(float(score["rougeL"].precision))
+      rl_r.append(float(score["rougeL"].recall))
     else:
       pred_toks = tokenize_words(pred_clean)
       ref_toks = tokenize_words(ref_clean)
-      r1_scores.append(_pure_python_rouge_f1(pred_toks, ref_toks, n=1))
-      r2_scores.append(_pure_python_rouge_f1(pred_toks, ref_toks, n=2))
-      rl_scores.append(_pure_python_rouge_f1(pred_toks, ref_toks, n=0))
+      p1, rec1, f1_1 = _pure_python_rouge_scores(pred_toks, ref_toks, n=1)
+      p2, rec2, f1_2 = _pure_python_rouge_scores(pred_toks, ref_toks, n=2)
+      pl, recl, f1_l = _pure_python_rouge_scores(pred_toks, ref_toks, n=0)
+      r1_f1.append(f1_1)
+      r1_p.append(p1)
+      r1_r.append(rec1)
+      r2_f1.append(f1_2)
+      r2_p.append(p2)
+      r2_r.append(rec2)
+      rl_f1.append(f1_l)
+      rl_p.append(pl)
+      rl_r.append(recl)
 
   return {
-      "rouge1_f1": r1_scores,
-      "rouge2_f1": r2_scores,
-      "rougeL_f1": rl_scores,
+      "rouge1_f1": r1_f1,
+      "rouge1_precision": r1_p,
+      "rouge1_recall": r1_r,
+      "rouge2_f1": r2_f1,
+      "rouge2_precision": r2_p,
+      "rouge2_recall": r2_r,
+      "rougeL_f1": rl_f1,
+      "rougeL_precision": rl_p,
+      "rougeL_recall": rl_r,
   }
 
 
@@ -588,19 +619,23 @@ class GenerationMetricsEvaluator:
     self.fluency_tokenizer = fluency_tokenizer
 
   def find_reference_column(self, column_names: list[str]) -> Optional[str]:
-    """Identifies the reference/ground truth column from dataset column names.
+    """Identifies the reference or context column from dataset column names.
 
     Args:
         column_names: List of column names in dataset.
 
     Returns:
-        The matched reference column name, or None if not found.
+        The matched reference/context column name, or None if not found.
     """
     candidates = [
         "npov_response",
         "reference",
         "target",
         "ground_truth",
+        "Context",
+        "context",
+        "passages",
+        "source",
         "chosen",
         "gold",
         "answer",
@@ -610,6 +645,109 @@ class GenerationMetricsEvaluator:
       if c in column_names:
         return c
     return None
+
+  def extract_contexts(
+      self,
+      dataset: Any,
+      context_column: Optional[str] = None,
+  ) -> tuple[list[str], Optional[str]]:
+    """Extracts the source context string for each example in the dataset.
+
+    Supports:
+    - Multi-perspective NPOV arguments (perspective_1 + perspective_2).
+    - Dedicated context columns ('Context', 'context', 'passages', 'source', 'document').
+    - Ground-truth references if available ('npov_response', 'reference', 'target', 'ground_truth').
+
+    Args:
+        dataset: Dataset object.
+        context_column: Optional explicit column name.
+
+    Returns:
+        Tuple of (list of context strings, description of context source).
+    """
+    col_names = dataset.column_names if hasattr(dataset, "column_names") else []
+
+    # 1. Explicit context column specified
+    if context_column and context_column in col_names:
+      raw = list(dataset[context_column])
+      contexts = [
+          str(c).strip()
+          if (c is not None and not (isinstance(c, float) and math.isnan(c)))
+          else ""
+          for c in raw
+      ]
+      if any(len(c) > 0 for c in contexts):
+        return contexts, context_column
+
+    # 2. Multi-perspective arguments (NPOV task: perspective_1 + perspective_2)
+    if "perspective_1" in col_names and "perspective_2" in col_names:
+      p1_list = list(dataset["perspective_1"])
+      p2_list = list(dataset["perspective_2"])
+      p1_names = (
+          list(dataset["perspective_1_name"])
+          if "perspective_1_name" in col_names
+          else [None] * len(p1_list)
+      )
+      p2_names = (
+          list(dataset["perspective_2_name"])
+          if "perspective_2_name" in col_names
+          else [None] * len(p2_list)
+      )
+      contexts = []
+      for p1, p2, n1, n2 in zip(p1_list, p2_list, p1_names, p2_names):
+        parts = []
+        p1_s = str(p1).strip() if p1 is not None else ""
+        p2_s = str(p2).strip() if p2 is not None else ""
+        if p1_s:
+          parts.append(
+              f"{n1}: {p1_s}"
+              if (n1 and not p1_s.startswith(str(n1)))
+              else p1_s
+          )
+        if p2_s:
+          parts.append(
+              f"{n2}: {p2_s}"
+              if (n2 and not p2_s.startswith(str(n2)))
+              else p2_s
+          )
+        contexts.append("\n".join(parts))
+      if any(len(c) > 0 for c in contexts):
+        return contexts, "provided arguments (perspective_1 + perspective_2)"
+
+    # 3. Context column candidates
+    context_candidates = [
+        "Context",
+        "context",
+        "passages",
+        "source",
+        "source_text",
+        "document",
+        "documents",
+        "article",
+        "input_text",
+        "user_query",
+        "npov_response",
+        "reference",
+        "target",
+        "ground_truth",
+        "response",
+    ]
+    for c in context_candidates:
+      if c in col_names:
+        raw = list(dataset[c])
+        contexts = [
+            str(val).strip()
+            if (
+                val is not None
+                and not (isinstance(val, float) and math.isnan(val))
+            )
+            else ""
+            for val in raw
+        ]
+        if any(len(ctx) > 0 for ctx in contexts):
+          return contexts, c
+
+    return [""] * len(dataset), None
 
   def evaluate_dataset(
       self,
@@ -625,7 +763,7 @@ class GenerationMetricsEvaluator:
         dataset: Dataset instance or MockDataset.
         prompt_column: Column name for prompts.
         completion_column: Column name for generated completions.
-        reference_column: Column name for ground-truth references. If None,
+        reference_column: Column name for context / references. If None,
           auto-detected.
         tokenizer: Optional tokenizer for length calculation.
 
@@ -661,43 +799,29 @@ class GenerationMetricsEvaluator:
         "repetition_rate": repetition_4,
     }
 
-    # 3. Reference Alignment (ROUGE & BERTScore)
-    ref_col = reference_column or self.find_reference_column(
-        dataset.column_names
+    # 3. Context Grounding & Alignment (ROUGE & BERTScore w.r.t Context)
+    contexts, context_source = self.extract_contexts(
+        dataset, context_column=reference_column
     )
-    if ref_col is not None and ref_col in dataset.column_names:
-      raw_references = list(dataset[ref_col])
-      references = [
-          str(r).strip()
-          if (r is not None and not (isinstance(r, float) and math.isnan(r)))
-          else ""
-          for r in raw_references
-      ]
-      has_valid_refs = any(len(r) > 0 for r in references)
-      if has_valid_refs:
-        print(
-            f"Computing reference alignment metrics (ROUGE, BERTScore) against"
-            f" reference column '{ref_col}'..."
-        )
-        rouge_dict = compute_rouge(completions, references)
-        metric_columns["rouge1_f1"] = rouge_dict["rouge1_f1"]
-        metric_columns["rouge2_f1"] = rouge_dict["rouge2_f1"]
-        metric_columns["rougeL_f1"] = rouge_dict["rougeL_f1"]
+    has_valid_contexts = any(len(c) > 0 for c in contexts)
+    if has_valid_contexts:
+      print(
+          f"Computing context grounding metrics (ROUGE, BERTScore) against"
+          f" source context '{context_source}'..."
+      )
+      rouge_dict = compute_rouge(completions, contexts)
+      for k, v in rouge_dict.items():
+        metric_columns[k] = v
 
-        if self.compute_bertscore_metric:
-          bs_scores = compute_bertscore(
-              completions, references, model_type=self.bertscore_model
-          )
-          metric_columns["bertscore_f1"] = bs_scores
-      else:
-        print(
-            f"Notice: Reference column '{ref_col}' contains only empty/null values."
-            " Skipping ROUGE and BERTScore (no ground-truth reference text available)."
+      if self.compute_bertscore_metric:
+        bs_scores = compute_bertscore(
+            completions, contexts, model_type=self.bertscore_model
         )
+        metric_columns["bertscore_f1"] = bs_scores
     else:
       print(
-          "Notice: No reference column found in dataset."
-          " Skipping ROUGE and BERTScore (open-ended generation benchmark)."
+          "Notice: No source context found in dataset."
+          " Skipping ROUGE and BERTScore."
       )
 
     # 4. Fluency (Conditional Perplexity)
@@ -818,6 +942,10 @@ class GenerationMetricsEvaluator:
             "distinct_2",
             "repetition_rate",
         ]
+        if "rouge1_precision" in dataset.column_names:
+          table_cols.append("rouge1_precision")
+        if "rouge1_recall" in dataset.column_names:
+          table_cols.append("rouge1_recall")
         if "rougeL_f1" in dataset.column_names:
           table_cols.append("rougeL_f1")
         if "bertscore_f1" in dataset.column_names:
@@ -829,9 +957,16 @@ class GenerationMetricsEvaluator:
         if "classifications" in dataset.column_names:
           table_cols.append("classifications")
 
-        ref_col = self.find_reference_column(dataset.column_names)
-        if ref_col and ref_col not in table_cols:
-          table_cols.insert(2, ref_col)
+        for ctx_col in [
+            "perspective_1",
+            "perspective_2",
+            "Context",
+            "context",
+            "npov_response",
+            "reference",
+        ]:
+          if ctx_col in dataset.column_names and ctx_col not in table_cols:
+            table_cols.insert(2, ctx_col)
 
         table_data = []
         sample_indices = range(min(500, len(dataset)))

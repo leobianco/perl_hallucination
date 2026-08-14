@@ -26,7 +26,7 @@ Evaluating alignment models (PE-RL, SCOPE, SSFO, SFT) solely on a single halluci
 
 This codebase uses a **4-pillar evaluation framework**:
 1. **Faithfulness**: Calibrated LLM autorater scoring.
-2. **Reference Alignment**: ROUGE-1/2/L and BERTScore F1 against ground-truth targets.
+2. **Context Grounding & Coverage**: ROUGE-1/2/L (Precision, Recall, F1) and BERTScore against the provided input context (e.g. source perspective arguments, manual excerpt, or documents).
 3. **Generation Health**: Token/character length, Distinct-1/2 diversity, and n-gram repetition rates.
 4. **Fluency**: Conditional perplexity under a neutral pre-trained language model.
 
@@ -41,7 +41,7 @@ This codebase uses a **4-pillar evaluation framework**:
   * Specially trained for semantic similarity and sentence embedding cosine correlation.
   * Super lightweight (80MB vs 1.4GB for roberta-large), processes 1,000 samples in <1s, and runs with 0 initialization warnings.
 * **How It Works**:
-  1. Computes contextual embeddings for both the generated completion and the reference.
+  1. Computes contextual embeddings for both the generated completion and the source context (e.g. `perspective_1 + perspective_2`).
   2. Calculates normalized cosine similarity between the semantic embeddings.
   3. Returns the similarity score in $[0.0, 1.0]$.
 
@@ -79,10 +79,14 @@ This codebase uses a **4-pillar evaluation framework**:
 | **`scores`** | Faithfulness | $P(\text{No Hallucination})$ | Higher ($\to 1.0$) | Raw calibrated autorater probability. |
 | **`classifications`** | Faithfulness | $\mathbb{I}(\text{score} \ge \tau)$ | `1.0` (Faithful) | Binary classification after thresholding. |
 | **`hallucination_rate`** | Faithfulness | $\frac{1}{N}\sum \mathbb{I}(\text{score} < \tau)$ | Lower ($\to 0.0$) | Overall run hallucination percentage. |
-| **`rouge1_f1`** | Reference Alignment | Unigram overlap F1 | Higher ($\to 1.0$) | Overlap of individual words with reference. |
-| **`rouge2_f1`** | Reference Alignment | Bigram overlap F1 | Higher ($\to 1.0$) | Overlap of word pairs with reference. |
-| **`rougeL_f1`** | Reference Alignment | Longest Common Subsequence F1 | Higher ($\to 1.0$) | Structural sequence similarity with reference. |
-| **`bertscore_f1`** | Reference Alignment | DeBERTa token embedding cosine F1 | Higher ($\to 1.0$) | Semantic similarity robust to paraphrasing. |
+| **`rouge1_precision`** | Context Grounding | $\frac{|\text{Overlap Unigrams}|}{|\text{Generation Unigrams}|}$ | Higher ($\to 1.0$) | Lexical grounding: fraction of generation from context. |
+| **`rouge1_recall`** | Context Coverage | $\frac{|\text{Overlap Unigrams}|}{|\text{Context Unigrams}|}$ | Higher ($\to 1.0$) | Context coverage: fraction of context arguments preserved. |
+| **`rouge1_f1`** | Context Alignment | Harmonic mean of $P_1$ & $R_1$ | Higher ($\to 1.0$) | Balanced unigram context grounding and coverage. |
+| **`rouge2_precision`** | Context Grounding | Bigram lexical grounding | Higher ($\to 1.0$) | Bigram fraction originating from context. |
+| **`rouge2_recall`** | Context Coverage | Bigram context coverage | Higher ($\to 1.0$) | Bigram fraction of context captured in output. |
+| **`rouge2_f1`** | Context Alignment | Harmonic mean of $P_2$ & $R_2$ | Higher ($\to 1.0$) | Balanced bigram overlap with provided context. |
+| **`rougeL_f1`** | Context Alignment | Longest Common Subsequence F1 | Higher ($\to 1.0$) | Structural sequence similarity with context. |
+| **`bertscore_f1`** | Context Alignment | Sentence-embedding cosine sim | Higher ($\to 1.0$) | Semantic alignment between generation and context. |
 | **`token_length`** | Generation Health | Count of generated word/subword tokens | Task-dependent | Verifies policy did not collapse in length. |
 | **`char_length`** | Generation Health | Total character count | Task-dependent | Raw text length. |
 | **`distinct_1`** | Diversity | $\frac{\|\text{Unique Unigrams}\|}{\|\text{Total Unigrams}\|}$ | Higher ($\to 1.0$) | Vocabulary diversity within the completion. |
