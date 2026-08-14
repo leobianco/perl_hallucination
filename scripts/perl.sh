@@ -70,7 +70,6 @@ accelerate launch \
   --metric_for_best_model "rewards/reward_fn/mean" \
   --greater_is_better True \
   --save_total_limit 1 \
-  --save_only_model True \
   --num_train_epochs "$NUM_TRAIN_EPOCHS" \
   --learning_rate "$LEARNING_RATE" \
   --lr_scheduler_type "$LR_SCHEDULER_TYPE" \
