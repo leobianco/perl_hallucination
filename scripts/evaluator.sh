@@ -13,6 +13,8 @@ EVALUATOR_NUM_FEWSHOT=2
 WRITER_NUM_FEWSHOT=0
 MAX_TOKENS=250
 MAX_EVAL_SAMPLES=1000
+EVAL_BATCH_SIZE=32
+MAX_WORKERS=32
 TEMPERATURE=0.0
 TOP_P=1.0
 TOP_K=0
@@ -71,6 +73,8 @@ elif [ "$2" == "score" ]; then
         --user "$USER" \
         --seed "$SEED" \
         --max_eval_samples "$MAX_EVAL_SAMPLES" \
+        --eval_batch_size "$EVAL_BATCH_SIZE" \
+        --max_workers "$MAX_WORKERS" \
         --dataset_labels "$DATASET_LABELS" \
         --dataset_labels_split "$DATASET_LABELS_SPLIT" \
         --writer_model_lora "${RUN_IDENTIFIER}" \
@@ -93,6 +97,8 @@ elif [ "$2" == "autoratereval" ]; then
         --user "$USER" \
         --seed "$SEED" \
         --max_eval_samples "$MAX_EVAL_SAMPLES" \
+        --eval_batch_size "$EVAL_BATCH_SIZE" \
+        --max_workers "$MAX_WORKERS" \
         --dataset_labels "$DATASET_LABELS" \
         --dataset_labels_split "$DATASET_LABELS_SPLIT" \
         --writer_model_lora "${RUN_IDENTIFIER}" \
