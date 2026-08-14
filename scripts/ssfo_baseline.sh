@@ -98,6 +98,7 @@ if [ "$STAGE" == "all" ] || [ "$STAGE" == "sft" ]; then
     --num_train_epochs "$SFT_NUM_EPOCHS" \
     --learning_rate "$SFT_LR" \
     --per_device_train_batch_size "$SFT_BATCH_SIZE" \
+    --per_device_eval_batch_size 32 \
     --auto_find_batch_size True \
     --peft_type "LORA" \
     --task_type "CAUSAL_LM" \
@@ -166,6 +167,7 @@ if [ "$STAGE" == "all" ] || [ "$STAGE" == "dpo" ]; then
     --num_train_epochs "$DPO_NUM_EPOCHS" \
     --learning_rate "$DPO_LR" \
     --per_device_train_batch_size "$DPO_BATCH_SIZE" \
+    --per_device_eval_batch_size 16 \
     --auto_find_batch_size True \
     --peft_type "LORA" \
     --task_type "CAUSAL_LM" \

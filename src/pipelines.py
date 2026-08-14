@@ -73,9 +73,12 @@ from src.utils import (
     ScopeDataGenArguments,
     ScriptArguments,
     SsfoDataGenArguments,
+    build_eval_dataset_repo_id,
+    compact_model_name,
     compute_best_roc_threshold,
     create_lora_argument_parser,
     get_task_processor,
+    sanitize_hf_repo_id,
 )
 import torch
 from tqdm import tqdm
@@ -1069,7 +1072,7 @@ class ScopeDataGenerationPipeline(Pipeline):
     else:
       preference_dataset = DatasetDict({"train": train_dataset})
 
-    out_repo = (
+    out_repo = sanitize_hf_repo_id(
         self.args.output_dataset_repo_id
         or f"{self.args.dataset_repo_id}_scope_preference"
     )
@@ -1338,7 +1341,7 @@ class SSFODataGenerationPipeline(Pipeline):
     else:
       preference_dataset = DatasetDict({"train": train_dataset})
 
-    out_repo = (
+    out_repo = sanitize_hf_repo_id(
         self.args.output_dataset_repo_id
         or f"{self.args.dataset_repo_id}_ssfo_preference"
     )
@@ -2035,25 +2038,21 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
     self.dataset_prompts = self.dataset_prompts.add_column(
         "completion", generations
     )
-    try:
-      name_for_saving = self.args.writer_model_lora.split(f"{self.args.user}/")[
-          1
-      ]
-    except Exception:
-      name_for_saving = self.args.writer_model_lora.split("/")[1]
+    if getattr(self.args, "dataset_with_completions", None):
+      repo_id = sanitize_hf_repo_id(self.args.dataset_with_completions)
+    else:
+      repo_id = build_eval_dataset_repo_id(
+          user=self.args.user,
+          writer_model_lora=self.args.writer_model_lora,
+          temperature=self.args.temperature,
+          writer_num_fewshot=self.args.writer_num_fewshot,
+      )
 
-    name_for_saving = "eval_" + name_for_saving + "_gens"
-    name_for_saving += f"_T{str(float(self.args.temperature))}"
-    name_for_saving += f"_wfs{self.args.writer_num_fewshot}"
-
-    print(
-        "Pushing dataset with generations to"
-        f" {self.args.user}/{name_for_saving}"
-    )
+    print(f"Pushing dataset with generations to {repo_id}...")
     clean_dataset = Dataset.from_dict(self.dataset_prompts.to_dict())
     split_name = self.args.dataset_prompts_split or "test"
     dataset_dict = DatasetDict({split_name: clean_dataset})
-    dataset_dict.push_to_hub(f"{self.args.user}/{name_for_saving}")
+    dataset_dict.push_to_hub(repo_id)
 
 
 class EvaluationScoringPipeline(EvaluationPipeline):
@@ -2074,8 +2073,26 @@ class EvaluationScoringPipeline(EvaluationPipeline):
       )
 
   def load_data(self):
+    if not self.args.dataset_with_completions and getattr(
+        self.args, "writer_model_lora", None
+    ):
+      self.args.dataset_with_completions = build_eval_dataset_repo_id(
+          user=self.args.user,
+          writer_model_lora=self.args.writer_model_lora,
+          temperature=self.args.temperature,
+          writer_num_fewshot=self.args.writer_num_fewshot,
+      )
+    elif self.args.dataset_with_completions:
+      self.args.dataset_with_completions = sanitize_hf_repo_id(
+          self.args.dataset_with_completions
+      )
+
     if self.args.dataset_with_completions is None:
       raise ValueError("dataset_with_completions is required for scoring mode")
+    print(
+        "Loading dataset with completions from"
+        f" {self.args.dataset_with_completions}..."
+    )
     self.full_dataset = self.safe_load_dataset(
         self.args.dataset_with_completions, split="test"
     )

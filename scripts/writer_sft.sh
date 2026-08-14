@@ -7,6 +7,7 @@ MODEL_REPO_ID="google/gemma-4-E2B-it"
 
 # Training Parameters
 BATCH_SIZE=16
+EVAL_BATCH_SIZE=32
 AUTO_FIND_BATCH_SIZE=True
 NUM_TRAIN_EPOCHS=1
 LEARNING_RATE=3e-3
@@ -27,7 +28,9 @@ DEEPSPEED_CONFIG="scripts/deepspeed_config.yaml"
 TASK_NAME="$1"
 MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
 TIMESTAMP=$(date '+%y%m%d%H%M')
-RUN_IDENTIFIER="${USER}/${TASK_NAME}_SFT_${MODEL_NAME}_S${SEED}_epo${NUM_TRAIN_EPOCHS}_lr${LEARNING_RATE}_r${LORA_RANK}_${TIMESTAMP}"
+FORMATTED_LR=$(python3 -c "import sys; lr=float('${LEARNING_RATE}'); print(f'{lr:.1e}')" 2>/dev/null || echo "$LEARNING_RATE")
+FORMATTED_EPOCHS=$(python3 -c "import sys; e=float('${NUM_TRAIN_EPOCHS}'); print(f'{e:.2g}')" 2>/dev/null || echo "$NUM_TRAIN_EPOCHS")
+RUN_IDENTIFIER="${USER}/${TASK_NAME}_SFT_${MODEL_NAME}_S${SEED}_epo${FORMATTED_EPOCHS}_lr${FORMATTED_LR}_r${LORA_RANK}_${TIMESTAMP}"
 
 if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ]; then
     echo "Invalid task name" 
@@ -67,8 +70,7 @@ accelerate launch \
   --per_device_train_batch_size "$BATCH_SIZE" \
   --auto_find_batch_size "$AUTO_FIND_BATCH_SIZE" \
   --gradient_accumulation_steps 1 \
-  --per_device_eval_batch_size "$BATCH_SIZE" \
-  --eval_accumulation_steps 1 \
+  --per_device_eval_batch_size "$EVAL_BATCH_SIZE" \
   --peft_type "LORA" \
   --task_type "CAUSAL_LM" \
   --lora_r "$LORA_RANK" \

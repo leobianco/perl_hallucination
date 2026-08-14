@@ -36,7 +36,10 @@ SHUTDOWN=false
 TASK_NAME="$1"
 TIMESTAMP=$(date '+%y%m%d%H%M')
 MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
-RUN_IDENTIFIER="${USER}/${TASK_NAME}_PERL_${MODEL_NAME}_S${SEED}_epo${NUM_TRAIN_EPOCHS}_lr${LEARNING_RATE}_beta${BETA}_${TIMESTAMP}"
+FORMATTED_LR=$(python3 -c "import sys; lr=float('${LEARNING_RATE}'); print(f'{lr:.1e}')" 2>/dev/null || echo "$LEARNING_RATE")
+FORMATTED_BETA=$(python3 -c "import sys; b=float('${BETA}'); print(f'{b:.2g}' if b>=0.001 else f'{b:.1e}')" 2>/dev/null || echo "$BETA")
+FORMATTED_EPOCHS=$(python3 -c "import sys; e=float('${NUM_TRAIN_EPOCHS}'); print(f'{e:.2g}')" 2>/dev/null || echo "$NUM_TRAIN_EPOCHS")
+RUN_IDENTIFIER="${USER}/${TASK_NAME}_PERL_${MODEL_NAME}_S${SEED}_epo${FORMATTED_EPOCHS}_lr${FORMATTED_LR}_beta${FORMATTED_BETA}_${TIMESTAMP}"
 
 # Checks
 if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ]; then

@@ -50,6 +50,7 @@ fi
 if [ "$2" == "generate" ]; then
     echo "Running in generation mode (max_eval_samples=$MAX_EVAL_SAMPLES)..."
     python3 -m src.evaluator \
+        --mode "generate" \
         --task_name "$TASK_NAME" \
         --user "$USER" \
         --seed "$SEED" \
@@ -64,11 +65,12 @@ if [ "$2" == "generate" ]; then
         --temperature "$TEMPERATURE" \
         --top_p "$TOP_P" \
         --top_k "$TOP_K" \
-        --writer_num_fewshot $WRITER_NUM_FEWSHOT
+        --writer_num_fewshot $WRITER_NUM_FEWSHOT \
+        ${DATASET_WITH_COMPLETIONS:+--dataset_with_completions "$DATASET_WITH_COMPLETIONS"}
 elif [ "$2" == "score" ]; then
-    DATASET_WITH_COMPLETIONS="${USER}/eval_${RUN_IDENTIFIER#*/}_gens_T${TEMPERATURE}_wfs${WRITER_NUM_FEWSHOT}"
     echo "Running in scoring mode (run_autorater=$RUN_AUTORATER, max_eval_samples=$MAX_EVAL_SAMPLES)..."
     python3 -m src.evaluator \
+        --mode "score" \
         --task_name "$TASK_NAME" \
         --user "$USER" \
         --seed "$SEED" \
@@ -85,7 +87,7 @@ elif [ "$2" == "score" ]; then
         --evaluator_num_fewshot $EVALUATOR_NUM_FEWSHOT \
         --evaluate_evaluator False \
         --threshold $THRESHOLD \
-        --dataset_with_completions "$DATASET_WITH_COMPLETIONS" \
+        ${DATASET_WITH_COMPLETIONS:+--dataset_with_completions "$DATASET_WITH_COMPLETIONS"} \
         --compute_bertscore "$COMPUTE_BERTSCORE" \
         --bertscore_model "$BERTSCORE_MODEL" \
         --log_to_wandb "${LOG_TO_WANDB:-False}" \
@@ -93,6 +95,7 @@ elif [ "$2" == "score" ]; then
 elif [ "$2" == "autoratereval" ]; then
     echo "Running in autoratereval mode (max_eval_samples=$MAX_EVAL_SAMPLES)..."
     python3 -m src.evaluator \
+        --mode "autoratereval" \
         --task_name "$TASK_NAME" \
         --user "$USER" \
         --seed "$SEED" \

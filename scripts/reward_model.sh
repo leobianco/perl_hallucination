@@ -14,6 +14,7 @@ NUM_STRUCT_HALLUS_TO_KEEP=0
 
 # Training Parameters
 BATCH_SIZE=16
+EVAL_BATCH_SIZE=32
 AUTO_FIND_BATCH_SIZE=True
 NUM_TRAIN_EPOCHS=3
 LEARNING_RATE=1e-3
@@ -26,7 +27,7 @@ WARMUP_RATIO=0.1
 
 # Infrastructure Parameters
 PRECISION="BF16"
-EVAL_STEPS=5
+EVAL_STEPS=50
 DEEPSPEED_CONFIG="scripts/deepspeed_config.yaml"
 
 # Parameters derived from above
@@ -34,7 +35,9 @@ TASK_NAME="$1"
 DATASET_REPO_ID="${USER}/${TASK_NAME}_rm"
 MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
 TIMESTAMP=$(date '+%y%m%d%H%M')
-RUN_IDENTIFIER="leobianco/${TASK_NAME}_RM_${MODEL_NAME}_S${SEED}_LLM_${SYN_HALL_LLM}_STRUCT_${SYN_HALL_STRUCT}_epo${NUM_TRAIN_EPOCHS}_lr${LEARNING_RATE}_r${LORA_RANK}_${TIMESTAMP}"
+FORMATTED_LR=$(python3 -c "import sys; lr=float('${LEARNING_RATE}'); print(f'{lr:.1e}')" 2>/dev/null || echo "$LEARNING_RATE")
+FORMATTED_EPOCHS=$(python3 -c "import sys; e=float('${NUM_TRAIN_EPOCHS}'); print(f'{e:.2g}')" 2>/dev/null || echo "$NUM_TRAIN_EPOCHS")
+RUN_IDENTIFIER="${USER}/${TASK_NAME}_RM_${MODEL_NAME}_S${SEED}_LLM_${SYN_HALL_LLM}_STRUCT_${SYN_HALL_STRUCT}_epo${FORMATTED_EPOCHS}_lr${FORMATTED_LR}_r${LORA_RANK}_${TIMESTAMP}"
 
 # Checks
 if [ "$PRECISION" = "FP16" ]; then
@@ -104,8 +107,7 @@ accelerate launch \
   --eval_on_start True \
   --eval_strategy "steps" \
   --eval_steps "$EVAL_STEPS" \
-  --per_device_eval_batch_size "$BATCH_SIZE" \
-  --eval_accumulation_steps 1 \
+  --per_device_eval_batch_size "$EVAL_BATCH_SIZE" \
   --task_type "SEQ_CLS" \
   --peft_type "LORA" \
   --lora_r "$LORA_RANK" \

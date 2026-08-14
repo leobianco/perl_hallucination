@@ -7,16 +7,26 @@ including ROC analysis and histogram plotting.
 
 import argparse
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Sequence, Union
+import re
+from typing import Any, Dict, Optional, Sequence, Union
 
-import matplotlib.pyplot as plt
-import numpy as np
-from sklearn.metrics import accuracy_score, roc_curve
+try:
+  import matplotlib.pyplot as plt
+except ImportError:
+  plt = None
 
-from src.task_processors.base_task_processor import BaseTaskProcessor
-from src.task_processors.bosch_task_processor import BoschTaskProcessor
-from src.task_processors.npov_task_processor import NPOVTaskProcessor
-from src.task_processors.ragtruth_task_processor import RagtruthTaskProcessor
+try:
+  import numpy as np
+except ImportError:
+  np = None
+
+try:
+  from sklearn.metrics import accuracy_score, roc_curve
+except ImportError:
+  accuracy_score = None
+  roc_curve = None
+
+
 
 
 @dataclass
@@ -259,6 +269,8 @@ def create_lora_argument_parser() -> argparse.ArgumentParser:
 
 @dataclass
 class EvalArguments:
+  """Arguments for evaluation scripts (generation, scoring, autorater eval)."""
+
   task_name: str = field(metadata={"help": "Name of the task (NPOV, HalOmi)."})
 
   user: str = field(
@@ -269,6 +281,15 @@ class EvalArguments:
 
   writer_model_lora: str = field(
       metadata={"help": "The path to the LoRA adapters of the writer model."}
+  )
+
+  mode: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Evaluation mode: 'generate', 'score', or 'autoratereval'."
+          )
+      },
   )
 
   dataset_labels: Optional[str] = field(
@@ -589,8 +610,8 @@ def histogram_from_score_file(filepath: str) -> None:
 
 
 def compute_best_roc_threshold(
-    labels: Union[Sequence[int], np.ndarray],
-    scores: Union[Sequence[float], np.ndarray],
+    labels: Union[Sequence[int], Any],
+    scores: Union[Sequence[float], Any],
 ) -> Dict[str, float]:
   """Compute the best ROC threshold and related metrics.
 
@@ -702,7 +723,7 @@ def recompute_autorater_metrics(
   return results
 
 
-def get_task_processor(task_name: str) -> type[BaseTaskProcessor]:
+def get_task_processor(task_name: str) -> Any:
   """Return the TaskProcessor class for a given task name.
 
   This helper performs local imports to avoid circular import issues
@@ -715,8 +736,11 @@ def get_task_processor(task_name: str) -> type[BaseTaskProcessor]:
       class: The TaskProcessor class corresponding to task_name.
 
   Raises:
-      Exception: If an unknown task_name is provided.
+      ValueError: If an unknown task_name is provided.
   """
+  from src.task_processors.bosch_task_processor import BoschTaskProcessor
+  from src.task_processors.npov_task_processor import NPOVTaskProcessor
+  from src.task_processors.ragtruth_task_processor import RagtruthTaskProcessor
 
   task_map = {
       "npov": NPOVTaskProcessor,
@@ -726,5 +750,168 @@ def get_task_processor(task_name: str) -> type[BaseTaskProcessor]:
 
   processor_cls = task_map.get(task_name)
   if processor_cls is None:
-    raise Exception(f"Unknown task: {task_name}")
+    raise ValueError(f"Unknown task: {task_name}")
   return processor_cls
+
+
+def compact_model_name(model_name: str) -> str:
+  """Compacts float parameters in a model name/run identifier to prevent excessive string lengths.
+
+  For example:
+      'npov_PERL_google_S130104_epo0.2_lr2.3663655877360862e-05_beta0.04259128063013425_2608141244'
+  becomes:
+      'npov_PERL_google_S130104_epo0.2_lr2.4e-05_beta0.043_2608141244'
+
+  Args:
+      model_name (str): The raw model name or run identifier.
+
+  Returns:
+      str: The compacted model name.
+  """
+  if not model_name:
+    return model_name
+
+  def _replace_lr(match: re.Match) -> str:
+    prefix, val_str = match.group(1), match.group(2)
+    try:
+      val = float(val_str)
+      return f"{prefix}{val:.1e}"
+    except ValueError:
+      return match.group(0)
+
+  def _replace_beta(match: re.Match) -> str:
+    prefix, val_str = match.group(1), match.group(2)
+    try:
+      val = float(val_str)
+      formatted = f"{val:.2g}" if val >= 0.001 else f"{val:.1e}"
+      return f"{prefix}{formatted}"
+    except ValueError:
+      return match.group(0)
+
+  def _replace_generic_float(match: re.Match) -> str:
+    prefix, val_str = match.group(1), match.group(2)
+    try:
+      val = float(val_str)
+      return f"{prefix}{val:.2g}"
+    except ValueError:
+      return match.group(0)
+
+  name = re.sub(
+      r"((?:^|_)(?:lr|learning_rate))([0-9]+\.[0-9]+(?:e-?[0-9]+)?)",
+      _replace_lr,
+      model_name,
+      flags=re.IGNORECASE,
+  )
+  name = re.sub(
+      r"((?:^|_)(?:beta|b))([0-9]+\.[0-9]+(?:e-?[0-9]+)?)",
+      _replace_beta,
+      name,
+      flags=re.IGNORECASE,
+  )
+  name = re.sub(
+      r"((?:^|_)(?:epo|epochs?|alpha|temp|temperature))([0-9]+\.[0-9]{3,})",
+      _replace_generic_float,
+      name,
+      flags=re.IGNORECASE,
+  )
+  return name
+
+
+def sanitize_hf_repo_id(repo_id: str, max_length: int = 96) -> str:
+  """Sanitizes and bounds a Hugging Face repository ID to comply with Hugging Face Hub constraints.
+
+  Hugging Face Hub rules:
+  - Maximum repo_id length: 96 chars.
+  - Allowed characters: alphanumeric, '-', '_'
+  - Replaces all '.' with '_' to eliminate period-related validation issues.
+  - Cannot start or end with '-' or '.'
+
+  Args:
+      repo_id (str): The repository identifier (e.g. 'user/dataset_name').
+      max_length (int): Maximum length allowed (default 96).
+
+  Returns:
+      str: Sanitized and length-bounded repository identifier.
+  """
+  if not repo_id:
+    return repo_id
+
+  if "/" in repo_id:
+    namespace, repo_name = repo_id.split("/", 1)
+    namespace = namespace.strip()
+    repo_name = repo_name.strip()
+  else:
+    namespace = None
+    repo_name = repo_id.strip()
+
+  repo_name = compact_model_name(repo_name)
+  # Replace periods with underscores so there are NO periods in repo names
+  repo_name = repo_name.replace(".", "_")
+  # Replace any other non-alphanumeric characters (except - and _) with _
+  repo_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", repo_name)
+  # Collapse consecutive underscores and hyphens
+  repo_name = re.sub(r"_+", "_", repo_name)
+  repo_name = re.sub(r"-+", "-", repo_name)
+  repo_name = repo_name.strip(".-_")
+
+  if namespace:
+    namespace = namespace.replace(".", "_")
+    namespace = re.sub(r"[^a-zA-Z0-9_\-]", "_", namespace).strip(".-_")
+    max_repo_name_len = max_length - len(namespace) - 1
+    if len(repo_name) > max_repo_name_len:
+      repo_name = repo_name[:max_repo_name_len].rstrip(".-_")
+    return f"{namespace}/{repo_name}"
+  else:
+    if len(repo_name) > max_length:
+      repo_name = repo_name[:max_length].rstrip(".-_")
+    return repo_name
+
+
+def build_eval_dataset_repo_id(
+    user: str,
+    writer_model_lora: str,
+    temperature: float = 0.0,
+    writer_num_fewshot: int = 0,
+    max_length: int = 96,
+) -> str:
+  """Constructs a deterministic and valid Hugging Face dataset repo ID for generation completions.
+
+  Args:
+      user (str): Hugging Face username / namespace.
+      writer_model_lora (str): Writer model LoRA adapter path or repo ID.
+      temperature (float): Sampling temperature used for generation.
+      writer_num_fewshot (int): Number of fewshot examples prepended to prompts.
+      max_length (int): Maximum allowed repo ID length (default 96).
+
+  Returns:
+      str: A compliant Hugging Face dataset repository identifier (<= max_length
+        chars).
+  """
+  cleaned_path = writer_model_lora.rstrip("/")
+  if f"{user}/" in cleaned_path:
+    model_name = cleaned_path.split(f"{user}/", 1)[1]
+  elif "/" in cleaned_path:
+    model_name = cleaned_path.split("/")[-1]
+  else:
+    model_name = cleaned_path
+
+  compacted_model = compact_model_name(model_name).replace(".", "_")
+  compacted_model = re.sub(r"[^a-zA-Z0-9_\-]", "_", compacted_model)
+  compacted_model = re.sub(r"_+", "_", compacted_model).strip(".-_")
+
+  temp_val = float(temperature)
+  temp_str = (
+      f"{int(temp_val)}"
+      if temp_val.is_integer()
+      else f"{temp_val:.2g}".replace(".", "_")
+  )
+  suffix = f"_gens_T{temp_str}_wfs{writer_num_fewshot}"
+  prefix = "eval_"
+
+  allowed_model_len = max_length - len(user) - 1 - len(prefix) - len(suffix)
+  if len(compacted_model) > allowed_model_len and allowed_model_len > 0:
+    compacted_model = compacted_model[:allowed_model_len].rstrip(".-_")
+
+  full_name = f"{prefix}{compacted_model}{suffix}"
+  return sanitize_hf_repo_id(f"{user}/{full_name}", max_length=max_length)
+

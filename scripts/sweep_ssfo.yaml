@@ -43,7 +43,7 @@ command:
   - --max_length=512
   - --max_prompt_length=384
   - --per_device_train_batch_size=8
-  - --per_device_eval_batch_size=8
+  - --per_device_eval_batch_size=16
   - --auto_find_batch_size=True
   - --lr_scheduler_type=cosine
   - --peft_type=LORA

@@ -8,6 +8,7 @@ SFT_MODEL_PATH="${USER}/"
 
 # Training Parameters
 BATCH_SIZE=8
+EVAL_BATCH_SIZE=16
 AUTO_FIND_BATCH_SIZE=True
 NUM_TRAIN_EPOCHS=1
 LEARNING_RATE=5e-6
@@ -74,8 +75,7 @@ accelerate launch \
   --per_device_train_batch_size "$BATCH_SIZE" \
   --auto_find_batch_size "$AUTO_FIND_BATCH_SIZE" \
   --gradient_accumulation_steps 1 \
-  --per_device_eval_batch_size "$BATCH_SIZE" \
-  --eval_accumulation_steps 1 \
+  --per_device_eval_batch_size "$EVAL_BATCH_SIZE" \
   --peft_type "LORA" \
   --task_type "CAUSAL_LM" \
   --lora_r "$LORA_RANK" \

@@ -40,8 +40,12 @@ def main():
     script_args = parser.parse_args_into_dataclasses()[0]
     set_seed(script_args.seed)
 
-    if script_args.evaluate_evaluator:
+    if script_args.mode == "autoratereval" or script_args.evaluate_evaluator:
         pipe = EvaluationAutoraterPipeline()
+    elif script_args.mode == "generate":
+        pipe = EvaluationGenerationPipeline()
+    elif script_args.mode == "score":
+        pipe = EvaluationScoringPipeline()
     elif script_args.dataset_with_completions is None:
         pipe = EvaluationGenerationPipeline()
     else:

@@ -20,6 +20,11 @@ from src.metrics import (
     GenerationMetricsEvaluator,
     tokenize_words,
 )
+from src.utils import (
+    build_eval_dataset_repo_id,
+    compact_model_name,
+    sanitize_hf_repo_id,
+)
 
 
 class MockDataset:
@@ -398,6 +403,67 @@ class TestMetrics(unittest.TestCase):
     self.assertGreater(updated_ds["rouge1_precision"][0], 0.0)
     self.assertGreater(updated_ds["rouge1_recall"][0], 0.0)
     self.assertGreater(updated_ds["rougeL_f1"][0], 0.0)
+
+
+class TestEvalRepoNaming(unittest.TestCase):
+  """Unit tests for Hugging Face repo ID sanitization, compaction, and building."""
+
+  def test_compact_model_name_floats(self):
+    raw_name = (
+        "npov_PERL_google_S130104_epo0.2_lr2.3663655877360862e-05_beta0.04259128063013425_2608141244"
+    )
+    compacted = compact_model_name(raw_name)
+    self.assertEqual(
+        compacted,
+        "npov_PERL_google_S130104_epo0.2_lr2.4e-05_beta0.043_2608141244",
+    )
+
+  def test_compact_model_name_standard(self):
+    raw_name = "google/gemma-4-E2B-it"
+    compacted = compact_model_name(raw_name)
+    self.assertEqual(compacted, "google/gemma-4-E2B-it")
+
+  def test_build_eval_dataset_repo_id_user_reported_case(self):
+    raw_lora = (
+        "leobianco/npov_PERL_google_S130104_epo0.2_lr2.3663655877360862e-05_beta0.04259128063013425_2608141244"
+    )
+    repo_id = build_eval_dataset_repo_id(
+        user="leobianco",
+        writer_model_lora=raw_lora,
+        temperature=0.0,
+        writer_num_fewshot=0,
+    )
+    self.assertLessEqual(len(repo_id), 96)
+    self.assertNotIn(".", repo_id)
+    self.assertEqual(
+        repo_id,
+        "leobianco/eval_npov_PERL_google_S130104_epo0_2_lr2_4e-05_beta0_043_2608141244_gens_T0_wfs0",
+    )
+
+  def test_sanitize_hf_repo_id_matches_build(self):
+    uncompacted_eval = (
+        "leobianco/eval_npov_PERL_google_S130104_epo0.2_lr2.3663655877360862e-05_beta0.04259128063013425_2608141244_gens_T0.0_wfs0"
+    )
+    sanitized = sanitize_hf_repo_id(uncompacted_eval)
+    self.assertLessEqual(len(sanitized), 96)
+    self.assertNotIn(".", sanitized)
+    self.assertEqual(
+        sanitized,
+        "leobianco/eval_npov_PERL_google_S130104_epo0_2_lr2_4e-05_beta0_043_2608141244_gens_T0_0_wfs0",
+    )
+
+  def test_build_eval_dataset_repo_id_extreme_length(self):
+    huge_model_name = "leobianco/" + ("very_long_model_name_identifier_" * 5)
+    repo_id = build_eval_dataset_repo_id(
+        user="leobianco",
+        writer_model_lora=huge_model_name,
+        temperature=0.7,
+        writer_num_fewshot=2,
+    )
+    self.assertLessEqual(len(repo_id), 96)
+    self.assertNotIn(".", repo_id)
+    self.assertTrue(repo_id.startswith("leobianco/eval_"))
+    self.assertTrue(repo_id.endswith("_gens_T0_7_wfs2"))
 
 
 if __name__ == "__main__":
