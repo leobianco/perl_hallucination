@@ -87,6 +87,8 @@ elif [ "$2" == "score" ]; then
         --evaluator_num_fewshot $EVALUATOR_NUM_FEWSHOT \
         --evaluate_evaluator False \
         --threshold $THRESHOLD \
+        --temperature "$TEMPERATURE" \
+        --writer_num_fewshot $WRITER_NUM_FEWSHOT \
         ${DATASET_WITH_COMPLETIONS:+--dataset_with_completions "$DATASET_WITH_COMPLETIONS"} \
         --compute_bertscore "$COMPUTE_BERTSCORE" \
         --bertscore_model "$BERTSCORE_MODEL" \

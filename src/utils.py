@@ -384,7 +384,7 @@ class EvalArguments:
 
   max_tokens: int = field(default=128)
 
-  temperature: float = field(default=1)
+  temperature: float = field(default=0.0)
 
   top_p: float = field(default=1)
 
