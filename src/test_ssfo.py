@@ -295,6 +295,38 @@ class TestSSFODataGeneration(unittest.TestCase):
       self.assertIn("gemma-4-E4B", pushed_repo)
       self.assertTrue(pushed_repo.startswith("test_user/"))
 
+  def test_setup_arguments_cleaning(self):
+    """Test that setup_arguments correctly cleans CLI arguments with double dash."""
+    with patch("src.pipelines.HfArgumentParser") as mock_parser_cls:
+      mock_parser = MagicMock()
+      mock_parser.parse_args_into_dataclasses.return_value = [
+          SsfoDataGenArguments(
+              task_name="npov",
+              dataset_repo_id="user/dataset",
+              model_repo_id="google/gemma-4-E4B",
+              sft_model_path="user/sft",
+          )
+      ]
+      mock_parser_cls.return_value = mock_parser
+
+      test_pipeline = SSFODataGenerationPipeline()
+      test_pipeline.setup_arguments(
+          "--",
+          "--task_name",
+          "npov",
+          "--dataset_repo_id",
+          "user/dataset",
+          "--model_repo_id",
+          "google/gemma-4-E4B",
+          "--sft_model_path",
+          "user/sft",
+      )
+      called_args = mock_parser.parse_args_into_dataclasses.call_args[0][0]
+      self.assertNotIn("--", called_args)
+      self.assertEqual(test_pipeline.args.task_name, "npov")
+      self.assertEqual(test_pipeline.args.dataset_repo_id, "user/dataset")
+      self.assertEqual(test_pipeline.args.model_repo_id, "google/gemma-4-E4B")
+
 
 if __name__ == "__main__":
   unittest.main()
