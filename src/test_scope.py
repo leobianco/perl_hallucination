@@ -253,6 +253,60 @@ class TestScopeDataGeneration(unittest.TestCase):
     output_logit = self.pipeline._generate_unfaithful_sample("Test prompt")
     self.assertIsInstance(output_logit, str)
 
+    # Test CAD mixing single
+    self.pipeline.args.sampling_mode = "cad"
+    output_cad = self.pipeline._generate_unfaithful_sample("Test prompt")
+    self.assertIsInstance(output_cad, str)
+
+  def test_extract_prompts_npov(self):
+    """Test extracting prompts with and without context for NPOV in SCOPE."""
+    self.pipeline.args.task_name = "npov"
+    entry = {
+        "user_query": "Is quantum computing real?",
+        "perspective_1_name": "Pro",
+        "perspective_1": "Qubits allow superpositions.",
+        "perspective_2_name": "Con",
+        "perspective_2": "Decoherence is difficult.",
+        "npov_response": "Quantum computing has both promises and challenges.",
+    }
+    p_ctx, p_no_ctx, gt = self.pipeline._extract_prompts(entry)
+    self.assertIn("Qubits allow superpositions.", p_ctx)
+    self.assertIn("Is quantum computing real?", p_ctx)
+    self.assertIn("Is quantum computing real?", p_no_ctx)
+    self.assertNotIn("Qubits allow superpositions.", p_no_ctx)
+    self.assertEqual(
+        gt, "Quantum computing has both promises and challenges."
+    )
+
+  def test_extract_prompts_bosch(self):
+    """Test extracting prompts with and without context for Bosch in SCOPE."""
+    self.pipeline.args.task_name = "bosch"
+    entry = {
+        "Question": "Where is oil filter?",
+        "Context": "Under the engine cover on the left.",
+        "response": "The oil filter is under the left engine cover.",
+    }
+    p_ctx, p_no_ctx, gt = self.pipeline._extract_prompts(entry)
+    self.assertIn("Under the engine cover on the left.", p_ctx)
+    self.assertNotIn("Under the engine cover on the left.", p_no_ctx)
+    self.assertIn("Where is oil filter?", p_no_ctx)
+    self.assertEqual(
+        gt, "The oil filter is under the left engine cover."
+    )
+
+  def test_extract_prompts_ragtruth(self):
+    """Test extracting prompts with and without context for RAGTruth in SCOPE."""
+    self.pipeline.args.task_name = "ragtruth"
+    entry = {
+        "user_query": "What is photosynthesis?",
+        "passage": "Plants convert light energy into chemical energy.",
+        "completion": "Photosynthesis produces glucose from sunlight.",
+    }
+    p_ctx, p_no_ctx, gt = self.pipeline._extract_prompts(entry)
+    self.assertIn("Context: Plants convert light energy into chemical energy.", p_ctx)
+    self.assertEqual(p_no_ctx, "Question: What is photosynthesis?\nAnswer:\n")
+    self.assertEqual(gt, "Photosynthesis produces glucose from sunlight.")
+
   def test_batched_noisy_decoding(self):
     """Test batched noisy decoding with multiple prompts."""
     mock_tokenizer = MagicMock()

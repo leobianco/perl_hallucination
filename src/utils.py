@@ -86,6 +86,9 @@ class ScopeDataGenArguments:
       max_samples (Optional[int]): Maximum samples to process (useful for
         testing/debugging). Default: None.
       batch_size (int): Batch size for parallel noisy decoding. Default: 16.
+      n_untouched_logits (int): Number of initial tokens to keep purely
+        conditional from the SFT model (matching mixture_n_untouched in SCOPE).
+        Default: 2.
       push_to_hub (bool): Whether to push the resulting preference dataset to HF
         Hub. Default: True.
       output_dir (Optional[str]): Optional local directory to save the generated
@@ -107,6 +110,7 @@ class ScopeDataGenArguments:
   seed: int = 12345
   max_samples: Optional[int] = None
   batch_size: int = 16
+  n_untouched_logits: int = 2
   push_to_hub: bool = True
   output_dir: Optional[str] = None
 

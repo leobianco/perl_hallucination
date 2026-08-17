@@ -1319,43 +1319,126 @@ class ScopeDataGenerationPipeline(Pipeline):
     dataset = load_dataset(self.args.dataset_repo_id)
     self.raw_dataset = dataset
 
-  def _extract_prompt_and_chosen(self, entry: dict) -> Tuple[str, str]:
-    """Extract standard prompt and chosen completion from dataset entry."""
+  def _extract_prompts(self, entry: dict) -> Tuple[str, str, str]:
+    """Extract (prompt_with_context, prompt_without_context, ground_truth_chosen) from entry."""
     task_name = self.args.task_name
-    if "prompt" in entry and "chosen" in entry:
-      return entry["prompt"], entry["chosen"]
-    if "prompt" in entry and "completion" in entry:
-      return entry["prompt"], entry["completion"]
-    if "prompt" in entry and "npov_response" in entry:
-      return entry["prompt"], entry["npov_response"]
-
-    # Fallback to task processor prompt formatting
     processor_cls = get_task_processor(task_name)
+
+    gt = entry.get(
+        "npov_response",
+        entry.get(
+            "completion",
+            entry.get("response", entry.get("chosen", "")),
+        ),
+    )
+
     if task_name == "npov":
-      prompt = processor_cls._writer_prompt(entry, SFT=False)["prompt"]
-      chosen = entry.get("npov_response", entry.get("completion", ""))
-      return prompt, chosen
+      if "prompt" in entry and entry["prompt"]:
+        prompt_raw = entry["prompt"]
+        if gt and prompt_raw.endswith(gt):
+          prompt_with_context = prompt_raw[:-len(gt)].rstrip() + "\n"
+        else:
+          prompt_with_context = prompt_raw
+        user_query = entry.get("user_query", "")
+        if not user_query and "User query: " in prompt_raw:
+          after_query = prompt_raw.split("User query: ", 1)[1]
+          user_query = after_query.split("\n", 1)[0].strip()
+      elif "perspective_1" in entry and "perspective_2" in entry:
+        prompt_with_context = processor_cls._writer_prompt(entry, SFT=False)[
+            "prompt"
+        ]
+        user_query = entry.get("user_query", "")
+      else:
+        prompt_with_context = str(entry)
+        user_query = entry.get("user_query", "")
+
+      prompt_without_context = (
+          f"User query: {user_query}\n"
+          "Neutral point-of-view answer to user query in natural language:\n"
+      )
+      return prompt_with_context, prompt_without_context, gt
+
     elif task_name == "bosch":
-      prompt = (
+      if "prompt" in entry and entry["prompt"]:
+        prompt_raw = entry["prompt"]
+        if gt and prompt_raw.endswith(gt):
+          prompt_with_context = prompt_raw[:-len(gt)].rstrip() + "\n"
+        else:
+          prompt_with_context = prompt_raw
+        question = entry.get("Question", "")
+        if not question and "User question:\n" in prompt_raw:
+          question = (
+              prompt_raw.split("User question:\n", 1)[1]
+              .split("\nManual information:\n", 1)[0]
+              .strip()
+          )
+      else:
+        question = entry.get("Question", "")
+        context = entry.get("Context", "")
+        prompt_with_context = (
+            "You are a helpful assistant to car related questions. You will be"
+            " given an user's question, and the relevant part of the car"
+            " manual. Your task is to answer the user's question using the"
+            " information given. Do not add to your answer any information other"
+            " than those present in the manual excerpt.\nUser"
+            f" question:\n{question}\nManual"
+            f" information:\n{context}\nAnswer to user's"
+            " question:\n"
+        )
+      prompt_without_context = (
           "You are a helpful assistant to car related questions. You will be"
-          " given an user's question, and the relevant part of the car"
-          " manual. Your task is to answer the user's question using the"
-          " information given. Do not add to your answer any information other"
-          " than those present in the manual excerpt.\nUser"
-          f" question:\n{entry.get('Question', '')}\nManual"
-          f" information:\n{entry.get('Context', '')}\nAnswer to user's"
+          " given an user's question. Your task is to answer the user's"
+          f" question.\nUser question:\n{question}\nAnswer to user's"
           " question:\n"
       )
-      chosen = entry.get("response", entry.get("completion", ""))
-      return prompt, chosen
+      return prompt_with_context, prompt_without_context, gt
+
     elif task_name == "ragtruth":
-      prompt = entry.get("prompt", entry.get("user_query", ""))
-      chosen = entry.get("completion", entry.get("response", ""))
-      return prompt, chosen
+      if "prompt" in entry and entry["prompt"]:
+        prompt_raw = entry["prompt"]
+        if gt and prompt_raw.endswith(gt):
+          prompt_with_context = prompt_raw[:-len(gt)].rstrip() + "\n"
+        else:
+          prompt_with_context = prompt_raw
+        user_query = entry.get(
+            "user_query", entry.get("query", entry.get("question", ""))
+        )
+        if not user_query and "Question: " in prompt_raw:
+          user_query = (
+              prompt_raw.split("Question: ", 1)[1]
+              .split("\nAnswer:\n", 1)[0]
+              .strip()
+          )
+      else:
+        user_query = entry.get(
+            "user_query", entry.get("query", entry.get("question", ""))
+        )
+        context = entry.get(
+            "context", entry.get("passage", entry.get("document", ""))
+        )
+        if context:
+          prompt_with_context = (
+              f"Context: {context}\nQuestion: {user_query}\nAnswer:\n"
+          )
+        else:
+          prompt_with_context = f"Question: {user_query}\nAnswer:\n"
+      prompt_without_context = f"Question: {user_query}\nAnswer:\n"
+      return prompt_with_context, prompt_without_context, gt
+
     else:
-      prompt = entry.get("prompt", str(entry))
-      chosen = entry.get("chosen", entry.get("completion", ""))
-      return prompt, chosen
+      if "prompt" in entry and entry["prompt"]:
+        prompt_with_context = entry["prompt"]
+      else:
+        prompt_with_context = str(entry)
+      prompt_without_context = entry.get(
+          "prompt_no_context", entry.get("query", prompt_with_context)
+      )
+      return prompt_with_context, prompt_without_context, gt
+
+  def _extract_prompt_and_chosen(self, entry: dict) -> Tuple[str, str]:
+    """Extract standard prompt and chosen completion from dataset entry."""
+    p_ctx, _, gt = self._extract_prompts(entry)
+    return p_ctx, gt
 
   def process_data(self) -> None:
     train_split = (
@@ -1419,11 +1502,15 @@ class ScopeDataGenerationPipeline(Pipeline):
 
   def _generate_unfaithful_samples_batch(
       self,
-      prompts: list[str],
+      prompts_with_ctx: list[str],
+      prompts_without_ctx: list[str] | None = None,
   ) -> list[str]:
-    """Generate dispreferred samples for a batch using SCOPE noisy decoding (Algorithm 1)."""
-    if not prompts:
+    """Generate dispreferred samples for a batch using SCOPE noisy decoding (Algorithm 1 / MixtureLogitsProcessor)."""
+    if not prompts_with_ctx:
       return []
+
+    if prompts_without_ctx is None or len(prompts_without_ctx) != len(prompts_with_ctx):
+      prompts_without_ctx = prompts_with_ctx
 
     tokenizer = self.tokenizer
     device = self.device
@@ -1433,35 +1520,39 @@ class ScopeDataGenerationPipeline(Pipeline):
     top_k = self.args.top_k
     max_new_tokens = self.args.max_new_tokens
     sampling_mode = self.args.sampling_mode
-    batch_size = len(prompts)
+    n_untouched = getattr(self.args, "n_untouched_logits", 2) or 0
+    batch_size = len(prompts_with_ctx)
 
-    inputs = tokenizer(
-        prompts,
+    sft_inputs = tokenizer(
+        prompts_with_ctx,
         return_tensors="pt",
         padding=True,
     ).to(device)
-    prompt_ids = (
-        inputs.input_ids
-        if hasattr(inputs, "input_ids")
-        else inputs["input_ids"]
+    sft_input_ids = (
+        sft_inputs.input_ids
+        if hasattr(sft_inputs, "input_ids")
+        else sft_inputs["input_ids"]
     )
-    prompt_attention_mask = (
-        getattr(inputs, "attention_mask", None)
-        if hasattr(inputs, "attention_mask")
-        else inputs.get("attention_mask", None)
+    sft_attention_mask = (
+        getattr(sft_inputs, "attention_mask", None)
+        if hasattr(sft_inputs, "attention_mask")
+        else sft_inputs.get("attention_mask", None)
     )
 
-    if getattr(tokenizer, "bos_token_id", None) is not None:
-      base_input_ids = torch.full(
-          (batch_size, 1),
-          tokenizer.bos_token_id,
-          dtype=torch.long,
-          device=device,
-      )
-    else:
-      base_input_ids = prompt_ids[:, :1].clone()
-    base_attention_mask = torch.ones(
-        (batch_size, 1), dtype=torch.long, device=device
+    base_inputs = tokenizer(
+        prompts_without_ctx,
+        return_tensors="pt",
+        padding=True,
+    ).to(device)
+    base_input_ids = (
+        base_inputs.input_ids
+        if hasattr(base_inputs, "input_ids")
+        else base_inputs["input_ids"]
+    )
+    base_attention_mask = (
+        getattr(base_inputs, "attention_mask", None)
+        if hasattr(base_inputs, "attention_mask")
+        else base_inputs.get("attention_mask", None)
     )
 
     generated_tokens: list[list[int]] = [[] for _ in range(batch_size)]
@@ -1469,8 +1560,8 @@ class ScopeDataGenerationPipeline(Pipeline):
 
     past_key_values_sft = None
     past_key_values_base = None
-    cur_sft_input = prompt_ids
-    cur_sft_mask = prompt_attention_mask
+    cur_sft_input = sft_input_ids
+    cur_sft_mask = sft_attention_mask
     cur_base_input = base_input_ids
     cur_base_mask = base_attention_mask
 
@@ -1486,7 +1577,7 @@ class ScopeDataGenerationPipeline(Pipeline):
       eos_token_ids.update(tokenizer.additional_special_tokens_ids)
 
     with torch.no_grad():
-      for _ in range(max_new_tokens):
+      for step in range(max_new_tokens):
         if finished.all():
           break
 
@@ -1513,24 +1604,38 @@ class ScopeDataGenerationPipeline(Pipeline):
           logits_sft = logits_sft / temperature
           logits_base = logits_base / temperature
 
-        if sampling_mode == "bernoulli":
-          # Algorithm 1: alpha_t ~ Bernoulli(alpha) sampled on GPU across batch
-          alpha_mask = torch.bernoulli(
-              torch.full((batch_size, 1), alpha, device=device)
-          )
-          selected_logits = torch.where(
-              alpha_mask == 1.0, logits_base, logits_sft
-          )
-          probs = torch.softmax(selected_logits, dim=-1)
-        elif sampling_mode == "prob_mix":
-          probs_sft = torch.softmax(logits_sft, dim=-1)
-          probs_base = torch.softmax(logits_base, dim=-1)
-          probs = (1.0 - alpha) * probs_sft + alpha * probs_base
-        elif sampling_mode == "logit_mix":
-          mixed_logits = (1.0 - alpha) * logits_sft + alpha * logits_base
-          probs = torch.softmax(mixed_logits, dim=-1)
-        else:
+        # 1. Protection: Keep first n_untouched tokens purely conditional (SFT)
+        if step < n_untouched or alpha == 0.0:
           probs = torch.softmax(logits_sft, dim=-1)
+        else:
+          # 2. Protection: Mask invalid/special tokens from the unconditional/base model
+          inf_indices = torch.isinf(logits_sft) | (logits_sft <= -1e9)
+          logits_base[inf_indices] = float("-inf")
+
+          if sampling_mode in ("bernoulli", "hard"):
+            # Algorithm 1: alpha_t ~ Bernoulli(alpha) sampled on GPU across batch
+            alpha_mask = torch.bernoulli(
+                torch.full((batch_size, 1), alpha, device=device)
+            )
+            selected_logits = torch.where(
+                alpha_mask == 1.0, logits_base, logits_sft
+            )
+            probs = torch.softmax(selected_logits, dim=-1)
+          elif sampling_mode == "prob_mix":
+            probs_sft = torch.softmax(logits_sft, dim=-1)
+            probs_base = torch.softmax(logits_base, dim=-1)
+            probs = (1.0 - alpha) * probs_sft + alpha * probs_base
+          elif sampling_mode == "cad":
+            uncond_scores = torch.softmax(logits_base, dim=-1)
+            cond_scores = torch.softmax(logits_sft, dim=-1)
+            cad_scores = (1.0 + alpha) * cond_scores - alpha * uncond_scores
+            cad_scores = torch.clamp(cad_scores, min=0.0)
+            probs = cad_scores / cad_scores.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+          elif sampling_mode == "logit_mix":
+            mixed_logits = (1.0 - alpha) * logits_sft + alpha * logits_base
+            probs = torch.softmax(mixed_logits, dim=-1)
+          else:
+            probs = torch.softmax(logits_sft, dim=-1)
 
         if top_k > 0 and top_k < probs.size(-1):
           top_k_probs, top_k_indices = torch.topk(probs, top_k, dim=-1)
@@ -1624,15 +1729,20 @@ class ScopeDataGenerationPipeline(Pipeline):
         range(0, len(entries), batch_size), desc="SCOPE noisy decoding"
     ):
       batch_entries = entries[i : i + batch_size]
-      batch_prompts = []
+      batch_prompts_ctx = []
+      batch_prompts_no_ctx = []
       batch_chosens = []
       for entry in batch_entries:
-        prompt, chosen = self._extract_prompt_and_chosen(entry)
-        batch_prompts.append(prompt)
-        batch_chosens.append(chosen)
+        p_ctx, p_no_ctx, gt = self._extract_prompts(entry)
+        batch_prompts_ctx.append(p_ctx)
+        batch_prompts_no_ctx.append(p_no_ctx)
+        batch_chosens.append(gt)
 
-      batch_rejecteds = self._generate_unfaithful_samples_batch(batch_prompts)
-      prompts.extend(batch_prompts)
+      batch_rejecteds = self._generate_unfaithful_samples_batch(
+          prompts_with_ctx=batch_prompts_ctx,
+          prompts_without_ctx=batch_prompts_no_ctx,
+      )
+      prompts.extend(batch_prompts_ctx)
       chosens.extend(batch_chosens)
       rejecteds.extend(batch_rejecteds)
 
@@ -1651,10 +1761,10 @@ class ScopeDataGenerationPipeline(Pipeline):
     ):
       test_prompts, test_chosens, test_rejecteds = [], [], []
       for entry in self.raw_dataset["test"]:
-        prompt, chosen = self._extract_prompt_and_chosen(entry)
-        test_prompts.append(prompt)
-        test_chosens.append(chosen)
-        test_rejecteds.append(chosen)
+        p_ctx, _, gt = self._extract_prompts(entry)
+        test_prompts.append(p_ctx)
+        test_chosens.append(gt)
+        test_rejecteds.append(gt)
       test_split = Dataset.from_dict({
           "prompt": test_prompts,
           "chosen": test_chosens,

@@ -375,25 +375,17 @@ class TestSSFODataGeneration(unittest.TestCase):
     }
     self.pipeline.train_split = [entry]
     self.pipeline.raw_dataset = {"train": [entry], "test": [entry]}
-    self.pipeline.args.output_dir = "mock/output/dir"
-    self.pipeline.args.push_to_hub = False
-
-    saved_datasets = []
-
-    def mock_save(*args, **kwargs):
-      saved_datasets.append(args[0] if len(args) > 1 else None)
-
-    with patch.object(DatasetDict, "save_to_disk", autospec=True) as mock_save:
+    with patch("src.pipelines.DatasetDict") as mock_ds_dict:
       self.pipeline.run_and_save()
-      mock_save.assert_called_once()
-      pref_ds = mock_save.call_args[0][0]
-      self.assertIn("train", pref_ds)
-      self.assertIn("test", pref_ds)
+      mock_ds_dict.assert_called()
+      splits_dict = mock_ds_dict.call_args[0][0]
+      self.assertIn("train", splits_dict)
+      self.assertIn("test", splits_dict)
       self.assertEqual(
-          pref_ds["train"].column_names, pref_ds["test"].column_names
+          splits_dict["train"].column_names, splits_dict["test"].column_names
       )
       self.assertEqual(
-          pref_ds["train"].column_names, ["prompt", "chosen", "rejected"]
+          splits_dict["train"].column_names, ["prompt", "chosen", "rejected"]
       )
 
 
