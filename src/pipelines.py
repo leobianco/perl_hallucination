@@ -1417,14 +1417,6 @@ class ScopeDataGenerationPipeline(Pipeline):
     dataset = load_dataset(self.args.dataset_repo_id)
     self.raw_dataset = dataset
 
-  @staticmethod
-  def _format_turn_prompt(prompt_text: str) -> str:
-    """Wrap prompt with turn delimiters (<start_of_turn>user ... <start_of_turn>model) if not present."""
-    if "<start_of_turn>" in prompt_text:
-      return prompt_text
-    cleaned = prompt_text.strip()
-    return f"<start_of_turn>user\n{cleaned}<end_of_turn>\n<start_of_turn>model\n"
-
   def _extract_prompts(self, entry: dict) -> Tuple[str, str, str]:
     """Extract (prompt_with_context, prompt_without_context, ground_truth_chosen) from entry."""
     task_name = self.args.task_name
@@ -1469,8 +1461,6 @@ class ScopeDataGenerationPipeline(Pipeline):
           f"User query: {user_query}\n"
           "Neutral point-of-view answer to user query, rewriting provided arguments in natural language:\n"
       )
-      prompt_with_context = self._format_turn_prompt(prompt_with_context)
-      prompt_without_context = self._format_turn_prompt(prompt_without_context)
       return prompt_with_context, prompt_without_context, gt
 
     elif task_name == "bosch":
@@ -1506,8 +1496,6 @@ class ScopeDataGenerationPipeline(Pipeline):
           f" question.\nUser question:\n{question}\nAnswer to user's"
           " question:\n"
       )
-      prompt_with_context = self._format_turn_prompt(prompt_with_context)
-      prompt_without_context = self._format_turn_prompt(prompt_without_context)
       return prompt_with_context, prompt_without_context, gt
 
     elif task_name == "ragtruth":
@@ -1540,8 +1528,6 @@ class ScopeDataGenerationPipeline(Pipeline):
         else:
           prompt_with_context = f"Question: {user_query}\nAnswer:\n"
       prompt_without_context = f"Question: {user_query}\nAnswer:\n"
-      prompt_with_context = self._format_turn_prompt(prompt_with_context)
-      prompt_without_context = self._format_turn_prompt(prompt_without_context)
       return prompt_with_context, prompt_without_context, gt
 
     else:
@@ -1552,8 +1538,6 @@ class ScopeDataGenerationPipeline(Pipeline):
       prompt_without_context = entry.get(
           "prompt_no_context", entry.get("query", prompt_with_context)
       )
-      prompt_with_context = self._format_turn_prompt(prompt_with_context)
-      prompt_without_context = self._format_turn_prompt(prompt_without_context)
       return prompt_with_context, prompt_without_context, gt
 
   def _extract_prompt_and_chosen(self, entry: dict) -> Tuple[str, str]:
