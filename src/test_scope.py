@@ -348,6 +348,7 @@ class TestScopeDataGeneration(unittest.TestCase):
 
     prompts = ["Prompt 1", "Prompt 2"]
     batch_outputs = self.pipeline._generate_unfaithful_samples_batch(prompts)
+    self.assertEqual(mock_tokenizer.padding_side, "left")
     self.assertEqual(len(batch_outputs), 2)
     self.assertEqual(batch_outputs[0], "Output 1")
     self.assertEqual(batch_outputs[1], "Output 2")

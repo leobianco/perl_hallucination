@@ -1568,6 +1568,15 @@ class ScopeDataGenerationPipeline(Pipeline):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     self.device = device
 
+    if self.tokenizer.pad_token_id is None:
+      if self.tokenizer.eos_token_id is not None:
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+      elif self.tokenizer.unk_token_id is not None:
+        self.tokenizer.pad_token = self.tokenizer.unk_token
+        self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
+    self.tokenizer.padding_side = "left"
+
     print(f"Loading base pre-trained model: {self.args.model_repo_id}...")
     self.base_model = AutoModelForCausalLM.from_pretrained(
         self.args.model_repo_id,
@@ -1621,6 +1630,15 @@ class ScopeDataGenerationPipeline(Pipeline):
       prompts_without_ctx = prompts_with_ctx
 
     tokenizer = self.tokenizer
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token_id is None:
+      if tokenizer.eos_token_id is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+      elif tokenizer.unk_token_id is not None:
+        tokenizer.pad_token = tokenizer.unk_token
+        tokenizer.pad_token_id = tokenizer.unk_token_id
+
     device = self.device
     alpha = self.args.alpha
     temperature = self.args.temperature
