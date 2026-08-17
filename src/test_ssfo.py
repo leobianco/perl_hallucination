@@ -169,6 +169,9 @@ class TestSSFODataGeneration(unittest.TestCase):
         push_to_hub=False,
     )
     self.pipeline.device = torch.device("cpu")
+    self.pipeline.enable_lora = False
+    self.pipeline.lora_path = None
+    self.pipeline.vllm_model = self.pipeline.args.model_repo_id
 
   def test_extract_prompts_npov(self):
     """Test prompt extraction with and without context for NPOV."""
@@ -217,68 +220,35 @@ class TestSSFODataGeneration(unittest.TestCase):
         gt, "Locate the gauge in the glove compartment to check."
     )
 
-  def test_generate_simulation(self):
-    """Test SSFO generation step with mocked SFT model."""
-    mock_tokenizer = MagicMock()
-    mock_tokenizer.pad_token_id = 0
-    mock_tokenizer.eos_token_id = 1
-    mock_tokenizer.additional_special_tokens_ids = []
-    inputs_dict = {
-        "input_ids": MagicMock(shape=[1, 3]),
-        "attention_mask": MagicMock(shape=[1, 3]),
+  def test_setup_model_resolves_lora(self):
+    """Test setup_model correctly resolves LoRA and vllm model."""
+    self.pipeline.args.sft_model_path = "test_user/sft_adapter"
+    self.pipeline.args.model_repo_id = "google/gemma-4-E4B-it"
+    with patch.object(
+        self.pipeline,
+        "_resolve_lora_adapter_path",
+        return_value=(True, "/resolved/lora/path"),
+    ):
+      self.pipeline.setup_model()
+      self.assertTrue(self.pipeline.enable_lora)
+      self.assertEqual(self.pipeline.lora_path, "/resolved/lora/path")
+      self.assertEqual(self.pipeline.vllm_model, "google/gemma-4-E4B-it")
+
+  def test_extract_prompts_ragtruth(self):
+    """Test _extract_prompts for ragtruth task with context."""
+    self.pipeline.args.task_name = "ragtruth"
+    entry = {
+        "user_query": "What causes earthquakes?",
+        "passage": "Tectonic plates shift along faults.",
+        "completion": "Tectonic plate movements cause earthquakes.",
     }
-    mock_inputs = MagicMock()
-    mock_inputs.to.return_value = inputs_dict
-    mock_inputs.__getitem__.side_effect = lambda k: inputs_dict[k]
-    mock_inputs.get.side_effect = lambda k, d=None: inputs_dict.get(k, d)
-    mock_inputs.__contains__.side_effect = lambda k: k in inputs_dict
-    mock_tokenizer.return_value = mock_inputs
-    mock_tokenizer.batch_decode = MagicMock(
-        return_value=["Generated SSFO completion"]
+    prompt_ctx, prompt_no_ctx, gt = self.pipeline._extract_prompts(entry)
+    self.assertIn("Context: Tectonic plates shift along faults.", prompt_ctx)
+    self.assertIn("Question: What causes earthquakes?", prompt_ctx)
+    self.assertEqual(
+        prompt_no_ctx, "Question: What causes earthquakes?\nAnswer:\n"
     )
-    mock_tokenizer.decode = MagicMock(
-        return_value="Generated SSFO completion"
-    )
-    self.pipeline.tokenizer = mock_tokenizer
-
-    mock_sft = MagicMock()
-    mock_sft.generate = MagicMock(return_value=MagicMock())
-    self.pipeline.sft_model = mock_sft
-    self.pipeline.args.max_new_tokens = 5
-
-    completion = self.pipeline._generate("Test prompt")
-    self.assertEqual(completion, "Generated SSFO completion")
-
-  def test_generate_batch_simulation(self):
-    """Test SSFO batch generation with mocked SFT model."""
-    mock_tokenizer = MagicMock()
-    mock_tokenizer.pad_token_id = 0
-    mock_tokenizer.eos_token_id = 1
-    mock_tokenizer.additional_special_tokens_ids = []
-    inputs_dict = {
-        "input_ids": MagicMock(shape=[2, 3]),
-        "attention_mask": MagicMock(shape=[2, 3]),
-    }
-    mock_inputs = MagicMock()
-    mock_inputs.to.return_value = inputs_dict
-    mock_inputs.__getitem__.side_effect = lambda k: inputs_dict[k]
-    mock_inputs.get.side_effect = lambda k, d=None: inputs_dict.get(k, d)
-    mock_inputs.__contains__.side_effect = lambda k: k in inputs_dict
-    mock_tokenizer.return_value = mock_inputs
-    mock_tokenizer.batch_decode = MagicMock(
-        return_value=["Output 1", "Output 2"]
-    )
-    self.pipeline.tokenizer = mock_tokenizer
-
-    mock_sft = MagicMock()
-    mock_sft.generate = MagicMock(return_value=MagicMock())
-    self.pipeline.sft_model = mock_sft
-    self.pipeline.args.max_new_tokens = 5
-
-    completions = self.pipeline._generate_batch(["Prompt 1", "Prompt 2"])
-    self.assertEqual(len(completions), 2)
-    self.assertEqual(completions[0], "Output 1")
-    self.assertEqual(completions[1], "Output 2")
+    self.assertEqual(gt, "Tectonic plate movements cause earthquakes.")
 
   def test_ssfo_output_dataset_repo_id_formatting(self):
     """Test default preference dataset repo ID construction contains model and timestamp."""
@@ -318,11 +288,9 @@ class TestSSFODataGeneration(unittest.TestCase):
     mock_out_2 = MagicMock(outputs=[MagicMock(text="Chosen completion 2")])
     mock_out_3 = MagicMock(outputs=[MagicMock(text="Rejected completion 1")])
     mock_out_4 = MagicMock(outputs=[MagicMock(text="Rejected completion 2")])
-    mock_llm.generate.return_value = [
-        mock_out_1,
-        mock_out_2,
-        mock_out_3,
-        mock_out_4,
+    mock_llm.generate.side_effect = [
+        [mock_out_1, mock_out_2],
+        [mock_out_3, mock_out_4],
     ]
     self.pipeline.llm = mock_llm
     self.pipeline.train_split = [
@@ -349,10 +317,11 @@ class TestSSFODataGeneration(unittest.TestCase):
 
     with patch("src.pipelines.DatasetDict.save_to_disk"):
       self.pipeline.run_and_save()
-      mock_llm.generate.assert_called_once()
-      call_args = mock_llm.generate.call_args[0][0]
-      # Combined prompts (2 ctx + 2 no_ctx = 4 total prompts)
-      self.assertEqual(len(call_args), 4)
+      self.assertEqual(mock_llm.generate.call_count, 2)
+      ctx_args = mock_llm.generate.call_args_list[0][0][0]
+      no_ctx_args = mock_llm.generate.call_args_list[1][0][0]
+      self.assertEqual(len(ctx_args), 2)
+      self.assertEqual(len(no_ctx_args), 2)
 
   def test_setup_arguments_cleaning(self):
     """Test that setup_arguments correctly cleans CLI arguments with double dash."""

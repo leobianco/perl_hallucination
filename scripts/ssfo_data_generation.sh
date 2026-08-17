@@ -3,14 +3,14 @@
 # Core Parameters
 USER="leobianco"
 SEED=130104
-MODEL_REPO_ID="google/gemma-4-E4B"
+MODEL_REPO_ID="google/gemma-4-E4B-it"
 SFT_MODEL_PATH="${USER}/"
 
-# SSFO Generation Parameters (https://arxiv.org/abs/2508.17225)
-TEMPERATURE=0.7
-TOP_P=0.9
-TOP_K=50
-MAX_NEW_TOKENS=256
+# SSFO Generation Parameters (matching evaluator.sh)
+TEMPERATURE=0.0
+TOP_P=1.0
+TOP_K=0
+MAX_NEW_TOKENS=250
 BATCH_SIZE=16
 MAX_SAMPLES=""  # Set number of samples here directly (e.g. 500), or leave empty for full data
 USE_GROUND_TRUTH_CHOSEN=False

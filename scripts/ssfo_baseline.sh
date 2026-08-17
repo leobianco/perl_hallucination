@@ -16,7 +16,7 @@
 # Core Parameters
 USER="leobianco"
 SEED=130104
-MODEL_REPO_ID="google/gemma-4-E4B"
+MODEL_REPO_ID="google/gemma-4-E4B-it"
 
 # SFT Training Parameters (Stage 1)
 SFT_BATCH_SIZE=16
@@ -25,12 +25,12 @@ SFT_LR=0.004445051258597345
 SFT_LORA_R=8
 SFT_LORA_ALPHA=8
 
-# SSFO Generation Parameters (Stage 2)
+# SSFO Generation Parameters (Stage 2 - matching evaluator.sh)
 GEN_DATASET_REPO_ID="${GEN_DATASET_REPO_ID:-${USER}/${TASK_NAME}_perl}"
-GEN_TEMP=0.7
-GEN_TOP_P=0.9
-GEN_TOP_K=50
-MAX_NEW_TOKENS=256
+GEN_TEMP=0.0
+GEN_TOP_P=1.0
+GEN_TOP_K=0
+MAX_NEW_TOKENS=250
 GEN_BATCH_SIZE=16
 MAX_SAMPLES=""  # Set number of samples here directly (e.g. 500), or leave empty for full data
 USE_GROUND_TRUTH_CHOSEN=False

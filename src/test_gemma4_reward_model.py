@@ -1,7 +1,34 @@
-"""Unit tests for Gemma 4 sequence classification and reward modeling."""
-
+import sys
+import types
 import unittest
 from unittest.mock import MagicMock
+
+if "torch" not in sys.modules:
+  try:
+    import torch
+    from torch import nn
+  except ImportError:
+    torch = types.ModuleType("torch")
+    torch.__path__ = []
+    torch.nn = types.ModuleType("torch.nn")
+    torch.nn.Module = object
+    torch.nn.Linear = MagicMock
+    torch.nn.Identity = MagicMock
+    torch.nn.Embedding = MagicMock
+    torch.nn.BCEWithLogitsLoss = object
+    torch.nn.CrossEntropyLoss = object
+    torch.nn.MSELoss = object
+    torch.device = lambda x: x
+    torch.tensor = lambda x, **kw: MagicMock()
+    torch.randn = lambda *x: MagicMock()
+    torch.zeros = lambda *x, **kw: MagicMock()
+    torch.ones = lambda *x, **kw: MagicMock()
+    torch.long = "long"
+    torch.float32 = "float32"
+    torch.bfloat16 = "bfloat16"
+    torch.bool = "bool"
+    sys.modules["torch"] = torch
+    sys.modules["torch.nn"] = torch.nn
 
 from src.models.gemma4_sequence_classification import (
     Gemma4ForSequenceClassification,

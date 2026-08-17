@@ -148,10 +148,10 @@ class SsfoDataGenArguments:
   model_repo_id: str
   sft_model_path: str
   output_dataset_repo_id: Optional[str] = None
-  temperature: float = 0.7
-  top_p: float = 0.9
-  top_k: int = 50
-  max_new_tokens: int = 256
+  temperature: float = 0.0
+  top_p: float = 1.0
+  top_k: int = 0
+  max_new_tokens: int = 250
   seed: int = 12345
   max_samples: Optional[int] = None
   batch_size: int = 16

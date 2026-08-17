@@ -9,9 +9,20 @@ from __future__ import annotations
 
 from typing import Any, List, Optional, Tuple, Union
 
-import torch
-from torch import nn
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+try:
+  import torch
+  from torch import nn
+  from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+except ImportError:
+  import types
+  torch = types.ModuleType("torch")
+  nn = types.ModuleType("torch.nn")
+  nn.Module = object
+  nn.Linear = object
+  nn.Identity = object
+  BCEWithLogitsLoss = object
+  CrossEntropyLoss = object
+  MSELoss = object
 
 try:
   from transformers import (
@@ -25,7 +36,9 @@ except ImportError:
   AutoConfig = None
   AutoModel = None
   AutoModelForSequenceClassification = None
-  PreTrainedModel = nn.Module
+  class PreTrainedModel:
+    def __init__(self, *args, **kwargs):
+      pass
   SequenceClassifierOutputWithPast = None
 
 # Robustly resolve Gemma4Config

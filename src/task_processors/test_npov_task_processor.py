@@ -1,32 +1,73 @@
 import json
+import sys
+import types
 import unittest
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
+
+if "pandas" not in sys.modules:
+  try:
+    import pandas
+  except ImportError:
+    pandas_mock = types.ModuleType("pandas")
+    pandas_mock.DataFrame = MagicMock
+    pandas_mock.isna = lambda x: x is None
+    sys.modules["pandas"] = pandas_mock
 
 try:
-    from datasets import Dataset, DatasetDict
+  from datasets import Dataset, DatasetDict
 except ImportError:
-    class _MockDataset:
-        def __init__(self, data):
-            self._data = dict(data)
-            self.column_names = list(data.keys())
-        def __getitem__(self, key):
-            return self._data[key]
-        def map(self, fn):
-            num_rows = len(next(iter(self._data.values())))
-            new_rows = []
-            for i in range(num_rows):
-                entry = {k: self._data[k][i] for k in self._data}
-                res = fn(entry)
-                entry.update(res)
-                new_rows.append(entry)
-            new_data = {k: [row[k] for row in new_rows] for k in new_rows[0]}
-            return _MockDataset(new_data)
-    class Dataset:
-        @classmethod
-        def from_dict(cls, d):
-            return _MockDataset(d)
-    class DatasetDict(dict):
-        pass
+
+  class _MockDataset:
+
+    def __init__(self, data):
+      self._data = dict(data)
+      self.column_names = list(data.keys())
+
+    def __getitem__(self, key):
+      return self._data[key]
+
+    def __len__(self):
+      first_col = next(iter(self._data.values())) if self._data else []
+      return len(first_col)
+
+    def to_dict(self):
+      return dict(self._data)
+
+    def add_column(self, column_name, values):
+      new_data = dict(self._data)
+      new_data[column_name] = values
+      return _MockDataset(new_data)
+
+    def remove_columns(self, column_name):
+      new_data = {k: v for k, v in self._data.items() if k != column_name}
+      return _MockDataset(new_data)
+
+    def select(self, indices):
+      new_data = {k: [v[i] for i in indices] for k, v in self._data.items()}
+      return _MockDataset(new_data)
+
+    def shuffle(self, seed=42):
+      return self
+
+    def map(self, fn):
+      num_rows = len(next(iter(self._data.values())))
+      new_rows = []
+      for i in range(num_rows):
+        entry = {k: self._data[k][i] for k in self._data}
+        res = fn(entry)
+        entry.update(res)
+        new_rows.append(entry)
+      new_data = {k: [row[k] for row in new_rows] for k in new_rows[0]}
+      return _MockDataset(new_data)
+
+  class Dataset:
+
+    @classmethod
+    def from_dict(cls, d):
+      return _MockDataset(d)
+
+  class DatasetDict(dict):
+    pass
 
 from src.task_processors.npov_task_processor import NPOVTaskProcessor
 

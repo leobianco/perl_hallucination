@@ -283,6 +283,7 @@ class Pipeline(abc.ABC):
     self.trainer: Optional[Any] = None
     self.enable_lora: bool = False
     self.lora_path: Optional[str] = None
+    self.vllm_model: Optional[str] = None
     self.use_vllm: bool = False
 
   def run(self, *cli_args, **cli_kwargs) -> None:
@@ -1708,19 +1709,12 @@ class SSFODataGenerationPipeline(Pipeline):
     self.args = script_args
     self.enable_lora = False
     self.lora_path = None
-    self.use_vllm = False
+    self.vllm_model = self.args.model_repo_id
     set_seed(self.args.seed)
 
   def setup_tokenizer(self) -> None:
-    self.tokenizer = AutoTokenizer.from_pretrained(
-        self.args.model_repo_id,
-        padding_side="left",
-    )
-    if self.tokenizer.pad_token_id is None:
-      if self.tokenizer.eos_token_id is not None:
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-      elif self.tokenizer.unk_token_id is not None:
-        self.tokenizer.pad_token = self.tokenizer.unk_token
+    # Not needed for vLLM generation
+    pass
 
   def load_data(self) -> None:
     dataset = load_dataset(self.args.dataset_repo_id)
@@ -1731,23 +1725,30 @@ class SSFODataGenerationPipeline(Pipeline):
     task_name = self.args.task_name
     processor_cls = get_task_processor(task_name)
 
+    gt = entry.get(
+        "npov_response",
+        entry.get(
+            "completion",
+            entry.get("response", entry.get("chosen", "")),
+        ),
+    )
+
     if task_name == "npov":
-      if "perspective_1" in entry and "perspective_2" in entry:
-        prompt_with_context = processor_cls._writer_prompt(entry, SFT=False)[
-            "prompt"
-        ]
-        user_query = entry.get("user_query", "")
-      elif "prompt" in entry:
+      if "prompt" in entry and entry["prompt"]:
         prompt_raw = entry["prompt"]
-        gt = entry.get("npov_response", entry.get("completion", ""))
         if gt and prompt_raw.endswith(gt):
-          prompt_with_context = prompt_raw[: -len(gt)].rstrip() + "\n"
+          prompt_with_context = prompt_raw[:-len(gt)].rstrip() + "\n"
         else:
           prompt_with_context = prompt_raw
         user_query = entry.get("user_query", "")
         if not user_query and "User query: " in prompt_raw:
           after_query = prompt_raw.split("User query: ", 1)[1]
           user_query = after_query.split("\n", 1)[0].strip()
+      elif "perspective_1" in entry and "perspective_2" in entry:
+        prompt_with_context = processor_cls._writer_prompt(entry, SFT=False)[
+            "prompt"
+        ]
+        user_query = entry.get("user_query", "")
       else:
         prompt_with_context = str(entry)
         user_query = entry.get("user_query", "")
@@ -1756,16 +1757,25 @@ class SSFODataGenerationPipeline(Pipeline):
           f"User query: {user_query}\n"
           "Neutral point-of-view answer to user query in natural language:\n"
       )
-      ground_truth = entry.get("npov_response", entry.get("completion", ""))
-      return prompt_with_context, prompt_without_context, ground_truth
+      return prompt_with_context, prompt_without_context, gt
 
     elif task_name == "bosch":
-      question = entry.get("Question", "")
-      context = entry.get("Context", "")
-      if not question and "prompt" in entry:
-        prompt_with_context = entry["prompt"]
-        prompt_without_context = entry.get("prompt_no_context", prompt_with_context)
+      if "prompt" in entry and entry["prompt"]:
+        prompt_raw = entry["prompt"]
+        if gt and prompt_raw.endswith(gt):
+          prompt_with_context = prompt_raw[:-len(gt)].rstrip() + "\n"
+        else:
+          prompt_with_context = prompt_raw
+        question = entry.get("Question", "")
+        if not question and "User question:\n" in prompt_raw:
+          question = (
+              prompt_raw.split("User question:\n", 1)[1]
+              .split("\nManual information:\n", 1)[0]
+              .strip()
+          )
       else:
+        question = entry.get("Question", "")
+        context = entry.get("Context", "")
         prompt_with_context = (
             "You are a helpful assistant to car related questions. You will be"
             " given an user's question, and the relevant part of the car"
@@ -1776,42 +1786,55 @@ class SSFODataGenerationPipeline(Pipeline):
             f" information:\n{context}\nAnswer to user's"
             " question:\n"
         )
-        prompt_without_context = (
-            "You are a helpful assistant to car related questions. You will be"
-            " given an user's question. Your task is to answer the user's"
-            f" question.\nUser question:\n{question}\nAnswer to user's"
-            " question:\n"
-        )
-      ground_truth = entry.get("response", entry.get("completion", ""))
-      return prompt_with_context, prompt_without_context, ground_truth
+      prompt_without_context = (
+          "You are a helpful assistant to car related questions. You will be"
+          " given an user's question. Your task is to answer the user's"
+          f" question.\nUser question:\n{question}\nAnswer to user's"
+          " question:\n"
+      )
+      return prompt_with_context, prompt_without_context, gt
 
     elif task_name == "ragtruth":
-      user_query = entry.get(
-          "user_query", entry.get("query", entry.get("question", ""))
-      )
-      context = entry.get(
-          "context", entry.get("passage", entry.get("document", ""))
-      )
-      if context:
-        prompt_with_context = (
-            f"Context: {context}\nQuestion: {user_query}\nAnswer:\n"
+      if "prompt" in entry and entry["prompt"]:
+        prompt_raw = entry["prompt"]
+        if gt and prompt_raw.endswith(gt):
+          prompt_with_context = prompt_raw[:-len(gt)].rstrip() + "\n"
+        else:
+          prompt_with_context = prompt_raw
+        user_query = entry.get(
+            "user_query", entry.get("query", entry.get("question", ""))
         )
-        prompt_without_context = f"Question: {user_query}\nAnswer:\n"
+        if not user_query and "Question: " in prompt_raw:
+          user_query = (
+              prompt_raw.split("Question: ", 1)[1]
+              .split("\nAnswer:\n", 1)[0]
+              .strip()
+          )
       else:
-        prompt_with_context = entry.get("prompt", "")
-        prompt_without_context = (
-            user_query if user_query else prompt_with_context
+        user_query = entry.get(
+            "user_query", entry.get("query", entry.get("question", ""))
         )
-      ground_truth = entry.get("completion", entry.get("response", ""))
-      return prompt_with_context, prompt_without_context, ground_truth
+        context = entry.get(
+            "context", entry.get("passage", entry.get("document", ""))
+        )
+        if context:
+          prompt_with_context = (
+              f"Context: {context}\nQuestion: {user_query}\nAnswer:\n"
+          )
+        else:
+          prompt_with_context = f"Question: {user_query}\nAnswer:\n"
+      prompt_without_context = f"Question: {user_query}\nAnswer:\n"
+      return prompt_with_context, prompt_without_context, gt
 
     else:
-      prompt_with_context = entry.get("prompt", str(entry))
+      if "prompt" in entry and entry["prompt"]:
+        prompt_with_context = entry["prompt"]
+      else:
+        prompt_with_context = str(entry)
       prompt_without_context = entry.get(
           "prompt_no_context", entry.get("query", prompt_with_context)
       )
-      ground_truth = entry.get("chosen", entry.get("completion", ""))
-      return prompt_with_context, prompt_without_context, ground_truth
+      return prompt_with_context, prompt_without_context, gt
 
   def process_data(self) -> None:
     train_split = (
@@ -1827,233 +1850,15 @@ class SSFODataGenerationPipeline(Pipeline):
     self.train_split = shuffled_train
 
   def setup_model(self) -> None:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    self.device = device
-    self.use_vllm = False
-    self.enable_lora, self.lora_path = self._resolve_lora_adapter_path(
+    enable_lora, lora_path = self._resolve_lora_adapter_path(
         self.args.sft_model_path, self.args.model_repo_id
     )
+    self.enable_lora = enable_lora
+    self.lora_path = lora_path
     self.vllm_model = self.args.model_repo_id
-
-    # Try initializing vLLM if CUDA is available
-    if torch.cuda.is_available() and "LLM" in globals() and LLM is not None:
-      try:
-        llm_kwargs = {
-            "model": self.vllm_model,
-            "enable_lora": self.enable_lora,
-            "max_lora_rank": 64,
-            "dtype": "bfloat16",
-            "hf_overrides": {"allow_global_per_layer_attribute_access": True},
-        }
-        try:
-          self.llm = LLM(**llm_kwargs)
-        except TypeError:
-          llm_kwargs.pop("hf_overrides", None)
-          self.llm = LLM(**llm_kwargs)
-
-        self.use_vllm = True
-        print(
-            f"[vLLM] Successfully initialized vLLM for SSFO data generation with model={self.vllm_model} and adapter={self.lora_path} (enable_lora={self.enable_lora})"
-        )
-        return
-      except Exception as e:
-        print(
-            f"[vLLM] Could not initialize vLLM ({e}), falling back to Hugging Face PyTorch generate()..."
-        )
-        self.use_vllm = False
-
-    print(
-        f"Loading SFT model in PyTorch from base={self.args.model_repo_id}"
-        f" adapter={self.lora_path} (enable_lora={self.enable_lora})..."
-    )
-    sft_base = AutoModelForCausalLM.from_pretrained(
-        self.args.model_repo_id,
-        torch_dtype=torch.bfloat16,
-    ).to(device)
-    if self.tokenizer.pad_token_id is not None:
-      sft_base.config.pad_token_id = self.tokenizer.pad_token_id
-
-    if self.enable_lora and self.lora_path:
-      self.sft_model = PeftModel.from_pretrained(
-          sft_base, self.lora_path
-      ).to(device)
-    else:
-      self.sft_model = sft_base
-    self.sft_model.eval()
 
   def setup_trainer(self) -> None:
     pass
-
-  def _generate_batch(self, prompts: list[str]) -> list[str]:
-    """Generate completions in parallel from SFT model given a list of prompts."""
-    if not prompts:
-      return []
-
-    tokenizer = self.tokenizer
-    device = self.device
-    temperature = self.args.temperature
-    top_p = self.args.top_p
-    top_k = self.args.top_k
-    max_new_tokens = self.args.max_new_tokens
-
-    inputs = tokenizer(
-        prompts,
-        return_tensors="pt",
-        padding=True,
-    ).to(device)
-
-    # Use native huggingface generate if available
-    if hasattr(self.sft_model, "generate"):
-      generation_kwargs = {
-          "input_ids": (
-              inputs.input_ids
-              if hasattr(inputs, "input_ids")
-              else inputs["input_ids"]
-          ),
-          "attention_mask": (
-              getattr(inputs, "attention_mask", None)
-              if hasattr(inputs, "attention_mask")
-              else inputs.get("attention_mask", None)
-          ),
-          "max_new_tokens": max_new_tokens,
-          "pad_token_id": (
-              tokenizer.pad_token_id
-              if tokenizer.pad_token_id is not None
-              else tokenizer.eos_token_id
-          ),
-          "eos_token_id": tokenizer.eos_token_id,
-          "use_cache": True,
-      }
-      if temperature > 0:
-        generation_kwargs.update({
-            "do_sample": True,
-            "temperature": temperature,
-            "top_p": top_p,
-            "top_k": top_k if top_k > 0 else 0,
-        })
-      else:
-        generation_kwargs["do_sample"] = False
-
-      with torch.no_grad():
-        outputs = self.sft_model.generate(**generation_kwargs)
-
-      prompt_ids = (
-          inputs.input_ids
-          if hasattr(inputs, "input_ids")
-          else inputs["input_ids"]
-      )
-      prompt_len = prompt_ids.shape[1]
-      generated_ids = outputs[:, prompt_len:]
-      if hasattr(tokenizer, "batch_decode"):
-        decoded = tokenizer.batch_decode(
-            generated_ids, skip_special_tokens=True
-        )
-      else:
-        decoded = [
-            tokenizer.decode(seq, skip_special_tokens=True)
-            for seq in generated_ids
-        ]
-      return [
-          d.replace("<end_of_turn>", "").replace("<eos>", "").strip()
-          for d in decoded
-      ]
-
-    # Fallback to manual batched forward loop if generate() is not available on mock
-    batch_size = len(prompts)
-    cur_input = (
-        inputs.input_ids
-        if hasattr(inputs, "input_ids")
-        else inputs["input_ids"]
-    )
-    cur_mask = (
-        getattr(inputs, "attention_mask", None)
-        if hasattr(inputs, "attention_mask")
-        else inputs.get("attention_mask", None)
-    )
-    past_key_values = None
-    generated_tokens = [[] for _ in range(batch_size)]
-    finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
-
-    eos_token_ids = set()
-    if getattr(tokenizer, "eos_token_id", None) is not None:
-      eos_token_ids.add(tokenizer.eos_token_id)
-    if getattr(tokenizer, "pad_token_id", None) is not None:
-      eos_token_ids.add(tokenizer.pad_token_id)
-
-    with torch.no_grad():
-      for _ in range(max_new_tokens):
-        if finished.all():
-          break
-        out = self.sft_model(
-            input_ids=cur_input,
-            attention_mask=cur_mask,
-            past_key_values=past_key_values,
-            use_cache=True,
-        )
-        past_key_values = getattr(out, "past_key_values", None)
-        logits = out.logits[:, -1, :].clone()
-        if temperature > 0 and temperature != 1.0:
-          logits = logits / temperature
-        probs = torch.softmax(logits, dim=-1)
-        if top_k > 0 and top_k < probs.size(-1):
-          top_k_probs, top_k_indices = torch.topk(probs, top_k, dim=-1)
-          probs = torch.zeros_like(probs).scatter_(
-              -1, top_k_indices, top_k_probs
-          )
-          probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-        if top_p < 1.0:
-          sorted_probs, sorted_indices = torch.sort(
-              probs, descending=True, dim=-1
-          )
-          cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-          sorted_indices_to_remove = cumulative_probs > top_p
-          sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
-              ..., :-1
-          ].clone()
-          sorted_indices_to_remove[..., 0] = 0
-          sorted_probs[sorted_indices_to_remove] = 0.0
-          probs = torch.zeros_like(probs).scatter_(
-              -1, sorted_indices, sorted_probs
-          )
-          probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-        next_tokens = torch.multinomial(probs, num_samples=1)
-        next_tokens_list = next_tokens.squeeze(-1).tolist()
-        if not isinstance(next_tokens_list, list):
-          next_tokens_list = [next_tokens_list]
-        for i, tok_id in enumerate(next_tokens_list):
-          if not finished[i]:
-            if tok_id in eos_token_ids:
-              finished[i] = True
-            else:
-              generated_tokens[i].append(tok_id)
-        cur_input = next_tokens
-        if cur_mask is not None:
-          cur_mask = torch.cat(
-              [
-                  cur_mask,
-                  torch.ones((batch_size, 1), dtype=torch.long, device=device),
-              ],
-              dim=1,
-          )
-
-    if hasattr(tokenizer, "batch_decode"):
-      decoded = tokenizer.batch_decode(
-          generated_tokens, skip_special_tokens=True
-      )
-    else:
-      decoded = [
-          tokenizer.decode(seq, skip_special_tokens=True)
-          for seq in generated_tokens
-      ]
-    return [
-        d.replace("<end_of_turn>", "").replace("<eos>", "").strip()
-        for d in decoded
-    ]
-
-  def _generate(self, prompt: str) -> str:
-    """Generate completion from SFT model given a single prompt."""
-    results = self._generate_batch([prompt])
-    return results[0] if results else ""
 
   def _log_sample_inspection(
       self,
@@ -2202,15 +2007,15 @@ class SSFODataGenerationPipeline(Pipeline):
         print(all_gt_chosen[0])
       print("=" * 80 + "\n")
 
-    if (
-        getattr(self, "use_vllm", False)
-        and hasattr(self, "llm")
-        and self.llm is not None
-    ):
-      print(
-          f"Generating SSFO preference pairs with vLLM for {len(entries)}"
-          " samples..."
-      )
+    if not entries:
+      print("Warning: Dataset is empty, creating empty preference dataset.")
+      train_dataset = Dataset.from_dict({
+          "prompt": [],
+          "chosen": [],
+          "rejected": [],
+      })
+    else:
+      # Prepare sampling parameters for vLLM (matching EvaluationGenerationPipeline)
       top_k = self.args.top_k if self.args.top_k > 0 else -1
       sampling_params = SamplingParams(
           seed=self.args.seed,
@@ -2220,100 +2025,84 @@ class SSFODataGenerationPipeline(Pipeline):
           min_tokens=getattr(self.args, "min_tokens", 10),
           max_tokens=self.args.max_new_tokens,
       )
+
+      # Instantiate vLLM LLM (matching EvaluationGenerationPipeline)
+      vllm_model = (
+          getattr(self, "vllm_model", None)
+          or getattr(self.args, "model_repo_id", None)
+      )
+      llm_kwargs = {
+          "model": vllm_model,
+          "enable_lora": getattr(self, "enable_lora", False),
+          "max_lora_rank": 64,
+          "dtype": "bfloat16",
+          "hf_overrides": {"allow_global_per_layer_attribute_access": True},
+      }
+      if hasattr(self, "llm") and self.llm is not None:
+        llm = self.llm
+      else:
+        try:
+          llm = LLM(**llm_kwargs)
+        except TypeError:
+          llm_kwargs.pop("hf_overrides", None)
+          llm = LLM(**llm_kwargs)
+
       lora_request = (
-          LoRARequest("sft_lora_adapter", 1, lora_path=self.lora_path)
-          if (self.enable_lora and self.lora_path)
+          LoRARequest("writer_lora_adapter", 1, lora_path=self.lora_path)
+          if (self.enable_lora and self.lora_path is not None)
           else None
       )
 
+      # Generate Chosen (y+) with context
       if self.args.use_ground_truth_chosen and all(all_gt_chosen):
         chosens = all_gt_chosen
-        gen_outputs = self.llm.generate(
+      else:
+        print(
+            f"Generating chosen completions with context for {len(all_prompt_ctx)} samples..."
+        )
+        if lora_request is not None:
+          outputs_ctx = llm.generate(
+              all_prompt_ctx,
+              sampling_params,
+              lora_request=lora_request,
+          )
+        else:
+          outputs_ctx = llm.generate(all_prompt_ctx, sampling_params)
+        chosens = [output.outputs[0].text for output in outputs_ctx]
+
+      # Generate Rejected (y-) without context
+      print(
+          f"Generating rejected completions without context for {len(all_prompt_no_ctx)} samples..."
+      )
+      if lora_request is not None:
+        outputs_no_ctx = llm.generate(
             all_prompt_no_ctx,
             sampling_params,
             lora_request=lora_request,
         )
-        rejecteds = [
-            out.outputs[0]
-            .text.replace("<end_of_turn>", "")
-            .replace("<eos>", "")
-            .strip()
-            for out in gen_outputs
-        ]
       else:
-        combined_prompts = all_prompt_ctx + all_prompt_no_ctx
-        gen_outputs = self.llm.generate(
-            combined_prompts,
-            sampling_params,
-            lora_request=lora_request,
-        )
-        n = len(all_prompt_ctx)
-        chosens = [
-            out.outputs[0]
-            .text.replace("<end_of_turn>", "")
-            .replace("<eos>", "")
-            .strip()
-            for out in gen_outputs[:n]
-        ]
-        rejecteds = [
-            out.outputs[0]
-            .text.replace("<end_of_turn>", "")
-            .replace("<eos>", "")
-            .strip()
-            for out in gen_outputs[n:]
-        ]
-      prompts = all_prompt_ctx
-    else:
-      batch_size = getattr(self.args, "batch_size", 16) or 16
-      prompts = []
-      chosens = []
-      rejecteds = []
+        outputs_no_ctx = llm.generate(all_prompt_no_ctx, sampling_params)
+      rejecteds = [output.outputs[0].text for output in outputs_no_ctx]
 
-      print(
-          f"Generating SSFO preference pairs for {len(self.train_split)}"
-          f" samples (batch_size={batch_size})..."
+      # Log inspection samples
+      self._log_sample_inspection(
+          prompts_with_ctx=all_prompt_ctx,
+          prompts_without_ctx=all_prompt_no_ctx,
+          chosens=chosens,
+          rejecteds=rejecteds,
+          gt_chosens=all_gt_chosen,
       )
-      for i in tqdm(range(0, len(entries), batch_size), desc="SSFO generation"):
-        batch_entries = entries[i : i + batch_size]
-        batch_prompt_ctx = []
-        batch_prompt_no_ctx = []
-        batch_gt_chosen = []
 
-        for entry in batch_entries:
-          prompt_ctx, prompt_no_ctx, gt_chosen = self._extract_prompts(entry)
-          batch_prompt_ctx.append(prompt_ctx)
-          batch_prompt_no_ctx.append(prompt_no_ctx)
-          batch_gt_chosen.append(gt_chosen)
+      pref_dict = {
+          "prompt": all_prompt_ctx,
+          "chosen": chosens,
+          "rejected": rejecteds,
+      }
+      for col in entries[0].keys():
+        if col not in ("prompt", "chosen", "rejected"):
+          pref_dict[col] = [e.get(col, "") for e in entries]
 
-        if self.args.use_ground_truth_chosen and all(batch_gt_chosen):
-          batch_chosen = batch_gt_chosen
-          batch_rejected = self._generate_batch(batch_prompt_no_ctx)
-        else:
-          combined = batch_prompt_ctx + batch_prompt_no_ctx
-          combined_gen = self._generate_batch(combined)
-          k = len(batch_prompt_ctx)
-          batch_chosen = combined_gen[:k]
-          batch_rejected = combined_gen[k:]
-
-        prompts.extend(batch_prompt_ctx)
-        chosens.extend(batch_chosen)
-        rejecteds.extend(batch_rejected)
-
-    # Log comprehensive sample inputs and model outputs
-    self._log_sample_inspection(
-        prompts_with_ctx=prompts,
-        prompts_without_ctx=all_prompt_no_ctx,
-        chosens=chosens,
-        rejecteds=rejecteds,
-        gt_chosens=all_gt_chosen,
-    )
-
-    pref_dict = {
-        "prompt": prompts,
-        "chosen": chosens,
-        "rejected": rejecteds,
-    }
-    train_dataset = Dataset.from_dict(pref_dict)
+      train_dataset = Dataset.from_dict(pref_dict)
 
     test_split = None
     if (
