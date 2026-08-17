@@ -295,6 +295,65 @@ class TestSSFODataGeneration(unittest.TestCase):
       self.assertIn("gemma-4-E4B", pushed_repo)
       self.assertTrue(pushed_repo.startswith("test_user/"))
 
+  def test_ssfo_output_dataset_repo_id_with_max_samples(self):
+    """Test default preference dataset repo ID construction contains max_samples tag."""
+    self.pipeline.args.output_dataset_repo_id = None
+    self.pipeline.args.max_samples = 250
+    self.pipeline.train_split = []
+    self.pipeline.raw_dataset = {"train": []}
+    self.pipeline.args.push_to_hub = True
+
+    with patch("src.pipelines.DatasetDict.push_to_hub") as mock_push:
+      self.pipeline.run_and_save()
+      mock_push.assert_called_once()
+      pushed_repo = mock_push.call_args[0][0]
+      self.assertIn("_n250_", pushed_repo)
+
+  def test_run_and_save_with_vllm(self):
+    """Test SSFO data generation using mocked vLLM engine."""
+    self.pipeline.use_vllm = True
+    self.pipeline.lora_path = "mock/lora/path"
+    mock_llm = MagicMock()
+    mock_out_1 = MagicMock(outputs=[MagicMock(text="Chosen completion 1")])
+    mock_out_2 = MagicMock(outputs=[MagicMock(text="Chosen completion 2")])
+    mock_out_3 = MagicMock(outputs=[MagicMock(text="Rejected completion 1")])
+    mock_out_4 = MagicMock(outputs=[MagicMock(text="Rejected completion 2")])
+    mock_llm.generate.return_value = [
+        mock_out_1,
+        mock_out_2,
+        mock_out_3,
+        mock_out_4,
+    ]
+    self.pipeline.llm = mock_llm
+    self.pipeline.train_split = [
+        {
+            "user_query": "q1",
+            "perspective_1_name": "Pro",
+            "perspective_1": "arg1",
+            "perspective_2_name": "Con",
+            "perspective_2": "arg2",
+            "npov_response": "gt1",
+        },
+        {
+            "user_query": "q2",
+            "perspective_1_name": "Pro",
+            "perspective_1": "arg1",
+            "perspective_2_name": "Con",
+            "perspective_2": "arg2",
+            "npov_response": "gt2",
+        },
+    ]
+    self.pipeline.raw_dataset = {"train": self.pipeline.train_split}
+    self.pipeline.args.push_to_hub = False
+    self.pipeline.args.use_ground_truth_chosen = False
+
+    with patch("src.pipelines.DatasetDict.save_to_disk"):
+      self.pipeline.run_and_save()
+      mock_llm.generate.assert_called_once()
+      call_args = mock_llm.generate.call_args[0][0]
+      # Combined prompts (2 ctx + 2 no_ctx = 4 total prompts)
+      self.assertEqual(len(call_args), 4)
+
   def test_setup_arguments_cleaning(self):
     """Test that setup_arguments correctly cleans CLI arguments with double dash."""
     with patch("src.pipelines.HfArgumentParser") as mock_parser_cls:

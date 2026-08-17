@@ -1693,9 +1693,47 @@ class SSFODataGenerationPipeline(Pipeline):
   def setup_model(self) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     self.device = device
+    self.use_vllm = False
+    self.lora_path = None
+
+    # Try initializing vLLM if CUDA is available
+    if torch.cuda.is_available() and "LLM" in globals() and LLM is not None:
+      try:
+        lora_path = self.args.sft_model_path
+        if lora_path and not os.path.exists(lora_path):
+          lora_path = snapshot_download(
+              repo_id=self.args.sft_model_path,
+              allow_patterns=["*.json", "*.safetensors", "*.bin"],
+          )
+        self.lora_path = lora_path
+        self.vllm_model = self.args.model_repo_id
+
+        llm_kwargs = {
+            "model": self.vllm_model,
+            "enable_lora": bool(self.lora_path),
+            "max_lora_rank": 64,
+            "dtype": "bfloat16",
+            "hf_overrides": {"allow_global_per_layer_attribute_access": True},
+        }
+        try:
+          self.llm = LLM(**llm_kwargs)
+        except TypeError:
+          llm_kwargs.pop("hf_overrides", None)
+          self.llm = LLM(**llm_kwargs)
+
+        self.use_vllm = True
+        print(
+            f"[vLLM] Successfully initialized vLLM for SSFO data generation with model={self.vllm_model} and adapter={self.lora_path}"
+        )
+        return
+      except Exception as e:
+        print(
+            f"[vLLM] Could not initialize vLLM ({e}), falling back to Hugging Face PyTorch generate()..."
+        )
+        self.use_vllm = False
 
     print(
-        f"Loading SFT model from base={self.args.model_repo_id}"
+        f"Loading SFT model in PyTorch from base={self.args.model_repo_id}"
         f" adapter={self.args.sft_model_path}..."
     )
     sft_base = AutoModelForCausalLM.from_pretrained(
@@ -1875,38 +1913,111 @@ class SSFODataGenerationPipeline(Pipeline):
     return results[0] if results else ""
 
   def run_and_save(self) -> None:
-    batch_size = getattr(self.args, "batch_size", 16) or 16
-    prompts = []
-    chosens = []
-    rejecteds = []
-
-    print(
-        f"Generating SSFO preference pairs for {len(self.train_split)}"
-        f" samples (batch_size={batch_size})..."
-    )
     entries = list(self.train_split)
-    for i in tqdm(range(0, len(entries), batch_size), desc="SSFO generation"):
-      batch_entries = entries[i : i + batch_size]
-      batch_prompt_ctx = []
-      batch_prompt_no_ctx = []
-      batch_gt_chosen = []
+    all_prompt_ctx = []
+    all_prompt_no_ctx = []
+    all_gt_chosen = []
 
-      for entry in batch_entries:
-        prompt_ctx, prompt_no_ctx, gt_chosen = self._extract_prompts(entry)
-        batch_prompt_ctx.append(prompt_ctx)
-        batch_prompt_no_ctx.append(prompt_no_ctx)
-        batch_gt_chosen.append(gt_chosen)
+    for entry in entries:
+      p_ctx, p_no_ctx, gt = self._extract_prompts(entry)
+      all_prompt_ctx.append(p_ctx)
+      all_prompt_no_ctx.append(p_no_ctx)
+      all_gt_chosen.append(gt)
 
-      if self.args.use_ground_truth_chosen and all(batch_gt_chosen):
-        batch_chosen = batch_gt_chosen
+    if (
+        getattr(self, "use_vllm", False)
+        and hasattr(self, "llm")
+        and self.llm is not None
+    ):
+      print(
+          f"Generating SSFO preference pairs with vLLM for {len(entries)}"
+          " samples..."
+      )
+      sampling_params = SamplingParams(
+          seed=self.args.seed,
+          temperature=self.args.temperature,
+          top_p=self.args.top_p,
+          top_k=self.args.top_k,
+          max_tokens=self.args.max_new_tokens,
+      )
+      lora_request = (
+          LoRARequest("sft_lora_adapter", 1, lora_path=self.lora_path)
+          if self.lora_path
+          else None
+      )
+
+      if self.args.use_ground_truth_chosen and all(all_gt_chosen):
+        chosens = all_gt_chosen
+        gen_outputs = self.llm.generate(
+            all_prompt_no_ctx,
+            sampling_params,
+            lora_request=lora_request,
+        )
+        rejecteds = [
+            out.outputs[0]
+            .text.replace("<end_of_turn>", "")
+            .replace("<eos>", "")
+            .strip()
+            for out in gen_outputs
+        ]
       else:
-        batch_chosen = self._generate_batch(batch_prompt_ctx)
+        combined_prompts = all_prompt_ctx + all_prompt_no_ctx
+        gen_outputs = self.llm.generate(
+            combined_prompts,
+            sampling_params,
+            lora_request=lora_request,
+        )
+        n = len(all_prompt_ctx)
+        chosens = [
+            out.outputs[0]
+            .text.replace("<end_of_turn>", "")
+            .replace("<eos>", "")
+            .strip()
+            for out in gen_outputs[:n]
+        ]
+        rejecteds = [
+            out.outputs[0]
+            .text.replace("<end_of_turn>", "")
+            .replace("<eos>", "")
+            .strip()
+            for out in gen_outputs[n:]
+        ]
+      prompts = all_prompt_ctx
+    else:
+      batch_size = getattr(self.args, "batch_size", 16) or 16
+      prompts = []
+      chosens = []
+      rejecteds = []
 
-      batch_rejected = self._generate_batch(batch_prompt_no_ctx)
+      print(
+          f"Generating SSFO preference pairs for {len(self.train_split)}"
+          f" samples (batch_size={batch_size})..."
+      )
+      for i in tqdm(range(0, len(entries), batch_size), desc="SSFO generation"):
+        batch_entries = entries[i : i + batch_size]
+        batch_prompt_ctx = []
+        batch_prompt_no_ctx = []
+        batch_gt_chosen = []
 
-      prompts.extend(batch_prompt_ctx)
-      chosens.extend(batch_chosen)
-      rejecteds.extend(batch_rejected)
+        for entry in batch_entries:
+          prompt_ctx, prompt_no_ctx, gt_chosen = self._extract_prompts(entry)
+          batch_prompt_ctx.append(prompt_ctx)
+          batch_prompt_no_ctx.append(prompt_no_ctx)
+          batch_gt_chosen.append(gt_chosen)
+
+        if self.args.use_ground_truth_chosen and all(batch_gt_chosen):
+          batch_chosen = batch_gt_chosen
+          batch_rejected = self._generate_batch(batch_prompt_no_ctx)
+        else:
+          combined = batch_prompt_ctx + batch_prompt_no_ctx
+          combined_gen = self._generate_batch(combined)
+          k = len(batch_prompt_ctx)
+          batch_chosen = combined_gen[:k]
+          batch_rejected = combined_gen[k:]
+
+        prompts.extend(batch_prompt_ctx)
+        chosens.extend(batch_chosen)
+        rejecteds.extend(batch_rejected)
 
     pref_dict = {
         "prompt": prompts,
