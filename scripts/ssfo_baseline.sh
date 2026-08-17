@@ -17,9 +17,6 @@
 USER="leobianco"
 SEED=130104
 MODEL_REPO_ID="google/gemma-4-E4B"
-TASK_NAME="$1"
-STAGE="${2:-all}"  # "sft", "generate_data", "dpo", or "all"
-MAX_SAMPLES="${MAX_SAMPLES:-$3}"  # Optional subsampling count for preference data generation (e.g. 500)
 
 # SFT Training Parameters (Stage 1)
 SFT_BATCH_SIZE=16
@@ -35,6 +32,7 @@ GEN_TOP_P=0.9
 GEN_TOP_K=50
 MAX_NEW_TOKENS=256
 GEN_BATCH_SIZE=16
+MAX_SAMPLES=""  # Set number of samples here directly (e.g. 500), or leave empty for full data
 USE_GROUND_TRUTH_CHOSEN=False
 
 # DPO Training Parameters (Stage 3)
@@ -48,6 +46,13 @@ MAX_LENGTH=512
 
 # Infrastructure Parameters
 DEEPSPEED_CONFIG="scripts/deepspeed_config.yaml"
+
+# Parameters derived from above
+TASK_NAME="$1"
+STAGE="${2:-all}"  # "sft", "generate_data", "dpo", or "all"
+if [ -n "$3" ]; then
+    MAX_SAMPLES="$3"
+fi
 
 # Checks
 if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ]; then

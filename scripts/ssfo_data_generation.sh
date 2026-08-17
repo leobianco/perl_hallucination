@@ -12,11 +12,14 @@ TOP_P=0.9
 TOP_K=50
 MAX_NEW_TOKENS=256
 BATCH_SIZE=16
+MAX_SAMPLES=""  # Set number of samples here directly (e.g. 500), or leave empty for full data
 USE_GROUND_TRUTH_CHOSEN=False
+
 # Parameters derived from above
 TASK_NAME="$1"
-MAX_SAMPLES="${MAX_SAMPLES:-$2}"
-if [ "$2" == "--max_samples" ] && [ -n "$3" ]; then
+if [ -n "$2" ] && [ "$2" != "--max_samples" ]; then
+  MAX_SAMPLES="$2"
+elif [ "$2" == "--max_samples" ] && [ -n "$3" ]; then
   MAX_SAMPLES="$3"
 fi
 
