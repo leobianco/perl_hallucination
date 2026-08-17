@@ -201,7 +201,9 @@ class TestScopeDataGeneration(unittest.TestCase):
         "npov_response": "Test chosen completion",
     }
     prompt, chosen = self.pipeline._extract_prompt_and_chosen(entry_with_npov)
-    self.assertEqual(prompt, "Test prompt")
+    self.assertIn("Test prompt", prompt)
+    self.assertIn("<start_of_turn>user", prompt)
+    self.assertIn("<start_of_turn>model", prompt)
     self.assertEqual(chosen, "Test chosen completion")
 
     entry_with_chosen = {
@@ -209,7 +211,9 @@ class TestScopeDataGeneration(unittest.TestCase):
         "chosen": "Another chosen",
     }
     prompt, chosen = self.pipeline._extract_prompt_and_chosen(entry_with_chosen)
-    self.assertEqual(prompt, "Another prompt")
+    self.assertIn("Another prompt", prompt)
+    self.assertIn("<start_of_turn>user", prompt)
+    self.assertIn("<start_of_turn>model", prompt)
     self.assertEqual(chosen, "Another chosen")
 
   def test_noisy_decoding_simulation(self):
@@ -314,7 +318,10 @@ class TestScopeDataGeneration(unittest.TestCase):
     }
     p_ctx, p_no_ctx, gt = self.pipeline._extract_prompts(entry)
     self.assertIn("Context: Plants convert light energy into chemical energy.", p_ctx)
-    self.assertEqual(p_no_ctx, "Question: What is photosynthesis?\nAnswer:\n")
+    self.assertIn("Question: What is photosynthesis?", p_no_ctx)
+    self.assertIn("Answer:", p_no_ctx)
+    self.assertIn("<start_of_turn>user", p_no_ctx)
+    self.assertIn("<start_of_turn>model", p_no_ctx)
     self.assertEqual(gt, "Photosynthesis produces glucose from sunlight.")
 
   def test_batched_noisy_decoding(self):

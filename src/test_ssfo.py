@@ -60,6 +60,8 @@ if "transformers" not in sys.modules or not hasattr(
   transformers_mod.DataCollatorWithPadding = MagicMock()
   transformers_mod.HfArgumentParser = MagicMock()
   transformers_mod.set_seed = MagicMock()
+  transformers_mod.LogitsProcessor = object
+  transformers_mod.LogitsProcessorList = list
   sys.modules["transformers"] = transformers_mod
   sys.modules["transformers.trainer_utils"] = types.ModuleType(
       "transformers.trainer_utils"
