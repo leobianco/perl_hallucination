@@ -76,12 +76,13 @@ class ScopeDataGenArguments:
       split_ratio (float): Fraction of SFT data used for SFT training D1 vs
         SCOPE D2 generation. Default: 0.5.
       sampling_mode (str): Sampling strategy: 'bernoulli' (Algorithm 1),
-        'prob_mix', or 'logit_mix'. Default: 'bernoulli'.
-      temperature (float): Sampling temperature. Default: 0.7.
-      top_p (float): Nucleus sampling top_p threshold. Default: 0.9.
-      top_k (int): Top-k token filtering. Default: 50.
+        'prob_mix', 'cad', or 'logit_mix'. Default: 'bernoulli'.
+      temperature (float): Sampling temperature (0.0 for greedy decoding, matching paper). Default: 0.0.
+      top_p (float): Nucleus sampling top_p threshold. Default: 1.0.
+      top_k (int): Top-k token filtering. Default: 0.
+      repetition_penalty (float): Repetition penalty for generation. Default: 1.0.
       max_new_tokens (int): Maximum new tokens to generate per completion.
-        Default: 256.
+        Default: 250.
       seed (int): Random seed. Default: 12345.
       max_samples (Optional[int]): Maximum samples to process (useful for
         testing/debugging). Default: None.
@@ -103,10 +104,11 @@ class ScopeDataGenArguments:
   alpha: float = 0.5
   split_ratio: float = 0.5
   sampling_mode: str = "bernoulli"
-  temperature: float = 0.7
-  top_p: float = 0.9
-  top_k: int = 50
-  max_new_tokens: int = 256
+  temperature: float = 0.0
+  top_p: float = 1.0
+  top_k: int = 0
+  repetition_penalty: float = 1.0
+  max_new_tokens: int = 250
   seed: int = 12345
   max_samples: Optional[int] = None
   batch_size: int = 16
@@ -130,11 +132,12 @@ class SsfoDataGenArguments:
         identifier.
       output_dataset_repo_id (Optional[str]): Repository identifier for saving
         generated preference data.
-      temperature (float): Sampling temperature. Default: 0.7.
-      top_p (float): Nucleus sampling top_p threshold. Default: 0.9.
-      top_k (int): Top-k token filtering. Default: 50.
+      temperature (float): Sampling temperature (0.0 for greedy). Default: 0.0.
+      top_p (float): Nucleus sampling top_p threshold. Default: 1.0.
+      top_k (int): Top-k token filtering. Default: 0.
+      repetition_penalty (float): Repetition penalty for generation. Default: 1.0.
       max_new_tokens (int): Maximum new tokens to generate per completion.
-        Default: 256.
+        Default: 250.
       seed (int): Random seed. Default: 12345.
       max_samples (Optional[int]): Maximum samples to process (useful for
         testing/debugging). Default: None.
@@ -155,6 +158,7 @@ class SsfoDataGenArguments:
   temperature: float = 0.0
   top_p: float = 1.0
   top_k: int = 0
+  repetition_penalty: float = 1.0
   max_new_tokens: int = 250
   seed: int = 12345
   max_samples: Optional[int] = None

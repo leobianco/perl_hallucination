@@ -1354,7 +1354,7 @@ class ScopeDataGenerationPipeline(Pipeline):
 
       prompt_without_context = (
           f"User query: {user_query}\n"
-          "Neutral point-of-view answer to user query in natural language:\n"
+          "Neutral point-of-view answer to user query, rewriting provided arguments in natural language:\n"
       )
       return prompt_with_context, prompt_without_context, gt
 
@@ -1637,30 +1637,34 @@ class ScopeDataGenerationPipeline(Pipeline):
           else:
             probs = torch.softmax(logits_sft, dim=-1)
 
-        if top_k > 0 and top_k < probs.size(-1):
-          top_k_probs, top_k_indices = torch.topk(probs, top_k, dim=-1)
-          probs = torch.zeros_like(probs).scatter_(
-              -1, top_k_indices, top_k_probs
-          )
-          probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        if temperature == 0.0:
+          # Greedy decoding (argmax), matching author paper and evaluator
+          next_tokens = torch.argmax(probs, dim=-1, keepdim=True)
+        else:
+          if top_k > 0 and top_k < probs.size(-1):
+            top_k_probs, top_k_indices = torch.topk(probs, top_k, dim=-1)
+            probs = torch.zeros_like(probs).scatter_(
+                -1, top_k_indices, top_k_probs
+            )
+            probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
-        if top_p < 1.0:
-          sorted_probs, sorted_indices = torch.sort(
-              probs, descending=True, dim=-1
-          )
-          cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-          sorted_indices_to_remove = cumulative_probs > top_p
-          sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
-              ..., :-1
-          ].clone()
-          sorted_indices_to_remove[..., 0] = 0
-          sorted_probs[sorted_indices_to_remove] = 0.0
-          probs = torch.zeros_like(probs).scatter_(
-              -1, sorted_indices, sorted_probs
-          )
-          probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+          if top_p < 1.0:
+            sorted_probs, sorted_indices = torch.sort(
+                probs, descending=True, dim=-1
+            )
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
+                ..., :-1
+            ].clone()
+            sorted_indices_to_remove[..., 0] = 0
+            sorted_probs[sorted_indices_to_remove] = 0.0
+            probs = torch.zeros_like(probs).scatter_(
+                -1, sorted_indices, sorted_probs
+            )
+            probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
-        next_tokens = torch.multinomial(probs, num_samples=1)
+          next_tokens = torch.multinomial(probs, num_samples=1)
         next_tokens_list = next_tokens.squeeze(-1).tolist()
         if not isinstance(next_tokens_list, list):
           next_tokens_list = [next_tokens_list]
@@ -1865,7 +1869,7 @@ class SSFODataGenerationPipeline(Pipeline):
 
       prompt_without_context = (
           f"User query: {user_query}\n"
-          "Neutral point-of-view answer to user query in natural language:\n"
+          "Neutral point-of-view answer to user query, rewriting provided arguments in natural language:\n"
       )
       return prompt_with_context, prompt_without_context, gt
 
@@ -2127,11 +2131,13 @@ class SSFODataGenerationPipeline(Pipeline):
     else:
       # Prepare sampling parameters for vLLM (matching EvaluationGenerationPipeline)
       top_k = self.args.top_k if self.args.top_k > 0 else -1
+      rep_penalty = getattr(self.args, "repetition_penalty", 1.0) or 1.0
       sampling_params = SamplingParams(
           seed=self.args.seed,
           temperature=self.args.temperature,
           top_p=self.args.top_p,
           top_k=top_k,
+          repetition_penalty=rep_penalty,
           min_tokens=getattr(self.args, "min_tokens", 10),
           max_tokens=self.args.max_new_tokens,
       )

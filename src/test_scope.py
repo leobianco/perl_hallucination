@@ -30,6 +30,7 @@ if "torch" not in sys.modules:
     torch.sort = lambda x, **kw: (MagicMock(), MagicMock())
     torch.cumsum = lambda x, **kw: MagicMock()
     torch.multinomial = lambda x, **kw: MagicMock()
+    torch.argmax = lambda *x, **kw: MagicMock()
     torch.full = lambda *x, **kw: MagicMock()
     torch.ones = lambda *x, **kw: MagicMock()
     torch.zeros = lambda *x, **kw: MagicMock()
