@@ -41,6 +41,32 @@ FORMATTED_BETA=$(python3 -c "import sys; b=float('${BETA}'); print(f'{b:.2g}' if
 FORMATTED_EPOCHS=$(python3 -c "import sys; e=float('${NUM_TRAIN_EPOCHS}'); print(f'{e:.2g}')" 2>/dev/null || echo "$NUM_TRAIN_EPOCHS")
 RUN_IDENTIFIER="${USER}/${TASK_NAME}_PERL_${MODEL_NAME}_S${SEED}_epo${FORMATTED_EPOCHS}_lr${FORMATTED_LR}_beta${FORMATTED_BETA}_${TIMESTAMP}"
 
+# Resumption configuration (can be passed via environment variable or second argument)
+RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
+if [ -n "$2" ] && [[ "$2" != --* ]]; then
+    RESUME_FROM_CHECKPOINT="$2"
+fi
+
+OUTPUT_DIR="./checkpoints/${TASK_NAME}/perl/${RUN_IDENTIFIER}"
+if [ -n "$RESUME_FROM_CHECKPOINT" ] && [ "$RESUME_FROM_CHECKPOINT" != "auto" ] && [ "$RESUME_FROM_CHECKPOINT" != "True" ] && [ "$RESUME_FROM_CHECKPOINT" != "true" ]; then
+    if [[ "$RESUME_FROM_CHECKPOINT" == *"checkpoint-"* ]] && [ -d "$RESUME_FROM_CHECKPOINT" ]; then
+        OUTPUT_DIR=$(dirname "$RESUME_FROM_CHECKPOINT")
+        RUN_IDENTIFIER=$(basename "$OUTPUT_DIR")
+    elif [ -d "$RESUME_FROM_CHECKPOINT" ]; then
+        OUTPUT_DIR="$RESUME_FROM_CHECKPOINT"
+        RUN_IDENTIFIER=$(basename "$OUTPUT_DIR")
+    elif [[ "$RESUME_FROM_CHECKPOINT" == *"/"* ]]; then
+        CLEANED_HF_REPO=$(echo "$RESUME_FROM_CHECKPOINT" | sed 's|https://huggingface.co/||g' | sed 's|http://huggingface.co/||g' | sed 's|hf://||g' | sed 's|hf.co/||g' | awk -F'[@:]' '{print $1}')
+        RUN_IDENTIFIER="$CLEANED_HF_REPO"
+        OUTPUT_DIR="./checkpoints/${TASK_NAME}/perl/${RUN_IDENTIFIER}"
+    fi
+fi
+
+EXTRA_ARGS=()
+if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
+    EXTRA_ARGS+=(--resume_from_checkpoint "$RESUME_FROM_CHECKPOINT")
+fi
+
 # Checks
 if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ]; then
     echo "Invalid task name" 
@@ -57,7 +83,7 @@ accelerate launch \
   --run_name "$RUN_IDENTIFIER" \
   --logging_steps 1 \
   --log_completions True \
-  --output_dir "./checkpoints/${TASK_NAME}/perl/${RUN_IDENTIFIER}" \
+  --output_dir "$OUTPUT_DIR" \
   --push_to_hub True \
   --hub_model_id "$RUN_IDENTIFIER" \
   --dataset_repo_id "${USER}/${TASK_NAME}_perl" \
@@ -89,7 +115,8 @@ accelerate launch \
   --steps_per_generation "$STEPS_PER_GENERATION" \
   --per_device_train_batch_size "$PER_DEVICE_BATCH_SIZE" \
   --auto_find_batch_size "$AUTO_FIND_BATCH_SIZE" \
-  --temperature "$TEMPERATURE"
+  --temperature "$TEMPERATURE" \
+  "${EXTRA_ARGS[@]}"
 
 if [ "$SHUTDOWN" = true ]; then
   echo "Shutting down the VM..."

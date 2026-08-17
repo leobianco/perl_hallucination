@@ -14,6 +14,7 @@ TEMPERATURE=0.7
 TOP_P=0.9
 TOP_K=50
 MAX_NEW_TOKENS=256
+BATCH_SIZE=16
 MAX_SAMPLES=""
 
 # Parameters derived from above
@@ -42,6 +43,7 @@ CMD_ARGS=(
   --top_p "$TOP_P"
   --top_k "$TOP_K"
   --max_new_tokens "$MAX_NEW_TOKENS"
+  --batch_size "$BATCH_SIZE"
   --push_to_hub True
 )
 

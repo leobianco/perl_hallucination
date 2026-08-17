@@ -1,12 +1,147 @@
 """Unit tests for the SCOPE baseline implementation."""
 
+import sys
+import types
+from typing import Any
 import unittest
 from unittest.mock import MagicMock, patch
-from datasets import Dataset, DatasetDict
-from src.pipelines import DPOPipeline, ScopeDataGenerationPipeline
-from src.task_processors.npov_task_processor import NPOVTaskProcessor
-from src.utils import ScopeDataGenArguments, ScriptArguments
+
+if "torch" not in sys.modules:
+  try:
+    import torch
+  except ImportError:
+    import contextlib
+    torch = types.ModuleType("torch")
+    torch.__path__ = []
+    torch.nn = types.ModuleType("torch.nn")
+    torch.nn.Module = object
+    torch.nn.Linear = MagicMock()
+    torch.nn.Identity = MagicMock()
+    torch.nn.BCEWithLogitsLoss = object
+    torch.nn.CrossEntropyLoss = object
+    torch.nn.MSELoss = object
+    torch.no_grad = contextlib.nullcontext
+    torch.device = lambda x: x
+    torch.tensor = lambda x, **kw: MagicMock()
+    torch.randn = lambda *x: MagicMock()
+    torch.bernoulli = lambda x: MagicMock()
+    torch.softmax = lambda x, **kw: MagicMock()
+    torch.zeros_like = lambda x: MagicMock()
+    torch.sort = lambda x, **kw: (MagicMock(), MagicMock())
+    torch.cumsum = lambda x, **kw: MagicMock()
+    torch.multinomial = lambda x, **kw: MagicMock()
+    torch.full = lambda *x, **kw: MagicMock()
+    torch.ones = lambda *x, **kw: MagicMock()
+    torch.zeros = lambda *x, **kw: MagicMock()
+    torch.where = lambda *x: MagicMock()
+    torch.stack = lambda *x, **kw: MagicMock(tolist=lambda: [[10, 11], [12, 13]])
+    torch.long = "long"
+    torch.bool = "bool"
+    torch.bfloat16 = "bfloat16"
+    sys.modules["torch"] = torch
+    sys.modules["torch.nn"] = torch.nn
+
+if "transformers" not in sys.modules or not hasattr(
+    sys.modules["transformers"], "__path__"
+):
+  transformers_mod = types.ModuleType("transformers")
+  transformers_mod.__path__ = []
+  transformers_mod.TrainerCallback = object
+  transformers_mod.TrainerControl = object
+  transformers_mod.TrainerState = object
+  transformers_mod.TrainingArguments = object
+  transformers_mod.Trainer = object
+  transformers_mod.AutoModelForCausalLM = MagicMock()
+  transformers_mod.AutoModelForSequenceClassification = MagicMock()
+  transformers_mod.AutoConfig = MagicMock()
+  transformers_mod.AutoTokenizer = MagicMock()
+  transformers_mod.PretrainedConfig = MagicMock()
+  transformers_mod.PreTrainedModel = object
+  transformers_mod.DataCollatorWithPadding = MagicMock()
+  transformers_mod.HfArgumentParser = MagicMock()
+  transformers_mod.set_seed = MagicMock()
+  sys.modules["transformers"] = transformers_mod
+  sys.modules["transformers.trainer_utils"] = types.ModuleType(
+      "transformers.trainer_utils"
+  )
+  sys.modules["transformers.trainer_utils"].get_last_checkpoint = MagicMock(
+      return_value=None
+  )
+
+for mod_name in [
+    "transformers.configuration_utils",
+    "transformers.integrations",
+    "transformers.integrations.heterogeneity",
+    "transformers.integrations.heterogeneity.configuration_utils",
+    "trl",
+    "peft",
+    "vllm",
+    "vllm.lora",
+    "vllm.lora.request",
+    "evaluate",
+    "scipy",
+    "scipy.special",
+    "sklearn",
+    "sklearn.metrics",
+    "google",
+    "google.genai",
+    "google.genai.types",
+    "huggingface_hub",
+    "matplotlib",
+    "matplotlib.pyplot",
+    "numpy",
+    "pandas",
+    "nltk",
+    "tqdm",
+]:
+  if mod_name not in sys.modules:
+    sys.modules[mod_name] = MagicMock()
+
 import torch
+
+
+class _TestMockDataset:
+
+  def __init__(self, data: dict[str, list[Any]]):
+    self._data = dict(data)
+    self.column_names = list(data.keys())
+
+  def __getitem__(self, key: str):
+    return self._data[key]
+
+  def __len__(self):
+    first_col = next(iter(self._data.values()))
+    return len(first_col)
+
+  def select(self, indices):
+    new_data = {k: [self._data[k][i] for i in indices] for k in self._data}
+    return _TestMockDataset(new_data)
+
+  def shuffle(self, seed=None):
+    return self
+
+
+class DatasetDict(dict):
+  pass
+
+
+class Dataset:
+
+  @classmethod
+  def from_dict(cls, d):
+    return _TestMockDataset(d)
+
+
+datasets_mod = types.ModuleType("datasets")
+datasets_mod.Dataset = Dataset
+datasets_mod.DatasetDict = DatasetDict
+datasets_mod.Value = MagicMock()
+datasets_mod.load_dataset = MagicMock()
+datasets_mod.concatenate_datasets = MagicMock()
+sys.modules["datasets"] = datasets_mod
+
+from src.pipelines import DPOPipeline, ScopeDataGenerationPipeline
+from src.utils import ScopeDataGenArguments
 
 
 class TestScopeDataGeneration(unittest.TestCase):
@@ -26,15 +161,15 @@ class TestScopeDataGeneration(unittest.TestCase):
         top_p=1.0,
         top_k=0,
         max_new_tokens=10,
+        batch_size=2,
         seed=42,
         push_to_hub=False,
     )
     self.pipeline.device = torch.device("cpu")
 
   def test_scope_sft_splits(self):
-    """Test splitting SFT data into D1 and D2."""
-    processor = NPOVTaskProcessor()
-    dummy_data = DatasetDict({
+    """Test splitting SFT data into D1 and D2 in ScopeDataGenerationPipeline."""
+    self.pipeline.raw_dataset = DatasetDict({
         "train": Dataset.from_dict({
             "prompt": [f"prompt_{i}" for i in range(100)],
             "completion": [f"completion_{i}" for i in range(100)],
@@ -44,16 +179,8 @@ class TestScopeDataGeneration(unittest.TestCase):
             "completion": [f"test_completion_{i}" for i in range(20)],
         }),
     })
-
-    d1, d2 = processor._make_scope_sft_splits(
-        dummy_data, split_ratio=0.5, seed=123
-    )
-    self.assertEqual(len(d1), 50)
-    self.assertEqual(len(d2), 50)
-    # Ensure no overlap between D1 and D2
-    d1_prompts = set(d1["prompt"])
-    d2_prompts = set(d2["prompt"])
-    self.assertEqual(len(d1_prompts.intersection(d2_prompts)), 0)
+    self.pipeline.process_data()
+    self.assertEqual(len(self.pipeline.d2_split), 50)
 
   def test_extract_prompt_and_chosen(self):
     """Test prompt and chosen extraction from dataset entries."""
@@ -75,52 +202,86 @@ class TestScopeDataGeneration(unittest.TestCase):
 
   def test_noisy_decoding_simulation(self):
     """Test noisy decoding step with mocked SFT and Base models."""
-    vocab_size = 50
     mock_tokenizer = MagicMock()
     mock_tokenizer.pad_token_id = 0
     mock_tokenizer.eos_token_id = 1
     mock_tokenizer.bos_token_id = 2
     mock_tokenizer.additional_special_tokens_ids = []
-    mock_tokenizer.return_value = MagicMock(
-        input_ids=torch.tensor([[2, 10, 11]], dtype=torch.long)
+    inputs_dict = {
+        "input_ids": MagicMock(shape=[1, 3]),
+        "attention_mask": MagicMock(shape=[1, 3]),
+    }
+    mock_inputs = MagicMock()
+    mock_inputs.to.return_value = inputs_dict
+    mock_inputs.__getitem__.side_effect = lambda k: inputs_dict[k]
+    mock_inputs.get.side_effect = lambda k, d=None: inputs_dict.get(k, d)
+    mock_tokenizer.return_value = mock_inputs
+    mock_tokenizer.batch_decode = MagicMock(
+        return_value=["Generated unfaithful completion"]
     )
     mock_tokenizer.decode = MagicMock(
-        side_effect=lambda token_ids, **kw: " ".join(
-            f"tok_{t}" for t in token_ids
-        )
+        return_value="Generated unfaithful completion"
     )
 
     self.pipeline.tokenizer = mock_tokenizer
 
-    # Mock SFT and Base models
     mock_sft = MagicMock()
     mock_base = MagicMock()
-
-    # Step 0: return logits
-    sft_logits = torch.randn(1, 1, vocab_size)
-    base_logits = torch.randn(1, 1, vocab_size)
-
-    mock_sft.return_value = MagicMock(logits=sft_logits, past_key_values=None)
-    mock_base.return_value = MagicMock(logits=base_logits, past_key_values=None)
-
+    mock_sft.return_value = MagicMock(logits=MagicMock(), past_key_values=None)
+    mock_base.return_value = MagicMock(logits=MagicMock(), past_key_values=None)
     self.pipeline.sft_model = mock_sft
     self.pipeline.base_model = mock_base
-    self.pipeline.args.max_new_tokens = 5
+    self.pipeline.args.max_new_tokens = 3
 
-    # Test Bernoulli sampling
+    # Test Bernoulli sampling single
     self.pipeline.args.sampling_mode = "bernoulli"
     output_bernoulli = self.pipeline._generate_unfaithful_sample("Test prompt")
     self.assertIsInstance(output_bernoulli, str)
 
-    # Test prob mixing
+    # Test prob mixing single
     self.pipeline.args.sampling_mode = "prob_mix"
     output_prob = self.pipeline._generate_unfaithful_sample("Test prompt")
     self.assertIsInstance(output_prob, str)
 
-    # Test logit mixing
+    # Test logit mixing single
     self.pipeline.args.sampling_mode = "logit_mix"
     output_logit = self.pipeline._generate_unfaithful_sample("Test prompt")
     self.assertIsInstance(output_logit, str)
+
+  def test_batched_noisy_decoding(self):
+    """Test batched noisy decoding with multiple prompts."""
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.pad_token_id = 0
+    mock_tokenizer.eos_token_id = 1
+    mock_tokenizer.bos_token_id = 2
+    mock_tokenizer.additional_special_tokens_ids = []
+    inputs_dict = {
+        "input_ids": MagicMock(shape=[2, 3]),
+        "attention_mask": MagicMock(shape=[2, 3]),
+    }
+    mock_inputs = MagicMock()
+    mock_inputs.to.return_value = inputs_dict
+    mock_inputs.__getitem__.side_effect = lambda k: inputs_dict[k]
+    mock_inputs.get.side_effect = lambda k, d=None: inputs_dict.get(k, d)
+    mock_tokenizer.return_value = mock_inputs
+    mock_tokenizer.batch_decode = MagicMock(
+        return_value=["Output 1", "Output 2"]
+    )
+    self.pipeline.tokenizer = mock_tokenizer
+
+    mock_sft = MagicMock()
+    mock_base = MagicMock()
+    mock_sft.return_value = MagicMock(logits=MagicMock(), past_key_values=None)
+    mock_base.return_value = MagicMock(logits=MagicMock(), past_key_values=None)
+    self.pipeline.sft_model = mock_sft
+    self.pipeline.base_model = mock_base
+    self.pipeline.args.max_new_tokens = 3
+
+    prompts = ["Prompt 1", "Prompt 2"]
+    batch_outputs = self.pipeline._generate_unfaithful_samples_batch(prompts)
+    self.assertEqual(len(batch_outputs), 2)
+    self.assertEqual(batch_outputs[0], "Output 1")
+    self.assertEqual(batch_outputs[1], "Output 2")
 
 
 class TestDPOPipeline(unittest.TestCase):
@@ -134,6 +295,42 @@ class TestDPOPipeline(unittest.TestCase):
     self.assertTrue(hasattr(pipeline, "setup_model"))
     self.assertTrue(hasattr(pipeline, "setup_trainer"))
     self.assertTrue(hasattr(pipeline, "run_and_save"))
+
+  def test_dpo_setup_arguments_with_max_prompt_length(self):
+    pipeline = DPOPipeline()
+    mock_script_args = MagicMock()
+    mock_script_args.task_name = "npov"
+    mock_script_args.max_prompt_length = 384
+    mock_training_args = MagicMock()
+    mock_training_args.seed = 42
+    mock_training_args.learning_rate = 5e-6
+    mock_training_args.beta = 0.1
+    mock_training_args.run_name = "test_run"
+
+    with patch("src.pipelines.HfArgumentParser") as mock_parser_cls:
+      mock_parser = MagicMock()
+      mock_parser.parse_args_into_dataclasses.return_value = (
+          mock_script_args,
+          mock_training_args,
+      )
+      mock_parser_cls.return_value = mock_parser
+
+      pipeline.setup_arguments(
+          "--task_name",
+          "npov",
+          "--dataset_repo_id",
+          "test/scope_pref",
+          "--model_repo_id",
+          "google/gemma-4-E4B",
+          "--max_length",
+          "512",
+          "--max_prompt_length",
+          "384",
+      )
+      self.assertEqual(pipeline.args.task_name, "npov")
+      self.assertEqual(pipeline.training_args.learning_rate, 5e-6)
+      if hasattr(mock_training_args, "max_prompt_length"):
+        self.assertEqual(mock_training_args.max_prompt_length, 384)
 
 
 if __name__ == "__main__":

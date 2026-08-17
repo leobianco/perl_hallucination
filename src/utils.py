@@ -42,6 +42,9 @@ class ScriptArguments:
       sft_model_path (Optional[str]): Path to the SFT model adapter checkpoint.
       sft_data_fraction (Optional[float]): Fraction of SFT training data to use
         (e.g. 0.5 for SCOPE Stage 1).
+      max_prompt_length (Optional[int]): Maximum prompt token length (supported
+        for backwards compatibility with older DPO scripts).
+      max_completion_length (Optional[int]): Maximum completion token length.
   """
 
   task_name: str
@@ -51,6 +54,8 @@ class ScriptArguments:
   reward_model_path: Optional[str] = None
   sft_model_path: Optional[str] = None
   sft_data_fraction: Optional[float] = None
+  max_prompt_length: Optional[int] = None
+  max_completion_length: Optional[int] = None
 
 
 @dataclass
@@ -80,6 +85,7 @@ class ScopeDataGenArguments:
       seed (int): Random seed. Default: 12345.
       max_samples (Optional[int]): Maximum samples to process (useful for
         testing/debugging). Default: None.
+      batch_size (int): Batch size for parallel noisy decoding. Default: 16.
       push_to_hub (bool): Whether to push the resulting preference dataset to HF
         Hub. Default: True.
       output_dir (Optional[str]): Optional local directory to save the generated
@@ -100,6 +106,7 @@ class ScopeDataGenArguments:
   max_new_tokens: int = 256
   seed: int = 12345
   max_samples: Optional[int] = None
+  batch_size: int = 16
   push_to_hub: bool = True
   output_dir: Optional[str] = None
 
@@ -127,6 +134,7 @@ class SsfoDataGenArguments:
       seed (int): Random seed. Default: 12345.
       max_samples (Optional[int]): Maximum samples to process (useful for
         testing/debugging). Default: None.
+      batch_size (int): Batch size for parallel generation. Default: 16.
       use_ground_truth_chosen (bool): If True, use ground truth target as
         chosen instead of SFT model generation with context. Default: False.
       push_to_hub (bool): Whether to push the resulting preference dataset to HF
@@ -146,6 +154,7 @@ class SsfoDataGenArguments:
   max_new_tokens: int = 256
   seed: int = 12345
   max_samples: Optional[int] = None
+  batch_size: int = 16
   use_ground_truth_chosen: bool = False
   push_to_hub: bool = True
   output_dir: Optional[str] = None

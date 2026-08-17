@@ -22,16 +22,17 @@ STAGE="${2:-all}"  # "sft", "generate_data", "dpo", or "all"
 
 # SFT Training Parameters (Stage 1)
 SFT_BATCH_SIZE=16
-SFT_NUM_EPOCHS=1
-SFT_LR=3e-3
+SFT_NUM_EPOCHS=10
+SFT_LR=0.004445051258597345
 SFT_LORA_R=8
-SFT_LORA_ALPHA=16
+SFT_LORA_ALPHA=8
 
 # SSFO Generation Parameters (Stage 2)
 GEN_TEMP=0.7
 GEN_TOP_P=0.9
 GEN_TOP_K=50
 MAX_NEW_TOKENS=256
+GEN_BATCH_SIZE=16
 USE_GROUND_TRUTH_CHOSEN=False
 
 # DPO Training Parameters (Stage 3)
@@ -42,7 +43,6 @@ DPO_LR=5e-6
 DPO_LORA_R=8
 DPO_LORA_ALPHA=16
 MAX_LENGTH=512
-MAX_PROMPT_LENGTH=384
 
 # Infrastructure Parameters
 DEEPSPEED_CONFIG="scripts/deepspeed_config.yaml"
@@ -125,6 +125,7 @@ if [ "$STAGE" == "all" ] || [ "$STAGE" == "generate_data" ]; then
     --top_p "$GEN_TOP_P" \
     --top_k "$GEN_TOP_K" \
     --max_new_tokens "$MAX_NEW_TOKENS" \
+    --batch_size "$GEN_BATCH_SIZE" \
     --use_ground_truth_chosen "$USE_GROUND_TRUTH_CHOSEN" \
     --push_to_hub True
 fi
@@ -163,7 +164,6 @@ if [ "$STAGE" == "all" ] || [ "$STAGE" == "dpo" ]; then
     --warmup_ratio 0.1 \
     --beta "$DPO_BETA" \
     --max_length "$MAX_LENGTH" \
-    --max_prompt_length "$MAX_PROMPT_LENGTH" \
     --num_train_epochs "$DPO_NUM_EPOCHS" \
     --learning_rate "$DPO_LR" \
     --per_device_train_batch_size "$DPO_BATCH_SIZE" \

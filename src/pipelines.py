@@ -51,7 +51,7 @@ from datasets import (
 import evaluate
 from google import genai
 from google.genai import types
-from huggingface_hub import snapshot_download
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 import matplotlib.pyplot as plt
 import numpy as np
 from peft import LoraConfig, PeftModel, get_peft_model
@@ -89,9 +89,13 @@ from transformers import (
     DataCollatorWithPadding,
     HfArgumentParser,
     Trainer,
+    TrainerCallback,
+    TrainerControl,
+    TrainerState,
     TrainingArguments,
     set_seed,
 )
+from transformers.trainer_utils import get_last_checkpoint
 from trl import (
     DPOConfig,
     DPOTrainer,
@@ -113,6 +117,154 @@ def _clean_cli_args(cli_args: Sequence[str] | None = None) -> list[str]:
   """Filter out stray '--' tokens from arguments before passing to argparse."""
   raw = list(cli_args) if cli_args else sys.argv[1:]
   return [arg for arg in raw if arg != "--"]
+
+
+def parse_hf_repo_reference(
+    ref: str,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+  """Parses a Hugging Face hub reference into (repo_id, subfolder, revision).
+
+  Supports formats:
+  - username/repo_name
+  - username/repo_name/checkpoint-50
+  - username/repo_name:checkpoint-50
+  - username/repo_name@revision
+  - username/repo_name/tree/revision/subfolder
+  - https://huggingface.co/username/repo_name/...
+  - hf://username/repo_name/...
+  """
+  if not isinstance(ref, str) or not ref.strip():
+    return None, None, None
+
+  cleaned = ref.strip()
+  for prefix in (
+      "https://huggingface.co/",
+      "http://huggingface.co/",
+      "hf://",
+      "hf.co/",
+  ):
+    if cleaned.startswith(prefix):
+      cleaned = cleaned[len(prefix) :]
+      break
+
+  revision = None
+  subfolder = None
+
+  if "@" in cleaned:
+    cleaned, revision = cleaned.split("@", 1)
+
+  if ":" in cleaned:
+    cleaned, subfolder = cleaned.split(":", 1)
+
+  parts = [p for p in cleaned.strip("/").split("/") if p]
+  if not parts:
+    return None, None, None
+
+  if len(parts) == 1:
+    return parts[0], subfolder, revision
+
+  if "tree" in parts:
+    tree_idx = parts.index("tree")
+    repo_id = "/".join(parts[:tree_idx])
+    if tree_idx + 1 < len(parts):
+      revision = parts[tree_idx + 1]
+    if tree_idx + 2 < len(parts):
+      subfolder = "/".join(parts[tree_idx + 2 :])
+    return repo_id, subfolder, revision
+
+  repo_id = f"{parts[0]}/{parts[1]}"
+  if len(parts) > 2:
+    extra_path = "/".join(parts[2:])
+    subfolder = extra_path if subfolder is None else f"{extra_path}/{subfolder}"
+
+  return repo_id, subfolder, revision
+
+
+class WandbResumptionCallback(TrainerCallback):
+  """TrainerCallback that records the active WandB run ID to disk and HF Hub for seamless cross-machine resumption."""
+
+  def on_train_begin(
+      self,
+      args: TrainingArguments,
+      state: TrainerState,
+      control: TrainerControl,
+      **kwargs,
+  ):
+    if (
+        getattr(state, "is_world_process_zero", True)
+        and wandb is not None
+        and getattr(wandb, "run", None) is not None
+    ):
+      run_id = wandb.run.id
+      output_dir = getattr(args, "output_dir", None)
+      if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        id_file = os.path.join(output_dir, "wandb_run_id.txt")
+        try:
+          with open(id_file, "w") as f:
+            f.write(run_id)
+        except Exception as e:
+          print(f"[WandB] Notice: Could not write {id_file}: {e}")
+
+        hub_model_id = getattr(args, "hub_model_id", None)
+        push_to_hub = getattr(args, "push_to_hub", False)
+        if push_to_hub and hub_model_id and os.path.isfile(id_file):
+          try:
+            api = HfApi()
+            api.upload_file(
+                path_or_fileobj=id_file,
+                path_in_repo="wandb_run_id.txt",
+                repo_id=hub_model_id,
+                commit_message="Add wandb_run_id for cross-machine resumption",
+            )
+          except Exception:
+            pass
+
+  def on_save(
+      self,
+      args: TrainingArguments,
+      state: TrainerState,
+      control: TrainerControl,
+      **kwargs,
+  ):
+    if (
+        getattr(state, "is_world_process_zero", True)
+        and wandb is not None
+        and getattr(wandb, "run", None) is not None
+    ):
+      run_id = wandb.run.id
+      output_dir = getattr(args, "output_dir", None)
+      if output_dir:
+        checkpoint_folder = f"checkpoint-{state.global_step}"
+        checkpoint_dir = os.path.join(output_dir, checkpoint_folder)
+        if os.path.isdir(checkpoint_dir):
+          id_file = os.path.join(checkpoint_dir, "wandb_run_id.txt")
+          try:
+            with open(id_file, "w") as f:
+              f.write(run_id)
+          except Exception as e:
+            print(f"[WandB] Notice: Could not write {id_file}: {e}")
+
+        root_id_file = os.path.join(output_dir, "wandb_run_id.txt")
+        try:
+          with open(root_id_file, "w") as f:
+            f.write(run_id)
+        except Exception as e:
+          print(f"[WandB] Notice: Could not write {root_id_file}: {e}")
+
+        hub_model_id = getattr(args, "hub_model_id", None)
+        push_to_hub = getattr(args, "push_to_hub", False)
+        if push_to_hub and hub_model_id and os.path.isfile(root_id_file):
+          try:
+            api = HfApi()
+            api.upload_file(
+                path_or_fileobj=root_id_file,
+                path_in_repo="wandb_run_id.txt",
+                repo_id=hub_model_id,
+                commit_message=f"Update wandb_run_id at step {state.global_step}",
+            )
+          except Exception:
+            pass
 
 
 class Pipeline(abc.ABC):
@@ -139,6 +291,234 @@ class Pipeline(abc.ABC):
     self.setup_model()
     self.setup_trainer()
     self.run_and_save()
+
+  def _setup_wandb_resumption(self) -> None:
+    """Inspects resume_from_checkpoint (local or HF Hub) and output_dir to restore WandB run ID."""
+    if self.training_args is None:
+      return
+
+    resume_ckpt = getattr(self.training_args, "resume_from_checkpoint", None)
+    output_dir = getattr(self.training_args, "output_dir", None)
+    hub_model_id = getattr(self.training_args, "hub_model_id", None)
+
+    search_dirs = []
+    if isinstance(resume_ckpt, str) and os.path.isdir(resume_ckpt):
+      search_dirs.append(resume_ckpt)
+      parent_dir = os.path.dirname(os.path.normpath(resume_ckpt))
+      if parent_dir and os.path.isdir(parent_dir):
+        search_dirs.append(parent_dir)
+    if output_dir and os.path.isdir(output_dir):
+      search_dirs.append(output_dir)
+
+    # 1. Search local directories first
+    for d in search_dirs:
+      id_file = os.path.join(d, "wandb_run_id.txt")
+      if os.path.isfile(id_file):
+        try:
+          with open(id_file, "r") as f:
+            saved_run_id = f.read().strip()
+          if saved_run_id:
+            os.environ["WANDB_RUN_ID"] = saved_run_id
+            os.environ["WANDB_RESUME"] = "allow"
+            print(
+                f"[WandB] Restored run ID '{saved_run_id}' with resume='allow'"
+                f" from local: {id_file}"
+            )
+            return
+        except Exception as e:
+          print(f"[WandB] Notice: could not read {id_file}: {e}")
+
+    # 2. Check Hugging Face Hub if resume_ckpt is a HF reference or hub_model_id is set
+    hf_candidates = []
+    if isinstance(resume_ckpt, str) and not os.path.isdir(resume_ckpt):
+      repo_id, subfolder, revision = parse_hf_repo_reference(resume_ckpt)
+      if repo_id:
+        hf_candidates.append((repo_id, subfolder, revision))
+    if hub_model_id and isinstance(hub_model_id, str):
+      repo_id, subfolder, revision = parse_hf_repo_reference(hub_model_id)
+      if repo_id and (repo_id, subfolder, revision) not in hf_candidates:
+        hf_candidates.append((repo_id, subfolder, revision))
+
+    for repo_id, subfolder, revision in hf_candidates:
+      try:
+        filenames_to_try = []
+        if subfolder:
+          filenames_to_try.append(f"{subfolder}/wandb_run_id.txt")
+        filenames_to_try.append("wandb_run_id.txt")
+
+        for fname in filenames_to_try:
+          try:
+            downloaded_file = hf_hub_download(
+                repo_id=repo_id,
+                filename=fname,
+                revision=revision,
+            )
+            if os.path.isfile(downloaded_file):
+              with open(downloaded_file, "r") as f:
+                saved_run_id = f.read().strip()
+              if saved_run_id:
+                os.environ["WANDB_RUN_ID"] = saved_run_id
+                os.environ["WANDB_RESUME"] = "allow"
+                print(
+                    f"[WandB] Restored run ID '{saved_run_id}' with"
+                    f" resume='allow' from Hugging Face Hub: {repo_id}/{fname}"
+                )
+                return
+          except Exception:
+            continue
+      except Exception as e:
+        print(
+            "[WandB] Notice: Could not fetch wandb_run_id.txt from HF Hub"
+            f" ({repo_id}): {e}"
+        )
+
+  def _download_hf_checkpoint(
+      self,
+      repo_id: str,
+      subfolder: Optional[str] = None,
+      revision: Optional[str] = None,
+  ) -> Optional[str]:
+    """Downloads a checkpoint snapshot from Hugging Face Hub and returns the local directory path."""
+    try:
+      print(
+          f"Downloading checkpoint from Hugging Face Hub: repo_id='{repo_id}'"
+          f"{f', subfolder={subfolder}' if subfolder else ''}"
+          f"{f', revision={revision}' if revision else ''}..."
+      )
+      downloaded_dir = snapshot_download(
+          repo_id=repo_id,
+          revision=revision,
+      )
+
+      target_dir = (
+          os.path.join(downloaded_dir, subfolder)
+          if subfolder
+          else downloaded_dir
+      )
+
+      if not os.path.isdir(target_dir):
+        print(
+            f"Subfolder '{subfolder}' not found in downloaded repo '{repo_id}'."
+            f" Using root directory: {downloaded_dir}"
+        )
+        target_dir = downloaded_dir
+
+      # Check if target_dir has nested checkpoint-XXX folders
+      try:
+        last_ckpt = get_last_checkpoint(target_dir)
+      except Exception:
+        last_ckpt = None
+
+      if last_ckpt is not None:
+        print(
+            f"Found latest checkpoint in Hugging Face Hub repo '{repo_id}':"
+            f" {last_ckpt}"
+        )
+        resolved_path = last_ckpt
+      else:
+        print(
+            f"Using checkpoint directory from Hugging Face Hub repo"
+            f" '{repo_id}': {target_dir}"
+        )
+        resolved_path = target_dir
+
+      # Update WandB resumption with any wandb_run_id.txt found in the downloaded files
+      self._setup_wandb_resumption()
+
+      return resolved_path
+
+    except Exception as e:
+      print(
+          f"Error downloading checkpoint from Hugging Face Hub ({repo_id}): {e}"
+      )
+      return None
+
+  def _resolve_resume_checkpoint(self) -> Optional[str]:
+    """Resolves the checkpoint path to resume from (supporting local paths, auto-discovery, and Hugging Face Hub repos)."""
+    if self.training_args is None:
+      return None
+
+    resume_arg = getattr(self.training_args, "resume_from_checkpoint", None)
+    if (
+        resume_arg is None
+        or resume_arg is False
+        or str(resume_arg).lower() in ("false", "none", "0", "")
+    ):
+      return None
+
+    output_dir = getattr(self.training_args, "output_dir", None)
+    hub_model_id = getattr(self.training_args, "hub_model_id", None)
+
+    # 1. Handle boolean / auto / latest flags
+    if isinstance(resume_arg, bool) or str(resume_arg).lower() in (
+        "true",
+        "auto",
+        "latest",
+        "1",
+    ):
+      # First try local output_dir
+      if output_dir and os.path.isdir(output_dir):
+        try:
+          last_ckpt = get_last_checkpoint(output_dir)
+        except Exception:
+          last_ckpt = None
+        if last_ckpt is not None:
+          print(f"Resuming training from latest local checkpoint: {last_ckpt}")
+          return last_ckpt
+
+      # If not found locally, try hub_model_id on Hugging Face Hub
+      if hub_model_id and isinstance(hub_model_id, str):
+        repo_id, subfolder, revision = parse_hf_repo_reference(hub_model_id)
+        if repo_id:
+          print(
+              f"No local checkpoint in output_dir. Attempting to download"
+              f" latest checkpoint from Hugging Face Hub repo '{repo_id}'..."
+          )
+          hf_ckpt = self._download_hf_checkpoint(repo_id, subfolder, revision)
+          if hf_ckpt is not None:
+            return hf_ckpt
+
+      print(
+          f"No checkpoint found in output_dir '{output_dir}'. Starting"
+          " training from scratch."
+      )
+      return None
+
+    # 2. Handle string path or Hugging Face Hub repo reference
+    if isinstance(resume_arg, str):
+      # If it is an existing local directory:
+      if os.path.isdir(resume_arg):
+        try:
+          last_ckpt = get_last_checkpoint(resume_arg)
+        except Exception:
+          last_ckpt = None
+        if last_ckpt is not None and last_ckpt != resume_arg:
+          print(
+              f"Resuming training from checkpoint found in '{resume_arg}':"
+              f" {last_ckpt}"
+          )
+          return last_ckpt
+        return resume_arg
+
+      # If it's not a local directory, check if it's a Hugging Face Hub path/repo
+      repo_id, subfolder, revision = parse_hf_repo_reference(resume_arg)
+      if repo_id:
+        print(
+            f"Fetching checkpoint from Hugging Face Hub: repo_id='{repo_id}'"
+            f"{f', subfolder={subfolder}' if subfolder else ''}"
+            f"{f', revision={revision}' if revision else ''}..."
+        )
+        hf_ckpt = self._download_hf_checkpoint(repo_id, subfolder, revision)
+        if hf_ckpt is not None:
+          return hf_ckpt
+
+      print(
+          f"Specified checkpoint '{resume_arg}' was not found locally or on"
+          " Hugging Face Hub. Starting from scratch."
+      )
+      return None
+
+    return None
 
   def _configure_warmup_steps(self) -> None:
     """Compute and set warmup_steps from warmup_ratio to avoid HF deprecation warnings."""
@@ -261,6 +641,7 @@ class SFTPipeline(Pipeline):
       self.training_args.run_name = run_name
     if wandb is not None and getattr(wandb, "run", None) is not None:
       wandb.run.name = run_name
+    self._setup_wandb_resumption()
 
   def load_data(self) -> None:
     train_dataset = load_dataset(self.args.dataset_repo_id, split="train")
@@ -332,10 +713,12 @@ class SFTPipeline(Pipeline):
         train_dataset=self.data["train"],
         eval_dataset=self.data["test"],
         processing_class=self.tokenizer,
+        callbacks=[WandbResumptionCallback()],
     )
 
   def run_and_save(self) -> None:
-    self.trainer.train()
+    resume_ckpt = self._resolve_resume_checkpoint()
+    self.trainer.train(resume_from_checkpoint=resume_ckpt)
     self.trainer.push_to_hub()
 
 
@@ -375,6 +758,7 @@ class RewardModelPipeline(Pipeline):
       self.training_args.run_name = run_name
     if wandb is not None and getattr(wandb, "run", None) is not None:
       wandb.run.name = run_name
+    self._setup_wandb_resumption()
 
   def load_data(self) -> None:
     self.data = load_dataset(self.args.dataset_repo_id)
@@ -518,10 +902,12 @@ class RewardModelPipeline(Pipeline):
         processing_class=self.tokenizer,
         data_collator=self.data_collator,
         compute_metrics=compute_metrics,
+        callbacks=[WandbResumptionCallback()],
     )
 
   def run_and_save(self) -> None:
-    self.trainer.train()
+    resume_ckpt = self._resolve_resume_checkpoint()
+    self.trainer.train(resume_from_checkpoint=resume_ckpt)
     if getattr(self.training_args, "output_dir", None):
       self.trainer.save_model(self.training_args.output_dir)
     if (
@@ -564,6 +950,7 @@ class PERLPipeline(Pipeline):
       self.training_args.run_name = run_name
     if wandb is not None and getattr(wandb, "run", None) is not None:
       wandb.run.name = run_name
+    self._setup_wandb_resumption()
 
   def load_data(self) -> None:
     self.data = load_dataset(self.args.dataset_repo_id)
@@ -690,11 +1077,13 @@ class PERLPipeline(Pipeline):
         train_dataset=self.data["train"],
         eval_dataset=self.data.get("test", None),
         processing_class=self.tokenizer,
+        callbacks=[WandbResumptionCallback()],
     )
 
   def run_and_save(self) -> None:
     if self.training_args.do_train:
-      self.trainer.train()
+      resume_ckpt = self._resolve_resume_checkpoint()
+      self.trainer.train(resume_from_checkpoint=resume_ckpt)
       self.trainer.push_to_hub()
 
 
@@ -719,6 +1108,10 @@ class DPOPipeline(Pipeline):
 
     self.args = script_args
     self.training_args = training_args
+    if getattr(script_args, "max_prompt_length", None) is not None and hasattr(
+        training_args, "max_prompt_length"
+    ):
+      training_args.max_prompt_length = script_args.max_prompt_length
     set_seed(training_args.seed)
     self._lora_args = lora_args
 
@@ -740,6 +1133,7 @@ class DPOPipeline(Pipeline):
       self.training_args.run_name = run_name
     if wandb is not None and getattr(wandb, "run", None) is not None:
       wandb.run.name = run_name
+    self._setup_wandb_resumption()
 
   def load_data(self) -> None:
     data = load_dataset(self.args.dataset_repo_id)
@@ -798,11 +1192,13 @@ class DPOPipeline(Pipeline):
         train_dataset=self.data["train"],
         eval_dataset=self.data.get("test", None),
         processing_class=self.tokenizer,
+        callbacks=[WandbResumptionCallback()],
     )
 
   def run_and_save(self) -> None:
     if self.training_args.do_train:
-      self.trainer.train()
+      resume_ckpt = self._resolve_resume_checkpoint()
+      self.trainer.train(resume_from_checkpoint=resume_ckpt)
       self.trainer.push_to_hub()
 
 
@@ -876,7 +1272,7 @@ class ScopeDataGenerationPipeline(Pipeline):
   def process_data(self) -> None:
     train_split = (
         self.raw_dataset["train"]
-        if isinstance(self.raw_dataset, (DatasetDict, dict))
+        if isinstance(self.raw_dataset, dict)
         else self.raw_dataset
     )
     shuffled_train = train_split.shuffle(seed=self.args.seed)
@@ -916,11 +1312,14 @@ class ScopeDataGenerationPipeline(Pipeline):
   def setup_trainer(self) -> None:
     pass
 
-  def _generate_unfaithful_sample(
+  def _generate_unfaithful_samples_batch(
       self,
-      prompt: str,
-  ) -> str:
-    """Generate a dispreferred sample using SCOPE noisy decoding (Algorithm 1)."""
+      prompts: list[str],
+  ) -> list[str]:
+    """Generate dispreferred samples for a batch using SCOPE noisy decoding (Algorithm 1)."""
+    if not prompts:
+      return []
+
     tokenizer = self.tokenizer
     device = self.device
     alpha = self.args.alpha
@@ -929,40 +1328,78 @@ class ScopeDataGenerationPipeline(Pipeline):
     top_k = self.args.top_k
     max_new_tokens = self.args.max_new_tokens
     sampling_mode = self.args.sampling_mode
+    batch_size = len(prompts)
 
-    prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-    if tokenizer.bos_token_id is not None:
-      base_input_ids = torch.tensor([[tokenizer.bos_token_id]], device=device)
+    inputs = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+    ).to(device)
+    prompt_ids = (
+        inputs.input_ids
+        if hasattr(inputs, "input_ids")
+        else inputs["input_ids"]
+    )
+    prompt_attention_mask = (
+        getattr(inputs, "attention_mask", None)
+        if hasattr(inputs, "attention_mask")
+        else inputs.get("attention_mask", None)
+    )
+
+    if getattr(tokenizer, "bos_token_id", None) is not None:
+      base_input_ids = torch.full(
+          (batch_size, 1),
+          tokenizer.bos_token_id,
+          dtype=torch.long,
+          device=device,
+      )
     else:
-      base_input_ids = prompt_ids[:, :1]
+      base_input_ids = prompt_ids[:, :1].clone()
+    base_attention_mask = torch.ones(
+        (batch_size, 1), dtype=torch.long, device=device
+    )
 
-    generated_tokens = []
+    generated_tokens: list[list[int]] = [[] for _ in range(batch_size)]
+    finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
     past_key_values_sft = None
     past_key_values_base = None
     cur_sft_input = prompt_ids
+    cur_sft_mask = prompt_attention_mask
     cur_base_input = base_input_ids
+    cur_base_mask = base_attention_mask
 
-    eos_token_ids = {tokenizer.eos_token_id}
+    eos_token_ids = set()
+    if getattr(tokenizer, "eos_token_id", None) is not None:
+      eos_token_ids.add(tokenizer.eos_token_id)
     if getattr(tokenizer, "pad_token_id", None) is not None:
       eos_token_ids.add(tokenizer.pad_token_id)
-    if hasattr(tokenizer, "additional_special_tokens_ids"):
+    if (
+        hasattr(tokenizer, "additional_special_tokens_ids")
+        and tokenizer.additional_special_tokens_ids
+    ):
       eos_token_ids.update(tokenizer.additional_special_tokens_ids)
 
     with torch.no_grad():
       for _ in range(max_new_tokens):
+        if finished.all():
+          break
+
         sft_out = self.sft_model(
             input_ids=cur_sft_input,
+            attention_mask=cur_sft_mask,
             past_key_values=past_key_values_sft,
             use_cache=True,
         )
         base_out = self.base_model(
             input_ids=cur_base_input,
+            attention_mask=cur_base_mask,
             past_key_values=past_key_values_base,
             use_cache=True,
         )
 
-        past_key_values_sft = sft_out.past_key_values
-        past_key_values_base = base_out.past_key_values
+        past_key_values_sft = getattr(sft_out, "past_key_values", None)
+        past_key_values_base = getattr(base_out, "past_key_values", None)
 
         logits_sft = sft_out.logits[:, -1, :].clone()
         logits_base = base_out.logits[:, -1, :].clone()
@@ -972,9 +1409,13 @@ class ScopeDataGenerationPipeline(Pipeline):
           logits_base = logits_base / temperature
 
         if sampling_mode == "bernoulli":
-          # Algorithm 1: alpha_t ~ Bernoulli(alpha)
-          alpha_t = torch.bernoulli(torch.tensor([alpha], device=device)).item()
-          selected_logits = logits_base if (alpha_t == 1.0) else logits_sft
+          # Algorithm 1: alpha_t ~ Bernoulli(alpha) sampled on GPU across batch
+          alpha_mask = torch.bernoulli(
+              torch.full((batch_size, 1), alpha, device=device)
+          )
+          selected_logits = torch.where(
+              alpha_mask == 1.0, logits_base, logits_sft
+          )
           probs = torch.softmax(selected_logits, dim=-1)
         elif sampling_mode == "prob_mix":
           probs_sft = torch.softmax(logits_sft, dim=-1)
@@ -991,7 +1432,7 @@ class ScopeDataGenerationPipeline(Pipeline):
           probs = torch.zeros_like(probs).scatter_(
               -1, top_k_indices, top_k_probs
           )
-          probs = probs / probs.sum(dim=-1, keepdim=True)
+          probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
         if top_p < 1.0:
           sorted_probs, sorted_indices = torch.sort(
@@ -1007,38 +1448,78 @@ class ScopeDataGenerationPipeline(Pipeline):
           probs = torch.zeros_like(probs).scatter_(
               -1, sorted_indices, sorted_probs
           )
-          probs = probs / probs.sum(dim=-1, keepdim=True)
+          probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
-        next_token = torch.multinomial(probs, num_samples=1)
-        token_id = next_token.item()
+        next_tokens = torch.multinomial(probs, num_samples=1)
+        next_tokens_list = next_tokens.squeeze(-1).tolist()
+        if not isinstance(next_tokens_list, list):
+          next_tokens_list = [next_tokens_list]
 
-        if token_id in eos_token_ids:
-          break
-        token_str = tokenizer.decode([token_id])
-        if "<end_of_turn>" in token_str or "<eos>" in token_str:
-          break
+        for i, tok_id in enumerate(next_tokens_list):
+          if not finished[i]:
+            if tok_id in eos_token_ids:
+              finished[i] = True
+            else:
+              generated_tokens[i].append(tok_id)
 
-        generated_tokens.append(token_id)
-        cur_sft_input = next_token
-        cur_base_input = next_token
+        cur_sft_input = next_tokens
+        cur_sft_mask = torch.ones(
+            (batch_size, 1), dtype=torch.long, device=device
+        )
+        cur_base_input = next_tokens
+        cur_base_mask = torch.ones(
+            (batch_size, 1), dtype=torch.long, device=device
+        )
 
-    return tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+    if hasattr(tokenizer, "batch_decode"):
+      decoded = tokenizer.batch_decode(
+          generated_tokens, skip_special_tokens=True
+      )
+    else:
+      decoded = [
+          tokenizer.decode(seq, skip_special_tokens=True)
+          for seq in generated_tokens
+      ]
+
+    clean_completions = [
+        d.replace("<end_of_turn>", "").replace("<eos>", "").strip()
+        for d in decoded
+    ]
+    return clean_completions
+
+  def _generate_unfaithful_sample(
+      self,
+      prompt: str,
+  ) -> str:
+    """Generate a single dispreferred sample (delegates to batch method)."""
+    return self._generate_unfaithful_samples_batch([prompt])[0]
 
   def run_and_save(self) -> None:
+    batch_size = getattr(self.args, "batch_size", 16) or 16
     prompts = []
     chosens = []
     rejecteds = []
 
     print(
         "Generating synthetic dispreferred completions for"
-        f" {len(self.d2_split)} samples..."
+        f" {len(self.d2_split)} samples (batch_size={batch_size})..."
     )
-    for entry in tqdm(self.d2_split, desc="SCOPE noisy decoding"):
-      prompt, chosen = self._extract_prompt_and_chosen(entry)
-      rejected = self._generate_unfaithful_sample(prompt)
-      prompts.append(prompt)
-      chosens.append(chosen)
-      rejecteds.append(rejected)
+    entries = list(self.d2_split)
+    for i in tqdm(
+        range(0, len(entries), batch_size), desc="SCOPE noisy decoding"
+    ):
+      batch_entries = entries[i : i + batch_size]
+      batch_prompts = []
+      batch_chosens = []
+      for entry in batch_entries:
+        prompt, chosen = self._extract_prompt_and_chosen(entry)
+        batch_prompts.append(prompt)
+        batch_chosens.append(chosen)
+
+      batch_rejecteds = self._generate_unfaithful_samples_batch(batch_prompts)
+      prompts.extend(batch_prompts)
+      chosens.extend(batch_chosens)
+      rejecteds.extend(batch_rejecteds)
 
     pref_dict = {
         "prompt": prompts,
@@ -1215,8 +1696,11 @@ class SSFODataGenerationPipeline(Pipeline):
   def setup_trainer(self) -> None:
     pass
 
-  def _generate(self, prompt: str) -> str:
-    """Generate completion from SFT model given a prompt."""
+  def _generate_batch(self, prompts: list[str]) -> list[str]:
+    """Generate completions in parallel from SFT model given a list of prompts."""
+    if not prompts:
+      return []
+
     tokenizer = self.tokenizer
     device = self.device
     temperature = self.args.temperature
@@ -1224,39 +1708,103 @@ class SSFODataGenerationPipeline(Pipeline):
     top_k = self.args.top_k
     max_new_tokens = self.args.max_new_tokens
 
-    prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-    generated_tokens = []
-    past_key_values = None
-    cur_input = prompt_ids
+    inputs = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+    ).to(device)
 
-    eos_token_ids = {tokenizer.eos_token_id}
+    # Use native huggingface generate if available
+    if hasattr(self.sft_model, "generate"):
+      generation_kwargs = {
+          "input_ids": (
+              inputs.input_ids
+              if hasattr(inputs, "input_ids")
+              else inputs["input_ids"]
+          ),
+          "attention_mask": (
+              getattr(inputs, "attention_mask", None)
+              if hasattr(inputs, "attention_mask")
+              else inputs.get("attention_mask", None)
+          ),
+          "max_new_tokens": max_new_tokens,
+          "pad_token_id": (
+              tokenizer.pad_token_id
+              if tokenizer.pad_token_id is not None
+              else tokenizer.eos_token_id
+          ),
+          "eos_token_id": tokenizer.eos_token_id,
+          "use_cache": True,
+      }
+      if temperature > 0:
+        generation_kwargs.update({
+            "do_sample": True,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+        })
+      else:
+        generation_kwargs["do_sample"] = False
+
+      with torch.no_grad():
+        outputs = self.sft_model.generate(**generation_kwargs)
+
+      prompt_ids = (
+          inputs.input_ids
+          if hasattr(inputs, "input_ids")
+          else inputs["input_ids"]
+      )
+      prompt_len = prompt_ids.shape[1]
+      generated_ids = outputs[:, prompt_len:]
+      if hasattr(tokenizer, "batch_decode"):
+        decoded = tokenizer.batch_decode(
+            generated_ids, skip_special_tokens=True
+        )
+      else:
+        decoded = [
+            tokenizer.decode(seq, skip_special_tokens=True)
+            for seq in generated_ids
+        ]
+      return [
+          d.replace("<end_of_turn>", "").replace("<eos>", "").strip()
+          for d in decoded
+      ]
+
+    # Fallback to manual batched forward loop if generate() is not available on mock
+    batch_size = len(prompts)
+    cur_input = inputs.input_ids
+    cur_mask = inputs.attention_mask
+    past_key_values = None
+    generated_tokens = [[] for _ in range(batch_size)]
+    finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+    eos_token_ids = set()
+    if getattr(tokenizer, "eos_token_id", None) is not None:
+      eos_token_ids.add(tokenizer.eos_token_id)
     if getattr(tokenizer, "pad_token_id", None) is not None:
       eos_token_ids.add(tokenizer.pad_token_id)
-    if hasattr(tokenizer, "additional_special_tokens_ids"):
-      eos_token_ids.update(tokenizer.additional_special_tokens_ids)
 
     with torch.no_grad():
       for _ in range(max_new_tokens):
+        if finished.all():
+          break
         out = self.sft_model(
             input_ids=cur_input,
+            attention_mask=cur_mask,
             past_key_values=past_key_values,
             use_cache=True,
         )
-        past_key_values = out.past_key_values
+        past_key_values = getattr(out, "past_key_values", None)
         logits = out.logits[:, -1, :].clone()
-
         if temperature > 0 and temperature != 1.0:
           logits = logits / temperature
-
         probs = torch.softmax(logits, dim=-1)
-
         if top_k > 0 and top_k < probs.size(-1):
           top_k_probs, top_k_indices = torch.topk(probs, top_k, dim=-1)
           probs = torch.zeros_like(probs).scatter_(
               -1, top_k_indices, top_k_probs
           )
-          probs = probs / probs.sum(dim=-1, keepdim=True)
-
+          probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
         if top_p < 1.0:
           sorted_probs, sorted_indices = torch.sort(
               probs, descending=True, dim=-1
@@ -1271,44 +1819,71 @@ class SSFODataGenerationPipeline(Pipeline):
           probs = torch.zeros_like(probs).scatter_(
               -1, sorted_indices, sorted_probs
           )
-          probs = probs / probs.sum(dim=-1, keepdim=True)
+          probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        next_tokens = torch.multinomial(probs, num_samples=1)
+        next_tokens_list = next_tokens.squeeze(-1).tolist()
+        if not isinstance(next_tokens_list, list):
+          next_tokens_list = [next_tokens_list]
+        for i, tok_id in enumerate(next_tokens_list):
+          if not finished[i]:
+            if tok_id in eos_token_ids:
+              finished[i] = True
+            else:
+              generated_tokens[i].append(tok_id)
+        cur_input = next_tokens
+        cur_mask = torch.ones((batch_size, 1), dtype=torch.long, device=device)
 
-        next_token = torch.multinomial(probs, num_samples=1)
-        token_id = next_token.item()
+    if hasattr(tokenizer, "batch_decode"):
+      decoded = tokenizer.batch_decode(
+          generated_tokens, skip_special_tokens=True
+      )
+    else:
+      decoded = [
+          tokenizer.decode(seq, skip_special_tokens=True)
+          for seq in generated_tokens
+      ]
+    return [
+        d.replace("<end_of_turn>", "").replace("<eos>", "").strip()
+        for d in decoded
+    ]
 
-        if token_id in eos_token_ids:
-          break
-        token_str = tokenizer.decode([token_id])
-        if "<end_of_turn>" in token_str or "<eos>" in token_str:
-          break
-
-        generated_tokens.append(token_id)
-        cur_input = next_token
-
-    return tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+  def _generate(self, prompt: str) -> str:
+    """Generate completion from SFT model given a single prompt."""
+    return self._generate_batch([prompt])[0]
 
   def run_and_save(self) -> None:
+    batch_size = getattr(self.args, "batch_size", 16) or 16
     prompts = []
     chosens = []
     rejecteds = []
 
     print(
         f"Generating SSFO preference pairs for {len(self.train_split)}"
-        " samples..."
+        f" samples (batch_size={batch_size})..."
     )
-    for entry in tqdm(self.train_split, desc="SSFO generation"):
-      prompt_ctx, prompt_no_ctx, gt_chosen = self._extract_prompts(entry)
+    entries = list(self.train_split)
+    for i in tqdm(range(0, len(entries), batch_size), desc="SSFO generation"):
+      batch_entries = entries[i : i + batch_size]
+      batch_prompt_ctx = []
+      batch_prompt_no_ctx = []
+      batch_gt_chosen = []
 
-      if self.args.use_ground_truth_chosen and gt_chosen:
-        chosen = gt_chosen
+      for entry in batch_entries:
+        prompt_ctx, prompt_no_ctx, gt_chosen = self._extract_prompts(entry)
+        batch_prompt_ctx.append(prompt_ctx)
+        batch_prompt_no_ctx.append(prompt_no_ctx)
+        batch_gt_chosen.append(gt_chosen)
+
+      if self.args.use_ground_truth_chosen and all(batch_gt_chosen):
+        batch_chosen = batch_gt_chosen
       else:
-        chosen = self._generate(prompt_ctx)
+        batch_chosen = self._generate_batch(batch_prompt_ctx)
 
-      rejected = self._generate(prompt_no_ctx)
+      batch_rejected = self._generate_batch(batch_prompt_no_ctx)
 
-      prompts.append(prompt_ctx)
-      chosens.append(chosen)
-      rejecteds.append(rejected)
+      prompts.extend(batch_prompt_ctx)
+      chosens.extend(batch_chosen)
+      rejecteds.extend(batch_rejected)
 
     pref_dict = {
         "prompt": prompts,

@@ -11,6 +11,7 @@ TEMPERATURE=0.7
 TOP_P=0.9
 TOP_K=50
 MAX_NEW_TOKENS=256
+BATCH_SIZE=16
 USE_GROUND_TRUTH_CHOSEN=False
 MAX_SAMPLES=""
 
@@ -37,6 +38,7 @@ CMD_ARGS=(
   --top_p "$TOP_P"
   --top_k "$TOP_K"
   --max_new_tokens "$MAX_NEW_TOKENS"
+  --batch_size "$BATCH_SIZE"
   --use_ground_truth_chosen "$USE_GROUND_TRUTH_CHOSEN"
   --push_to_hub True
 )

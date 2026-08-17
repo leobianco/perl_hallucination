@@ -20,7 +20,6 @@ LORA_DROPOUT=0.0
 LR_SCHEDULER_TYPE="cosine"
 WARMUP_RATIO=0.1
 MAX_LENGTH=512
-MAX_PROMPT_LENGTH=384
 EVAL_STRATEGY="epoch"
 SAVE_STRATEGY="epoch"
 
@@ -33,6 +32,32 @@ DATASET_REPO_ID="${USER}/${TASK_NAME}_scope_preference"
 MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
 TIMESTAMP=$(date '+%y%m%d%H%M')
 RUN_IDENTIFIER="${USER}/${TASK_NAME}_SCOPE_DPO_${MODEL_NAME}_S${SEED}_epo${NUM_TRAIN_EPOCHS}_lr${LEARNING_RATE}_beta${BETA}_${TIMESTAMP}"
+
+# Resumption configuration (can be passed via environment variable or second argument)
+RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
+if [ -n "$2" ] && [[ "$2" != --* ]]; then
+    RESUME_FROM_CHECKPOINT="$2"
+fi
+
+OUTPUT_DIR="./checkpoints/${TASK_NAME}/scope_dpo/${RUN_IDENTIFIER}"
+if [ -n "$RESUME_FROM_CHECKPOINT" ] && [ "$RESUME_FROM_CHECKPOINT" != "auto" ] && [ "$RESUME_FROM_CHECKPOINT" != "True" ] && [ "$RESUME_FROM_CHECKPOINT" != "true" ]; then
+    if [[ "$RESUME_FROM_CHECKPOINT" == *"checkpoint-"* ]] && [ -d "$RESUME_FROM_CHECKPOINT" ]; then
+        OUTPUT_DIR=$(dirname "$RESUME_FROM_CHECKPOINT")
+        RUN_IDENTIFIER=$(basename "$OUTPUT_DIR")
+    elif [ -d "$RESUME_FROM_CHECKPOINT" ]; then
+        OUTPUT_DIR="$RESUME_FROM_CHECKPOINT"
+        RUN_IDENTIFIER=$(basename "$OUTPUT_DIR")
+    elif [[ "$RESUME_FROM_CHECKPOINT" == *"/"* ]]; then
+        CLEANED_HF_REPO=$(echo "$RESUME_FROM_CHECKPOINT" | sed 's|https://huggingface.co/||g' | sed 's|http://huggingface.co/||g' | sed 's|hf://||g' | sed 's|hf.co/||g' | awk -F'[@:]' '{print $1}')
+        RUN_IDENTIFIER="$CLEANED_HF_REPO"
+        OUTPUT_DIR="./checkpoints/${TASK_NAME}/scope_dpo/${RUN_IDENTIFIER}"
+    fi
+fi
+
+EXTRA_ARGS=()
+if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
+    EXTRA_ARGS+=(--resume_from_checkpoint "$RESUME_FROM_CHECKPOINT")
+fi
 
 # Checks
 if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ]; then
@@ -48,7 +73,7 @@ accelerate launch \
   --report_to "wandb" \
   --run_name "$RUN_IDENTIFIER" \
   --logging_steps 1 \
-  --output_dir "./checkpoints/${TASK_NAME}/scope_dpo/${RUN_IDENTIFIER}" \
+  --output_dir "$OUTPUT_DIR" \
   --push_to_hub True \
   --hub_model_id "$RUN_IDENTIFIER" \
   --seed "$SEED" \
@@ -66,7 +91,6 @@ accelerate launch \
   --save_total_limit 1 \
   --beta "$BETA" \
   --max_length "$MAX_LENGTH" \
-  --max_prompt_length "$MAX_PROMPT_LENGTH" \
   --num_train_epochs "$NUM_TRAIN_EPOCHS" \
   --learning_rate "$LEARNING_RATE" \
   --lr_scheduler_type "$LR_SCHEDULER_TYPE" \
@@ -80,4 +104,5 @@ accelerate launch \
   --task_type "CAUSAL_LM" \
   --lora_r "$LORA_RANK" \
   --lora_alpha "$LORA_ALPHA" \
-  --lora_dropout "$LORA_DROPOUT"
+  --lora_dropout "$LORA_DROPOUT" \
+  "${EXTRA_ARGS[@]}"

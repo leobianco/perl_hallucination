@@ -39,6 +39,32 @@ FORMATTED_LR=$(python3 -c "import sys; lr=float('${LEARNING_RATE}'); print(f'{lr
 FORMATTED_EPOCHS=$(python3 -c "import sys; e=float('${NUM_TRAIN_EPOCHS}'); print(f'{e:.2g}')" 2>/dev/null || echo "$NUM_TRAIN_EPOCHS")
 RUN_IDENTIFIER="${USER}/${TASK_NAME}_RM_${MODEL_NAME}_S${SEED}_LLM_${SYN_HALL_LLM}_STRUCT_${SYN_HALL_STRUCT}_epo${FORMATTED_EPOCHS}_lr${FORMATTED_LR}_r${LORA_RANK}_${TIMESTAMP}"
 
+# Resumption configuration (can be passed via environment variable or second argument)
+RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
+if [ -n "$2" ] && [[ "$2" != --* ]]; then
+    RESUME_FROM_CHECKPOINT="$2"
+fi
+
+OUTPUT_DIR="./checkpoints/${TASK_NAME}/reward_model/${RUN_IDENTIFIER}"
+if [ -n "$RESUME_FROM_CHECKPOINT" ] && [ "$RESUME_FROM_CHECKPOINT" != "auto" ] && [ "$RESUME_FROM_CHECKPOINT" != "True" ] && [ "$RESUME_FROM_CHECKPOINT" != "true" ]; then
+    if [[ "$RESUME_FROM_CHECKPOINT" == *"checkpoint-"* ]] && [ -d "$RESUME_FROM_CHECKPOINT" ]; then
+        OUTPUT_DIR=$(dirname "$RESUME_FROM_CHECKPOINT")
+        RUN_IDENTIFIER=$(basename "$OUTPUT_DIR")
+    elif [ -d "$RESUME_FROM_CHECKPOINT" ]; then
+        OUTPUT_DIR="$RESUME_FROM_CHECKPOINT"
+        RUN_IDENTIFIER=$(basename "$OUTPUT_DIR")
+    elif [[ "$RESUME_FROM_CHECKPOINT" == *"/"* ]]; then
+        CLEANED_HF_REPO=$(echo "$RESUME_FROM_CHECKPOINT" | sed 's|https://huggingface.co/||g' | sed 's|http://huggingface.co/||g' | sed 's|hf://||g' | sed 's|hf.co/||g' | awk -F'[@:]' '{print $1}')
+        RUN_IDENTIFIER="$CLEANED_HF_REPO"
+        OUTPUT_DIR="./checkpoints/${TASK_NAME}/reward_model/${RUN_IDENTIFIER}"
+    fi
+fi
+
+EXTRA_ARGS=()
+if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
+    EXTRA_ARGS+=(--resume_from_checkpoint "$RESUME_FROM_CHECKPOINT")
+fi
+
 # Checks
 if [ "$PRECISION" = "FP16" ]; then
   FP16="True"
@@ -79,7 +105,7 @@ accelerate launch \
   --report_to "wandb" \
   --run_name "$RUN_IDENTIFIER" \
   --logging_steps 1 \
-  --output_dir "./checkpoints/${TASK_NAME}/reward_model/${RUN_IDENTIFIER}" \
+  --output_dir "$OUTPUT_DIR" \
   --push_to_hub True \
   --hub_model_id "$RUN_IDENTIFIER" \
   --dataset_repo_id "${DATASET_REPO_ID}" \
@@ -112,4 +138,5 @@ accelerate launch \
   --peft_type "LORA" \
   --lora_r "$LORA_RANK" \
   --lora_alpha "$LORA_ALPHA" \
-  --lora_dropout "$LORA_DROPOUT" 
+  --lora_dropout "$LORA_DROPOUT" \
+  "${EXTRA_ARGS[@]}" 
