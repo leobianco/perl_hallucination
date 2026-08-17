@@ -122,7 +122,12 @@ class _TestMockDataset:
 
 
 class DatasetDict(dict):
-  pass
+
+  def push_to_hub(self, repo_id, **kwargs):
+    pass
+
+  def save_to_disk(self, path, **kwargs):
+    pass
 
 
 class Dataset:
@@ -282,6 +287,22 @@ class TestScopeDataGeneration(unittest.TestCase):
     self.assertEqual(len(batch_outputs), 2)
     self.assertEqual(batch_outputs[0], "Output 1")
     self.assertEqual(batch_outputs[1], "Output 2")
+
+  def test_scope_output_dataset_repo_id_formatting(self):
+    """Test default preference dataset repo ID construction contains model, alpha, and timestamp."""
+    self.pipeline.args.output_dataset_repo_id = None
+    self.pipeline.d2_split = []
+    self.pipeline.raw_dataset = {"train": []}
+    self.pipeline.args.push_to_hub = True
+
+    with patch("src.pipelines.DatasetDict.push_to_hub") as mock_push:
+      self.pipeline.run_and_save()
+      mock_push.assert_called_once()
+      pushed_repo = mock_push.call_args[0][0]
+      self.assertIn("npov_scope_preference", pushed_repo)
+      self.assertIn("gemma-4-E4B", pushed_repo)
+      self.assertIn("alpha_0_5", pushed_repo)
+      self.assertTrue(pushed_repo.startswith("test_user/"))
 
 
 class TestDPOPipeline(unittest.TestCase):

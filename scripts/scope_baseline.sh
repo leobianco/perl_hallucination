@@ -58,13 +58,13 @@ if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" !
     exit 1
 fi
 
-MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
+MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $NF}')
 TIMESTAMP=$(date '+%y%m%d%H%M')
 
 # Identifiers
 SFT_RUN_IDENTIFIER="${USER}/${TASK_NAME}_SFT_half_${MODEL_NAME}_S${SEED}_${TIMESTAMP}"
 SFT_MODEL_PATH="${USER}/${TASK_NAME}_SFT_half_${MODEL_NAME}_S${SEED}_${TIMESTAMP}"
-PREF_DATASET_REPO="${USER}/${TASK_NAME}_scope_preference"
+PREF_DATASET_REPO="${USER}/${TASK_NAME}_scope_preference_${MODEL_NAME}_alpha_${ALPHA}_${TIMESTAMP}"
 DPO_RUN_IDENTIFIER="${USER}/${TASK_NAME}_SCOPE_DPO_${MODEL_NAME}_S${SEED}_${TIMESTAMP}"
 
 # ------------------------------------------------------------------------------

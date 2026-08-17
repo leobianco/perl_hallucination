@@ -8,7 +8,42 @@ from typing import Any
 import unittest
 from unittest.mock import MagicMock, patch
 
+import contextlib
 import types
+
+if "torch" not in sys.modules or not hasattr(sys.modules["torch"], "__path__"):
+  if "torch" not in sys.modules:
+    torch = types.ModuleType("torch")
+    torch.__path__ = []
+    torch.nn = types.ModuleType("torch.nn")
+    torch.nn.Module = object
+    torch.nn.Linear = MagicMock()
+    torch.nn.Identity = MagicMock()
+    torch.nn.BCEWithLogitsLoss = object
+    torch.nn.CrossEntropyLoss = object
+    torch.nn.MSELoss = object
+    torch.no_grad = contextlib.nullcontext
+    torch.device = lambda x: x
+    torch.cuda = MagicMock()
+    torch.cuda.is_available = lambda: False
+    torch.tensor = lambda x, **kw: MagicMock()
+    torch.randn = lambda *x: MagicMock()
+    torch.bernoulli = lambda x: MagicMock()
+    torch.softmax = lambda x, **kw: MagicMock()
+    torch.zeros_like = lambda x: MagicMock()
+    torch.sort = lambda x, **kw: (MagicMock(), MagicMock())
+    torch.cumsum = lambda x, **kw: MagicMock()
+    torch.multinomial = lambda x, **kw: MagicMock()
+    torch.full = lambda *x, **kw: MagicMock()
+    torch.ones = lambda *x, **kw: MagicMock()
+    torch.zeros = lambda *x, **kw: MagicMock()
+    torch.where = lambda *x: MagicMock()
+    torch.stack = lambda *x, **kw: MagicMock(tolist=lambda: [[10, 11], [12, 13]])
+    torch.long = "long"
+    torch.bool = "bool"
+    torch.bfloat16 = "bfloat16"
+    sys.modules["torch"] = torch
+    sys.modules["torch.nn"] = torch.nn
 
 # Ensure third-party modules are mocked if not installed in local environment
 if "transformers" not in sys.modules or not hasattr(
@@ -86,7 +121,12 @@ class _TestMockDataset:
 
 
 class DatasetDict(dict):
-  pass
+
+  def push_to_hub(self, repo_id, **kwargs):
+    pass
+
+  def save_to_disk(self, path, **kwargs):
+    pass
 
 
 class Dataset:

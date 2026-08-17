@@ -1553,10 +1553,23 @@ class ScopeDataGenerationPipeline(Pipeline):
     else:
       preference_dataset = DatasetDict({"train": train_dataset})
 
-    out_repo = sanitize_hf_repo_id(
-        self.args.output_dataset_repo_id
-        or f"{self.args.dataset_repo_id}_scope_preference"
-    )
+    if self.args.output_dataset_repo_id:
+      out_repo = sanitize_hf_repo_id(self.args.output_dataset_repo_id)
+    else:
+      model_part = (
+          self.args.model_repo_id.split("/")[-1]
+          if "/" in self.args.model_repo_id
+          else self.args.model_repo_id
+      )
+      alpha_val = getattr(self.args, "alpha", 0.5)
+      timestamp = time.strftime("%y%m%d%H%M")
+      task = getattr(self.args, "task_name", "npov") or "npov"
+      user_prefix = ""
+      if "/" in self.args.dataset_repo_id:
+        user_prefix = self.args.dataset_repo_id.split("/")[0] + "/"
+      out_repo = sanitize_hf_repo_id(
+          f"{user_prefix}{task}_scope_preference_{model_part}_alpha_{alpha_val}_{timestamp}"
+      )
     if self.args.output_dir:
       os.makedirs(self.args.output_dir, exist_ok=True)
       preference_dataset.save_to_disk(self.args.output_dir)

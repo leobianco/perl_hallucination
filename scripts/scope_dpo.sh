@@ -28,8 +28,8 @@ DEEPSPEED_CONFIG="scripts/deepspeed_config.yaml"
 
 # Parameters derived from above
 TASK_NAME="$1"
-DATASET_REPO_ID="${USER}/${TASK_NAME}_scope_preference"
-MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
+DATASET_REPO_ID="${DATASET_REPO_ID:-${USER}/${TASK_NAME}_scope_preference}"
+MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $NF}')
 TIMESTAMP=$(date '+%y%m%d%H%M')
 RUN_IDENTIFIER="${USER}/${TASK_NAME}_SCOPE_DPO_${MODEL_NAME}_S${SEED}_epo${NUM_TRAIN_EPOCHS}_lr${LEARNING_RATE}_beta${BETA}_${TIMESTAMP}"
 

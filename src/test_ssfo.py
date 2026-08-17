@@ -122,7 +122,12 @@ class _TestMockDataset:
 
 
 class DatasetDict(dict):
-  pass
+
+  def push_to_hub(self, repo_id, **kwargs):
+    pass
+
+  def save_to_disk(self, path, **kwargs):
+    pass
 
 
 class Dataset:
