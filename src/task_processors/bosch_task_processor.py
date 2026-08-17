@@ -48,7 +48,7 @@ class BoschTaskProcessor(BaseTaskProcessor):
         data = data.map(
             lambda entry: {
                 "prompt": (
-                    "You are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information giver. Do not add to your answer any information other than those present in the manual excerpt.\n"
+                    "You are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information given. Do not add to your answer any information other than those present in the manual excerpt.\n"
                     + "User question:\n"
                     + entry["Question"]
                     + "\nManual information:\n"
@@ -544,7 +544,7 @@ class BoschTaskProcessor(BaseTaskProcessor):
         entry["class_hall"] = "Yes"
         entry["label"] = 0
         entry["prompt"] = (
-            "You are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information giver. Do not add to your answer any information other than those present in the manual excerpt.\n"
+            "You are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information given. Do not add to your answer any information other than those present in the manual excerpt.\n"
             + "User question:\n"
             + entry["Question"]
             + "\nManual information:\n"

@@ -281,6 +281,9 @@ class Pipeline(abc.ABC):
     self.data: Optional[Any] = None
     self.model: Optional[torch.nn.Module] = None
     self.trainer: Optional[Any] = None
+    self.enable_lora: bool = False
+    self.lora_path: Optional[str] = None
+    self.use_vllm: bool = False
 
   def run(self, *cli_args, **cli_kwargs) -> None:
     self.setup_arguments(*cli_args, **cli_kwargs)
@@ -432,6 +435,85 @@ class Pipeline(abc.ABC):
           f"Error downloading checkpoint from Hugging Face Hub ({repo_id}): {e}"
       )
       return None
+
+  def _resolve_lora_adapter_path(
+      self,
+      adapter_path_or_repo: Optional[str],
+      base_model_id: Optional[str] = None,
+  ) -> tuple[bool, Optional[str]]:
+    """Resolves whether a model reference requires LoRA and its directory path containing adapter_config.json.
+
+    Supports:
+    - None or empty string -> (False, None)
+    - Base model repository ID (equal to base_model_id) -> (False, None)
+    - Local directory with adapter_config.json directly -> (True, local_dir)
+    - Local run directory with checkpoint-XXX subfolders -> (True, checkpoint_dir)
+    - Hugging Face Hub repository with adapter_config.json at root -> (True, downloaded_dir)
+    - Hugging Face Hub repository with subfolders or checkpoint-XXX -> (True, target_dir)
+
+    Returns:
+        (enable_lora, resolved_adapter_path)
+    """
+    if not adapter_path_or_repo or not str(adapter_path_or_repo).strip():
+      return False, None
+
+    cleaned_ref = str(adapter_path_or_repo).strip()
+    if base_model_id and cleaned_ref == str(base_model_id).strip():
+      return False, None
+
+    # 1. Check if it's an existing local directory
+    if os.path.isdir(cleaned_ref):
+      if os.path.isfile(os.path.join(cleaned_ref, "adapter_config.json")):
+        return True, cleaned_ref
+      try:
+        last_ckpt = get_last_checkpoint(cleaned_ref)
+      except Exception:
+        last_ckpt = None
+      if last_ckpt and os.path.isfile(os.path.join(last_ckpt, "adapter_config.json")):
+        return True, last_ckpt
+      adapter_files = sorted(
+          glob.glob(os.path.join(cleaned_ref, "**/adapter_config.json"), recursive=True)
+      )
+      if adapter_files:
+        return True, os.path.dirname(adapter_files[-1])
+      return False, cleaned_ref
+
+    # 2. Check Hugging Face Hub repo reference
+    repo_id, subfolder, revision = parse_hf_repo_reference(cleaned_ref)
+    if repo_id:
+      try:
+        print(
+            f"Resolving/downloading adapter checkpoint from HF Hub: repo_id='{repo_id}'"
+            f"{f', subfolder={subfolder}' if subfolder else ''}"
+            f"{f', revision={revision}' if revision else ''}..."
+        )
+        downloaded_dir = snapshot_download(
+            repo_id=repo_id,
+            revision=revision,
+            allow_patterns=["*.json", "*.safetensors", "*.bin"],
+        )
+        target_dir = os.path.join(downloaded_dir, subfolder) if subfolder else downloaded_dir
+        if os.path.isdir(target_dir):
+          if os.path.isfile(os.path.join(target_dir, "adapter_config.json")):
+            return True, target_dir
+          try:
+            last_ckpt = get_last_checkpoint(target_dir)
+          except Exception:
+            last_ckpt = None
+          if last_ckpt and os.path.isfile(os.path.join(last_ckpt, "adapter_config.json")):
+            return True, last_ckpt
+          adapter_files = sorted(
+              glob.glob(os.path.join(target_dir, "**/adapter_config.json"), recursive=True)
+          )
+          if adapter_files:
+            return True, os.path.dirname(adapter_files[-1])
+          return False, target_dir
+        return True, downloaded_dir
+      except Exception as e:
+        print(f"Warning: Could not resolve/download HF Hub repo '{repo_id}': {e}")
+        return False, None
+
+    return False, None
 
   def _resolve_resume_checkpoint(self) -> Optional[str]:
     """Resolves the checkpoint path to resume from (supporting local paths, auto-discovery, and Hugging Face Hub repos)."""
@@ -1169,13 +1251,17 @@ class DPOPipeline(Pipeline):
     if self.tokenizer.pad_token_id is not None:
       base_model.config.pad_token_id = self.tokenizer.pad_token_id
 
-    if sft_model_path:
-      # In SCOPE, the policy is initialized at the SFT model p_{\theta_0}, and
+    enable_lora, resolved_adapter_path = self._resolve_lora_adapter_path(
+        sft_model_path, self.args.model_repo_id
+    )
+
+    if enable_lora and resolved_adapter_path:
+      # In SCOPE/SSFO, the policy is initialized at the SFT model p_{\theta_0}, and
       # the reference model is also p_{\theta_0}.
       # By loading and merging the SFT adapter into the base weights, then applying
       # a fresh LoRA adapter for DPO, DPOTrainer's adapter disabling automatically
       # evaluates the exact SFT reference model without extra memory overhead.
-      sft_peft = PeftModel.from_pretrained(base_model, sft_model_path)
+      sft_peft = PeftModel.from_pretrained(base_model, resolved_adapter_path)
       merged_base = sft_peft.merge_and_unload()
       self.model = get_peft_model(merged_base, self._lora_config)
     else:
@@ -1253,7 +1339,7 @@ class ScopeDataGenerationPipeline(Pipeline):
           "You are a helpful assistant to car related questions. You will be"
           " given an user's question, and the relevant part of the car"
           " manual. Your task is to answer the user's question using the"
-          " information giver. Do not add to your answer any information other"
+          " information given. Do not add to your answer any information other"
           " than those present in the manual excerpt.\nUser"
           f" question:\n{entry.get('Question', '')}\nManual"
           f" information:\n{entry.get('Context', '')}\nAnswer to user's"
@@ -1298,16 +1384,33 @@ class ScopeDataGenerationPipeline(Pipeline):
         self.args.model_repo_id,
         torch_dtype=torch.bfloat16,
     ).to(device)
+    if self.tokenizer.pad_token_id is not None:
+      self.base_model.config.pad_token_id = self.tokenizer.pad_token_id
     self.base_model.eval()
 
-    print(f"Loading SFT model from: {self.args.sft_model_path}...")
+    enable_lora, resolved_adapter_path = self._resolve_lora_adapter_path(
+        self.args.sft_model_path, self.args.model_repo_id
+    )
+    self.enable_lora = enable_lora
+    self.lora_path = resolved_adapter_path
+
+    print(
+        f"Loading SFT model from base={self.args.model_repo_id}"
+        f" adapter={self.lora_path} (enable_lora={self.enable_lora})..."
+    )
     sft_base = AutoModelForCausalLM.from_pretrained(
         self.args.model_repo_id,
         torch_dtype=torch.bfloat16,
     ).to(device)
-    self.sft_model = PeftModel.from_pretrained(
-        sft_base, self.args.sft_model_path
-    ).to(device)
+    if self.tokenizer.pad_token_id is not None:
+      sft_base.config.pad_token_id = self.tokenizer.pad_token_id
+
+    if self.enable_lora and self.lora_path:
+      self.sft_model = PeftModel.from_pretrained(
+          sft_base, self.lora_path
+      ).to(device)
+    else:
+      self.sft_model = sft_base
     self.sft_model.eval()
 
   def setup_trainer(self) -> None:
@@ -1464,13 +1567,23 @@ class ScopeDataGenerationPipeline(Pipeline):
               generated_tokens[i].append(tok_id)
 
         cur_sft_input = next_tokens
-        cur_sft_mask = torch.ones(
-            (batch_size, 1), dtype=torch.long, device=device
-        )
+        if cur_sft_mask is not None:
+          cur_sft_mask = torch.cat(
+              [
+                  cur_sft_mask,
+                  torch.ones((batch_size, 1), dtype=torch.long, device=device),
+              ],
+              dim=1,
+          )
         cur_base_input = next_tokens
-        cur_base_mask = torch.ones(
-            (batch_size, 1), dtype=torch.long, device=device
-        )
+        if cur_base_mask is not None:
+          cur_base_mask = torch.cat(
+              [
+                  cur_base_mask,
+                  torch.ones((batch_size, 1), dtype=torch.long, device=device),
+              ],
+              dim=1,
+          )
 
     if hasattr(tokenizer, "batch_decode"):
       decoded = tokenizer.batch_decode(
@@ -1593,6 +1706,9 @@ class SSFODataGenerationPipeline(Pipeline):
     parser = HfArgumentParser(SsfoDataGenArguments)
     script_args = parser.parse_args_into_dataclasses(clean_args)[0]
     self.args = script_args
+    self.enable_lora = False
+    self.lora_path = None
+    self.use_vllm = False
     set_seed(self.args.seed)
 
   def setup_tokenizer(self) -> None:
@@ -1654,7 +1770,7 @@ class SSFODataGenerationPipeline(Pipeline):
             "You are a helpful assistant to car related questions. You will be"
             " given an user's question, and the relevant part of the car"
             " manual. Your task is to answer the user's question using the"
-            " information giver. Do not add to your answer any information other"
+            " information given. Do not add to your answer any information other"
             " than those present in the manual excerpt.\nUser"
             f" question:\n{question}\nManual"
             f" information:\n{context}\nAnswer to user's"
@@ -1714,23 +1830,17 @@ class SSFODataGenerationPipeline(Pipeline):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     self.device = device
     self.use_vllm = False
-    self.lora_path = None
+    self.enable_lora, self.lora_path = self._resolve_lora_adapter_path(
+        self.args.sft_model_path, self.args.model_repo_id
+    )
+    self.vllm_model = self.args.model_repo_id
 
     # Try initializing vLLM if CUDA is available
     if torch.cuda.is_available() and "LLM" in globals() and LLM is not None:
       try:
-        lora_path = self.args.sft_model_path
-        if lora_path and not os.path.exists(lora_path):
-          lora_path = snapshot_download(
-              repo_id=self.args.sft_model_path,
-              allow_patterns=["*.json", "*.safetensors", "*.bin"],
-          )
-        self.lora_path = lora_path
-        self.vllm_model = self.args.model_repo_id
-
         llm_kwargs = {
             "model": self.vllm_model,
-            "enable_lora": bool(self.lora_path),
+            "enable_lora": self.enable_lora,
             "max_lora_rank": 64,
             "dtype": "bfloat16",
             "hf_overrides": {"allow_global_per_layer_attribute_access": True},
@@ -1743,7 +1853,7 @@ class SSFODataGenerationPipeline(Pipeline):
 
         self.use_vllm = True
         print(
-            f"[vLLM] Successfully initialized vLLM for SSFO data generation with model={self.vllm_model} and adapter={self.lora_path}"
+            f"[vLLM] Successfully initialized vLLM for SSFO data generation with model={self.vllm_model} and adapter={self.lora_path} (enable_lora={self.enable_lora})"
         )
         return
       except Exception as e:
@@ -1754,15 +1864,21 @@ class SSFODataGenerationPipeline(Pipeline):
 
     print(
         f"Loading SFT model in PyTorch from base={self.args.model_repo_id}"
-        f" adapter={self.args.sft_model_path}..."
+        f" adapter={self.lora_path} (enable_lora={self.enable_lora})..."
     )
     sft_base = AutoModelForCausalLM.from_pretrained(
         self.args.model_repo_id,
         torch_dtype=torch.bfloat16,
     ).to(device)
-    self.sft_model = PeftModel.from_pretrained(
-        sft_base, self.args.sft_model_path
-    ).to(device)
+    if self.tokenizer.pad_token_id is not None:
+      sft_base.config.pad_token_id = self.tokenizer.pad_token_id
+
+    if self.enable_lora and self.lora_path:
+      self.sft_model = PeftModel.from_pretrained(
+          sft_base, self.lora_path
+      ).to(device)
+    else:
+      self.sft_model = sft_base
     self.sft_model.eval()
 
   def setup_trainer(self) -> None:
@@ -1813,7 +1929,7 @@ class SSFODataGenerationPipeline(Pipeline):
             "do_sample": True,
             "temperature": temperature,
             "top_p": top_p,
-            "top_k": top_k,
+            "top_k": top_k if top_k > 0 else 0,
         })
       else:
         generation_kwargs["do_sample"] = False
@@ -1911,7 +2027,14 @@ class SSFODataGenerationPipeline(Pipeline):
             else:
               generated_tokens[i].append(tok_id)
         cur_input = next_tokens
-        cur_mask = torch.ones((batch_size, 1), dtype=torch.long, device=device)
+        if cur_mask is not None:
+          cur_mask = torch.cat(
+              [
+                  cur_mask,
+                  torch.ones((batch_size, 1), dtype=torch.long, device=device),
+              ],
+              dim=1,
+          )
 
     if hasattr(tokenizer, "batch_decode"):
       decoded = tokenizer.batch_decode(
@@ -2088,16 +2211,18 @@ class SSFODataGenerationPipeline(Pipeline):
           f"Generating SSFO preference pairs with vLLM for {len(entries)}"
           " samples..."
       )
+      top_k = self.args.top_k if self.args.top_k > 0 else -1
       sampling_params = SamplingParams(
           seed=self.args.seed,
           temperature=self.args.temperature,
           top_p=self.args.top_p,
-          top_k=self.args.top_k,
+          top_k=top_k,
+          min_tokens=getattr(self.args, "min_tokens", 10),
           max_tokens=self.args.max_new_tokens,
       )
       lora_request = (
           LoRARequest("sft_lora_adapter", 1, lora_path=self.lora_path)
-          if self.lora_path
+          if (self.enable_lora and self.lora_path)
           else None
       )
 
@@ -2861,36 +2986,24 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
     self.prompts = prompts
 
   def setup_model(self) -> None:
-    enable_lora = (
-        False
-        if self.args.writer_model_base == self.args.writer_model_lora
-        else True
+    enable_lora, lora_path = self._resolve_lora_adapter_path(
+        self.args.writer_model_lora, self.args.writer_model_base
     )
     self.enable_lora = enable_lora
-    # vLLM model identifier (instantiated in run_and_save)
+    self.lora_path = lora_path
     self.vllm_model = self.args.writer_model_base
 
   def run_and_save(self) -> None:
     # Prepare sampling parameters for vLLM
+    top_k = self.args.top_k if self.args.top_k > 0 else -1
     sampling_params = SamplingParams(
         seed=self.args.seed,
         temperature=self.args.temperature,
         top_p=self.args.top_p,
-        top_k=self.args.top_k,
-        min_tokens=10,
+        top_k=top_k,
+        min_tokens=getattr(self.args, "min_tokens", 10),
         max_tokens=self.args.max_tokens,
     )
-
-    # If LoRA is enabled, ensure we have the adapter path available (download if needed)
-    lora_path = None
-    if self.enable_lora:
-      if os.path.exists(self.args.writer_model_lora):
-        lora_path = self.args.writer_model_lora
-      else:
-        lora_path = snapshot_download(
-            repo_id=self.args.writer_model_lora,
-            allow_patterns=["*.json", "*.safetensors"],
-        )
 
     # Instantiate vLLM LLM (use bfloat16 dtype and allow global attribute access)
     llm_kwargs = {
@@ -2907,12 +3020,12 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
       llm = LLM(**llm_kwargs)
 
     # Run generation
-    if self.enable_lora and lora_path is not None:
+    if self.enable_lora and self.lora_path is not None:
       outputs = llm.generate(
           self.prompts,
           sampling_params,
           lora_request=LoRARequest(
-              "writer_lora_adapter", 1, lora_path=lora_path
+              "writer_lora_adapter", 1, lora_path=self.lora_path
           ),
       )
     else:

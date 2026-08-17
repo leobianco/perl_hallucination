@@ -2,7 +2,31 @@ import json
 import unittest
 from unittest.mock import Mock
 
-from datasets import Dataset, DatasetDict
+try:
+    from datasets import Dataset, DatasetDict
+except ImportError:
+    class _MockDataset:
+        def __init__(self, data):
+            self._data = dict(data)
+            self.column_names = list(data.keys())
+        def __getitem__(self, key):
+            return self._data[key]
+        def map(self, fn):
+            num_rows = len(next(iter(self._data.values())))
+            new_rows = []
+            for i in range(num_rows):
+                entry = {k: self._data[k][i] for k in self._data}
+                res = fn(entry)
+                entry.update(res)
+                new_rows.append(entry)
+            new_data = {k: [row[k] for row in new_rows] for k in new_rows[0]}
+            return _MockDataset(new_data)
+    class Dataset:
+        @classmethod
+        def from_dict(cls, d):
+            return _MockDataset(d)
+    class DatasetDict(dict):
+        pass
 
 from src.task_processors.npov_task_processor import NPOVTaskProcessor
 
