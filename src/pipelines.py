@@ -1322,40 +1322,16 @@ class ScopeMixtureLogitsProcessor(LogitsProcessor):
   def __call__(
       self, input_ids: torch.LongTensor, scores: torch.FloatTensor
   ) -> torch.FloatTensor:
-    step = input_ids.shape[1] - self.main_input_length
-    if step < self.n_untouched_logits or self.alpha == 0.0:
+    if self.alpha == 0.0:
       return scores
 
     with torch.no_grad():
       if self.noise_past_key_values is None:
-        # Evaluate noise prompt + any previously generated tokens
         noise_out = self.noise_model(
             input_ids=self.noise_input_ids,
             attention_mask=self.noise_attention_mask,
             use_cache=True,
         )
-        self.noise_past_key_values = noise_out.past_key_values
-        gen_since_prompt = input_ids[:, self.main_input_length :]
-        prev_tokens = gen_since_prompt[:, :-1]
-        if prev_tokens.shape[1] > 0:
-          self.noise_cur_mask = torch.cat(
-              [
-                  self.noise_cur_mask,
-                  torch.ones(
-                      (input_ids.shape[0], prev_tokens.shape[1]),
-                      dtype=torch.long,
-                      device=input_ids.device,
-                  ),
-              ],
-              dim=1,
-          )
-          noise_out = self.noise_model(
-              input_ids=prev_tokens,
-              attention_mask=self.noise_cur_mask,
-              past_key_values=self.noise_past_key_values,
-              use_cache=True,
-          )
-          self.noise_past_key_values = noise_out.past_key_values
       else:
         last_token = input_ids[:, -1:]
         self.noise_cur_mask = torch.cat(
@@ -1375,9 +1351,12 @@ class ScopeMixtureLogitsProcessor(LogitsProcessor):
             past_key_values=self.noise_past_key_values,
             use_cache=True,
         )
-        self.noise_past_key_values = noise_out.past_key_values
-
+      self.noise_past_key_values = noise_out.past_key_values
       logits_base = noise_out.logits[:, -1, :].clone()
+
+    step = input_ids.shape[1] - self.main_input_length
+    if step < self.n_untouched_logits:
+      return scores
 
     # Mask invalid/special tokens
     inf_indices = torch.isinf(scores) | (scores <= -1e9)
@@ -1453,10 +1432,17 @@ class ScopeDataGenerationPipeline(Pipeline):
 
     if task_name == "npov":
       if "perspective_1" in entry and "perspective_2" in entry:
-        prompt_with_context = processor_cls._writer_prompt(entry, SFT=False)[
-            "prompt"
-        ]
+        p1_name = entry.get("perspective_1_name", "Perspective 1")
+        p1 = entry.get("perspective_1", "")
+        p2_name = entry.get("perspective_2_name", "Perspective 2")
+        p2 = entry.get("perspective_2", "")
         user_query = entry.get("user_query", "")
+        prompt_with_context = (
+            f"User query: {user_query}\n"
+            f"{p1_name} arguments provided: {p1}\n"
+            f"{p2_name} arguments provided: {p2}\n"
+            "Neutral point-of-view answer to user query, rewriting provided arguments in natural language:\n"
+        )
       elif "prompt" in entry and entry["prompt"]:
         prompt_raw = entry["prompt"]
         if gt and prompt_raw.endswith(gt):
@@ -1609,9 +1595,12 @@ class ScopeDataGenerationPipeline(Pipeline):
       sft_base.config.pad_token_id = self.tokenizer.pad_token_id
 
     if self.enable_lora and self.lora_path:
-      self.sft_model = PeftModel.from_pretrained(
-          sft_base, self.lora_path
-      ).to(device)
+      print(f"Loading LoRA adapter from {self.lora_path} and merging weights...")
+      peft_model = PeftModel.from_pretrained(sft_base, self.lora_path)
+      if hasattr(peft_model, "merge_and_unload"):
+        self.sft_model = peft_model.merge_and_unload().to(device)
+      else:
+        self.sft_model = peft_model.to(device)
     else:
       self.sft_model = sft_base
     self.sft_model.eval()
@@ -1640,6 +1629,7 @@ class ScopeDataGenerationPipeline(Pipeline):
     max_new_tokens = self.args.max_new_tokens
     sampling_mode = self.args.sampling_mode
     n_untouched = getattr(self.args, "n_untouched_logits", 2) or 0
+    min_tokens = getattr(self.args, "min_tokens", 10) or 10
 
     sft_inputs = tokenizer(
         prompts_with_ctx,
@@ -1688,6 +1678,7 @@ class ScopeDataGenerationPipeline(Pipeline):
         "attention_mask": sft_attention_mask,
         "logits_processor": LogitsProcessorList([logits_processor]),
         "max_new_tokens": max_new_tokens,
+        "min_new_tokens": min_tokens,
         "do_sample": (temperature > 0.0),
         "pad_token_id": tokenizer.pad_token_id,
         "eos_token_id": tokenizer.eos_token_id,

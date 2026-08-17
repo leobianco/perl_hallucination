@@ -476,7 +476,7 @@ class TestScopeMixtureLogitsProcessor(unittest.TestCase):
     mock_scores = MagicMock()
     out = processor(mock_input_ids, mock_scores)
     self.assertIs(out, mock_scores)
-    mock_base_model.assert_not_called()
+    self.assertTrue(mock_base_model.called)
 
 
 if __name__ == "__main__":
