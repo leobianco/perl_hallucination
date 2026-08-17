@@ -4,7 +4,7 @@ import sys
 import types
 from typing import Any
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 if "torch" not in sys.modules:
   try:
@@ -279,6 +279,21 @@ class TestSSFODataGeneration(unittest.TestCase):
     self.assertEqual(len(completions), 2)
     self.assertEqual(completions[0], "Output 1")
     self.assertEqual(completions[1], "Output 2")
+
+  def test_ssfo_output_dataset_repo_id_formatting(self):
+    """Test default preference dataset repo ID construction contains model and timestamp."""
+    self.pipeline.args.output_dataset_repo_id = None
+    self.pipeline.train_split = []
+    self.pipeline.raw_dataset = {"train": []}
+    self.pipeline.args.push_to_hub = True
+
+    with patch("src.pipelines.DatasetDict.push_to_hub") as mock_push:
+      self.pipeline.run_and_save()
+      mock_push.assert_called_once()
+      pushed_repo = mock_push.call_args[0][0]
+      self.assertIn("npov_ssfo_preference", pushed_repo)
+      self.assertIn("gemma-4-E4B", pushed_repo)
+      self.assertTrue(pushed_repo.startswith("test_user/"))
 
 
 if __name__ == "__main__":

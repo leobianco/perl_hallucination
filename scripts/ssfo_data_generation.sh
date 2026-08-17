@@ -18,7 +18,9 @@ MAX_SAMPLES=""
 # Parameters derived from above
 TASK_NAME="$1"
 DATASET_REPO_ID="${USER}/${TASK_NAME}_sft"
-OUTPUT_DATASET_REPO_ID="${USER}/${TASK_NAME}_ssfo_preference"
+MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $NF}')
+TIMESTAMP=$(date '+%y%m%d%H%M')
+OUTPUT_DATASET_REPO_ID="${USER}/${TASK_NAME}_ssfo_preference_${MODEL_NAME}_${TIMESTAMP}"
 
 # Checks
 if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ]; then

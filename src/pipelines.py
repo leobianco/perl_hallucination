@@ -1211,8 +1211,9 @@ class ScopeDataGenerationPipeline(Pipeline):
   """
 
   def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
+    clean_args = _clean_cli_args(cli_args)
     parser = HfArgumentParser(ScopeDataGenArguments)
-    script_args = parser.parse_args_into_dataclasses()[0]
+    script_args = parser.parse_args_into_dataclasses(clean_args)[0]
     self.args = script_args
     set_seed(self.args.seed)
 
@@ -1589,8 +1590,9 @@ class SSFODataGenerationPipeline(Pipeline):
   """
 
   def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
+    clean_args = _clean_cli_args(cli_args)
     parser = HfArgumentParser(SsfoDataGenArguments)
-    script_args = parser.parse_args_into_dataclasses()[0]
+    script_args = parser.parse_args_into_dataclasses(clean_args)[0]
     self.args = script_args
     set_seed(self.args.seed)
 
@@ -1679,7 +1681,7 @@ class SSFODataGenerationPipeline(Pipeline):
   def process_data(self) -> None:
     train_split = (
         self.raw_dataset["train"]
-        if isinstance(self.raw_dataset, (DatasetDict, dict))
+        if isinstance(self.raw_dataset, dict)
         else self.raw_dataset
     )
     shuffled_train = train_split.shuffle(seed=self.args.seed)
@@ -1785,8 +1787,16 @@ class SSFODataGenerationPipeline(Pipeline):
 
     # Fallback to manual batched forward loop if generate() is not available on mock
     batch_size = len(prompts)
-    cur_input = inputs.input_ids
-    cur_mask = inputs.attention_mask
+    cur_input = (
+        inputs.input_ids
+        if hasattr(inputs, "input_ids")
+        else inputs["input_ids"]
+    )
+    cur_mask = (
+        getattr(inputs, "attention_mask", None)
+        if hasattr(inputs, "attention_mask")
+        else inputs.get("attention_mask", None)
+    )
     past_key_values = None
     generated_tokens = [[] for _ in range(batch_size)]
     finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
@@ -1862,7 +1872,8 @@ class SSFODataGenerationPipeline(Pipeline):
 
   def _generate(self, prompt: str) -> str:
     """Generate completion from SFT model given a single prompt."""
-    return self._generate_batch([prompt])[0]
+    results = self._generate_batch([prompt])
+    return results[0] if results else ""
 
   def run_and_save(self) -> None:
     batch_size = getattr(self.args, "batch_size", 16) or 16
@@ -1907,7 +1918,7 @@ class SSFODataGenerationPipeline(Pipeline):
 
     test_split = None
     if (
-        isinstance(self.raw_dataset, (DatasetDict, dict))
+        isinstance(self.raw_dataset, dict)
         and "test" in self.raw_dataset
     ):
       test_prompts, test_chosens, test_rejecteds = [], [], []
@@ -1929,10 +1940,18 @@ class SSFODataGenerationPipeline(Pipeline):
     else:
       preference_dataset = DatasetDict({"train": train_dataset})
 
-    out_repo = sanitize_hf_repo_id(
-        self.args.output_dataset_repo_id
-        or f"{self.args.dataset_repo_id}_ssfo_preference"
-    )
+    if self.args.output_dataset_repo_id:
+      out_repo = sanitize_hf_repo_id(self.args.output_dataset_repo_id)
+    else:
+      model_part = compact_model_name(self.args.model_repo_id)
+      timestamp = time.strftime("%y%m%d%H%M")
+      task = getattr(self.args, "task_name", "npov") or "npov"
+      user_prefix = ""
+      if "/" in self.args.dataset_repo_id:
+        user_prefix = self.args.dataset_repo_id.split("/")[0] + "/"
+      out_repo = sanitize_hf_repo_id(
+          f"{user_prefix}{task}_ssfo_preference_{model_part}_{timestamp}"
+      )
     if self.args.output_dir:
       os.makedirs(self.args.output_dir, exist_ok=True)
       preference_dataset.save_to_disk(self.args.output_dir)
