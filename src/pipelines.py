@@ -1616,10 +1616,26 @@ class SSFODataGenerationPipeline(Pipeline):
     processor_cls = get_task_processor(task_name)
 
     if task_name == "npov":
-      prompt_with_context = processor_cls._writer_prompt(entry, SFT=False)[
-          "prompt"
-      ]
-      user_query = entry.get("user_query", "")
+      if "perspective_1" in entry and "perspective_2" in entry:
+        prompt_with_context = processor_cls._writer_prompt(entry, SFT=False)[
+            "prompt"
+        ]
+        user_query = entry.get("user_query", "")
+      elif "prompt" in entry:
+        prompt_raw = entry["prompt"]
+        gt = entry.get("npov_response", entry.get("completion", ""))
+        if gt and prompt_raw.endswith(gt):
+          prompt_with_context = prompt_raw[: -len(gt)].rstrip() + "\n"
+        else:
+          prompt_with_context = prompt_raw
+        user_query = entry.get("user_query", "")
+        if not user_query and "User query: " in prompt_raw:
+          after_query = prompt_raw.split("User query: ", 1)[1]
+          user_query = after_query.split("\n", 1)[0].strip()
+      else:
+        prompt_with_context = str(entry)
+        user_query = entry.get("user_query", "")
+
       prompt_without_context = (
           f"User query: {user_query}\n"
           "Neutral point-of-view answer to user query in natural language:\n"
@@ -1630,22 +1646,26 @@ class SSFODataGenerationPipeline(Pipeline):
     elif task_name == "bosch":
       question = entry.get("Question", "")
       context = entry.get("Context", "")
-      prompt_with_context = (
-          "You are a helpful assistant to car related questions. You will be"
-          " given an user's question, and the relevant part of the car"
-          " manual. Your task is to answer the user's question using the"
-          " information giver. Do not add to your answer any information other"
-          " than those present in the manual excerpt.\nUser"
-          f" question:\n{question}\nManual"
-          f" information:\n{context}\nAnswer to user's"
-          " question:\n"
-      )
-      prompt_without_context = (
-          "You are a helpful assistant to car related questions. You will be"
-          " given an user's question. Your task is to answer the user's"
-          f" question.\nUser question:\n{question}\nAnswer to user's"
-          " question:\n"
-      )
+      if not question and "prompt" in entry:
+        prompt_with_context = entry["prompt"]
+        prompt_without_context = entry.get("prompt_no_context", prompt_with_context)
+      else:
+        prompt_with_context = (
+            "You are a helpful assistant to car related questions. You will be"
+            " given an user's question, and the relevant part of the car"
+            " manual. Your task is to answer the user's question using the"
+            " information giver. Do not add to your answer any information other"
+            " than those present in the manual excerpt.\nUser"
+            f" question:\n{question}\nManual"
+            f" information:\n{context}\nAnswer to user's"
+            " question:\n"
+        )
+        prompt_without_context = (
+            "You are a helpful assistant to car related questions. You will be"
+            " given an user's question. Your task is to answer the user's"
+            f" question.\nUser question:\n{question}\nAnswer to user's"
+            " question:\n"
+        )
       ground_truth = entry.get("response", entry.get("completion", ""))
       return prompt_with_context, prompt_without_context, ground_truth
 
@@ -1912,6 +1932,118 @@ class SSFODataGenerationPipeline(Pipeline):
     results = self._generate_batch([prompt])
     return results[0] if results else ""
 
+  def _log_sample_inspection(
+      self,
+      prompts_with_ctx: list[str],
+      prompts_without_ctx: list[str],
+      chosens: list[str],
+      rejecteds: list[str],
+      gt_chosens: list[str] | None = None,
+      max_samples_to_log: int = 5,
+  ) -> None:
+    """Logs detailed input prompts and model outputs for inspection."""
+    num_samples = min(max_samples_to_log, len(prompts_with_ctx))
+    if num_samples == 0:
+      return
+
+    print("\n" + "=" * 80)
+    print(f"[SSFO Detailed Inspection - First {num_samples} Sample Pairs]")
+    print("=" * 80)
+
+    for i in range(num_samples):
+      print(f"\n{'#' * 30} Sample {i + 1} / {len(prompts_with_ctx)} {'#' * 30}")
+      print(
+          f"[1. Input Prompt WITH Context (for Chosen y+)] (Length:"
+          f" {len(prompts_with_ctx[i])} chars):"
+      )
+      print("-" * 70)
+      print(prompts_with_ctx[i])
+      print("-" * 70)
+
+      no_ctx_str = (
+          prompts_without_ctx[i] if i < len(prompts_without_ctx) else "N/A"
+      )
+      print(
+          f"[2. Input Prompt WITHOUT Context (for Rejected y-)] (Length:"
+          f" {len(no_ctx_str)} chars):"
+      )
+      print("-" * 70)
+      print(no_ctx_str)
+      print("-" * 70)
+
+      chosen_str = chosens[i] if i < len(chosens) else "N/A"
+      print(
+          f"[3. Generated Chosen Completion (y+)] (Length: {len(chosen_str)}"
+          " chars):"
+      )
+      print("-" * 70)
+      print(chosen_str)
+      print("-" * 70)
+
+      rejected_str = rejecteds[i] if i < len(rejecteds) else "N/A"
+      print(
+          f"[4. Generated Rejected Completion (y-)] (Length: {len(rejected_str)}"
+          " chars):"
+      )
+      print("-" * 70)
+      print(rejected_str)
+      print("-" * 70)
+
+      if gt_chosens and i < len(gt_chosens) and gt_chosens[i]:
+        print(f"[5. Ground Truth Reference Completion]:")
+        print("-" * 70)
+        print(gt_chosens[i])
+        print("-" * 70)
+
+    print("=" * 80 + "\n")
+
+    # Also save up to 25 samples to a local text inspection file
+    try:
+      os.makedirs("logs", exist_ok=True)
+      timestamp = time.strftime("%y%m%d%H%M")
+      log_file = (
+          f"logs/ssfo_inputs_and_outputs_{self.args.task_name}_{timestamp}.txt"
+      )
+      file_samples = min(25, len(prompts_with_ctx))
+      with open(log_file, "w", encoding="utf-8") as f:
+        f.write("=" * 80 + "\n")
+        f.write(f"SSFO Data Generation Detailed Inspection Log\n")
+        f.write(f"Task: {self.args.task_name}\n")
+        f.write(f"Dataset: {self.args.dataset_repo_id}\n")
+        f.write(f"Model: {self.args.model_repo_id}\n")
+        f.write(f"SFT Adapter: {self.args.sft_model_path}\n")
+        f.write(f"Timestamp: {timestamp}\n")
+        f.write(f"Total Samples: {len(prompts_with_ctx)}\n")
+        f.write("=" * 80 + "\n\n")
+        for i in range(file_samples):
+          f.write(
+              f"\n{'#' * 35} Sample {i + 1} / {len(prompts_with_ctx)} {'#' * 35}\n"
+          )
+          f.write(f"[1. Input Prompt WITH Context (for Chosen y+)]:\n")
+          f.write(prompts_with_ctx[i] + "\n\n")
+          f.write(f"[2. Input Prompt WITHOUT Context (for Rejected y-)]:\n")
+          f.write(
+              (
+                  prompts_without_ctx[i]
+                  if i < len(prompts_without_ctx)
+                  else "N/A"
+              )
+              + "\n\n"
+          )
+          f.write(f"[3. Generated Chosen Completion (y+)]:\n")
+          f.write((chosens[i] if i < len(chosens) else "N/A") + "\n\n")
+          f.write(f"[4. Generated Rejected Completion (y-)]:\n")
+          f.write((rejecteds[i] if i < len(rejecteds) else "N/A") + "\n\n")
+          if gt_chosens and i < len(gt_chosens) and gt_chosens[i]:
+            f.write(f"[5. Ground Truth Reference Completion]:\n")
+            f.write(gt_chosens[i] + "\n\n")
+      print(
+          f"[SSFO Inspection Log] Saved first {file_samples} sample"
+          f" prompt-generation pairs to {log_file}"
+      )
+    except Exception as e:
+      print(f"[SSFO Inspection Log] Could not save log file: {e}")
+
   def run_and_save(self) -> None:
     entries = list(self.train_split)
     all_prompt_ctx = []
@@ -1923,6 +2055,29 @@ class SSFODataGenerationPipeline(Pipeline):
       all_prompt_ctx.append(p_ctx)
       all_prompt_no_ctx.append(p_no_ctx)
       all_gt_chosen.append(gt)
+
+    print(
+        f"[SSFO Dataset Input Summary] Total samples: {len(entries)}, "
+        f"Columns: {list(entries[0].keys()) if entries else []}"
+    )
+    if all_prompt_ctx:
+      print("\n" + "=" * 80)
+      print(f"[SSFO Input Prompt Preview (Sample 1 of {len(all_prompt_ctx)})]")
+      print("-" * 80)
+      print(
+          "--- Prompt WITH Context (Passed to SFT Model for Chosen y+) ---"
+      )
+      print(all_prompt_ctx[0])
+      print("-" * 80)
+      print(
+          "--- Prompt WITHOUT Context (Passed to SFT Model for Rejected y-) ---"
+      )
+      print(all_prompt_no_ctx[0])
+      if all_gt_chosen and all_gt_chosen[0]:
+        print("-" * 80)
+        print(f"--- Ground Truth Completion in Dataset (if any) ---")
+        print(all_gt_chosen[0])
+      print("=" * 80 + "\n")
 
     if (
         getattr(self, "use_vllm", False)
@@ -2018,6 +2173,15 @@ class SSFODataGenerationPipeline(Pipeline):
         prompts.extend(batch_prompt_ctx)
         chosens.extend(batch_chosen)
         rejecteds.extend(batch_rejected)
+
+    # Log comprehensive sample inputs and model outputs
+    self._log_sample_inspection(
+        prompts_with_ctx=prompts,
+        prompts_without_ctx=all_prompt_no_ctx,
+        chosens=chosens,
+        rejecteds=rejecteds,
+        gt_chosens=all_gt_chosen,
+    )
 
     pref_dict = {
         "prompt": prompts,
