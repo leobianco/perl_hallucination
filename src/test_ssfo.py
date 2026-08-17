@@ -355,6 +355,47 @@ class TestSSFODataGeneration(unittest.TestCase):
       self.assertEqual(test_pipeline.args.dataset_repo_id, "user/dataset")
       self.assertEqual(test_pipeline.args.model_repo_id, "google/gemma-4-E4B")
 
+  def test_train_and_test_split_schema_match(self):
+    """Test that train and test splits have identical column names in preference_dataset."""
+    self.pipeline.use_vllm = True
+    mock_llm = MagicMock()
+    mock_llm.generate.return_value = [
+        MagicMock(outputs=[MagicMock(text="gen1")])
+    ]
+    self.pipeline.llm = mock_llm
+    entry = {
+        "user_query": "q1",
+        "perspective_1_name": "Pro",
+        "perspective_1": "arg1",
+        "perspective_2_name": "Con",
+        "perspective_2": "arg2",
+        "npov_response": "gt1",
+        "topic": "topic1",
+        "extra_meta": "meta1",
+    }
+    self.pipeline.train_split = [entry]
+    self.pipeline.raw_dataset = {"train": [entry], "test": [entry]}
+    self.pipeline.args.output_dir = "mock/output/dir"
+    self.pipeline.args.push_to_hub = False
+
+    saved_datasets = []
+
+    def mock_save(*args, **kwargs):
+      saved_datasets.append(args[0] if len(args) > 1 else None)
+
+    with patch.object(DatasetDict, "save_to_disk", autospec=True) as mock_save:
+      self.pipeline.run_and_save()
+      mock_save.assert_called_once()
+      pref_ds = mock_save.call_args[0][0]
+      self.assertIn("train", pref_ds)
+      self.assertIn("test", pref_ds)
+      self.assertEqual(
+          pref_ds["train"].column_names, pref_ds["test"].column_names
+      )
+      self.assertEqual(
+          pref_ds["train"].column_names, ["prompt", "chosen", "rejected"]
+      )
+
 
 if __name__ == "__main__":
   unittest.main()

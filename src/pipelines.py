@@ -2098,10 +2098,6 @@ class SSFODataGenerationPipeline(Pipeline):
           "chosen": chosens,
           "rejected": rejecteds,
       }
-      for col in entries[0].keys():
-        if col not in ("prompt", "chosen", "rejected"):
-          pref_dict[col] = [e.get(col, "") for e in entries]
-
       train_dataset = Dataset.from_dict(pref_dict)
 
     test_split = None
