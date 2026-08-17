@@ -1557,19 +1557,18 @@ class ScopeDataGenerationPipeline(Pipeline):
     if self.args.output_dataset_repo_id:
       out_repo = sanitize_hf_repo_id(self.args.output_dataset_repo_id)
     else:
-      model_part = (
-          self.args.model_repo_id.split("/")[-1]
-          if "/" in self.args.model_repo_id
-          else self.args.model_repo_id
-      )
-      alpha_val = getattr(self.args, "alpha", 0.5)
+      model_part = compact_model_name(self.args.model_repo_id)
+      alpha_val = str(getattr(self.args, "alpha", 0.5)).replace(".", "_")
       timestamp = time.strftime("%y%m%d%H%M")
       task = getattr(self.args, "task_name", "npov") or "npov"
       user_prefix = ""
       if "/" in self.args.dataset_repo_id:
         user_prefix = self.args.dataset_repo_id.split("/")[0] + "/"
+      samples_tag = (
+          f"_n{self.args.max_samples}" if self.args.max_samples else ""
+      )
       out_repo = sanitize_hf_repo_id(
-          f"{user_prefix}{task}_scope_preference_{model_part}_alpha_{alpha_val}_{timestamp}"
+          f"{user_prefix}{task}_scope_preference_{model_part}_alpha_{alpha_val}{samples_tag}_{timestamp}"
       )
     if self.args.output_dir:
       os.makedirs(self.args.output_dir, exist_ok=True)
@@ -1949,8 +1948,11 @@ class SSFODataGenerationPipeline(Pipeline):
       user_prefix = ""
       if "/" in self.args.dataset_repo_id:
         user_prefix = self.args.dataset_repo_id.split("/")[0] + "/"
+      samples_tag = (
+          f"_n{self.args.max_samples}" if self.args.max_samples else ""
+      )
       out_repo = sanitize_hf_repo_id(
-          f"{user_prefix}{task}_ssfo_preference_{model_part}_{timestamp}"
+          f"{user_prefix}{task}_ssfo_preference_{model_part}{samples_tag}_{timestamp}"
       )
     if self.args.output_dir:
       os.makedirs(self.args.output_dir, exist_ok=True)

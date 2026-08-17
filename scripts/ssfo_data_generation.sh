@@ -13,18 +13,27 @@ TOP_K=50
 MAX_NEW_TOKENS=256
 BATCH_SIZE=16
 USE_GROUND_TRUTH_CHOSEN=False
-MAX_SAMPLES=""
-
 # Parameters derived from above
 TASK_NAME="$1"
-DATASET_REPO_ID="${USER}/${TASK_NAME}_sft"
+MAX_SAMPLES="${MAX_SAMPLES:-$2}"
+if [ "$2" == "--max_samples" ] && [ -n "$3" ]; then
+  MAX_SAMPLES="$3"
+fi
+
+DATASET_REPO_ID="${DATASET_REPO_ID:-${USER}/${TASK_NAME}_perl}"
 MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $NF}')
 TIMESTAMP=$(date '+%y%m%d%H%M')
-OUTPUT_DATASET_REPO_ID="${USER}/${TASK_NAME}_ssfo_preference_${MODEL_NAME}_${TIMESTAMP}"
+
+SAMPLES_TAG=""
+if [ -n "$MAX_SAMPLES" ]; then
+  SAMPLES_TAG="_n${MAX_SAMPLES}"
+fi
+OUTPUT_DATASET_REPO_ID="${USER}/${TASK_NAME}_ssfo_preference_${MODEL_NAME}${SAMPLES_TAG}_${TIMESTAMP}"
 
 # Checks
 if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ]; then
     echo "Invalid task name: $TASK_NAME"
+    echo "Usage: ./scripts/ssfo_data_generation.sh <task_name> [max_samples]"
     echo "Valid choices: npov, bosch, ragtruth"
     exit 1
 fi

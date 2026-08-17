@@ -304,6 +304,31 @@ class TestScopeDataGeneration(unittest.TestCase):
       self.assertIn("alpha_0_5", pushed_repo)
       self.assertTrue(pushed_repo.startswith("test_user/"))
 
+  def test_scope_output_dataset_repo_id_with_max_samples(self):
+    """Test default preference dataset repo ID construction contains max_samples tag."""
+    self.pipeline.args.output_dataset_repo_id = None
+    self.pipeline.args.max_samples = 150
+    self.pipeline.d2_split = []
+    self.pipeline.raw_dataset = {"train": []}
+    self.pipeline.args.push_to_hub = True
+
+    with patch("src.pipelines.DatasetDict.push_to_hub") as mock_push:
+      self.pipeline.run_and_save()
+      mock_push.assert_called_once()
+      pushed_repo = mock_push.call_args[0][0]
+      self.assertIn("_n150_", pushed_repo)
+
+  def test_process_data_with_max_samples(self):
+    """Test that process_data correctly subsamples D2 to max_samples."""
+    mock_raw = {
+        "train": _TestMockDataset({"prompt": [f"p{i}" for i in range(100)]})
+    }
+    self.pipeline.raw_dataset = mock_raw
+    self.pipeline.args.split_ratio = 0.5
+    self.pipeline.args.max_samples = 20
+    self.pipeline.process_data()
+    self.assertEqual(len(self.pipeline.d2_split), 20)
+
 
 class TestDPOPipeline(unittest.TestCase):
   """Test suite for DPO pipeline setup."""

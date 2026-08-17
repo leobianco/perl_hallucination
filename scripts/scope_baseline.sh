@@ -19,6 +19,7 @@ SEED=130104
 MODEL_REPO_ID="google/gemma-4-E4B"
 TASK_NAME="$1"
 STAGE="${2:-all}"  # "sft", "generate_data", "dpo", or "all"
+MAX_SAMPLES="${MAX_SAMPLES:-$3}"  # Optional subsampling count for preference data generation (e.g. 500)
 
 # SFT Training Parameters (Stage 1)
 SFT_BATCH_SIZE=16
@@ -53,7 +54,7 @@ DEEPSPEED_CONFIG="scripts/deepspeed_config.yaml"
 # Checks
 if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ]; then
     echo "Invalid task name: $TASK_NAME"
-    echo "Usage: ./scripts/scope_baseline.sh <task_name> [stage: all|sft|generate_data|dpo]"
+    echo "Usage: ./scripts/scope_baseline.sh <task_name> [stage: all|sft|generate_data|dpo] [max_samples]"
     echo "Valid task choices: npov, bosch, ragtruth"
     exit 1
 fi
@@ -61,10 +62,15 @@ fi
 MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $NF}')
 TIMESTAMP=$(date '+%y%m%d%H%M')
 
+SAMPLES_TAG=""
+if [ -n "$MAX_SAMPLES" ]; then
+    SAMPLES_TAG="_n${MAX_SAMPLES}"
+fi
+
 # Identifiers
 SFT_RUN_IDENTIFIER="${USER}/${TASK_NAME}_SFT_half_${MODEL_NAME}_S${SEED}_${TIMESTAMP}"
 SFT_MODEL_PATH="${USER}/${TASK_NAME}_SFT_half_${MODEL_NAME}_S${SEED}_${TIMESTAMP}"
-PREF_DATASET_REPO="${USER}/${TASK_NAME}_scope_preference_${MODEL_NAME}_alpha_${ALPHA}_${TIMESTAMP}"
+PREF_DATASET_REPO="${USER}/${TASK_NAME}_scope_preference_${MODEL_NAME}_alpha_${ALPHA}${SAMPLES_TAG}_${TIMESTAMP}"
 DPO_RUN_IDENTIFIER="${USER}/${TASK_NAME}_SCOPE_DPO_${MODEL_NAME}_S${SEED}_${TIMESTAMP}"
 
 # ------------------------------------------------------------------------------
@@ -115,8 +121,13 @@ fi
 # ------------------------------------------------------------------------------
 if [ "$STAGE" == "all" ] || [ "$STAGE" == "generate_data" ]; then
   echo "======================================================================"
-  echo "Stage 2: Generating synthetic dispreferred data via noisy decoding (alpha=$ALPHA)..."
+  echo "Stage 2: Generating synthetic dispreferred data via noisy decoding (alpha=$ALPHA, max_samples=${MAX_SAMPLES:-all})..."
   echo "======================================================================"
+
+  EXTRA_GEN_ARGS=()
+  if [ -n "$MAX_SAMPLES" ]; then
+    EXTRA_GEN_ARGS+=(--max_samples "$MAX_SAMPLES")
+  fi
 
   python3 -m src.scope_data_generation \
     --task_name "$TASK_NAME" \
@@ -133,7 +144,8 @@ if [ "$STAGE" == "all" ] || [ "$STAGE" == "generate_data" ]; then
     --top_k "$GEN_TOP_K" \
     --max_new_tokens "$MAX_NEW_TOKENS" \
     --batch_size "$GEN_BATCH_SIZE" \
-    --push_to_hub True
+    --push_to_hub True \
+    "${EXTRA_GEN_ARGS[@]}"
 fi
 
 # ------------------------------------------------------------------------------
