@@ -61,6 +61,8 @@ if "transformers" not in sys.modules or not hasattr(
   transformers_mod.DataCollatorWithPadding = MagicMock()
   transformers_mod.HfArgumentParser = MagicMock()
   transformers_mod.set_seed = MagicMock()
+  transformers_mod.LogitsProcessor = object
+  transformers_mod.LogitsProcessorList = list
   sys.modules["transformers"] = transformers_mod
   sys.modules["transformers.trainer_utils"] = types.ModuleType(
       "transformers.trainer_utils"
@@ -146,7 +148,11 @@ datasets_mod.load_dataset = MagicMock()
 datasets_mod.concatenate_datasets = MagicMock()
 sys.modules["datasets"] = datasets_mod
 
-from src.pipelines import DPOPipeline, ScopeDataGenerationPipeline
+from src.pipelines import (
+    DPOPipeline,
+    ScopeDataGenerationPipeline,
+    ScopeMixtureLogitsProcessor,
+)
 from src.utils import ScopeDataGenArguments
 
 
@@ -235,6 +241,9 @@ class TestScopeDataGeneration(unittest.TestCase):
     mock_base = MagicMock()
     mock_sft.return_value = MagicMock(logits=MagicMock(), past_key_values=None)
     mock_base.return_value = MagicMock(logits=MagicMock(), past_key_values=None)
+    mock_output_tensor = MagicMock()
+    mock_output_tensor.__getitem__.return_value = MagicMock()
+    mock_sft.generate.return_value = mock_output_tensor
     self.pipeline.sft_model = mock_sft
     self.pipeline.base_model = mock_base
     self.pipeline.args.max_new_tokens = 3
@@ -432,6 +441,42 @@ class TestDPOPipeline(unittest.TestCase):
       self.assertEqual(pipeline.training_args.learning_rate, 5e-6)
       if hasattr(mock_training_args, "max_prompt_length"):
         self.assertEqual(mock_training_args.max_prompt_length, 384)
+
+
+class TestScopeMixtureLogitsProcessor(unittest.TestCase):
+  """Test suite for ScopeMixtureLogitsProcessor."""
+
+  def test_alpha_zero_returns_untouched_scores(self):
+    mock_base_model = MagicMock()
+    processor = ScopeMixtureLogitsProcessor(
+        main_input_length=5,
+        noise_input_ids=MagicMock(),
+        noise_attention_mask=MagicMock(),
+        noise_model=mock_base_model,
+        alpha=0.0,
+    )
+    mock_input_ids = MagicMock(shape=[1, 8])
+    mock_scores = MagicMock()
+    out = processor(mock_input_ids, mock_scores)
+    self.assertIs(out, mock_scores)
+    mock_base_model.assert_not_called()
+
+  def test_untouched_prefix_returns_untouched_scores(self):
+    mock_base_model = MagicMock()
+    processor = ScopeMixtureLogitsProcessor(
+        main_input_length=5,
+        noise_input_ids=MagicMock(),
+        noise_attention_mask=MagicMock(),
+        noise_model=mock_base_model,
+        alpha=0.5,
+        n_untouched_logits=2,
+    )
+    # step 1 (< 2)
+    mock_input_ids = MagicMock(shape=[1, 6])
+    mock_scores = MagicMock()
+    out = processor(mock_input_ids, mock_scores)
+    self.assertIs(out, mock_scores)
+    mock_base_model.assert_not_called()
 
 
 if __name__ == "__main__":

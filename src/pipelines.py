@@ -88,6 +88,8 @@ from transformers import (
     AutoTokenizer,
     DataCollatorWithPadding,
     HfArgumentParser,
+    LogitsProcessor,
+    LogitsProcessorList,
     Trainer,
     TrainerCallback,
     TrainerControl,
@@ -1289,6 +1291,123 @@ class DPOPipeline(Pipeline):
       self.trainer.push_to_hub()
 
 
+class ScopeMixtureLogitsProcessor(LogitsProcessor):
+  """LogitsProcessor for SCOPE noisy decoding (Algorithm 1 / flbbb/scope-decoding).
+
+  Injects unfaithful parametric noise by mixing or substituting conditional SFT logits
+  with unconditional base model logits at decoding step t >= n_untouched_logits.
+  """
+
+  def __init__(
+      self,
+      main_input_length: int,
+      noise_input_ids: torch.Tensor,
+      noise_attention_mask: torch.Tensor,
+      noise_model: torch.nn.Module,
+      alpha: float = 0.5,
+      sampling_mode: str = "bernoulli",
+      n_untouched_logits: int = 2,
+  ):
+    super().__init__()
+    self.main_input_length = main_input_length
+    self.noise_input_ids = noise_input_ids
+    self.noise_attention_mask = noise_attention_mask
+    self.noise_model = noise_model
+    self.alpha = alpha
+    self.sampling_mode = sampling_mode
+    self.n_untouched_logits = n_untouched_logits
+    self.noise_past_key_values = None
+    self.noise_cur_mask = noise_attention_mask
+
+  def __call__(
+      self, input_ids: torch.LongTensor, scores: torch.FloatTensor
+  ) -> torch.FloatTensor:
+    step = input_ids.shape[1] - self.main_input_length
+    if step < self.n_untouched_logits or self.alpha == 0.0:
+      return scores
+
+    with torch.no_grad():
+      if self.noise_past_key_values is None:
+        # Evaluate noise prompt + any previously generated tokens
+        noise_out = self.noise_model(
+            input_ids=self.noise_input_ids,
+            attention_mask=self.noise_attention_mask,
+            use_cache=True,
+        )
+        self.noise_past_key_values = noise_out.past_key_values
+        gen_since_prompt = input_ids[:, self.main_input_length :]
+        prev_tokens = gen_since_prompt[:, :-1]
+        if prev_tokens.shape[1] > 0:
+          self.noise_cur_mask = torch.cat(
+              [
+                  self.noise_cur_mask,
+                  torch.ones(
+                      (input_ids.shape[0], prev_tokens.shape[1]),
+                      dtype=torch.long,
+                      device=input_ids.device,
+                  ),
+              ],
+              dim=1,
+          )
+          noise_out = self.noise_model(
+              input_ids=prev_tokens,
+              attention_mask=self.noise_cur_mask,
+              past_key_values=self.noise_past_key_values,
+              use_cache=True,
+          )
+          self.noise_past_key_values = noise_out.past_key_values
+      else:
+        last_token = input_ids[:, -1:]
+        self.noise_cur_mask = torch.cat(
+            [
+                self.noise_cur_mask,
+                torch.ones(
+                    (input_ids.shape[0], 1),
+                    dtype=torch.long,
+                    device=input_ids.device,
+                ),
+            ],
+            dim=1,
+        )
+        noise_out = self.noise_model(
+            input_ids=last_token,
+            attention_mask=self.noise_cur_mask,
+            past_key_values=self.noise_past_key_values,
+            use_cache=True,
+        )
+        self.noise_past_key_values = noise_out.past_key_values
+
+      logits_base = noise_out.logits[:, -1, :].clone()
+
+    # Mask invalid/special tokens
+    inf_indices = torch.isinf(scores) | (scores <= -1e9)
+    logits_base[inf_indices] = float("-inf")
+
+    if self.sampling_mode in ("bernoulli", "hard"):
+      alpha_mask = torch.bernoulli(
+          torch.full((scores.shape[0], 1), self.alpha, device=scores.device)
+      )
+      processed_scores = torch.where(alpha_mask == 1.0, logits_base, scores)
+    elif self.sampling_mode == "prob_mix":
+      probs_sft = torch.softmax(scores, dim=-1)
+      probs_base = torch.softmax(logits_base, dim=-1)
+      mixed_probs = (1.0 - self.alpha) * probs_sft + self.alpha * probs_base
+      processed_scores = torch.log(mixed_probs.clamp(min=1e-8))
+    elif self.sampling_mode == "cad":
+      uncond_scores = torch.softmax(logits_base, dim=-1)
+      cond_scores = torch.softmax(scores, dim=-1)
+      cad_scores = (1.0 + self.alpha) * cond_scores - self.alpha * uncond_scores
+      cad_scores = torch.clamp(cad_scores, min=0.0)
+      cad_probs = cad_scores / cad_scores.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+      processed_scores = torch.log(cad_probs.clamp(min=1e-8))
+    elif self.sampling_mode == "logit_mix":
+      processed_scores = (1.0 - self.alpha) * scores + self.alpha * logits_base
+    else:
+      processed_scores = scores
+
+    return processed_scores
+
+
 class ScopeDataGenerationPipeline(Pipeline):
   """Pipeline for generating synthetic preference datasets for SCOPE.
 
@@ -1333,7 +1452,12 @@ class ScopeDataGenerationPipeline(Pipeline):
     )
 
     if task_name == "npov":
-      if "prompt" in entry and entry["prompt"]:
+      if "perspective_1" in entry and "perspective_2" in entry:
+        prompt_with_context = processor_cls._writer_prompt(entry, SFT=False)[
+            "prompt"
+        ]
+        user_query = entry.get("user_query", "")
+      elif "prompt" in entry and entry["prompt"]:
         prompt_raw = entry["prompt"]
         if gt and prompt_raw.endswith(gt):
           prompt_with_context = prompt_raw[:-len(gt)].rstrip() + "\n"
@@ -1343,11 +1467,6 @@ class ScopeDataGenerationPipeline(Pipeline):
         if not user_query and "User query: " in prompt_raw:
           after_query = prompt_raw.split("User query: ", 1)[1]
           user_query = after_query.split("\n", 1)[0].strip()
-      elif "perspective_1" in entry and "perspective_2" in entry:
-        prompt_with_context = processor_cls._writer_prompt(entry, SFT=False)[
-            "prompt"
-        ]
-        user_query = entry.get("user_query", "")
       else:
         prompt_with_context = str(entry)
         user_query = entry.get("user_query", "")
@@ -1505,7 +1624,7 @@ class ScopeDataGenerationPipeline(Pipeline):
       prompts_with_ctx: list[str],
       prompts_without_ctx: list[str] | None = None,
   ) -> list[str]:
-    """Generate dispreferred samples for a batch using SCOPE noisy decoding (Algorithm 1 / MixtureLogitsProcessor)."""
+    """Generate dispreferred samples for a batch using SCOPE noisy decoding via sft_model.generate()."""
     if not prompts_with_ctx:
       return []
 
@@ -1521,7 +1640,6 @@ class ScopeDataGenerationPipeline(Pipeline):
     max_new_tokens = self.args.max_new_tokens
     sampling_mode = self.args.sampling_mode
     n_untouched = getattr(self.args, "n_untouched_logits", 2) or 0
-    batch_size = len(prompts_with_ctx)
 
     sft_inputs = tokenizer(
         prompts_with_ctx,
@@ -1555,145 +1673,37 @@ class ScopeDataGenerationPipeline(Pipeline):
         else base_inputs.get("attention_mask", None)
     )
 
-    generated_tokens: list[list[int]] = [[] for _ in range(batch_size)]
-    finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    logits_processor = ScopeMixtureLogitsProcessor(
+        main_input_length=sft_input_ids.shape[1],
+        noise_input_ids=base_input_ids,
+        noise_attention_mask=base_attention_mask,
+        noise_model=self.base_model,
+        alpha=alpha,
+        sampling_mode=sampling_mode,
+        n_untouched_logits=n_untouched,
+    )
 
-    past_key_values_sft = None
-    past_key_values_base = None
-    cur_sft_input = sft_input_ids
-    cur_sft_mask = sft_attention_mask
-    cur_base_input = base_input_ids
-    cur_base_mask = base_attention_mask
-
-    eos_token_ids = set()
-    if getattr(tokenizer, "eos_token_id", None) is not None:
-      eos_token_ids.add(tokenizer.eos_token_id)
-    if getattr(tokenizer, "pad_token_id", None) is not None:
-      eos_token_ids.add(tokenizer.pad_token_id)
-    if (
-        hasattr(tokenizer, "additional_special_tokens_ids")
-        and tokenizer.additional_special_tokens_ids
-    ):
-      eos_token_ids.update(tokenizer.additional_special_tokens_ids)
+    gen_kwargs = {
+        "input_ids": sft_input_ids,
+        "attention_mask": sft_attention_mask,
+        "logits_processor": LogitsProcessorList([logits_processor]),
+        "max_new_tokens": max_new_tokens,
+        "do_sample": (temperature > 0.0),
+        "pad_token_id": tokenizer.pad_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+    }
+    if temperature > 0.0:
+      gen_kwargs["temperature"] = temperature
+      if top_p < 1.0:
+        gen_kwargs["top_p"] = top_p
+      if top_k > 0:
+        gen_kwargs["top_k"] = top_k
 
     with torch.no_grad():
-      for step in range(max_new_tokens):
-        if finished.all():
-          break
+      outputs = self.sft_model.generate(**gen_kwargs)
 
-        sft_out = self.sft_model(
-            input_ids=cur_sft_input,
-            attention_mask=cur_sft_mask,
-            past_key_values=past_key_values_sft,
-            use_cache=True,
-        )
-        base_out = self.base_model(
-            input_ids=cur_base_input,
-            attention_mask=cur_base_mask,
-            past_key_values=past_key_values_base,
-            use_cache=True,
-        )
-
-        past_key_values_sft = getattr(sft_out, "past_key_values", None)
-        past_key_values_base = getattr(base_out, "past_key_values", None)
-
-        logits_sft = sft_out.logits[:, -1, :].clone()
-        logits_base = base_out.logits[:, -1, :].clone()
-
-        if temperature > 0 and temperature != 1.0:
-          logits_sft = logits_sft / temperature
-          logits_base = logits_base / temperature
-
-        # 1. Protection: Keep first n_untouched tokens purely conditional (SFT)
-        if step < n_untouched or alpha == 0.0:
-          probs = torch.softmax(logits_sft, dim=-1)
-        else:
-          # 2. Protection: Mask invalid/special tokens from the unconditional/base model
-          inf_indices = torch.isinf(logits_sft) | (logits_sft <= -1e9)
-          logits_base[inf_indices] = float("-inf")
-
-          if sampling_mode in ("bernoulli", "hard"):
-            # Algorithm 1: alpha_t ~ Bernoulli(alpha) sampled on GPU across batch
-            alpha_mask = torch.bernoulli(
-                torch.full((batch_size, 1), alpha, device=device)
-            )
-            selected_logits = torch.where(
-                alpha_mask == 1.0, logits_base, logits_sft
-            )
-            probs = torch.softmax(selected_logits, dim=-1)
-          elif sampling_mode == "prob_mix":
-            probs_sft = torch.softmax(logits_sft, dim=-1)
-            probs_base = torch.softmax(logits_base, dim=-1)
-            probs = (1.0 - alpha) * probs_sft + alpha * probs_base
-          elif sampling_mode == "cad":
-            uncond_scores = torch.softmax(logits_base, dim=-1)
-            cond_scores = torch.softmax(logits_sft, dim=-1)
-            cad_scores = (1.0 + alpha) * cond_scores - alpha * uncond_scores
-            cad_scores = torch.clamp(cad_scores, min=0.0)
-            probs = cad_scores / cad_scores.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-          elif sampling_mode == "logit_mix":
-            mixed_logits = (1.0 - alpha) * logits_sft + alpha * logits_base
-            probs = torch.softmax(mixed_logits, dim=-1)
-          else:
-            probs = torch.softmax(logits_sft, dim=-1)
-
-        if temperature == 0.0:
-          # Greedy decoding (argmax), matching author paper and evaluator
-          next_tokens = torch.argmax(probs, dim=-1, keepdim=True)
-        else:
-          if top_k > 0 and top_k < probs.size(-1):
-            top_k_probs, top_k_indices = torch.topk(probs, top_k, dim=-1)
-            probs = torch.zeros_like(probs).scatter_(
-                -1, top_k_indices, top_k_probs
-            )
-            probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-
-          if top_p < 1.0:
-            sorted_probs, sorted_indices = torch.sort(
-                probs, descending=True, dim=-1
-            )
-            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-            sorted_indices_to_remove = cumulative_probs > top_p
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
-                ..., :-1
-            ].clone()
-            sorted_indices_to_remove[..., 0] = 0
-            sorted_probs[sorted_indices_to_remove] = 0.0
-            probs = torch.zeros_like(probs).scatter_(
-                -1, sorted_indices, sorted_probs
-            )
-            probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-
-          next_tokens = torch.multinomial(probs, num_samples=1)
-        next_tokens_list = next_tokens.squeeze(-1).tolist()
-        if not isinstance(next_tokens_list, list):
-          next_tokens_list = [next_tokens_list]
-
-        for i, tok_id in enumerate(next_tokens_list):
-          if not finished[i]:
-            if tok_id in eos_token_ids:
-              finished[i] = True
-            else:
-              generated_tokens[i].append(tok_id)
-
-        cur_sft_input = next_tokens
-        if cur_sft_mask is not None:
-          cur_sft_mask = torch.cat(
-              [
-                  cur_sft_mask,
-                  torch.ones((batch_size, 1), dtype=torch.long, device=device),
-              ],
-              dim=1,
-          )
-        cur_base_input = next_tokens
-        if cur_base_mask is not None:
-          cur_base_mask = torch.cat(
-              [
-                  cur_base_mask,
-                  torch.ones((batch_size, 1), dtype=torch.long, device=device),
-              ],
-              dim=1,
-          )
+    prompt_length = sft_input_ids.shape[1]
+    generated_tokens = outputs[:, prompt_length:]
 
     if hasattr(tokenizer, "batch_decode"):
       decoded = tokenizer.batch_decode(
