@@ -86,8 +86,16 @@ class DummyBackbone(nn.Module):
       batch_size, seq_len = 1, 10
 
     # Deterministic distinct hidden state per position for testing pooling
-    positions = torch.arange(seq_len, dtype=torch.float32).unsqueeze(0).expand(batch_size, -1)
-    hidden_states = positions.unsqueeze(-1).expand(batch_size, seq_len, self.hidden_size).clone()
+    positions = (
+        torch.arange(seq_len, dtype=torch.float32)
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+    )
+    hidden_states = (
+        positions.unsqueeze(-1)
+        .expand(batch_size, seq_len, self.hidden_size)
+        .clone()
+    )
 
     output = MagicMock()
     output.__getitem__ = lambda s, idx: hidden_states if idx == 0 else None
@@ -146,8 +154,12 @@ class TestGemma4ForSequenceClassification(unittest.TestCase):
     expected_logit_0 = self.model.score(pos2_hidden)
     expected_logit_1 = self.model.score(pos3_hidden)
 
-    self.assertTrue(torch.allclose(output.logits[0], expected_logit_0[0], atol=1e-5))
-    self.assertTrue(torch.allclose(output.logits[1], expected_logit_1[0], atol=1e-5))
+    self.assertTrue(
+        torch.allclose(output.logits[0], expected_logit_0[0], atol=1e-5)
+    )
+    self.assertTrue(
+        torch.allclose(output.logits[1], expected_logit_1[0], atol=1e-5)
+    )
 
   def test_forward_left_padding_pooling(self):
     """Test that left-padded inputs correctly pool logits at the last token."""
@@ -157,7 +169,9 @@ class TestGemma4ForSequenceClassification(unittest.TestCase):
 
     pos4_hidden = torch.full((1, self.hidden_size), 4.0)
     expected_logit = self.model.score(pos4_hidden)
-    self.assertTrue(torch.allclose(output.logits[0], expected_logit[0], atol=1e-5))
+    self.assertTrue(
+        torch.allclose(output.logits[0], expected_logit[0], atol=1e-5)
+    )
 
   def test_forward_with_labels_classification_loss(self):
     """Test loss computation for single-label binary classification."""
@@ -217,10 +231,14 @@ class TestAutoModelRegistration(unittest.TestCase):
 
   def test_registration_non_gemma4_skipped(self):
     """Test that non-Gemma 4 models are not registered."""
-    res_gemma3 = register_gemma4_for_sequence_classification("google/gemma-3-1b-it")
+    res_gemma3 = register_gemma4_for_sequence_classification(
+        "google/gemma-3-1b-it"
+    )
     self.assertFalse(res_gemma3)
 
-    res_llama = register_gemma4_for_sequence_classification("meta-llama/Llama-3.2-1B")
+    res_llama = register_gemma4_for_sequence_classification(
+        "meta-llama/Llama-3.2-1B"
+    )
     self.assertFalse(res_llama)
 
 

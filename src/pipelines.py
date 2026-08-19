@@ -263,7 +263,9 @@ class WandbResumptionCallback(TrainerCallback):
                 path_or_fileobj=root_id_file,
                 path_in_repo="wandb_run_id.txt",
                 repo_id=hub_model_id,
-                commit_message=f"Update wandb_run_id at step {state.global_step}",
+                commit_message=(
+                    f"Update wandb_run_id at step {state.global_step}"
+                ),
             )
           except Exception:
             pass
@@ -304,6 +306,20 @@ class Pipeline(abc.ABC):
       return
 
     resume_ckpt = getattr(self.training_args, "resume_from_checkpoint", None)
+    if not resume_ckpt or resume_ckpt in (
+        False,
+        "False",
+        "false",
+        "None",
+        "none",
+        "no",
+    ):
+      return
+
+    is_auto = resume_ckpt in (True, "True", "true", "auto", "AUTO")
+    if is_auto and os.environ.get("WANDB_SWEEP_ID"):
+      return
+
     output_dir = getattr(self.training_args, "output_dir", None)
     hub_model_id = getattr(self.training_args, "hub_model_id", None)
 
@@ -313,7 +329,7 @@ class Pipeline(abc.ABC):
       parent_dir = os.path.dirname(os.path.normpath(resume_ckpt))
       if parent_dir and os.path.isdir(parent_dir):
         search_dirs.append(parent_dir)
-    if output_dir and os.path.isdir(output_dir):
+    elif is_auto and output_dir and os.path.isdir(output_dir):
       search_dirs.append(output_dir)
 
     # 1. Search local directories first
@@ -336,11 +352,15 @@ class Pipeline(abc.ABC):
 
     # 2. Check Hugging Face Hub if resume_ckpt is a HF reference or hub_model_id is set
     hf_candidates = []
-    if isinstance(resume_ckpt, str) and not os.path.isdir(resume_ckpt):
+    if (
+        isinstance(resume_ckpt, str)
+        and not os.path.isdir(resume_ckpt)
+        and not is_auto
+    ):
       repo_id, subfolder, revision = parse_hf_repo_reference(resume_ckpt)
       if repo_id:
         hf_candidates.append((repo_id, subfolder, revision))
-    if hub_model_id and isinstance(hub_model_id, str):
+    elif is_auto and hub_model_id and isinstance(hub_model_id, str):
       repo_id, subfolder, revision = parse_hf_repo_reference(hub_model_id)
       if repo_id and (repo_id, subfolder, revision) not in hf_candidates:
         hf_candidates.append((repo_id, subfolder, revision))
@@ -423,7 +443,7 @@ class Pipeline(abc.ABC):
         resolved_path = last_ckpt
       else:
         print(
-            f"Using checkpoint directory from Hugging Face Hub repo"
+            "Using checkpoint directory from Hugging Face Hub repo"
             f" '{repo_id}': {target_dir}"
         )
         resolved_path = target_dir
@@ -450,9 +470,12 @@ class Pipeline(abc.ABC):
     - None or empty string -> (False, None)
     - Base model repository ID (equal to base_model_id) -> (False, None)
     - Local directory with adapter_config.json directly -> (True, local_dir)
-    - Local run directory with checkpoint-XXX subfolders -> (True, checkpoint_dir)
-    - Hugging Face Hub repository with adapter_config.json at root -> (True, downloaded_dir)
-    - Hugging Face Hub repository with subfolders or checkpoint-XXX -> (True, target_dir)
+    - Local run directory with checkpoint-XXX subfolders -> (True,
+    checkpoint_dir)
+    - Hugging Face Hub repository with adapter_config.json at root -> (True,
+    downloaded_dir)
+    - Hugging Face Hub repository with subfolders or checkpoint-XXX -> (True,
+    target_dir)
 
     Returns:
         (enable_lora, resolved_adapter_path)
@@ -472,10 +495,15 @@ class Pipeline(abc.ABC):
         last_ckpt = get_last_checkpoint(cleaned_ref)
       except Exception:
         last_ckpt = None
-      if last_ckpt and os.path.isfile(os.path.join(last_ckpt, "adapter_config.json")):
+      if last_ckpt and os.path.isfile(
+          os.path.join(last_ckpt, "adapter_config.json")
+      ):
         return True, last_ckpt
       adapter_files = sorted(
-          glob.glob(os.path.join(cleaned_ref, "**/adapter_config.json"), recursive=True)
+          glob.glob(
+              os.path.join(cleaned_ref, "**/adapter_config.json"),
+              recursive=True,
+          )
       )
       if adapter_files:
         return True, os.path.dirname(adapter_files[-1])
@@ -486,7 +514,8 @@ class Pipeline(abc.ABC):
     if repo_id:
       try:
         print(
-            f"Resolving/downloading adapter checkpoint from HF Hub: repo_id='{repo_id}'"
+            "Resolving/downloading adapter checkpoint from HF Hub:"
+            f" repo_id='{repo_id}'"
             f"{f', subfolder={subfolder}' if subfolder else ''}"
             f"{f', revision={revision}' if revision else ''}..."
         )
@@ -495,7 +524,11 @@ class Pipeline(abc.ABC):
             revision=revision,
             allow_patterns=["*.json", "*.safetensors", "*.bin"],
         )
-        target_dir = os.path.join(downloaded_dir, subfolder) if subfolder else downloaded_dir
+        target_dir = (
+            os.path.join(downloaded_dir, subfolder)
+            if subfolder
+            else downloaded_dir
+        )
         if os.path.isdir(target_dir):
           if os.path.isfile(os.path.join(target_dir, "adapter_config.json")):
             return True, target_dir
@@ -503,17 +536,24 @@ class Pipeline(abc.ABC):
             last_ckpt = get_last_checkpoint(target_dir)
           except Exception:
             last_ckpt = None
-          if last_ckpt and os.path.isfile(os.path.join(last_ckpt, "adapter_config.json")):
+          if last_ckpt and os.path.isfile(
+              os.path.join(last_ckpt, "adapter_config.json")
+          ):
             return True, last_ckpt
           adapter_files = sorted(
-              glob.glob(os.path.join(target_dir, "**/adapter_config.json"), recursive=True)
+              glob.glob(
+                  os.path.join(target_dir, "**/adapter_config.json"),
+                  recursive=True,
+              )
           )
           if adapter_files:
             return True, os.path.dirname(adapter_files[-1])
           return False, target_dir
         return True, downloaded_dir
       except Exception as e:
-        print(f"Warning: Could not resolve/download HF Hub repo '{repo_id}': {e}")
+        print(
+            f"Warning: Could not resolve/download HF Hub repo '{repo_id}': {e}"
+        )
         return False, None
 
     return False, None
@@ -556,7 +596,7 @@ class Pipeline(abc.ABC):
         repo_id, subfolder, revision = parse_hf_repo_reference(hub_model_id)
         if repo_id:
           print(
-              f"No local checkpoint in output_dir. Attempting to download"
+              "No local checkpoint in output_dir. Attempting to download"
               f" latest checkpoint from Hugging Face Hub repo '{repo_id}'..."
           )
           hf_ckpt = self._download_hf_checkpoint(repo_id, subfolder, revision)
@@ -722,7 +762,10 @@ class SFTPipeline(Pipeline):
     if epochs is not None:
       run_name_parts.append(f"epo{epochs}")
     run_name = "_".join(run_name_parts)
-    if not training_args.run_name or "sweep" in str(training_args.run_name).lower():
+    if (
+        not training_args.run_name
+        or "sweep" in str(training_args.run_name).lower()
+    ):
       self.training_args.run_name = run_name
     if wandb is not None and getattr(wandb, "run", None) is not None:
       wandb.run.name = run_name
@@ -804,7 +847,8 @@ class SFTPipeline(Pipeline):
   def run_and_save(self) -> None:
     resume_ckpt = self._resolve_resume_checkpoint()
     self.trainer.train(resume_from_checkpoint=resume_ckpt)
-    self.trainer.push_to_hub()
+    if getattr(self.training_args, "push_to_hub", False):
+      self.trainer.push_to_hub()
 
 
 class RewardModelPipeline(Pipeline):
@@ -839,7 +883,10 @@ class RewardModelPipeline(Pipeline):
     if epochs is not None:
       run_name_parts.append(f"epo{epochs}")
     run_name = "_".join(run_name_parts)
-    if not training_args.run_name or "sweep" in str(training_args.run_name).lower():
+    if (
+        not training_args.run_name
+        or "sweep" in str(training_args.run_name).lower()
+    ):
       self.training_args.run_name = run_name
     if wandb is not None and getattr(wandb, "run", None) is not None:
       wandb.run.name = run_name
@@ -909,9 +956,11 @@ class RewardModelPipeline(Pipeline):
           torch_dtype=self.torch_dtype,
       )
     except ValueError as e:
-      if "Gemma4Config" in str(e) or "gemma-4" in str(
-          self.args.model_repo_id
-      ).lower() or "gemma4" in str(self.args.model_repo_id).lower():
+      if (
+          "Gemma4Config" in str(e)
+          or "gemma-4" in str(self.args.model_repo_id).lower()
+          or "gemma4" in str(self.args.model_repo_id).lower()
+      ):
         self.model = Gemma4ForSequenceClassification.from_pretrained(
             self.args.model_repo_id,
             num_labels=2,
@@ -995,9 +1044,8 @@ class RewardModelPipeline(Pipeline):
     self.trainer.train(resume_from_checkpoint=resume_ckpt)
     if getattr(self.training_args, "output_dir", None):
       self.trainer.save_model(self.training_args.output_dir)
-    if (
-        getattr(self.training_args, "push_to_hub", False)
-        and getattr(self.training_args, "hub_model_id", None)
+    if getattr(self.training_args, "push_to_hub", False) and getattr(
+        self.training_args, "hub_model_id", None
     ):
       self.model.push_to_hub(self.training_args.hub_model_id)
 
@@ -1031,7 +1079,10 @@ class PERLPipeline(Pipeline):
     if epochs is not None:
       run_name_parts.append(f"epo{epochs}")
     run_name = "_".join(run_name_parts)
-    if not training_args.run_name or "sweep" in str(training_args.run_name).lower():
+    if (
+        not training_args.run_name
+        or "sweep" in str(training_args.run_name).lower()
+    ):
       self.training_args.run_name = run_name
     if wandb is not None and getattr(wandb, "run", None) is not None:
       wandb.run.name = run_name
@@ -1169,7 +1220,8 @@ class PERLPipeline(Pipeline):
     if self.training_args.do_train:
       resume_ckpt = self._resolve_resume_checkpoint()
       self.trainer.train(resume_from_checkpoint=resume_ckpt)
-      self.trainer.push_to_hub()
+      if getattr(self.training_args, "push_to_hub", False):
+        self.trainer.push_to_hub()
 
 
 class DPOPipeline(Pipeline):
@@ -1214,7 +1266,10 @@ class DPOPipeline(Pipeline):
     if epochs is not None:
       run_name_parts.append(f"epo{epochs}")
     run_name = "_".join(run_name_parts)
-    if not training_args.run_name or "sweep" in str(training_args.run_name).lower():
+    if (
+        not training_args.run_name
+        or "sweep" in str(training_args.run_name).lower()
+    ):
       self.training_args.run_name = run_name
     if wandb is not None and getattr(wandb, "run", None) is not None:
       wandb.run.name = run_name
@@ -1288,13 +1343,15 @@ class DPOPipeline(Pipeline):
     if self.training_args.do_train:
       resume_ckpt = self._resolve_resume_checkpoint()
       self.trainer.train(resume_from_checkpoint=resume_ckpt)
-      self.trainer.push_to_hub()
+      if getattr(self.training_args, "push_to_hub", False):
+        self.trainer.push_to_hub()
 
 
 class ScopeMixtureLogitsProcessor(LogitsProcessor):
   """LogitsProcessor for SCOPE noisy decoding (Algorithm 1 / flbbb/scope-decoding).
 
-  Injects unfaithful parametric noise by mixing or substituting conditional SFT logits
+  Injects unfaithful parametric noise by mixing or substituting conditional SFT
+  logits
   with unconditional base model logits at decoding step t >= n_untouched_logits.
   """
 
@@ -1377,7 +1434,9 @@ class ScopeMixtureLogitsProcessor(LogitsProcessor):
       cond_scores = torch.softmax(scores, dim=-1)
       cad_scores = (1.0 + self.alpha) * cond_scores - self.alpha * uncond_scores
       cad_scores = torch.clamp(cad_scores, min=0.0)
-      cad_probs = cad_scores / cad_scores.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+      cad_probs = cad_scores / cad_scores.sum(dim=-1, keepdim=True).clamp(
+          min=1e-8
+      )
       processed_scores = torch.log(cad_probs.clamp(min=1e-8))
     elif self.sampling_mode == "logit_mix":
       processed_scores = (1.0 - self.alpha) * scores + self.alpha * logits_base
@@ -1438,15 +1497,15 @@ class ScopeDataGenerationPipeline(Pipeline):
         p2 = entry.get("perspective_2", "")
         user_query = entry.get("user_query", "")
         prompt_with_context = (
-            f"User query: {user_query}\n"
-            f"{p1_name} arguments provided: {p1}\n"
-            f"{p2_name} arguments provided: {p2}\n"
-            "Neutral point-of-view answer to user query, rewriting provided arguments in natural language:\n"
+            f"User query: {user_query}\n{p1_name} arguments provided:"
+            f" {p1}\n{p2_name} arguments provided: {p2}\nNeutral point-of-view"
+            " answer to user query, rewriting provided arguments in natural"
+            " language:\n"
         )
       elif "prompt" in entry and entry["prompt"]:
         prompt_raw = entry["prompt"]
         if gt and prompt_raw.endswith(gt):
-          prompt_with_context = prompt_raw[:-len(gt)].rstrip() + "\n"
+          prompt_with_context = prompt_raw[: -len(gt)].rstrip() + "\n"
         else:
           prompt_with_context = prompt_raw
         user_query = entry.get("user_query", "")
@@ -1458,8 +1517,8 @@ class ScopeDataGenerationPipeline(Pipeline):
         user_query = entry.get("user_query", "")
 
       prompt_without_context = (
-          f"User query: {user_query}\n"
-          "Neutral point-of-view answer to user query, rewriting provided arguments in natural language:\n"
+          f"User query: {user_query}\nNeutral point-of-view answer to user"
+          " query, rewriting provided arguments in natural language:\n"
       )
       return prompt_with_context, prompt_without_context, gt
 
@@ -1467,7 +1526,7 @@ class ScopeDataGenerationPipeline(Pipeline):
       if "prompt" in entry and entry["prompt"]:
         prompt_raw = entry["prompt"]
         if gt and prompt_raw.endswith(gt):
-          prompt_with_context = prompt_raw[:-len(gt)].rstrip() + "\n"
+          prompt_with_context = prompt_raw[: -len(gt)].rstrip() + "\n"
         else:
           prompt_with_context = prompt_raw
         question = entry.get("Question", "")
@@ -1484,11 +1543,10 @@ class ScopeDataGenerationPipeline(Pipeline):
             "You are a helpful assistant to car related questions. You will be"
             " given an user's question, and the relevant part of the car"
             " manual. Your task is to answer the user's question using the"
-            " information given. Do not add to your answer any information other"
-            " than those present in the manual excerpt.\nUser"
-            f" question:\n{question}\nManual"
-            f" information:\n{context}\nAnswer to user's"
-            " question:\n"
+            " information given. Do not add to your answer any information"
+            " other than those present in the manual excerpt.\nUser"
+            f" question:\n{question}\nManual information:\n{context}\nAnswer to"
+            " user's question:\n"
         )
       prompt_without_context = (
           "You are a helpful assistant to car related questions. You will be"
@@ -1502,7 +1560,7 @@ class ScopeDataGenerationPipeline(Pipeline):
       if "prompt" in entry and entry["prompt"]:
         prompt_raw = entry["prompt"]
         if gt and prompt_raw.endswith(gt):
-          prompt_with_context = prompt_raw[:-len(gt)].rstrip() + "\n"
+          prompt_with_context = prompt_raw[: -len(gt)].rstrip() + "\n"
         else:
           prompt_with_context = prompt_raw
         user_query = entry.get(
@@ -1604,7 +1662,9 @@ class ScopeDataGenerationPipeline(Pipeline):
       sft_base.config.pad_token_id = self.tokenizer.pad_token_id
 
     if self.enable_lora and self.lora_path:
-      print(f"Loading LoRA adapter from {self.lora_path} and merging weights...")
+      print(
+          f"Loading LoRA adapter from {self.lora_path} and merging weights..."
+      )
       peft_model = PeftModel.from_pretrained(sft_base, self.lora_path)
       if hasattr(peft_model, "merge_and_unload"):
         self.sft_model = peft_model.merge_and_unload().to(device)
@@ -1626,7 +1686,9 @@ class ScopeDataGenerationPipeline(Pipeline):
     if not prompts_with_ctx:
       return []
 
-    if prompts_without_ctx is None or len(prompts_without_ctx) != len(prompts_with_ctx):
+    if prompts_without_ctx is None or len(prompts_without_ctx) != len(
+        prompts_with_ctx
+    ):
       prompts_without_ctx = prompts_with_ctx
 
     tokenizer = self.tokenizer
@@ -1697,7 +1759,7 @@ class ScopeDataGenerationPipeline(Pipeline):
         "logits_processor": LogitsProcessorList([logits_processor]),
         "max_new_tokens": max_new_tokens,
         "min_new_tokens": min_tokens,
-        "do_sample": (temperature > 0.0),
+        "do_sample": temperature > 0.0,
         "pad_token_id": tokenizer.pad_token_id,
         "eos_token_id": tokenizer.eos_token_id,
     }
@@ -1870,7 +1932,7 @@ class SSFODataGenerationPipeline(Pipeline):
       if "prompt" in entry and entry["prompt"]:
         prompt_raw = entry["prompt"]
         if gt and prompt_raw.endswith(gt):
-          prompt_with_context = prompt_raw[:-len(gt)].rstrip() + "\n"
+          prompt_with_context = prompt_raw[: -len(gt)].rstrip() + "\n"
         else:
           prompt_with_context = prompt_raw
         user_query = entry.get("user_query", "")
@@ -1887,8 +1949,8 @@ class SSFODataGenerationPipeline(Pipeline):
         user_query = entry.get("user_query", "")
 
       prompt_without_context = (
-          f"User query: {user_query}\n"
-          "Neutral point-of-view answer to user query, rewriting provided arguments in natural language:\n"
+          f"User query: {user_query}\nNeutral point-of-view answer to user"
+          " query, rewriting provided arguments in natural language:\n"
       )
       return prompt_with_context, prompt_without_context, gt
 
@@ -1896,7 +1958,7 @@ class SSFODataGenerationPipeline(Pipeline):
       if "prompt" in entry and entry["prompt"]:
         prompt_raw = entry["prompt"]
         if gt and prompt_raw.endswith(gt):
-          prompt_with_context = prompt_raw[:-len(gt)].rstrip() + "\n"
+          prompt_with_context = prompt_raw[: -len(gt)].rstrip() + "\n"
         else:
           prompt_with_context = prompt_raw
         question = entry.get("Question", "")
@@ -1913,11 +1975,10 @@ class SSFODataGenerationPipeline(Pipeline):
             "You are a helpful assistant to car related questions. You will be"
             " given an user's question, and the relevant part of the car"
             " manual. Your task is to answer the user's question using the"
-            " information given. Do not add to your answer any information other"
-            " than those present in the manual excerpt.\nUser"
-            f" question:\n{question}\nManual"
-            f" information:\n{context}\nAnswer to user's"
-            " question:\n"
+            " information given. Do not add to your answer any information"
+            " other than those present in the manual excerpt.\nUser"
+            f" question:\n{question}\nManual information:\n{context}\nAnswer to"
+            " user's question:\n"
         )
       prompt_without_context = (
           "You are a helpful assistant to car related questions. You will be"
@@ -1931,7 +1992,7 @@ class SSFODataGenerationPipeline(Pipeline):
       if "prompt" in entry and entry["prompt"]:
         prompt_raw = entry["prompt"]
         if gt and prompt_raw.endswith(gt):
-          prompt_with_context = prompt_raw[:-len(gt)].rstrip() + "\n"
+          prompt_with_context = prompt_raw[: -len(gt)].rstrip() + "\n"
         else:
           prompt_with_context = prompt_raw
         user_query = entry.get(
@@ -2014,7 +2075,7 @@ class SSFODataGenerationPipeline(Pipeline):
     for i in range(num_samples):
       print(f"\n{'#' * 30} Sample {i + 1} / {len(prompts_with_ctx)} {'#' * 30}")
       print(
-          f"[1. Input Prompt WITH Context (for Chosen y+)] (Length:"
+          "[1. Input Prompt WITH Context (for Chosen y+)] (Length:"
           f" {len(prompts_with_ctx[i])} chars):"
       )
       print("-" * 70)
@@ -2025,7 +2086,7 @@ class SSFODataGenerationPipeline(Pipeline):
           prompts_without_ctx[i] if i < len(prompts_without_ctx) else "N/A"
       )
       print(
-          f"[2. Input Prompt WITHOUT Context (for Rejected y-)] (Length:"
+          "[2. Input Prompt WITHOUT Context (for Rejected y-)] (Length:"
           f" {len(no_ctx_str)} chars):"
       )
       print("-" * 70)
@@ -2043,8 +2104,8 @@ class SSFODataGenerationPipeline(Pipeline):
 
       rejected_str = rejecteds[i] if i < len(rejecteds) else "N/A"
       print(
-          f"[4. Generated Rejected Completion (y-)] (Length: {len(rejected_str)}"
-          " chars):"
+          "[4. Generated Rejected Completion (y-)] (Length:"
+          f" {len(rejected_str)} chars):"
       )
       print("-" * 70)
       print(rejected_str)
@@ -2078,7 +2139,8 @@ class SSFODataGenerationPipeline(Pipeline):
         f.write("=" * 80 + "\n\n")
         for i in range(file_samples):
           f.write(
-              f"\n{'#' * 35} Sample {i + 1} / {len(prompts_with_ctx)} {'#' * 35}\n"
+              f"\n{'#' * 35} Sample {i + 1} / {len(prompts_with_ctx)}"
+              f" {'#' * 35}\n"
           )
           f.write(f"[1. Input Prompt WITH Context (for Chosen y+)]:\n")
           f.write(prompts_with_ctx[i] + "\n\n")
@@ -2125,9 +2187,7 @@ class SSFODataGenerationPipeline(Pipeline):
       print("\n" + "=" * 80)
       print(f"[SSFO Input Prompt Preview (Sample 1 of {len(all_prompt_ctx)})]")
       print("-" * 80)
-      print(
-          "--- Prompt WITH Context (Passed to SFT Model for Chosen y+) ---"
-      )
+      print("--- Prompt WITH Context (Passed to SFT Model for Chosen y+) ---")
       print(all_prompt_ctx[0])
       print("-" * 80)
       print(
@@ -2162,9 +2222,8 @@ class SSFODataGenerationPipeline(Pipeline):
       )
 
       # Instantiate vLLM LLM (matching EvaluationGenerationPipeline)
-      vllm_model = (
-          getattr(self, "vllm_model", None)
-          or getattr(self.args, "model_repo_id", None)
+      vllm_model = getattr(self, "vllm_model", None) or getattr(
+          self.args, "model_repo_id", None
       )
       llm_kwargs = {
           "model": vllm_model,
@@ -2193,7 +2252,8 @@ class SSFODataGenerationPipeline(Pipeline):
         chosens = all_gt_chosen
       else:
         print(
-            f"Generating chosen completions with context for {len(all_prompt_ctx)} samples..."
+            "Generating chosen completions with context for"
+            f" {len(all_prompt_ctx)} samples..."
         )
         if lora_request is not None:
           outputs_ctx = llm.generate(
@@ -2207,7 +2267,8 @@ class SSFODataGenerationPipeline(Pipeline):
 
       # Generate Rejected (y-) without context
       print(
-          f"Generating rejected completions without context for {len(all_prompt_no_ctx)} samples..."
+          "Generating rejected completions without context for"
+          f" {len(all_prompt_no_ctx)} samples..."
       )
       if lora_request is not None:
         outputs_no_ctx = llm.generate(
@@ -2236,10 +2297,7 @@ class SSFODataGenerationPipeline(Pipeline):
       train_dataset = Dataset.from_dict(pref_dict)
 
     test_split = None
-    if (
-        isinstance(self.raw_dataset, dict)
-        and "test" in self.raw_dataset
-    ):
+    if isinstance(self.raw_dataset, dict) and "test" in self.raw_dataset:
       test_prompts, test_chosens, test_rejecteds = [], [], []
       for entry in self.raw_dataset["test"]:
         p_ctx, _, gt = self._extract_prompts(entry)
@@ -2616,8 +2674,8 @@ class EvaluationPipeline(Pipeline):
               or "429" in error_str
               or "503" in error_str
           ) and retry_count < server_max_retries - 1:
-            backoff = (
-                server_retry_wait * (1.5**retry_count) + random.uniform(0.5, 2.0)
+            backoff = server_retry_wait * (1.5**retry_count) + random.uniform(
+                0.5, 2.0
             )
             time.sleep(backoff)
             retry_count += 1
@@ -2981,10 +3039,7 @@ class EvaluationScoringPipeline(EvaluationPipeline):
     set_seed(self.args.seed)
 
   def setup_tokenizer(self):
-    if (
-        getattr(self.args, "run_autorater", True)
-        and not self.args.use_gemini
-    ):
+    if getattr(self.args, "run_autorater", True) and not self.args.use_gemini:
       self.tokenizer = AutoTokenizer.from_pretrained(
           self.args.evaluator_model, padding_side="left"
       )
@@ -3060,10 +3115,7 @@ class EvaluationScoringPipeline(EvaluationPipeline):
     )
 
   def setup_model(self):
-    if (
-        getattr(self.args, "run_autorater", True)
-        and not self.args.use_gemini
-    ):
+    if getattr(self.args, "run_autorater", True) and not self.args.use_gemini:
       device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
       # Use causal LM evaluator and set eval mode
       self.evaluator = AutoModelForCausalLM.from_pretrained(
@@ -3144,7 +3196,10 @@ class EvaluationScoringPipeline(EvaluationPipeline):
       final_dict = (
           dict(self.full_dataset.to_dict())
           if hasattr(self.full_dataset, "to_dict")
-          else {col: list(self.full_dataset[col]) for col in self.full_dataset.column_names}
+          else {
+              col: list(self.full_dataset[col])
+              for col in self.full_dataset.column_names
+          }
       )
       n_total = len(self.full_dataset)
       evaluated_metric_cols = [
@@ -3168,10 +3223,7 @@ class EvaluationScoringPipeline(EvaluationPipeline):
           "perplexity",
       ]
       for col_name in self.val_data.column_names:
-        if (
-            col_name in evaluated_metric_cols
-            or col_name not in final_dict
-        ):
+        if col_name in evaluated_metric_cols or col_name not in final_dict:
           if col_name in final_dict:
             full_col_vals = list(final_dict[col_name])
           else:
@@ -3193,7 +3245,10 @@ class EvaluationScoringPipeline(EvaluationPipeline):
           "rougeL_recall",
           "bertscore_f1",
       ]:
-        if metric_col not in self.val_data.column_names and metric_col in final_dict:
+        if (
+            metric_col not in self.val_data.column_names
+            and metric_col in final_dict
+        ):
           final_dict.pop(metric_col, None)
 
       self.full_dataset = Dataset.from_dict(final_dict)

@@ -27,8 +27,6 @@ except ImportError:
   roc_curve = None
 
 
-
-
 @dataclass
 class ScriptArguments:
   """Arguments common to all scripts (reward model, SFT, PERL, DPO).
@@ -77,10 +75,12 @@ class ScopeDataGenArguments:
         SCOPE D2 generation. Default: 0.5.
       sampling_mode (str): Sampling strategy: 'bernoulli' (Algorithm 1),
         'prob_mix', 'cad', or 'logit_mix'. Default: 'bernoulli'.
-      temperature (float): Sampling temperature (0.0 for greedy decoding, matching paper). Default: 0.0.
+      temperature (float): Sampling temperature (0.0 for greedy decoding,
+        matching paper). Default: 0.0.
       top_p (float): Nucleus sampling top_p threshold. Default: 1.0.
       top_k (int): Top-k token filtering. Default: 0.
-      repetition_penalty (float): Repetition penalty for generation. Default: 1.0.
+      repetition_penalty (float): Repetition penalty for generation. Default:
+        1.0.
       max_new_tokens (int): Maximum new tokens to generate per completion.
         Default: 250.
       seed (int): Random seed. Default: 12345.
@@ -135,15 +135,16 @@ class SsfoDataGenArguments:
       temperature (float): Sampling temperature (0.0 for greedy). Default: 0.0.
       top_p (float): Nucleus sampling top_p threshold. Default: 1.0.
       top_k (int): Top-k token filtering. Default: 0.
-      repetition_penalty (float): Repetition penalty for generation. Default: 1.0.
+      repetition_penalty (float): Repetition penalty for generation. Default:
+        1.0.
       max_new_tokens (int): Maximum new tokens to generate per completion.
         Default: 250.
       seed (int): Random seed. Default: 12345.
       max_samples (Optional[int]): Maximum samples to process (useful for
         testing/debugging). Default: None.
       batch_size (int): Batch size for parallel generation. Default: 16.
-      use_ground_truth_chosen (bool): If True, use ground truth target as
-        chosen instead of SFT model generation with context. Default: False.
+      use_ground_truth_chosen (bool): If True, use ground truth target as chosen
+        instead of SFT model generation with context. Default: False.
       push_to_hub (bool): Whether to push the resulting preference dataset to HF
         Hub. Default: True.
       output_dir (Optional[str]): Optional local directory to save the generated
@@ -303,9 +304,7 @@ class EvalArguments:
   mode: Optional[str] = field(
       default=None,
       metadata={
-          "help": (
-              "Evaluation mode: 'generate', 'score', or 'autoratereval'."
-          )
+          "help": "Evaluation mode: 'generate', 'score', or 'autoratereval'."
       },
   )
 
@@ -504,7 +503,9 @@ class EvalArguments:
 
   log_to_wandb: bool = field(
       default=False,
-      metadata={"help": "Whether to log evaluation metrics and tables to WandB."},
+      metadata={
+          "help": "Whether to log evaluation metrics and tables to WandB."
+      },
   )
 
   wandb_project: str = field(
@@ -931,4 +932,3 @@ def build_eval_dataset_repo_id(
 
   full_name = f"{prefix}{compacted_model}{suffix}"
   return sanitize_hf_repo_id(f"{user}/{full_name}", max_length=max_length)
-

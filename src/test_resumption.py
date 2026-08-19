@@ -1,15 +1,14 @@
 """Unit tests for checkpoint and WandB run resumption."""
 
+import contextlib
 import os
 import shutil
 import sys
 import tempfile
+import types
 from typing import Any
 import unittest
 from unittest.mock import MagicMock, patch
-
-import contextlib
-import types
 
 if "torch" not in sys.modules or not hasattr(sys.modules["torch"], "__path__"):
   if "torch" not in sys.modules:
@@ -38,7 +37,9 @@ if "torch" not in sys.modules or not hasattr(sys.modules["torch"], "__path__"):
     torch.ones = lambda *x, **kw: MagicMock()
     torch.zeros = lambda *x, **kw: MagicMock()
     torch.where = lambda *x: MagicMock()
-    torch.stack = lambda *x, **kw: MagicMock(tolist=lambda: [[10, 11], [12, 13]])
+    torch.stack = lambda *x, **kw: MagicMock(
+        tolist=lambda: [[10, 11], [12, 13]]
+    )
     torch.long = "long"
     torch.bool = "bool"
     torch.bfloat16 = "bfloat16"
@@ -205,19 +206,25 @@ class TestParseHfRepoReference(unittest.TestCase):
     self.assertIsNone(rev)
 
   def test_repo_with_subfolder(self):
-    repo_id, subfolder, rev = parse_hf_repo_reference("leobianco/npov_PERL/checkpoint-50")
+    repo_id, subfolder, rev = parse_hf_repo_reference(
+        "leobianco/npov_PERL/checkpoint-50"
+    )
     self.assertEqual(repo_id, "leobianco/npov_PERL")
     self.assertEqual(subfolder, "checkpoint-50")
     self.assertIsNone(rev)
 
   def test_repo_with_colon_subfolder(self):
-    repo_id, subfolder, rev = parse_hf_repo_reference("leobianco/npov_PERL:checkpoint-50")
+    repo_id, subfolder, rev = parse_hf_repo_reference(
+        "leobianco/npov_PERL:checkpoint-50"
+    )
     self.assertEqual(repo_id, "leobianco/npov_PERL")
     self.assertEqual(subfolder, "checkpoint-50")
     self.assertIsNone(rev)
 
   def test_repo_with_revision(self):
-    repo_id, subfolder, rev = parse_hf_repo_reference("leobianco/npov_PERL@v1.0")
+    repo_id, subfolder, rev = parse_hf_repo_reference(
+        "leobianco/npov_PERL@v1.0"
+    )
     self.assertEqual(repo_id, "leobianco/npov_PERL")
     self.assertIsNone(subfolder)
     self.assertEqual(rev, "v1.0")
@@ -231,7 +238,9 @@ class TestParseHfRepoReference(unittest.TestCase):
     self.assertIsNone(rev)
 
   def test_hf_protocol_url(self):
-    repo_id, subfolder, rev = parse_hf_repo_reference("hf://leobianco/npov_PERL")
+    repo_id, subfolder, rev = parse_hf_repo_reference(
+        "hf://leobianco/npov_PERL"
+    )
     self.assertEqual(repo_id, "leobianco/npov_PERL")
     self.assertIsNone(subfolder)
     self.assertIsNone(rev)
@@ -272,7 +281,10 @@ class TestWandbResumptionCallback(unittest.TestCase):
     mock_wandb.run.id = "wandb_test_run_12345"
 
     mock_hf_api = MagicMock()
-    with patch("src.pipelines.wandb", mock_wandb), patch("src.pipelines.HfApi", return_value=mock_hf_api):
+    with (
+        patch("src.pipelines.wandb", mock_wandb),
+        patch("src.pipelines.HfApi", return_value=mock_hf_api),
+    ):
       callback.on_train_begin(mock_args, mock_state, mock_control)
 
     id_file = os.path.join(self.temp_dir, "wandb_run_id.txt")
@@ -303,7 +315,10 @@ class TestWandbResumptionCallback(unittest.TestCase):
     mock_wandb.run.id = "wandb_test_run_50"
 
     mock_hf_api = MagicMock()
-    with patch("src.pipelines.wandb", mock_wandb), patch("src.pipelines.HfApi", return_value=mock_hf_api):
+    with (
+        patch("src.pipelines.wandb", mock_wandb),
+        patch("src.pipelines.HfApi", return_value=mock_hf_api),
+    ):
       callback.on_save(mock_args, mock_state, mock_control)
 
     id_file = os.path.join(checkpoint_dir, "wandb_run_id.txt")
@@ -374,6 +389,35 @@ class TestPipelineResumptionHelpers(unittest.TestCase):
     self.assertEqual(os.environ.get("WANDB_RUN_ID"), "hf_wandb_run_id_777")
     self.assertEqual(os.environ.get("WANDB_RESUME"), "allow")
 
+  def test_setup_wandb_resumption_ignores_when_resume_is_none_or_false(self):
+    """Verify that _setup_wandb_resumption does not restore run ID when resume_from_checkpoint is None/False even if id file exists."""
+    id_file = os.path.join(self.temp_dir, "wandb_run_id.txt")
+    with open(id_file, "w") as f:
+      f.write("stale_run_id_12345\n")
+
+    for val in (None, False, "False", "false", "None", "none", "no"):
+      os.environ.pop("WANDB_RUN_ID", None)
+      os.environ.pop("WANDB_RESUME", None)
+      self.mock_training_args.resume_from_checkpoint = val
+      self.pipeline._setup_wandb_resumption()
+      self.assertIsNone(os.environ.get("WANDB_RUN_ID"))
+      self.assertIsNone(os.environ.get("WANDB_RESUME"))
+
+  def test_setup_wandb_resumption_ignores_auto_in_sweep(self):
+    """Verify that auto resumption does not restore old run ID when running in a W&B sweep."""
+    id_file = os.path.join(self.temp_dir, "wandb_run_id.txt")
+    with open(id_file, "w") as f:
+      f.write("sweep_stale_id_999\n")
+
+    os.environ["WANDB_SWEEP_ID"] = "test_sweep_123"
+    try:
+      self.mock_training_args.resume_from_checkpoint = True
+      self.pipeline._setup_wandb_resumption()
+      self.assertIsNone(os.environ.get("WANDB_RUN_ID"))
+      self.assertIsNone(os.environ.get("WANDB_RESUME"))
+    finally:
+      os.environ.pop("WANDB_SWEEP_ID", None)
+
   def test_resolve_resume_checkpoint_none(self):
     """Verify that None/False returns None."""
     self.mock_training_args.resume_from_checkpoint = None
@@ -413,22 +457,34 @@ class TestPipelineResumptionHelpers(unittest.TestCase):
     self.mock_training_args.resume_from_checkpoint = "leobianco/npov_PERL_run"
     self.mock_training_args.output_dir = None
 
-    with patch.object(self.pipeline, "_download_hf_checkpoint", return_value=downloaded_hf_dir) as mock_download:
+    with patch.object(
+        self.pipeline, "_download_hf_checkpoint", return_value=downloaded_hf_dir
+    ) as mock_download:
       resolved = self.pipeline._resolve_resume_checkpoint()
-      mock_download.assert_called_once_with("leobianco/npov_PERL_run", None, None)
+      mock_download.assert_called_once_with(
+          "leobianco/npov_PERL_run", None, None
+      )
       self.assertEqual(resolved, downloaded_hf_dir)
 
   def test_resolve_resume_checkpoint_from_hf_hub_subfolder(self):
     """Verify that a Hugging Face Hub subfolder path is downloaded and resolved."""
-    downloaded_hf_dir = os.path.join(self.temp_dir, "hf_download", "checkpoint-50")
+    downloaded_hf_dir = os.path.join(
+        self.temp_dir, "hf_download", "checkpoint-50"
+    )
     os.makedirs(downloaded_hf_dir, exist_ok=True)
 
-    self.mock_training_args.resume_from_checkpoint = "leobianco/npov_PERL_run/checkpoint-50"
+    self.mock_training_args.resume_from_checkpoint = (
+        "leobianco/npov_PERL_run/checkpoint-50"
+    )
     self.mock_training_args.output_dir = None
 
-    with patch.object(self.pipeline, "_download_hf_checkpoint", return_value=downloaded_hf_dir) as mock_download:
+    with patch.object(
+        self.pipeline, "_download_hf_checkpoint", return_value=downloaded_hf_dir
+    ) as mock_download:
       resolved = self.pipeline._resolve_resume_checkpoint()
-      mock_download.assert_called_once_with("leobianco/npov_PERL_run", "checkpoint-50", None)
+      mock_download.assert_called_once_with(
+          "leobianco/npov_PERL_run", "checkpoint-50", None
+      )
       self.assertEqual(resolved, downloaded_hf_dir)
 
   def test_download_hf_checkpoint_with_nested_checkpoint(self):
@@ -437,9 +493,13 @@ class TestPipelineResumptionHelpers(unittest.TestCase):
     nested_ckpt = os.path.join(downloaded_dir, "checkpoint-150")
     os.makedirs(nested_ckpt, exist_ok=True)
 
-    with patch("src.pipelines.snapshot_download", return_value=downloaded_dir), \
-         patch("src.pipelines.get_last_checkpoint", return_value=nested_ckpt):
-      resolved = self.pipeline._download_hf_checkpoint("leobianco/npov_PERL_run")
+    with (
+        patch("src.pipelines.snapshot_download", return_value=downloaded_dir),
+        patch("src.pipelines.get_last_checkpoint", return_value=nested_ckpt),
+    ):
+      resolved = self.pipeline._download_hf_checkpoint(
+          "leobianco/npov_PERL_run"
+      )
       self.assertEqual(resolved, nested_ckpt)
 
 
@@ -467,7 +527,9 @@ class TestPipelineRunAndSaveResumption(unittest.TestCase):
 
     with patch("src.pipelines.get_last_checkpoint", return_value=None):
       pipeline.run_and_save()
-      mock_trainer.train.assert_called_once_with(resume_from_checkpoint=ckpt_dir)
+      mock_trainer.train.assert_called_once_with(
+          resume_from_checkpoint=ckpt_dir
+      )
       mock_trainer.push_to_hub.assert_called_once()
 
   def test_sft_pipeline_run_and_save_calls_train_with_checkpoint(self):
@@ -475,6 +537,7 @@ class TestPipelineRunAndSaveResumption(unittest.TestCase):
     pipeline.training_args = MagicMock()
     pipeline.training_args.output_dir = self.temp_dir
     pipeline.training_args.resume_from_checkpoint = None
+    pipeline.training_args.push_to_hub = True
 
     mock_trainer = MagicMock()
     pipeline.trainer = mock_trainer

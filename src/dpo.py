@@ -8,9 +8,9 @@ from src.pipelines import DPOPipeline
 
 
 def main():
-    """Run the DPO preference tuning pipeline."""
-    DPOPipeline().run()
+  """Run the DPO preference tuning pipeline."""
+  DPOPipeline().run()
 
 
 if __name__ == "__main__":
-    main()
+  main()

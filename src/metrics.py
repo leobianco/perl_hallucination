@@ -211,8 +211,10 @@ def compute_bertscore(
 ) -> list[float]:
   """Computes semantic embedding similarity / BERTScore between predictions and references.
 
-  Supports sentence-transformers embeddings (fast cosine similarity on mean-pooled
-  vectors) and standard transformer encoders (token-level greedy matching BERTScore).
+  Supports sentence-transformers embeddings (fast cosine similarity on
+  mean-pooled
+  vectors) and standard transformer encoders (token-level greedy matching
+  BERTScore).
 
   Args:
       predictions: List of generated completion strings.
@@ -261,7 +263,8 @@ def compute_bertscore(
 
   scores = []
   is_sentence_emb = any(
-      k in model_type.lower() for k in ["sentence-transformers", "minilm", "bge", "mpnet"]
+      k in model_type.lower()
+      for k in ["sentence-transformers", "minilm", "bge", "mpnet"]
   )
 
   for i in range(0, len(predictions), batch_size):
@@ -502,10 +505,16 @@ def compute_conditional_perplexity(
         continue
 
       prompt_ids = tokenizer.encode(
-          p_clean, add_special_tokens=True, truncation=True, max_length=max_length
+          p_clean,
+          add_special_tokens=True,
+          truncation=True,
+          max_length=max_length,
       )
       comp_ids = tokenizer.encode(
-          c_clean, add_special_tokens=False, truncation=True, max_length=max_length
+          c_clean,
+          add_special_tokens=False,
+          truncation=True,
+          max_length=max_length,
       )
 
       if not comp_ids:
@@ -581,7 +590,9 @@ def compute_summary_statistics(
   if n % 2 == 1:
     median_val = float(sorted_scores[n // 2])
   else:
-    median_val = float((sorted_scores[n // 2 - 1] + sorted_scores[n // 2]) / 2.0)
+    median_val = float(
+        (sorted_scores[n // 2 - 1] + sorted_scores[n // 2]) / 2.0
+    )
 
   return {
       "mean": mean_val,
@@ -655,8 +666,10 @@ class GenerationMetricsEvaluator:
 
     Supports:
     - Multi-perspective NPOV arguments (perspective_1 + perspective_2).
-    - Dedicated context columns ('Context', 'context', 'passages', 'source', 'document').
-    - Ground-truth references if available ('npov_response', 'reference', 'target', 'ground_truth').
+    - Dedicated context columns ('Context', 'context', 'passages', 'source',
+    'document').
+    - Ground-truth references if available ('npov_response', 'reference',
+    'target', 'ground_truth').
 
     Args:
         dataset: Dataset object.
@@ -700,15 +713,11 @@ class GenerationMetricsEvaluator:
         p2_s = str(p2).strip() if p2 is not None else ""
         if p1_s:
           parts.append(
-              f"{n1}: {p1_s}"
-              if (n1 and not p1_s.startswith(str(n1)))
-              else p1_s
+              f"{n1}: {p1_s}" if (n1 and not p1_s.startswith(str(n1))) else p1_s
           )
         if p2_s:
           parts.append(
-              f"{n2}: {p2_s}"
-              if (n2 and not p2_s.startswith(str(n2)))
-              else p2_s
+              f"{n2}: {p2_s}" if (n2 and not p2_s.startswith(str(n2))) else p2_s
           )
         contexts.append("\n".join(parts))
       if any(len(c) > 0 for c in contexts):
@@ -806,7 +815,7 @@ class GenerationMetricsEvaluator:
     has_valid_contexts = any(len(c) > 0 for c in contexts)
     if has_valid_contexts:
       print(
-          f"Computing context grounding metrics (ROUGE, BERTScore) against"
+          "Computing context grounding metrics (ROUGE, BERTScore) against"
           f" source context '{context_source}'..."
       )
       rouge_dict = compute_rouge(completions, contexts)
@@ -849,6 +858,7 @@ class GenerationMetricsEvaluator:
 
     try:
       from datasets import Dataset
+
       updated_dataset = Dataset.from_dict(updated_dict)
     except Exception:
       updated_dataset = dataset
@@ -900,9 +910,7 @@ class GenerationMetricsEvaluator:
     summary_path = os.path.join(output_dir, f"{dataset_name}_summary.json")
 
     if autorater_scores:
-      clean_autorater = [
-          float(s) for s in autorater_scores if s is not None
-      ]
+      clean_autorater = [float(s) for s in autorater_scores if s is not None]
       if clean_autorater:
         hallu_rate = float(
             sum(1.0 for s in clean_autorater if s < threshold)
@@ -972,9 +980,7 @@ class GenerationMetricsEvaluator:
         sample_indices = range(min(500, len(dataset)))
         for idx in sample_indices:
           row = [
-              dataset[col][idx]
-              if col in dataset.column_names
-              else None
+              dataset[col][idx] if col in dataset.column_names else None
               for col in table_cols
           ]
           table_data.append(row)

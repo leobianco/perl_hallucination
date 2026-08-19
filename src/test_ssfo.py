@@ -11,6 +11,7 @@ if "torch" not in sys.modules:
     import torch
   except ImportError:
     import contextlib
+
     torch = types.ModuleType("torch")
     torch.__path__ = []
     torch.nn = types.ModuleType("torch.nn")
@@ -34,7 +35,9 @@ if "torch" not in sys.modules:
     torch.ones = lambda *x, **kw: MagicMock()
     torch.zeros = lambda *x, **kw: MagicMock()
     torch.where = lambda *x: MagicMock()
-    torch.stack = lambda *x, **kw: MagicMock(tolist=lambda: [[10, 11], [12, 13]])
+    torch.stack = lambda *x, **kw: MagicMock(
+        tolist=lambda: [[10, 11], [12, 13]]
+    )
     torch.long = "long"
     torch.bool = "bool"
     torch.bfloat16 = "bfloat16"
@@ -218,9 +221,7 @@ class TestSSFODataGeneration(unittest.TestCase):
         "Use the gauge located in the glove compartment.", prompt_no_ctx
     )
     self.assertIn("How do I check tire pressure?", prompt_no_ctx)
-    self.assertEqual(
-        gt, "Locate the gauge in the glove compartment to check."
-    )
+    self.assertEqual(gt, "Locate the gauge in the glove compartment to check.")
 
   def test_setup_model_resolves_lora(self):
     """Test setup_model correctly resolves LoRA and vllm model."""

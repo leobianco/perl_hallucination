@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from src.metrics import (
+    GenerationMetricsEvaluator,
     compute_bertscore,
     compute_conditional_perplexity,
     compute_distinct_n,
@@ -17,7 +18,6 @@ from src.metrics import (
     compute_repetition_rate,
     compute_rouge,
     compute_summary_statistics,
-    GenerationMetricsEvaluator,
     tokenize_words,
 )
 from src.utils import (
@@ -162,7 +162,9 @@ class TestMetrics(unittest.TestCase):
   def test_reference_column_auto_detection(self):
     evaluator = GenerationMetricsEvaluator()
     self.assertEqual(
-        evaluator.find_reference_column(["prompt", "completion", "npov_response"]),
+        evaluator.find_reference_column(
+            ["prompt", "completion", "npov_response"]
+        ),
         "npov_response",
     )
     self.assertEqual(
@@ -170,7 +172,9 @@ class TestMetrics(unittest.TestCase):
         "target",
     )
     self.assertEqual(
-        evaluator.find_reference_column(["prompt", "completion", "ground_truth"]),
+        evaluator.find_reference_column(
+            ["prompt", "completion", "ground_truth"]
+        ),
         "ground_truth",
     )
     self.assertIsNone(evaluator.find_reference_column(["prompt", "completion"]))
@@ -270,7 +274,11 @@ class TestMetrics(unittest.TestCase):
     dataset = MockDataset(data)
 
     def subsample(data_obj, max_samples, seed=42):
-      if max_samples is not None and max_samples > 0 and len(data_obj) > max_samples:
+      if (
+          max_samples is not None
+          and max_samples > 0
+          and len(data_obj) > max_samples
+      ):
         return data_obj.shuffle(seed=seed).select(range(max_samples))
       return data_obj
 
@@ -292,6 +300,7 @@ class TestMetrics(unittest.TestCase):
 
     # Subsample 10 rows
     import random
+
     rng = random.Random(12345)
     all_indices = list(range(len(full_dataset)))
     rng.shuffle(all_indices)
@@ -329,7 +338,9 @@ class TestMetrics(unittest.TestCase):
     for orig_idx in unscored_indices:
       self.assertIsNone(final_dataset["scores"][orig_idx])
       self.assertEqual(final_dataset["prompt"][orig_idx], f"Prompt {orig_idx}")
-      self.assertEqual(final_dataset["completion"][orig_idx], f"Completion {orig_idx}")
+      self.assertEqual(
+          final_dataset["completion"][orig_idx], f"Completion {orig_idx}"
+      )
 
   def test_save_and_log_results_with_none_autorater_scores(self):
     """Verifies that save_and_log_results handles None in autorater_scores without crashing."""
@@ -409,9 +420,7 @@ class TestEvalRepoNaming(unittest.TestCase):
   """Unit tests for Hugging Face repo ID sanitization, compaction, and building."""
 
   def test_compact_model_name_floats(self):
-    raw_name = (
-        "npov_PERL_google_S130104_epo0.2_lr2.3663655877360862e-05_beta0.04259128063013425_2608141244"
-    )
+    raw_name = "npov_PERL_google_S130104_epo0.2_lr2.3663655877360862e-05_beta0.04259128063013425_2608141244"
     compacted = compact_model_name(raw_name)
     self.assertEqual(
         compacted,
@@ -424,9 +433,7 @@ class TestEvalRepoNaming(unittest.TestCase):
     self.assertEqual(compacted, "google/gemma-4-E2B-it")
 
   def test_build_eval_dataset_repo_id_user_reported_case(self):
-    raw_lora = (
-        "leobianco/npov_PERL_google_S130104_epo0.2_lr2.3663655877360862e-05_beta0.04259128063013425_2608141244"
-    )
+    raw_lora = "leobianco/npov_PERL_google_S130104_epo0.2_lr2.3663655877360862e-05_beta0.04259128063013425_2608141244"
     repo_id = build_eval_dataset_repo_id(
         user="leobianco",
         writer_model_lora=raw_lora,
@@ -441,9 +448,7 @@ class TestEvalRepoNaming(unittest.TestCase):
     )
 
   def test_sanitize_hf_repo_id_matches_build(self):
-    uncompacted_eval = (
-        "leobianco/eval_npov_PERL_google_S130104_epo0.2_lr2.3663655877360862e-05_beta0.04259128063013425_2608141244_gens_T0.0_wfs0"
-    )
+    uncompacted_eval = "leobianco/eval_npov_PERL_google_S130104_epo0.2_lr2.3663655877360862e-05_beta0.04259128063013425_2608141244_gens_T0.0_wfs0"
     sanitized = sanitize_hf_repo_id(uncompacted_eval)
     self.assertLessEqual(len(sanitized), 96)
     self.assertNotIn(".", sanitized)
