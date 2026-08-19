@@ -2142,6 +2142,10 @@ class SSFODataGenerationPipeline(Pipeline):
         f.write(f"Dataset: {self.args.dataset_repo_id}\n")
         f.write(f"Model: {self.args.model_repo_id}\n")
         f.write(f"SFT Adapter: {self.args.sft_model_path}\n")
+        f.write(
+            "Base Model for Rejected:"
+            f" {getattr(self.args, 'use_base_model_for_rejected', True)}\n"
+        )
         f.write(f"Timestamp: {timestamp}\n")
         f.write(f"Total Samples: {len(prompts_with_ctx)}\n")
         f.write("=" * 80 + "\n\n")
@@ -2274,18 +2278,28 @@ class SSFODataGenerationPipeline(Pipeline):
         chosens = [output.outputs[0].text for output in outputs_ctx]
 
       # Generate Rejected (y-) without context
-      print(
-          "Generating rejected completions without context for"
-          f" {len(all_prompt_no_ctx)} samples..."
+      use_base_for_rejected = getattr(
+          self.args, "use_base_model_for_rejected", True
       )
-      if lora_request is not None:
-        outputs_no_ctx = llm.generate(
-            all_prompt_no_ctx,
-            sampling_params,
-            lora_request=lora_request,
+      if use_base_for_rejected:
+        print(
+            "Generating rejected completions without context using BASE model"
+            f" (no adapter) for {len(all_prompt_no_ctx)} samples..."
         )
-      else:
         outputs_no_ctx = llm.generate(all_prompt_no_ctx, sampling_params)
+      else:
+        print(
+            "Generating rejected completions without context using SFT adapter"
+            f" for {len(all_prompt_no_ctx)} samples..."
+        )
+        if lora_request is not None:
+          outputs_no_ctx = llm.generate(
+              all_prompt_no_ctx,
+              sampling_params,
+              lora_request=lora_request,
+          )
+        else:
+          outputs_no_ctx = llm.generate(all_prompt_no_ctx, sampling_params)
       rejecteds = [output.outputs[0].text for output in outputs_no_ctx]
 
       # Log inspection samples
