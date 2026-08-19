@@ -34,6 +34,7 @@ MAX_NEW_TOKENS=250
 GEN_BATCH_SIZE=16
 MAX_SAMPLES=""  # Set number of samples here directly (e.g. 500), or leave empty for full data
 USE_GROUND_TRUTH_CHOSEN=False
+USE_BASE_MODEL_FOR_REJECTED=True
 
 # DPO Training Parameters (Stage 3)
 DPO_BETA=0.1
@@ -144,6 +145,7 @@ if [ "$STAGE" == "all" ] || [ "$STAGE" == "generate_data" ]; then
     --max_new_tokens "$MAX_NEW_TOKENS" \
     --batch_size "$GEN_BATCH_SIZE" \
     --use_ground_truth_chosen "$USE_GROUND_TRUTH_CHOSEN" \
+    --use_base_model_for_rejected "$USE_BASE_MODEL_FOR_REJECTED" \
     --push_to_hub True \
     "${EXTRA_GEN_ARGS[@]}"
 fi
