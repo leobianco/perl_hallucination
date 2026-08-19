@@ -283,8 +283,9 @@ class TestSSFODataGeneration(unittest.TestCase):
       self.assertIn("_n250_", pushed_repo)
 
   def test_run_and_save_with_vllm(self):
-    """Test SSFO data generation using mocked vLLM engine."""
+    """Test SSFO data generation using mocked vLLM engine with base model for rejected."""
     self.pipeline.use_vllm = True
+    self.pipeline.enable_lora = True
     self.pipeline.lora_path = "mock/lora/path"
     mock_llm = MagicMock()
     mock_out_1 = MagicMock(outputs=[MagicMock(text="Chosen completion 1")])
@@ -317,14 +318,54 @@ class TestSSFODataGeneration(unittest.TestCase):
     self.pipeline.raw_dataset = {"train": self.pipeline.train_split}
     self.pipeline.args.push_to_hub = False
     self.pipeline.args.use_ground_truth_chosen = False
+    self.pipeline.args.use_base_model_for_rejected = True
 
     with patch("src.pipelines.DatasetDict.save_to_disk"):
       self.pipeline.run_and_save()
       self.assertEqual(mock_llm.generate.call_count, 2)
       ctx_args = mock_llm.generate.call_args_list[0][0][0]
       no_ctx_args = mock_llm.generate.call_args_list[1][0][0]
+      ctx_kwargs = mock_llm.generate.call_args_list[0][1]
+      no_ctx_kwargs = mock_llm.generate.call_args_list[1][1]
       self.assertEqual(len(ctx_args), 2)
       self.assertEqual(len(no_ctx_args), 2)
+      self.assertIn("lora_request", ctx_kwargs)
+      self.assertIsNotNone(ctx_kwargs["lora_request"])
+      # Base model for rejected should not pass lora_request
+      self.assertNotIn("lora_request", no_ctx_kwargs)
+
+  def test_run_and_save_with_sft_adapter_for_rejected(self):
+    """Test SSFO data generation with use_base_model_for_rejected=False passes lora_request."""
+    self.pipeline.use_vllm = True
+    self.pipeline.enable_lora = True
+    self.pipeline.lora_path = "mock/lora/path"
+    mock_llm = MagicMock()
+    mock_out_1 = MagicMock(outputs=[MagicMock(text="Chosen completion")])
+    mock_out_2 = MagicMock(outputs=[MagicMock(text="Rejected completion")])
+    mock_llm.generate.side_effect = [[mock_out_1], [mock_out_2]]
+    self.pipeline.llm = mock_llm
+    entry = {
+        "user_query": "q1",
+        "perspective_1_name": "Pro",
+        "perspective_1": "arg1",
+        "perspective_2_name": "Con",
+        "perspective_2": "arg2",
+        "npov_response": "gt1",
+    }
+    self.pipeline.train_split = [entry]
+    self.pipeline.raw_dataset = {"train": [entry]}
+    self.pipeline.args.push_to_hub = False
+    self.pipeline.args.use_ground_truth_chosen = False
+    self.pipeline.args.use_base_model_for_rejected = False
+
+    with patch("src.pipelines.DatasetDict.save_to_disk"):
+      self.pipeline.run_and_save()
+      self.assertEqual(mock_llm.generate.call_count, 2)
+      ctx_kwargs = mock_llm.generate.call_args_list[0][1]
+      no_ctx_kwargs = mock_llm.generate.call_args_list[1][1]
+      self.assertIn("lora_request", ctx_kwargs)
+      self.assertIn("lora_request", no_ctx_kwargs)
+      self.assertIsNotNone(no_ctx_kwargs["lora_request"])
 
   def test_setup_arguments_cleaning(self):
     """Test that setup_arguments correctly cleans CLI arguments with double dash."""
@@ -336,6 +377,7 @@ class TestSSFODataGeneration(unittest.TestCase):
               dataset_repo_id="user/dataset",
               model_repo_id="google/gemma-4-E4B",
               sft_model_path="user/sft",
+              use_base_model_for_rejected=True,
           )
       ]
       mock_parser_cls.return_value = mock_parser
@@ -351,12 +393,15 @@ class TestSSFODataGeneration(unittest.TestCase):
           "google/gemma-4-E4B",
           "--sft_model_path",
           "user/sft",
+          "--use_base_model_for_rejected",
+          "True",
       )
       called_args = mock_parser.parse_args_into_dataclasses.call_args[0][0]
       self.assertNotIn("--", called_args)
       self.assertEqual(test_pipeline.args.task_name, "npov")
       self.assertEqual(test_pipeline.args.dataset_repo_id, "user/dataset")
       self.assertEqual(test_pipeline.args.model_repo_id, "google/gemma-4-E4B")
+      self.assertTrue(test_pipeline.args.use_base_model_for_rejected)
 
   def test_train_and_test_split_schema_match(self):
     """Test that train and test splits have identical column names in preference_dataset."""

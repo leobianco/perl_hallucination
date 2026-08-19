@@ -1253,10 +1253,6 @@ class DPOPipeline(Pipeline):
 
     self.args = script_args
     self.training_args = training_args
-    if getattr(script_args, "max_prompt_length", None) is not None and hasattr(
-        training_args, "max_prompt_length"
-    ):
-      training_args.max_prompt_length = script_args.max_prompt_length
     set_seed(training_args.seed)
     self._lora_args = lora_args
 

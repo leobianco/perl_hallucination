@@ -417,6 +417,7 @@ class TestDPOPipeline(unittest.TestCase):
     mock_training_args.learning_rate = 5e-6
     mock_training_args.beta = 0.1
     mock_training_args.run_name = "test_run"
+    mock_training_args.max_prompt_length = 384
 
     with patch("src.pipelines.HfArgumentParser") as mock_parser_cls:
       mock_parser = MagicMock()

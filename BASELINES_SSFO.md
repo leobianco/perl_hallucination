@@ -85,15 +85,15 @@ The policy is initialized from $p_{\theta_0}$ and optimized with DPO using $\pi_
 ## Methodology: SSFO
 
 ### SSFO Context Contrasting Principle
-While SCOPE mixes logits with a pre-trained base model, **SSFO** (*Self-Supervised Faithfulness Optimization*, arXiv:2508.17225) uses only the fine-tuned SFT model $p_{\theta_0}$.
+While SCOPE mixes logits per token with a base model, **SSFO** (*Self-Supervised Faithfulness Optimization*, arXiv:2508.17225) contrasts context-conditioned and context-free generations.
 
 Given an input query $x$ and retrieved context $c$:
-1. **Preferred completion ($y^+$)**: The model generates conditioned on both query and retrieved context $(x, c)$:
+1. **Preferred completion ($y^+$)**: The fine-tuned SFT model generates conditioned on both query and retrieved context $(x, c)$:
    $$y^+ \sim p_{\theta_0}(\cdot \mid x, c)$$
    *(Optionally, the ground-truth reference completion can be used).*
-2. **Dispreferred completion ($y^-$)**: The model generates conditioned *only* on the query $x$, withholding context $c$:
-   $$y^- \sim p_{\theta_0}(\cdot \mid x)$$
-   Because the context is missing, the model relies on parametric memory, producing contextual hallucinations relative to $c$.
+2. **Dispreferred completion ($y^-$)**: The base instruction-tuned model $p_{\text{LM}}$ (or SFT model) generates conditioned *only* on the query $x$, withholding context $c$:
+   $$y^- \sim p_{\text{LM}}(\cdot \mid x)$$
+   Because the SFT adapter is heavily overfitted to context-conditioned templates (causing out-of-distribution mode collapse without context), generating $y^-$ with the base instruction-tuned model produces fluent, sensical sentences that rely purely on parametric memory (true contextual hallucinations relative to $c$).
 3. **Preference Pair**:
    $$\text{Prompt: } (x, c) \quad\mid\quad \text{Chosen: } y^+ \quad\mid\quad \text{Rejected: } y^-$$
 
@@ -178,6 +178,7 @@ All commands must be executed from the **root project directory**. Substitute `(
 | Split Ratio | `--split_ratio` | `0.5` | N/A | Data partition fraction ($\mathcal{D}_1$ vs. $\mathcal{D}_2$). |
 | Sampling Mode | `--sampling_mode` | `bernoulli` | N/A | `bernoulli`, `prob_mix`, or `logit_mix`. |
 | Ground Truth Chosen | `--use_ground_truth_chosen` | `True` (fixed) | `False` (configurable) | Use ground truth target vs. context-conditioned generation. |
+| Base Model for Rejected | `--use_base_model_for_rejected` | N/A | `True` (configurable) | Use base instruction model (no adapter) for context-free rejected generation. |
 | Gen Temperature | `--temperature` | `0.7` | `0.7` | Temperature for autoregressive sampling. |
 | Gen Top-$p$ | `--top_p` | `0.9` | `0.9` | Nucleus sampling threshold. |
 | Gen Top-$k$ | `--top_k` | `50` | `50` | Top-$k$ vocabulary filtering. |
@@ -196,7 +197,7 @@ All commands must be executed from the **root project directory**. Substitute `(
 | :--- | :--- | :--- | :--- |
 | **Optimization Method** | Reinforcement Learning (RLOO / PPO) | Direct Preference Optimization (DPO) | Direct Preference Optimization (DPO) |
 | **Reward Mechanism** | Token/sequence Reward Model score | Pairwise preference likelihood ratio | Pairwise preference likelihood ratio |
-| **Negative Data Source** | Synthetic hallucinations (structured / LLM perturbed) | Noisy decoding (mixing SFT and base logits) | Context-free SFT generation (withholding $c$) |
-| **Base Model Needed in Gen?** | No | Yes (for $p_{\text{LM}}$ logit mixing) | No (uses only SFT model $p_{\theta_0}$) |
+| **Negative Data Source** | Synthetic hallucinations (structured / LLM perturbed) | Noisy decoding (mixing SFT and base logits) | Context-free generation (withholding $c$) |
+| **Base Model Needed in Gen?** | No | Yes (for $p_{\text{LM}}$ logit mixing) | Yes (base IT model for rejected $y^-$) |
 | **Data Split Required** | Full dataset for RM + RL loops | Split dataset in half ($\mathcal{D}_1$ / $\mathcal{D}_2$) | Full dataset for SFT + generation |
 | **Generation Efficiency** | Online sampling during RL rollouts | Dual-model decoding per token | Standard single-model decoding per prompt |

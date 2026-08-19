@@ -40,9 +40,6 @@ class ScriptArguments:
       sft_model_path (Optional[str]): Path to the SFT model adapter checkpoint.
       sft_data_fraction (Optional[float]): Fraction of SFT training data to use
         (e.g. 0.5 for SCOPE Stage 1).
-      max_prompt_length (Optional[int]): Maximum prompt token length (supported
-        for backwards compatibility with older DPO scripts).
-      max_completion_length (Optional[int]): Maximum completion token length.
   """
 
   task_name: str
@@ -52,8 +49,7 @@ class ScriptArguments:
   reward_model_path: Optional[str] = None
   sft_model_path: Optional[str] = None
   sft_data_fraction: Optional[float] = None
-  max_prompt_length: Optional[int] = None
-  max_completion_length: Optional[int] = None
+
 
 
 @dataclass

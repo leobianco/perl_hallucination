@@ -547,5 +547,47 @@ class TestPipelineRunAndSaveResumption(unittest.TestCase):
     mock_trainer.push_to_hub.assert_called_once()
 
 
+class TestPipelineArgumentSetup(unittest.TestCase):
+  """Test that pipeline setup_arguments correctly handles arguments without conflicts."""
+
+  def test_perl_pipeline_setup_arguments(self):
+    pipeline = PERLPipeline()
+    mock_script_args = MagicMock()
+    mock_script_args.task_name = "bosch"
+    mock_training_args = MagicMock()
+    mock_training_args.seed = 130104
+    mock_training_args.learning_rate = 2e-5
+    mock_training_args.beta = 0.05
+    mock_training_args.temperature = 0.3
+    mock_training_args.num_train_epochs = 0.2
+    mock_training_args.max_completion_length = 256
+    mock_training_args.run_name = "test_perl_run"
+
+    with patch("src.pipelines.HfArgumentParser") as mock_parser_cls:
+      mock_parser = MagicMock()
+      mock_parser.parse_args_into_dataclasses.return_value = (
+          mock_script_args,
+          mock_training_args,
+      )
+      mock_parser_cls.return_value = mock_parser
+
+      pipeline.setup_arguments(
+          "--task_name=bosch",
+          "--dataset_repo_id=leobianco/bosch_perl",
+          "--model_repo_id=google/gemma-4-E2B-it",
+          "--max_completion_length=256",
+          "--num_generations=4",
+          "--num_iterations=1",
+          "--steps_per_generation=16",
+          "--learning_rate=2e-5",
+          "--beta=0.05",
+          "--temperature=0.3",
+      )
+      self.assertEqual(pipeline.args.task_name, "bosch")
+      self.assertEqual(pipeline.training_args.max_completion_length, 256)
+      self.assertEqual(pipeline.training_args.learning_rate, 2e-5)
+
+
 if __name__ == "__main__":
   unittest.main()
+
