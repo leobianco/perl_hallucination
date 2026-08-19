@@ -197,6 +197,14 @@ class WandbResumptionCallback(TrainerCallback):
         and wandb is not None
         and getattr(wandb, "run", None) is not None
     ):
+      try:
+        wandb.define_metric("train/global_step")
+        wandb.define_metric("train/*", step_metric="train/global_step")
+        wandb.define_metric("eval/*", step_metric="train/global_step")
+        wandb.define_metric("eval_*", step_metric="train/global_step")
+      except Exception:
+        pass
+
       run_id = wandb.run.id
       output_dir = getattr(args, "output_dir", None)
       if output_dir:
@@ -3043,6 +3051,17 @@ class EvaluationScoringPipeline(EvaluationPipeline):
       self.tokenizer = AutoTokenizer.from_pretrained(
           self.args.evaluator_model, padding_side="left"
       )
+    if getattr(self.args, "compute_perplexity", False):
+      fluency_model_name = getattr(
+          self.args, "fluency_model", None
+      ) or getattr(self.args, "writer_model_base", None)
+      if fluency_model_name:
+        print(f"Loading fluency tokenizer: {fluency_model_name}...")
+        self.fluency_tokenizer = AutoTokenizer.from_pretrained(
+            fluency_model_name, padding_side="left"
+        )
+      else:
+        self.fluency_tokenizer = None
 
   def load_data(self):
     if not self.args.dataset_with_completions and getattr(
@@ -3124,6 +3143,24 @@ class EvaluationScoringPipeline(EvaluationPipeline):
       ).to(device)
       self.evaluator.eval()
 
+    if getattr(self.args, "compute_perplexity", False):
+      fluency_model_name = getattr(
+          self.args, "fluency_model", None
+      ) or getattr(self.args, "writer_model_base", None)
+      if fluency_model_name:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(
+            "Loading fluency base model for perplexity evaluation:"
+            f" {fluency_model_name}..."
+        )
+        self.fluency_model = AutoModelForCausalLM.from_pretrained(
+            fluency_model_name,
+            torch_dtype=torch.bfloat16,
+        ).to(device)
+        self.fluency_model.eval()
+      else:
+        self.fluency_model = None
+
   def run_and_save(self):
     autorater_score_list = None
     if getattr(self.args, "run_autorater", True):
@@ -3171,12 +3208,17 @@ class EvaluationScoringPipeline(EvaluationPipeline):
           compute_perplexity_metric=getattr(
               self.args, "compute_perplexity", False
           ),
+          fluency_model=getattr(self, "fluency_model", None),
+          fluency_tokenizer=getattr(self, "fluency_tokenizer", None),
       )
       self.val_data, summary = evaluator.evaluate_dataset(
           self.val_data,
           prompt_column="prompt",
           completion_column="completion",
           reference_column=getattr(self.args, "reference_column", None),
+          tokenizer=getattr(
+              self, "fluency_tokenizer", getattr(self, "tokenizer", None)
+          ),
       )
       dataset_name = self.args.dataset_with_completions.split("/")[-1]
       evaluator.save_and_log_results(
@@ -3244,6 +3286,7 @@ class EvaluationScoringPipeline(EvaluationPipeline):
           "rougeL_precision",
           "rougeL_recall",
           "bertscore_f1",
+          "perplexity",
       ]:
         if (
             metric_col not in self.val_data.column_names
