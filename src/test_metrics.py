@@ -415,6 +415,96 @@ class TestMetrics(unittest.TestCase):
     self.assertGreater(updated_ds["rouge1_recall"][0], 0.0)
     self.assertGreater(updated_ds["rougeL_f1"][0], 0.0)
 
+  def test_compute_conditional_perplexity_no_torch_or_model(self):
+    """Test that missing torch or model returns 0.0 without error."""
+    res = compute_conditional_perplexity(
+        ["Prompt"], ["Completion"], model=None, tokenizer=None
+    )
+    self.assertEqual(res, [0.0])
+
+  def test_compute_conditional_perplexity_empty(self):
+    """Test that empty or missing completions return 0.0 perplexity."""
+    tokenizer = MockTokenizer()
+    model = MagicMock()
+    ppl = compute_conditional_perplexity(
+        ["Prompt"], [""], model=model, tokenizer=tokenizer
+    )
+    self.assertEqual(ppl, [0.0])
+
+  def test_compute_conditional_perplexity_with_mock_model(self):
+    """Test conditional perplexity calculation with causal LM when torch is present."""
+    try:
+      import torch
+    except ImportError:
+      torch = None
+
+    if torch is None:
+      res = compute_conditional_perplexity(
+          ["Prompt"],
+          ["Completion"],
+          model=MagicMock(),
+          tokenizer=MockTokenizer(),
+      )
+      self.assertEqual(res, [0.0])
+      return
+
+    class MockCausalLM:
+
+      def __init__(self, vocab_size=1000):
+        self.vocab_size = vocab_size
+        self._param = torch.nn.Parameter(torch.zeros(1))
+
+      def parameters(self):
+        yield self._param
+
+      def eval(self):
+        pass
+
+      def __call__(self, input_ids=None):
+        batch_size, seq_len = input_ids.shape
+        logits = torch.ones(
+            (batch_size, seq_len, self.vocab_size), dtype=torch.float32
+        )
+        out = MagicMock()
+        out.logits = logits
+        return out
+
+    model = MockCausalLM(vocab_size=1000)
+    tokenizer = MockTokenizer()
+    prompts = ["Question: What is gravity?"]
+    completions = ["Gravity is a natural phenomenon attracting masses."]
+
+    ppl = compute_conditional_perplexity(
+        prompts, completions, model=model, tokenizer=tokenizer
+    )
+    self.assertEqual(len(ppl), 1)
+    # With uniform logits over 1000 vocab, cross-entropy is ln(1000) ~ 6.908, PPL is ~ 1000.0
+    self.assertAlmostEqual(ppl[0], 1000.0, places=1)
+
+  def test_generation_metrics_evaluator_with_perplexity(self):
+    """Test GenerationMetricsEvaluator with fluency model and tokenizer enabled."""
+    model = MagicMock()
+    tokenizer = MockTokenizer()
+
+    data = {
+        "prompt": ["What is AI?", "What is water?"],
+        "completion": ["Artificial intelligence.", "A chemical compound H2O."],
+        "reference": ["AI overview", "Water chemistry"],
+    }
+    dataset = MockDataset(data)
+    evaluator = GenerationMetricsEvaluator(
+        compute_bertscore_metric=False,
+        compute_perplexity_metric=True,
+        fluency_model=model,
+        fluency_tokenizer=tokenizer,
+    )
+    updated_ds, summary = evaluator.evaluate_dataset(dataset)
+
+    self.assertIn("perplexity", updated_ds.column_names)
+    self.assertIn("perplexity_mean", summary)
+    self.assertIn("perplexity_median", summary)
+    self.assertEqual(len(updated_ds["perplexity"]), 2)
+
 
 class TestEvalRepoNaming(unittest.TestCase):
   """Unit tests for Hugging Face repo ID sanitization, compaction, and building."""

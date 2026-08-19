@@ -20,6 +20,8 @@ TOP_P=1.0
 TOP_K=0
 COMPUTE_BERTSCORE="True"
 BERTSCORE_MODEL="sentence-transformers/all-MiniLM-L6-v2"
+COMPUTE_PERPLEXITY="True"
+FLUENCY_MODEL="${BASE_MODEL}"
 LOG_TO_WANDB="True"
 WANDB_PROJECT="new_perl_eval"
 
@@ -79,6 +81,7 @@ elif [ "$2" == "score" ]; then
         --max_workers "$MAX_WORKERS" \
         --dataset_labels "$DATASET_LABELS" \
         --dataset_labels_split "$DATASET_LABELS_SPLIT" \
+        --writer_model_base ${BASE_MODEL} \
         --writer_model_lora "${RUN_IDENTIFIER}" \
         --run_autorater $RUN_AUTORATER \
         --evaluator_model ${EVALUATOR_MODEL} \
@@ -92,6 +95,8 @@ elif [ "$2" == "score" ]; then
         ${DATASET_WITH_COMPLETIONS:+--dataset_with_completions "$DATASET_WITH_COMPLETIONS"} \
         --compute_bertscore "$COMPUTE_BERTSCORE" \
         --bertscore_model "$BERTSCORE_MODEL" \
+        --compute_perplexity "$COMPUTE_PERPLEXITY" \
+        --fluency_model "$FLUENCY_MODEL" \
         --log_to_wandb "${LOG_TO_WANDB:-False}" \
         --wandb_project "${WANDB_PROJECT:-new_perl_eval}"
 elif [ "$2" == "autoratereval" ]; then

@@ -483,14 +483,18 @@ def compute_conditional_perplexity(
     return [0.0] * len(prompts)
 
   if device is None:
-    device = next(model.parameters()).device
+    try:
+      device = next(model.parameters()).device
+    except Exception:
+      device = "cuda" if (torch is not None and torch.cuda.is_available()) else "cpu"
 
-  model.eval()
+  if hasattr(model, "eval"):
+    model.eval()
   loss_fn = torch.nn.CrossEntropyLoss(reduction="none", ignore_index=-100)
   perplexities = []
 
-  if tokenizer.pad_token_id is None:
-    tokenizer.pad_token_id = tokenizer.eos_token_id
+  if getattr(tokenizer, "pad_token_id", None) is None:
+    tokenizer.pad_token_id = getattr(tokenizer, "eos_token_id", 0)
 
   for i in range(0, len(prompts), batch_size):
     batch_prompts = prompts[i : i + batch_size]
@@ -839,6 +843,7 @@ class GenerationMetricsEvaluator:
         and self.fluency_model is not None
         and self.fluency_tokenizer is not None
     ):
+      print("Computing conditional perplexity under base fluency model...")
       ppl_scores = compute_conditional_perplexity(
           prompts,
           completions,
@@ -846,6 +851,11 @@ class GenerationMetricsEvaluator:
           tokenizer=self.fluency_tokenizer,
       )
       metric_columns["perplexity"] = ppl_scores
+    elif self.compute_perplexity_metric:
+      print(
+          "Notice: compute_perplexity was enabled, but fluency_model /"
+          " fluency_tokenizer was not loaded. Skipping perplexity."
+      )
 
     # 5. Add columns to dataset
     updated_dict = (

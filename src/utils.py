@@ -145,6 +145,9 @@ class SsfoDataGenArguments:
       batch_size (int): Batch size for parallel generation. Default: 16.
       use_ground_truth_chosen (bool): If True, use ground truth target as chosen
         instead of SFT model generation with context. Default: False.
+      use_base_model_for_rejected (bool): If True, use base instruction-tuned
+        model (without SFT adapter) to generate context-free rejected completions.
+        Default: True.
       push_to_hub (bool): Whether to push the resulting preference dataset to HF
         Hub. Default: True.
       output_dir (Optional[str]): Optional local directory to save the generated
@@ -165,6 +168,7 @@ class SsfoDataGenArguments:
   max_samples: Optional[int] = None
   batch_size: int = 16
   use_ground_truth_chosen: bool = False
+  use_base_model_for_rejected: bool = True
   push_to_hub: bool = True
   output_dir: Optional[str] = None
 
