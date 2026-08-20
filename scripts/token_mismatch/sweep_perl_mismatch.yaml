@@ -1,0 +1,60 @@
+# ==============================================================================
+# W&B Sweep Configuration: PE-RL Training with Rollout Token Mismatch Matrix
+#
+# Explores scoring rollout completions under:
+# - end_of_turn (mismatched if RM trained on eos)
+# - eos (matched if RM trained on eos)
+# - as_generated
+# - none
+# ==============================================================================
+
+program: src/token_mismatch/perl.py
+method: grid
+metric:
+  name: train/rewards/reward_fn/mean
+  goal: maximize
+
+command:
+  - ${env}
+  - accelerate
+  - launch
+  - --config_file=scripts/deepspeed_config.yaml
+  - ${program}
+  - --report_to=wandb
+  - --logging_steps=1
+  - --logging_strategy=steps
+  - --log_completions=True
+  - --task_name=npov
+  - --seed=130104
+  - --dataset_repo_id=leobianco/npov_perl
+  - --model_repo_id=google/gemma-4-E2B-it
+  - --sft_model_path=leobianco/
+  - --reward_model_path=leobianco/
+  - --do_train=True
+  - --do_eval=True
+  - --eval_strategy=steps
+  - --eval_steps=50
+  - --eval_on_start=True
+  - --save_only_model=True
+  - --save_strategy=no
+  - --lr_scheduler_type=cosine
+  - --warmup_ratio=0.1
+  - --max_completion_length=256
+  - --num_generations=4
+  - --num_iterations=1
+  - --steps_per_generation=16
+  - --per_device_train_batch_size=8
+  - --per_device_eval_batch_size=16
+  - --auto_find_batch_size=False
+  - --num_train_epochs=0.2
+  - --learning_rate=0.00002
+  - --beta=0.0001
+  - ${args}
+
+parameters:
+  scoring_terminal_token:
+    values:
+      - end_of_turn
+      - eos
+      - as_generated
+      - none
