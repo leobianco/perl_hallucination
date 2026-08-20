@@ -31,7 +31,10 @@ TASK_NAME="$1"
 DATASET_REPO_ID="${DATASET_REPO_ID:-${USER}/${TASK_NAME}_scope_preference}"
 MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $NF}')
 TIMESTAMP=$(date '+%y%m%d%H%M')
-RUN_IDENTIFIER="${USER}/${TASK_NAME}_SCOPE_DPO_${MODEL_NAME}_S${SEED}_epo${NUM_TRAIN_EPOCHS}_lr${LEARNING_RATE}_beta${BETA}_${TIMESTAMP}"
+FORMATTED_LR=$(python3 -c "import sys; lr=float('${LEARNING_RATE}'); print(f'{lr:.1e}')" 2>/dev/null || echo "$LEARNING_RATE")
+FORMATTED_BETA=$(python3 -c "import sys; b=float('${BETA}'); print(f'{b:.2g}' if b>=0.001 else f'{b:.1e}')" 2>/dev/null || echo "$BETA")
+FORMATTED_EPOCHS=$(python3 -c "import sys; e=float('${NUM_TRAIN_EPOCHS}'); print(f'{e:.2g}')" 2>/dev/null || echo "$NUM_TRAIN_EPOCHS")
+RUN_IDENTIFIER="${USER}/${TASK_NAME}_SCOPE_DPO_${MODEL_NAME}_S${SEED}_epo${FORMATTED_EPOCHS}_lr${FORMATTED_LR}_beta${FORMATTED_BETA}_${TIMESTAMP}"
 
 # Resumption configuration (can be passed via environment variable or second argument)
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
