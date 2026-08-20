@@ -1520,7 +1520,9 @@ class ScopeDataGenerationPipeline(Pipeline):
         prompt_with_context = str(entry)
         user_query = entry.get("user_query", "")
 
-      prompt_without_context = user_query
+      prompt_without_context = (
+          f"<start_of_turn>user\n{user_query}<end_of_turn>\n<start_of_turn>model\n"
+      )
       return prompt_with_context, prompt_without_context, gt
 
     elif task_name == "bosch":
@@ -1549,7 +1551,9 @@ class ScopeDataGenerationPipeline(Pipeline):
             f" question:\n{question}\nManual information:\n{context}\nAnswer to"
             " user's question:\n"
         )
-      prompt_without_context = question
+      prompt_without_context = (
+          f"<start_of_turn>user\n{question}<end_of_turn>\n<start_of_turn>model\n"
+      )
       return prompt_with_context, prompt_without_context, gt
 
     elif task_name == "ragtruth":
@@ -1581,7 +1585,9 @@ class ScopeDataGenerationPipeline(Pipeline):
           )
         else:
           prompt_with_context = f"Question: {user_query}\nAnswer:\n"
-      prompt_without_context = user_query
+      prompt_without_context = (
+          f"<start_of_turn>user\n{user_query}<end_of_turn>\n<start_of_turn>model\n"
+      )
       return prompt_with_context, prompt_without_context, gt
 
     else:
@@ -1589,7 +1595,7 @@ class ScopeDataGenerationPipeline(Pipeline):
         prompt_with_context = entry["prompt"]
       else:
         prompt_with_context = str(entry)
-      prompt_without_context = entry.get(
+      raw_query = entry.get(
           "user_query",
           entry.get(
               "query",
@@ -1598,6 +1604,9 @@ class ScopeDataGenerationPipeline(Pipeline):
                   entry.get("prompt_no_context", prompt_with_context),
               ),
           ),
+      )
+      prompt_without_context = (
+          f"<start_of_turn>user\n{raw_query}<end_of_turn>\n<start_of_turn>model\n"
       )
       return prompt_with_context, prompt_without_context, gt
 
@@ -1951,7 +1960,9 @@ class SSFODataGenerationPipeline(Pipeline):
         prompt_with_context = str(entry)
         user_query = entry.get("user_query", "")
 
-      prompt_without_context = user_query
+      prompt_without_context = (
+          f"<start_of_turn>user\n{user_query}<end_of_turn>\n<start_of_turn>model\n"
+      )
       return prompt_with_context, prompt_without_context, gt
 
     elif task_name == "bosch":
@@ -1980,7 +1991,9 @@ class SSFODataGenerationPipeline(Pipeline):
             f" question:\n{question}\nManual information:\n{context}\nAnswer to"
             " user's question:\n"
         )
-      prompt_without_context = question
+      prompt_without_context = (
+          f"<start_of_turn>user\n{question}<end_of_turn>\n<start_of_turn>model\n"
+      )
       return prompt_with_context, prompt_without_context, gt
 
     elif task_name == "ragtruth":
@@ -2012,7 +2025,9 @@ class SSFODataGenerationPipeline(Pipeline):
           )
         else:
           prompt_with_context = f"Question: {user_query}\nAnswer:\n"
-      prompt_without_context = user_query
+      prompt_without_context = (
+          f"<start_of_turn>user\n{user_query}<end_of_turn>\n<start_of_turn>model\n"
+      )
       return prompt_with_context, prompt_without_context, gt
 
     else:
@@ -2020,7 +2035,7 @@ class SSFODataGenerationPipeline(Pipeline):
         prompt_with_context = entry["prompt"]
       else:
         prompt_with_context = str(entry)
-      prompt_without_context = entry.get(
+      raw_query = entry.get(
           "user_query",
           entry.get(
               "query",
@@ -2029,6 +2044,9 @@ class SSFODataGenerationPipeline(Pipeline):
                   entry.get("prompt_no_context", prompt_with_context),
               ),
           ),
+      )
+      prompt_without_context = (
+          f"<start_of_turn>user\n{raw_query}<end_of_turn>\n<start_of_turn>model\n"
       )
       return prompt_with_context, prompt_without_context, gt
 
