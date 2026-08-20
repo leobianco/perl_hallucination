@@ -197,7 +197,7 @@ class TestSSFODataGeneration(unittest.TestCase):
     self.assertIn("Is coffee healthy?", prompt_ctx)
 
     # Check that context-free prompt includes only query
-    self.assertIn("Is coffee healthy?", prompt_no_ctx)
+    self.assertEqual(prompt_no_ctx, "Is coffee healthy?")
     self.assertNotIn("Coffee has antioxidants.", prompt_no_ctx)
     self.assertNotIn("Excess caffeine causes anxiety.", prompt_no_ctx)
     self.assertEqual(gt, "Coffee has both antioxidants and caffeine effects.")
@@ -220,7 +220,7 @@ class TestSSFODataGeneration(unittest.TestCase):
     self.assertNotIn(
         "Use the gauge located in the glove compartment.", prompt_no_ctx
     )
-    self.assertIn("How do I check tire pressure?", prompt_no_ctx)
+    self.assertEqual(prompt_no_ctx, "How do I check tire pressure?")
     self.assertEqual(gt, "Locate the gauge in the glove compartment to check.")
 
   def test_setup_model_resolves_lora(self):
@@ -248,9 +248,7 @@ class TestSSFODataGeneration(unittest.TestCase):
     prompt_ctx, prompt_no_ctx, gt = self.pipeline._extract_prompts(entry)
     self.assertIn("Context: Tectonic plates shift along faults.", prompt_ctx)
     self.assertIn("Question: What causes earthquakes?", prompt_ctx)
-    self.assertEqual(
-        prompt_no_ctx, "Question: What causes earthquakes?\nAnswer:\n"
-    )
+    self.assertEqual(prompt_no_ctx, "What causes earthquakes?")
     self.assertEqual(gt, "Tectonic plate movements cause earthquakes.")
 
   def test_ssfo_output_dataset_repo_id_formatting(self):

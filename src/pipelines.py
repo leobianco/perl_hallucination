@@ -1520,10 +1520,7 @@ class ScopeDataGenerationPipeline(Pipeline):
         prompt_with_context = str(entry)
         user_query = entry.get("user_query", "")
 
-      prompt_without_context = (
-          f"User query: {user_query}\nNeutral point-of-view answer to user"
-          " query, rewriting provided arguments in natural language:\n"
-      )
+      prompt_without_context = user_query
       return prompt_with_context, prompt_without_context, gt
 
     elif task_name == "bosch":
@@ -1552,12 +1549,7 @@ class ScopeDataGenerationPipeline(Pipeline):
             f" question:\n{question}\nManual information:\n{context}\nAnswer to"
             " user's question:\n"
         )
-      prompt_without_context = (
-          "You are a helpful assistant to car related questions. You will be"
-          " given an user's question. Your task is to answer the user's"
-          f" question.\nUser question:\n{question}\nAnswer to user's"
-          " question:\n"
-      )
+      prompt_without_context = question
       return prompt_with_context, prompt_without_context, gt
 
     elif task_name == "ragtruth":
@@ -1589,7 +1581,7 @@ class ScopeDataGenerationPipeline(Pipeline):
           )
         else:
           prompt_with_context = f"Question: {user_query}\nAnswer:\n"
-      prompt_without_context = f"Question: {user_query}\nAnswer:\n"
+      prompt_without_context = user_query
       return prompt_with_context, prompt_without_context, gt
 
     else:
@@ -1598,7 +1590,14 @@ class ScopeDataGenerationPipeline(Pipeline):
       else:
         prompt_with_context = str(entry)
       prompt_without_context = entry.get(
-          "prompt_no_context", entry.get("query", prompt_with_context)
+          "user_query",
+          entry.get(
+              "query",
+              entry.get(
+                  "question",
+                  entry.get("prompt_no_context", prompt_with_context),
+              ),
+          ),
       )
       return prompt_with_context, prompt_without_context, gt
 
@@ -1952,10 +1951,7 @@ class SSFODataGenerationPipeline(Pipeline):
         prompt_with_context = str(entry)
         user_query = entry.get("user_query", "")
 
-      prompt_without_context = (
-          f"User query: {user_query}\nNeutral point-of-view answer to user"
-          " query, rewriting provided arguments in natural language:\n"
-      )
+      prompt_without_context = user_query
       return prompt_with_context, prompt_without_context, gt
 
     elif task_name == "bosch":
@@ -1984,12 +1980,7 @@ class SSFODataGenerationPipeline(Pipeline):
             f" question:\n{question}\nManual information:\n{context}\nAnswer to"
             " user's question:\n"
         )
-      prompt_without_context = (
-          "You are a helpful assistant to car related questions. You will be"
-          " given an user's question. Your task is to answer the user's"
-          f" question.\nUser question:\n{question}\nAnswer to user's"
-          " question:\n"
-      )
+      prompt_without_context = question
       return prompt_with_context, prompt_without_context, gt
 
     elif task_name == "ragtruth":
@@ -2021,7 +2012,7 @@ class SSFODataGenerationPipeline(Pipeline):
           )
         else:
           prompt_with_context = f"Question: {user_query}\nAnswer:\n"
-      prompt_without_context = f"Question: {user_query}\nAnswer:\n"
+      prompt_without_context = user_query
       return prompt_with_context, prompt_without_context, gt
 
     else:
@@ -2030,7 +2021,14 @@ class SSFODataGenerationPipeline(Pipeline):
       else:
         prompt_with_context = str(entry)
       prompt_without_context = entry.get(
-          "prompt_no_context", entry.get("query", prompt_with_context)
+          "user_query",
+          entry.get(
+              "query",
+              entry.get(
+                  "question",
+                  entry.get("prompt_no_context", prompt_with_context),
+              ),
+          ),
       )
       return prompt_with_context, prompt_without_context, gt
 
