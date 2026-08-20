@@ -123,6 +123,16 @@ class _TestMockDataset:
   def shuffle(self, seed=None):
     return self
 
+  def train_test_split(self, test_size=0.1, seed=None):
+    n = len(self)
+    n_test = max(1, int(n * test_size)) if n > 1 else 0
+    train_indices = list(range(n - n_test))
+    test_indices = list(range(n - n_test, n)) if n_test > 0 else list(range(n))
+    return {
+        "train": self.select(train_indices),
+        "test": self.select(test_indices),
+    }
+
 
 class DatasetDict(dict):
 

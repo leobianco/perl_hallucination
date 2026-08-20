@@ -1850,30 +1850,18 @@ class ScopeDataGenerationPipeline(Pipeline):
     }
     train_dataset = Dataset.from_dict(pref_dict)
 
-    # Process test split if available
-    test_split = None
-    if (
-        isinstance(self.raw_dataset, (DatasetDict, dict))
-        and "test" in self.raw_dataset
-    ):
-      test_prompts, test_chosens, test_rejecteds = [], [], []
-      for entry in self.raw_dataset["test"]:
-        p_ctx, _, gt = self._extract_prompts(entry)
-        test_prompts.append(p_ctx)
-        test_chosens.append(gt)
-        test_rejecteds.append(gt)
-      test_split = Dataset.from_dict({
-          "prompt": test_prompts,
-          "chosen": test_chosens,
-          "rejected": test_rejecteds,
-      })
-
-    if test_split is not None:
+    # Split generated synthetic preference dataset into 90% train, 10% validation
+    if len(train_dataset) > 1:
+      splits = train_dataset.train_test_split(
+          test_size=0.1, seed=self.args.seed
+      )
       preference_dataset = DatasetDict(
-          {"train": train_dataset, "test": test_split}
+          {"train": splits["train"], "test": splits["test"]}
       )
     else:
-      preference_dataset = DatasetDict({"train": train_dataset})
+      preference_dataset = DatasetDict(
+          {"train": train_dataset, "test": train_dataset}
+      )
 
     if self.args.output_dataset_repo_id:
       out_repo = sanitize_hf_repo_id(self.args.output_dataset_repo_id)
@@ -2330,26 +2318,18 @@ class SSFODataGenerationPipeline(Pipeline):
       }
       train_dataset = Dataset.from_dict(pref_dict)
 
-    test_split = None
-    if isinstance(self.raw_dataset, dict) and "test" in self.raw_dataset:
-      test_prompts, test_chosens, test_rejecteds = [], [], []
-      for entry in self.raw_dataset["test"]:
-        p_ctx, _, gt = self._extract_prompts(entry)
-        test_prompts.append(p_ctx)
-        test_chosens.append(gt)
-        test_rejecteds.append(gt)
-      test_split = Dataset.from_dict({
-          "prompt": test_prompts,
-          "chosen": test_chosens,
-          "rejected": test_rejecteds,
-      })
-
-    if test_split is not None:
+    # Split generated synthetic preference dataset into 90% train, 10% validation
+    if len(train_dataset) > 1:
+      splits = train_dataset.train_test_split(
+          test_size=0.1, seed=self.args.seed
+      )
       preference_dataset = DatasetDict(
-          {"train": train_dataset, "test": test_split}
+          {"train": splits["train"], "test": splits["test"]}
       )
     else:
-      preference_dataset = DatasetDict({"train": train_dataset})
+      preference_dataset = DatasetDict(
+          {"train": train_dataset, "test": train_dataset}
+      )
 
     if self.args.output_dataset_repo_id:
       out_repo = sanitize_hf_repo_id(self.args.output_dataset_repo_id)
