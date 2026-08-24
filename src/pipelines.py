@@ -22,6 +22,7 @@ import glob
 import math
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -2512,65 +2513,152 @@ class EvaluationPipeline(Pipeline):
       return genai.Client()
 
   def gemini_score_response(
-      self, response: types.GenerateContentResponse
+      self,
+      response: types.GenerateContentResponse,
+      entry_idx: Optional[int] = None,
   ) -> float:
     """Converts a Gemini API response to a normalized score.
+
+    Extracts log probabilities from constrained enum decoding ('No' / 'Yes')
+    across candidate steps, calculating P(No) = exp(logp_no) / (exp(logp_no) + exp(logp_yes)).
+    Falls back to deterministic text classification if logprobs are unavailable,
+    logging explicit warnings whenever a fallback path is taken.
 
     Args:
         response (google.genai.types.GenerateContentResponse): Gemini API
           response.
+        entry_idx (Optional[int]): Sample index for descriptive logging.
 
     Returns:
         float: Normalized score in [0.0, 1.0] for the response (P(No
         hallucination)).
     """
-    if not response or not response.candidates:
+    prefix = (
+        f"[Autorater fallback - sample #{entry_idx}]"
+        if entry_idx is not None
+        else "[Autorater fallback]"
+    )
+
+    if not response or not getattr(response, "candidates", None):
+      print(
+          f"{prefix} Empty response or blocked by safety filters (candidates is empty), "
+          "falling back to neutral score 0.5."
+      )
       return 0.5
 
     candidate = response.candidates[0]
-    text = response.text.strip() if response.text else ""
-    clean_text = text.strip("\"'` \n\r\t")
+    text = (response.text or "").strip() if getattr(response, "text", None) else ""
+    clean_text = text.strip("\"'` \n\r\t").lower()
 
-    # 1. Check if token logprobs are available in candidate.logprobs_result
+    # 1. Search for 'no' and 'yes' logprobs across all candidate steps
     if (
         hasattr(candidate, "logprobs_result")
         and candidate.logprobs_result is not None
     ):
-      chosen = getattr(candidate.logprobs_result, "chosen_candidates", None)
-      if chosen and len(chosen) > 0:
-        top_cands = getattr(chosen[0], "top_candidates", None)
-        if top_cands:
-          logp_no = None
-          logp_yes = None
-          for cand in top_cands:
-            cand_token = (
-                getattr(cand, "token", "").strip().strip("\"'`").lower()
+      logprobs_res = candidate.logprobs_result
+      top_candidates_steps = (
+          getattr(logprobs_res, "top_candidates", None)
+          or getattr(logprobs_res, "chosen_candidates", None)
+          or []
+      )
+
+      for step in top_candidates_steps:
+        candidates = (
+            getattr(step, "candidates", None)
+            or getattr(step, "top_candidates", None)
+            or ([step] if hasattr(step, "token") else [])
+        )
+        logp_no = None
+        logp_yes = None
+        for cand in candidates:
+          cand_token = (
+              getattr(cand, "token", "").strip().strip("\"'`").lower()
+          )
+          logprob = getattr(cand, "log_prob", getattr(cand, "logprob", None))
+          if cand_token == "no":
+            logp_no = logprob
+          elif cand_token == "yes":
+            logp_yes = logprob
+
+        if logp_no is not None and logp_yes is not None:
+          p_no = float(np.exp(logp_no))
+          p_yes = float(np.exp(logp_yes))
+          denom = p_no + p_yes
+          if denom > 0:
+            return float(p_no / denom)
+        elif logp_no is not None:
+          print(
+              f"{prefix} Only 'No' token found in candidate step (logprob={logp_no:.4f}, 'Yes' probability negligible), "
+              "assigning 1.0."
+          )
+          return 1.0
+        elif logp_yes is not None:
+          print(
+              f"{prefix} Only 'Yes' token found in candidate step (logprob={logp_yes:.4f}, 'No' probability negligible), "
+              "assigning 0.0."
+          )
+          return 0.0
+
+      # Check chosen_candidates as fallback if top_candidates was not structured
+      chosen = getattr(logprobs_res, "chosen_candidates", None)
+      if chosen:
+        for cand in chosen:
+          cand_token = (
+              getattr(cand, "token", "").strip().strip("\"'`").lower()
+          )
+          if cand_token == "no":
+            print(
+                f"{prefix} Logprob alternatives missing, falling back to chosen token 'No' -> 1.0."
             )
-            if cand_token == "no":
-              logp_no = getattr(cand, "logprob", None)
-            elif cand_token == "yes":
-              logp_yes = getattr(cand, "logprob", None)
-          if logp_no is not None and logp_yes is not None:
-            p_no = float(np.exp(logp_no))
-            p_yes = float(np.exp(logp_yes))
-            denom = p_no + p_yes
-            if denom > 0:
-              return float(p_no / denom)
+            return 1.0
+          elif cand_token == "yes":
+            print(
+                f"{prefix} Logprob alternatives missing, falling back to chosen token 'Yes' -> 0.0."
+            )
+            return 0.0
 
     # 2. Check avg_logprobs if available
     if getattr(candidate, "avg_logprobs", None) is not None:
       avg_logprob = candidate.avg_logprobs
-      if clean_text.lower().startswith("no"):
-        return float(np.exp(avg_logprob))
-      elif clean_text.lower().startswith("yes"):
-        return float(1.0 - np.exp(avg_logprob))
+      if clean_text.startswith("no"):
+        score = float(np.exp(avg_logprob))
+        print(
+            f"{prefix} Step logprobs missing, falling back to avg_logprobs for text '{text}' -> {score:.4f}."
+        )
+        return score
+      elif clean_text.startswith("yes"):
+        score = float(1.0 - np.exp(avg_logprob))
+        print(
+            f"{prefix} Step logprobs missing, falling back to avg_logprobs for text '{text}' -> {score:.4f}."
+        )
+        return score
 
     # 3. Fallback based on text classification
-    if clean_text.lower().startswith("no"):
+    if clean_text.startswith("no") or clean_text == "no":
+      print(
+          f"{prefix} Logprobs unavailable, falling back to text classification for response '{text}' -> 1.0."
+      )
       return 1.0
-    elif clean_text.lower().startswith("yes"):
+    elif clean_text.startswith("yes") or clean_text == "yes":
+      print(
+          f"{prefix} Logprobs unavailable, falling back to text classification for response '{text}' -> 0.0."
+      )
       return 0.0
 
+    # Word-boundary search for "no" or "yes" in JSON or surrounding text
+    match = re.search(r"\b(yes|no)\b", clean_text, re.IGNORECASE)
+    if match:
+      found = match.group(1).lower()
+      score = 1.0 if found == "no" else 0.0
+      print(
+          f"{prefix} Logprobs unavailable, falling back to regex word match '{found}' for response '{text}' -> {score}."
+      )
+      return score
+
+    print(
+        f"{prefix} Unresolved response (response text: {repr(text[:80])}), "
+        "falling back to neutral score 0.5."
+    )
     return 0.5
 
   def gemini_score_dataset(
@@ -2589,9 +2677,15 @@ class EvaluationPipeline(Pipeline):
     Returns:
         torch.Tensor: Scores for each entry in the dataset.
     """
-    model = getattr(script_args, "evaluator_model", None) or "gemini-2.0-flash"
-    schema = {"type": "STRING", "enum": ["No", "Yes"]}
-    print(f"Calling the Gemini API with model {model}...")
+    model = getattr(script_args, "evaluator_model", None) or "gemini-2.5-flash"
+    try:
+      schema = types.Schema(
+          type=types.Type.STRING,
+          enum=["No", "Yes"],
+      )
+    except Exception:
+      schema = {"type": "STRING", "enum": ["No", "Yes"]}
+    print(f"Calling the Gemini API with model {model} (constrained decoding)...")
 
     # Prepare local checkpoint directory
     checkpoint_dir = os.path.join("checkpoints", "eval")
@@ -2648,34 +2742,57 @@ class EvaluationPipeline(Pipeline):
           with lock:
             current_use_logprobs = use_logprobs_flag[0]
 
+          config_kwargs = {
+              "response_mime_type": "application/json",
+              "response_schema": schema,
+              "temperature": 0,
+              "max_output_tokens": 10,
+              "seed": script_args.seed,
+          }
+
           if current_use_logprobs:
-            config_kwargs = {
-                "temperature": 0,
-                "max_output_tokens": 10,
-                "response_logprobs": True,
-                "logprobs": 5,
-                "seed": script_args.seed,
-            }
-          else:
-            config_kwargs = {
-                "response_mime_type": "text/x.enum",
-                "response_schema": schema,
-                "temperature": 0,
-                "max_output_tokens": 10,
-                "seed": script_args.seed,
-            }
+            config_kwargs["response_logprobs"] = True
+            config_kwargs["logprobs"] = 5
+
+          # Explicitly set zero thinking budget to ensure immediate classification token
+          try:
+            if hasattr(types, "ThinkingConfig"):
+              config_kwargs["thinking_config"] = types.ThinkingConfig(
+                  thinking_budget=0
+              )
+          except Exception:
+            pass
 
           response = client.models.generate_content(
               model=model,
               contents=prompt_content,
               config=types.GenerateContentConfig(**config_kwargs),
           )
-          score = self.gemini_score_response(response)
+          score = self.gemini_score_response(response, entry_idx=idx)
           return idx, score
 
         except Exception as e:
           error_str = str(e).lower()
+          if "thinking" in error_str and "thinking_config" in config_kwargs:
+            print(
+                f"[Autorater fallback - sample #{idx}] ThinkingConfig not supported by model/API ({error_str[:80]}), "
+                "retrying without thinking_config."
+            )
+            config_kwargs.pop("thinking_config", None)
+            continue
+          if "schema" in error_str and "response_schema" in config_kwargs:
+            print(
+                f"[Autorater fallback - sample #{idx}] Response schema not supported by model/API ({error_str[:80]}), "
+                "retrying with unconstrained decoding."
+            )
+            config_kwargs.pop("response_schema", None)
+            config_kwargs.pop("response_mime_type", None)
+            continue
           if "logprob" in error_str and current_use_logprobs:
+            print(
+                f"[Autorater fallback - sample #{idx}] Logprobs error ({error_str[:80]}), "
+                "retrying in text-only mode."
+            )
             with lock:
               use_logprobs_flag[0] = False
             continue
@@ -2742,6 +2859,18 @@ class EvaluationPipeline(Pipeline):
 
     # Convert scores to tensor, replacing any remaining None with 0
     scores_tensor = torch.tensor([s if s is not None else 0 for s in scores])
+
+    # Summary of score distribution
+    n_total = len(scores_tensor)
+    n_exact_half = int((scores_tensor == 0.5).sum().item())
+    n_ones = int((scores_tensor == 1.0).sum().item())
+    n_zeros = int((scores_tensor == 0.0).sum().item())
+    n_probabilistic = n_total - n_exact_half - n_ones - n_zeros
+    print(
+        f"[Autorater Scoring Complete] {n_total} samples scored: "
+        f"{n_probabilistic} continuous probabilities, {n_ones} No (1.0), "
+        f"{n_zeros} Yes (0.0), {n_exact_half} neutral fallbacks (0.5)."
+    )
     return scores_tensor
 
 

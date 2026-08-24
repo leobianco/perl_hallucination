@@ -20,6 +20,10 @@ from src.metrics import (
     compute_summary_statistics,
     tokenize_words,
 )
+try:
+  from src.pipelines import EvaluationScoringPipeline
+except ImportError:
+  EvaluationScoringPipeline = None
 from src.utils import (
     build_eval_dataset_repo_id,
     compact_model_name,
@@ -559,6 +563,78 @@ class TestEvalRepoNaming(unittest.TestCase):
     self.assertNotIn(".", repo_id)
     self.assertTrue(repo_id.startswith("leobianco/eval_"))
     self.assertTrue(repo_id.endswith("_gens_T0_7_wfs2"))
+
+
+class TestGeminiScoreResponse(unittest.TestCase):
+  """Unit tests for gemini_score_response in EvaluationPipeline."""
+
+  def setUp(self):
+    if EvaluationScoringPipeline is None:
+      self.skipTest("pipelines module not available in lightweight test env")
+    self.pipeline = EvaluationScoringPipeline()
+
+  def test_both_tokens_in_logprobs(self):
+    candidate = MagicMock()
+    candidate.logprobs_result.top_candidates = [
+        MagicMock(
+            candidates=[
+                MagicMock(token='"', log_prob=-0.01),
+            ]
+        ),
+        MagicMock(
+            candidates=[
+                MagicMock(token="No", log_prob=-0.2),
+                MagicMock(token="Yes", log_prob=-1.8),
+            ]
+        ),
+    ]
+    response = MagicMock(candidates=[candidate], text='"No"')
+    score = self.pipeline.gemini_score_response(response)
+    expected = math.exp(-0.2) / (math.exp(-0.2) + math.exp(-1.8))
+    self.assertAlmostEqual(score, expected, places=4)
+
+  def test_only_no_token_in_logprobs(self):
+    candidate = MagicMock()
+    candidate.logprobs_result.top_candidates = [
+        MagicMock(
+            candidates=[
+                MagicMock(token="No", log_prob=-0.001),
+            ]
+        ),
+    ]
+    response = MagicMock(candidates=[candidate], text='"No"')
+    score = self.pipeline.gemini_score_response(response)
+    self.assertEqual(score, 1.0)
+
+  def test_only_yes_token_in_logprobs(self):
+    candidate = MagicMock()
+    candidate.logprobs_result.top_candidates = [
+        MagicMock(
+            candidates=[
+                MagicMock(token="Yes", log_prob=-0.001),
+            ]
+        ),
+    ]
+    response = MagicMock(candidates=[candidate], text='"Yes"')
+    score = self.pipeline.gemini_score_response(response)
+    self.assertEqual(score, 0.0)
+
+  def test_text_fallback_no_quotes(self):
+    candidate = MagicMock(logprobs_result=None)
+    response = MagicMock(candidates=[candidate], text="No")
+    score = self.pipeline.gemini_score_response(response)
+    self.assertEqual(score, 1.0)
+
+  def test_text_fallback_json_string_yes(self):
+    candidate = MagicMock(logprobs_result=None)
+    response = MagicMock(candidates=[candidate], text='  "Yes"  ')
+    score = self.pipeline.gemini_score_response(response)
+    self.assertEqual(score, 0.0)
+
+  def test_empty_response_fallback(self):
+    response = MagicMock(candidates=[])
+    score = self.pipeline.gemini_score_response(response)
+    self.assertEqual(score, 0.5)
 
 
 if __name__ == "__main__":
