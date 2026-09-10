@@ -135,9 +135,19 @@ for _mod_name in [
     sys.modules[_mod_name] = MagicMock()
 
 try:
-  from src.pipelines import EvaluationScoringPipeline
+  from src.pipelines import (
+      EvaluationAutoraterPipeline,
+      EvaluationGenerationPipeline,
+      EvaluationScoringPipeline,
+      SSFODataGenerationPipeline,
+      _VLLM_AVAILABLE,
+  )
 except ImportError:
+  EvaluationAutoraterPipeline = None
+  EvaluationGenerationPipeline = None
   EvaluationScoringPipeline = None
+  SSFODataGenerationPipeline = None
+  _VLLM_AVAILABLE = False
 
 from src.utils import (
     build_eval_dataset_repo_id,
@@ -934,6 +944,50 @@ class TestGeminiScoreDataset(unittest.TestCase):
     self.assertEqual(len(called_prompts), 1)
     self.assertIn("Prompt 1", called_prompts[0])
     self.assertEqual(scores, [0.95, 1.0, 0.05])
+
+
+class TestCpuCompatibility(unittest.TestCase):
+  """Unit tests for CPU-only execution without vLLM."""
+
+  def test_scoring_pipeline_available_without_vllm(self):
+    """Scoring pipeline works regardless of vLLM availability."""
+    pipe = EvaluationScoringPipeline()
+    self.assertIsNotNone(pipe)
+
+  def test_autorater_pipeline_available_without_vllm(self):
+    """Autorater evaluation pipeline works regardless of vLLM availability."""
+    pipe = EvaluationAutoraterPipeline()
+    self.assertIsNotNone(pipe)
+
+  def test_generation_pipeline_raises_without_vllm(self):
+    """Generation pipeline raises informative ImportError if vLLM is missing."""
+    pipe = EvaluationGenerationPipeline()
+    pipe.prompts = ["Test prompt"]
+    pipe.enable_lora = False
+    pipe.lora_path = None
+    pipe.vllm_model = "test-model"
+    with patch("src.pipelines._VLLM_AVAILABLE", False):
+      with self.assertRaises(ImportError) as ctx:
+        pipe.run_and_save()
+      self.assertIn("vLLM is required", str(ctx.exception))
+
+  def test_ssfo_pipeline_raises_without_vllm(self):
+    """SSFO pipeline raises informative ImportError if vLLM is missing."""
+    pipe = SSFODataGenerationPipeline()
+    pipe.train_split = [{"prompt": "p", "chosen": "c", "rejected": "r"}]
+    pipe.args = MagicMock(
+        top_k=0,
+        repetition_penalty=1.0,
+        seed=42,
+        temperature=0.7,
+        top_p=0.9,
+        min_tokens=10,
+        max_new_tokens=100,
+    )
+    with patch("src.pipelines._VLLM_AVAILABLE", False):
+      with self.assertRaises(ImportError) as ctx:
+        pipe.run_and_save()
+      self.assertIn("vLLM is required", str(ctx.exception))
 
 
 if __name__ == "__main__":

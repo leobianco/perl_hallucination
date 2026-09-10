@@ -1,0 +1,17 @@
+absl-py
+accelerate
+datasets
+evaluate
+google-auth
+google-genai
+peft
+torch
+transformers
+trl
+wandb
+huggingface-hub
+ipython
+matplotlib
+nltk
+scikit-learn
+rouge-score

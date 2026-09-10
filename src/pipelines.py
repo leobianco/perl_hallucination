@@ -107,8 +107,16 @@ from trl import (
     SFTConfig,
     SFTTrainer,
 )
-from vllm import LLM, SamplingParams
-from vllm.lora.request import LoRARequest
+
+try:
+  from vllm import LLM, SamplingParams
+  from vllm.lora.request import LoRARequest
+  _VLLM_AVAILABLE = True
+except ImportError:
+  LLM = None
+  SamplingParams = None
+  LoRARequest = None
+  _VLLM_AVAILABLE = False
 
 try:
   import wandb
@@ -2181,6 +2189,11 @@ class SSFODataGenerationPipeline(Pipeline):
       print(f"[SSFO Inspection Log] Could not save log file: {e}")
 
   def run_and_save(self) -> None:
+    if not _VLLM_AVAILABLE:
+      raise ImportError(
+          "vLLM is required for SSFO data generation, but is not installed."
+          " Please run in an environment with vLLM installed."
+      )
     entries = list(self.train_split)
     all_prompt_ctx = []
     all_prompt_no_ctx = []
@@ -3242,6 +3255,12 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
     self.vllm_model = self.args.writer_model_base
 
   def run_and_save(self) -> None:
+    if not _VLLM_AVAILABLE:
+      raise ImportError(
+          "vLLM is required for local completion generation, but is not"
+          " installed. Please run generation on a GPU environment with"
+          " vLLM installed."
+      )
     # Prepare sampling parameters for vLLM
     top_k = self.args.top_k if self.args.top_k > 0 else -1
     sampling_params = SamplingParams(
