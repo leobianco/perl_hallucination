@@ -19,6 +19,7 @@ from __future__ import annotations
 import abc
 import concurrent.futures
 import glob
+import json
 import math
 import os
 import random
@@ -2554,8 +2555,8 @@ class EvaluationPipeline(Pipeline):
 
     if not response or not getattr(response, "candidates", None):
       print(
-          f"{prefix} Empty response or blocked by safety filters (candidates is empty), "
-          "no score assigned."
+          f"{prefix} Empty response or blocked by safety filters"
+          " (candidates is empty), no score assigned."
       )
       return None
 
@@ -2600,16 +2601,8 @@ class EvaluationPipeline(Pipeline):
           if denom > 0:
             return float(p_no / denom)
         elif logp_no is not None:
-          print(
-              f"{prefix} Only 'No' token found in candidate step (logprob={logp_no:.4f}, 'Yes' probability negligible), "
-              "assigning 1.0."
-          )
           return 1.0
         elif logp_yes is not None:
-          print(
-              f"{prefix} Only 'Yes' token found in candidate step (logprob={logp_yes:.4f}, 'No' probability negligible), "
-              "assigning 0.0."
-          )
           return 0.0
 
       # Check chosen_candidates as fallback if top_candidates was not structured
@@ -2620,53 +2613,40 @@ class EvaluationPipeline(Pipeline):
               getattr(cand, "token", "").strip().strip("\"'`").lower()
           )
           if cand_token == "no":
-            print(
-                f"{prefix} Logprob alternatives missing, falling back to chosen token 'No' -> 1.0."
-            )
             return 1.0
           elif cand_token == "yes":
-            print(
-                f"{prefix} Logprob alternatives missing, falling back to chosen token 'Yes' -> 0.0."
-            )
             return 0.0
 
     # 2. Check avg_logprobs if available
     avg_logprob = getattr(candidate, "avg_logprobs", None)
     if isinstance(avg_logprob, (int, float)):
       if clean_text.startswith("no"):
-        score = float(math.exp(avg_logprob))
-        print(
-            f"{prefix} Step logprobs missing, falling back to avg_logprobs for text '{text}' -> {score:.4f}."
-        )
-        return score
+        return float(math.exp(avg_logprob))
       elif clean_text.startswith("yes"):
-        score = float(1.0 - math.exp(avg_logprob))
-        print(
-            f"{prefix} Step logprobs missing, falling back to avg_logprobs for text '{text}' -> {score:.4f}."
-        )
-        return score
+        return float(1.0 - math.exp(avg_logprob))
 
-    # 3. Fallback based on text classification
+    # 3. Fallback based on structured JSON and text classification
+    try:
+      parsed = json.loads(text)
+      if isinstance(parsed, dict) and "answer" in parsed:
+        ans = str(parsed["answer"]).strip().lower()
+        if ans == "no":
+          return 1.0
+        elif ans == "yes":
+          return 0.0
+    except Exception:
+      pass
+
     if clean_text.startswith("no") or clean_text == "no":
-      print(
-          f"{prefix} Logprobs unavailable, falling back to text classification for response '{text}' -> 1.0."
-      )
       return 1.0
     elif clean_text.startswith("yes") or clean_text == "yes":
-      print(
-          f"{prefix} Logprobs unavailable, falling back to text classification for response '{text}' -> 0.0."
-      )
       return 0.0
 
     # Word-boundary search for "no" or "yes" in JSON or surrounding text
     match = re.search(r"\b(yes|no)\b", clean_text, re.IGNORECASE)
     if match:
       found = match.group(1).lower()
-      score = 1.0 if found == "no" else 0.0
-      print(
-          f"{prefix} Logprobs unavailable, falling back to regex word match '{found}' for response '{text}' -> {score}."
-      )
-      return score
+      return 1.0 if found == "no" else 0.0
 
     print(
         f"{prefix} Unresolved response (response text: {repr(text[:80])}), "
@@ -2794,8 +2774,12 @@ class EvaluationPipeline(Pipeline):
                 "response_mime_type": "application/json",
                 "response_schema": schema,
                 "temperature": 0,
-                "max_output_tokens": 10,
+                "max_output_tokens": 64,
                 "seed": script_args.seed,
+                "system_instruction": (
+                    "You are an evaluator. Output strictly 'Yes' or 'No' with"
+                    " no conversational preamble or markdown."
+                ),
             }
 
             if current_use_logprobs:
@@ -2829,6 +2813,17 @@ class EvaluationPipeline(Pipeline):
                   " retrying without thinking_config."
               )
               config_kwargs.pop("thinking_config", None)
+              continue
+            if (
+                "system_instruction" in error_str
+                and "system_instruction" in config_kwargs
+            ):
+              print(
+                  f"[Autorater fallback - sample #{idx}] System instruction not"
+                  f" supported by model/API ({error_str[:80]}), retrying"
+                  " without system_instruction."
+              )
+              config_kwargs.pop("system_instruction", None)
               continue
             if "schema" in error_str and "response_schema" in config_kwargs:
               print(

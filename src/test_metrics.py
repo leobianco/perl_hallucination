@@ -745,6 +745,34 @@ class TestGeminiScoreResponse(unittest.TestCase):
     score = self.pipeline.gemini_score_response(response)
     self.assertIsNone(score)
 
+  def test_chosen_candidates_fallback(self):
+    candidate = MagicMock()
+    candidate.logprobs_result.top_candidates = []
+    candidate.logprobs_result.chosen_candidates = [
+        MagicMock(token="No", log_prob=-0.0001)
+    ]
+    response = MagicMock(candidates=[candidate], text='"No"')
+    score = self.pipeline.gemini_score_response(response)
+    self.assertEqual(score, 1.0)
+
+  def test_structured_json_with_preamble(self):
+    candidate = MagicMock(logprobs_result=None)
+    response = MagicMock(
+        candidates=[candidate],
+        text='Here is the JSON requested:\n```json\n{"answer": "No"}\n```',
+    )
+    score = self.pipeline.gemini_score_response(response)
+    self.assertEqual(score, 1.0)
+
+  def test_truncated_preamble_returns_none(self):
+    candidate = MagicMock(logprobs_result=None)
+    response = MagicMock(
+        candidates=[candidate],
+        text="Here is the JSON requested:\n```json",
+    )
+    score = self.pipeline.gemini_score_response(response)
+    self.assertIsNone(score)
+
 
 class TestGeminiScoreDataset(unittest.TestCase):
   """Unit tests for gemini_score_dataset error handling and resumption."""
@@ -944,6 +972,41 @@ class TestGeminiScoreDataset(unittest.TestCase):
     self.assertEqual(len(called_prompts), 1)
     self.assertIn("Prompt 1", called_prompts[0])
     self.assertEqual(scores, [0.95, 1.0, 0.05])
+
+  def test_dataset_scoring_token_budget_and_system_instruction(self):
+    """Test that Gemini API config includes 64 tokens and system instruction."""
+    dataset = MockDataset({"evaluator_prompt": ["Evaluate faithfulness."]})
+    script_args = MagicMock(
+        evaluator_model="gemini-2.5-flash",
+        scores_checkpoint_path=None,
+        overwrite_scores=False,
+        max_workers=1,
+        seed=42,
+    )
+    captured_calls = []
+
+    def mock_generate(model, contents, config):
+      captured_calls.append(config)
+      cand = MagicMock()
+      cand.logprobs_result.top_candidates = [
+          MagicMock(candidates=[MagicMock(token="No", log_prob=-0.01)])
+      ]
+      return MagicMock(candidates=[cand], text='"No"')
+
+    client = MagicMock()
+    client.models.generate_content.side_effect = mock_generate
+
+    scores = self.pipeline.gemini_score_dataset(client, dataset, script_args)
+    self.assertEqual(len(captured_calls), 1)
+    self.assertEqual(scores, [1.0])
+
+    from google.genai import types as genai_types
+
+    call_kwargs = genai_types.GenerateContentConfig.call_args.kwargs
+    self.assertGreaterEqual(call_kwargs.get("max_output_tokens", 0), 64)
+    self.assertIn("system_instruction", call_kwargs)
+    self.assertIn("Yes", call_kwargs["system_instruction"])
+    self.assertIn("No", call_kwargs["system_instruction"])
 
 
 class TestCpuCompatibility(unittest.TestCase):
