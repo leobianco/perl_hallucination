@@ -2530,8 +2530,8 @@ class EvaluationPipeline(Pipeline):
         entry_idx (Optional[int]): Sample index for descriptive logging.
 
     Returns:
-        float: Normalized score in [0.0, 1.0] for the response (P(No
-        hallucination)).
+        Optional[float]: Normalized score in [0.0, 1.0] for the response (P(No
+        hallucination)), or None if scoring failed/unresolved.
     """
     prefix = (
         f"[Autorater fallback - sample #{entry_idx}]"
@@ -2542,9 +2542,9 @@ class EvaluationPipeline(Pipeline):
     if not response or not getattr(response, "candidates", None):
       print(
           f"{prefix} Empty response or blocked by safety filters (candidates is empty), "
-          "falling back to neutral score 0.5."
+          "no score assigned."
       )
-      return 0.5
+      return None
 
     candidate = response.candidates[0]
     text = (response.text or "").strip() if getattr(response, "text", None) else ""
@@ -2581,8 +2581,8 @@ class EvaluationPipeline(Pipeline):
             logp_yes = logprob
 
         if logp_no is not None and logp_yes is not None:
-          p_no = float(np.exp(logp_no))
-          p_yes = float(np.exp(logp_yes))
+          p_no = float(math.exp(logp_no))
+          p_yes = float(math.exp(logp_yes))
           denom = p_no + p_yes
           if denom > 0:
             return float(p_no / denom)
@@ -2618,16 +2618,16 @@ class EvaluationPipeline(Pipeline):
             return 0.0
 
     # 2. Check avg_logprobs if available
-    if getattr(candidate, "avg_logprobs", None) is not None:
-      avg_logprob = candidate.avg_logprobs
+    avg_logprob = getattr(candidate, "avg_logprobs", None)
+    if isinstance(avg_logprob, (int, float)):
       if clean_text.startswith("no"):
-        score = float(np.exp(avg_logprob))
+        score = float(math.exp(avg_logprob))
         print(
             f"{prefix} Step logprobs missing, falling back to avg_logprobs for text '{text}' -> {score:.4f}."
         )
         return score
       elif clean_text.startswith("yes"):
-        score = float(1.0 - np.exp(avg_logprob))
+        score = float(1.0 - math.exp(avg_logprob))
         print(
             f"{prefix} Step logprobs missing, falling back to avg_logprobs for text '{text}' -> {score:.4f}."
         )
@@ -2657,16 +2657,16 @@ class EvaluationPipeline(Pipeline):
 
     print(
         f"{prefix} Unresolved response (response text: {repr(text[:80])}), "
-        "falling back to neutral score 0.5."
+        "no score assigned."
     )
-    return 0.5
+    return None
 
   def gemini_score_dataset(
       self,
       client: genai.Client,
       dataset: Dataset,
       script_args: ScriptArguments,
-  ) -> torch.Tensor:
+  ) -> list[Optional[float]]:
     """Scores a dataset using the Gemini API, with checkpointing and retries.
 
     Args:
@@ -2675,7 +2675,8 @@ class EvaluationPipeline(Pipeline):
         script_args (ScriptArguments): Parsed script arguments.
 
     Returns:
-        torch.Tensor: Scores for each entry in the dataset.
+        list[Optional[float]]: Scores for each entry in the dataset. Unscored
+          entries are None.
     """
     model = getattr(script_args, "evaluator_model", None) or "gemini-2.5-flash"
     try:
@@ -2687,191 +2688,276 @@ class EvaluationPipeline(Pipeline):
       schema = {"type": "STRING", "enum": ["No", "Yes"]}
     print(f"Calling the Gemini API with model {model} (constrained decoding)...")
 
-    # Prepare local checkpoint directory
-    checkpoint_dir = os.path.join("checkpoints", "eval")
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    if (
-        hasattr(script_args, "dataset_with_completions")
-        and script_args.dataset_with_completions
-    ):
-      dataset_name = script_args.dataset_with_completions.split("/")[-1]
-    elif hasattr(script_args, "dataset_labels") and script_args.dataset_labels:
-      dataset_name = script_args.dataset_labels.split("/")[-1]
-    else:
-      dataset_name = "eval"
-
-    checkpoint_path = os.path.join(
-        checkpoint_dir,
-        f"{dataset_name}_scores_checkpoint.pt",
-    )
+    # Checkpoint path is purely optional: only active if explicitly configured
+    checkpoint_path = getattr(script_args, "scores_checkpoint_path", None)
+    if checkpoint_path:
+      checkpoint_dir = os.path.dirname(checkpoint_path)
+      if checkpoint_dir:
+        os.makedirs(checkpoint_dir, exist_ok=True)
 
     # Initialize scores: load from checkpoint if exists, else from dataset or None
-    if os.path.exists(checkpoint_path):
-      print(f"Loading scores from checkpoint: {checkpoint_path}")
-      scores = torch.load(checkpoint_path)
+    overwrite = getattr(script_args, "overwrite_scores", False)
+    if not overwrite and checkpoint_path and os.path.exists(checkpoint_path):
+      print(f"Loading scores from local checkpoint: {checkpoint_path}")
+      loaded_scores = torch.load(checkpoint_path)
+      if hasattr(loaded_scores, "tolist"):
+        loaded_scores = loaded_scores.tolist()
+      scores = list(loaded_scores)
       # If checkpoint is shorter than dataset (e.g. dataset updated), pad with None
       if len(scores) < len(dataset):
         scores = list(scores) + [None] * (len(dataset) - len(scores))
       elif len(scores) > len(dataset):
         scores = list(scores)[: len(dataset)]
-    elif "scores" in dataset.column_names:
-      scores = list(dataset["scores"])
+    elif not overwrite and "scores" in dataset.column_names:
+      print(
+          "Found existing 'scores' column in dataset. Resuming from existing"
+          " scores on Hugging Face Hub..."
+      )
+      raw_scores = list(dataset["scores"])
+      if len(raw_scores) < len(dataset):
+        raw_scores = list(raw_scores) + [None] * (len(dataset) - len(raw_scores))
+      elif len(raw_scores) > len(dataset):
+        raw_scores = list(raw_scores)[: len(dataset)]
+      scores = raw_scores
     else:
       scores = [None] * len(dataset)
+
+    # Normalize existing scores: ensure missing, nan, or non-numeric entries are strictly None
+    for i in range(len(scores)):
+      val = scores[i]
+      if val is None:
+        continue
+      if isinstance(val, str) and val.strip().lower() in (
+          "",
+          "none",
+          "nan",
+          "null",
+      ):
+        scores[i] = None
+      else:
+        try:
+          f_val = float(val)
+          if math.isnan(f_val):
+            scores[i] = None
+          else:
+            scores[i] = f_val
+        except (ValueError, TypeError):
+          scores[i] = None
 
     max_workers = getattr(script_args, "max_workers", 16) or 16
     save_frequency = 50  # Save progress every 50 entries
     server_retry_wait = 5  # Base seconds to wait between server error retries
     server_max_retries = 4  # Number of times to retry on server error
     entries_to_score = [i for i, score in enumerate(scores) if score is None]
-    print(
-        f"Found {len(entries_to_score)} entries to score. Scoring concurrently"
-        f" with {max_workers} worker threads..."
-    )
+    already_scored = len(scores) - len(entries_to_score)
+    if already_scored > 0:
+      print(
+          f"Reusing {already_scored} already scored entries. "
+          f"{len(entries_to_score)} missing entries remaining to score."
+      )
+    else:
+      print(f"Found {len(entries_to_score)} entries to score.")
 
-    lock = threading.Lock()
-    use_logprobs_flag = [True]
-    completed_count = 0
-
-    def score_single_entry(idx: int) -> tuple[int, float]:
-      prompt_content = dataset[idx]["evaluator_prompt"]
-      retry_count = 0
-      while retry_count < server_max_retries:
-        current_use_logprobs = True
-        try:
-          with lock:
-            current_use_logprobs = use_logprobs_flag[0]
-
-          config_kwargs = {
-              "response_mime_type": "application/json",
-              "response_schema": schema,
-              "temperature": 0,
-              "max_output_tokens": 10,
-              "seed": script_args.seed,
-          }
-
-          if current_use_logprobs:
-            config_kwargs["response_logprobs"] = True
-            config_kwargs["logprobs"] = 5
-
-          # Explicitly set zero thinking budget to ensure immediate classification token
-          try:
-            if hasattr(types, "ThinkingConfig"):
-              config_kwargs["thinking_config"] = types.ThinkingConfig(
-                  thinking_budget=0
-              )
-          except Exception:
-            pass
-
-          response = client.models.generate_content(
-              model=model,
-              contents=prompt_content,
-              config=types.GenerateContentConfig(**config_kwargs),
-          )
-          score = self.gemini_score_response(response, entry_idx=idx)
-          return idx, score
-
-        except Exception as e:
-          error_str = str(e).lower()
-          if "thinking" in error_str and "thinking_config" in config_kwargs:
-            print(
-                f"[Autorater fallback - sample #{idx}] ThinkingConfig not supported by model/API ({error_str[:80]}), "
-                "retrying without thinking_config."
-            )
-            config_kwargs.pop("thinking_config", None)
-            continue
-          if "schema" in error_str and "response_schema" in config_kwargs:
-            print(
-                f"[Autorater fallback - sample #{idx}] Response schema not supported by model/API ({error_str[:80]}), "
-                "retrying with unconstrained decoding."
-            )
-            config_kwargs.pop("response_schema", None)
-            config_kwargs.pop("response_mime_type", None)
-            continue
-          if "logprob" in error_str and current_use_logprobs:
-            print(
-                f"[Autorater fallback - sample #{idx}] Logprobs error ({error_str[:80]}), "
-                "retrying in text-only mode."
-            )
-            with lock:
-              use_logprobs_flag[0] = False
-            continue
-          if (
-              "unavailable" in error_str
-              or "overloaded" in error_str
-              or "overcharged" in error_str
-              or "server" in error_str
-              or "resource_exhausted" in error_str
-              or "429" in error_str
-              or "503" in error_str
-          ) and retry_count < server_max_retries - 1:
-            backoff = server_retry_wait * (1.5**retry_count) + random.uniform(
-                0.5, 2.0
-            )
-            time.sleep(backoff)
-            retry_count += 1
-            continue
-          else:
-            raise e
-
-      raise RuntimeError(
-          f"Failed to score entry {idx} after {server_max_retries} attempts."
+    if entries_to_score:
+      print(
+          f"Scoring {len(entries_to_score)} entries concurrently with"
+          f" {max_workers} worker threads..."
       )
 
-    try:
-      with concurrent.futures.ThreadPoolExecutor(
-          max_workers=max_workers
-      ) as executor:
-        future_to_idx = {
-            executor.submit(score_single_entry, idx): idx
-            for idx in entries_to_score
-        }
-        for future in tqdm(
-            concurrent.futures.as_completed(future_to_idx),
-            total=len(entries_to_score),
-            desc="Scoring with Gemini API (parallel)",
-        ):
-          idx, score = future.result()
-          with lock:
-            scores[idx] = score
-            completed_count += 1
-            if completed_count % save_frequency == 0:
-              try:
-                torch.save(scores, checkpoint_path)
-              except Exception as save_err:
-                print(
-                    "Warning: Could not save intermediate progress locally:"
-                    f" {save_err}"
+      lock = threading.Lock()
+      use_logprobs_flag = [True]
+      completed_count = 0
+
+      def score_single_entry(idx: int) -> tuple[int, Optional[float]]:
+        prompt_content = dataset[idx]["evaluator_prompt"]
+        retry_count = 0
+        while retry_count < server_max_retries:
+          current_use_logprobs = True
+          try:
+            with lock:
+              current_use_logprobs = use_logprobs_flag[0]
+
+            config_kwargs = {
+                "response_mime_type": "application/json",
+                "response_schema": schema,
+                "temperature": 0,
+                "max_output_tokens": 10,
+                "seed": script_args.seed,
+            }
+
+            if current_use_logprobs:
+              config_kwargs["response_logprobs"] = True
+              config_kwargs["logprobs"] = 5
+
+            # Explicitly set zero thinking budget to ensure immediate
+            # classification token
+            try:
+              if hasattr(types, "ThinkingConfig"):
+                config_kwargs["thinking_config"] = types.ThinkingConfig(
+                    thinking_budget=0
                 )
+            except Exception:
+              pass
 
-    except Exception as e:
-      print(f"\nError encountered during parallel scoring: {str(e)}")
-      print("Saving current progress locally...")
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt_content,
+                config=types.GenerateContentConfig(**config_kwargs),
+            )
+            score = self.gemini_score_response(response, entry_idx=idx)
+            return idx, score
+
+          except Exception as e:
+            error_str = str(e).lower()
+            if "thinking" in error_str and "thinking_config" in config_kwargs:
+              print(
+                  f"[Autorater fallback - sample #{idx}] ThinkingConfig not"
+                  f" supported by model/API ({error_str[:60]}),"
+                  " retrying without thinking_config."
+              )
+              config_kwargs.pop("thinking_config", None)
+              continue
+            if "schema" in error_str and "response_schema" in config_kwargs:
+              print(
+                  f"[Autorater fallback - sample #{idx}] Response schema not"
+                  f" supported by model/API ({error_str[:80]}), retrying with"
+                  " unconstrained decoding."
+              )
+              config_kwargs.pop("response_schema", None)
+              config_kwargs.pop("response_mime_type", None)
+              continue
+            if "logprob" in error_str and current_use_logprobs:
+              print(
+                  f"[Autorater fallback - sample #{idx}] Logprobs error"
+                  f" ({error_str[:80]}), retrying in text-only mode."
+              )
+              with lock:
+                use_logprobs_flag[0] = False
+              continue
+            if (
+                "unavailable" in error_str
+                or "overloaded" in error_str
+                or "overcharged" in error_str
+                or "server" in error_str
+                or "resource_exhausted" in error_str
+                or "429" in error_str
+                or "503" in error_str
+            ) and retry_count < server_max_retries - 1:
+              backoff = server_retry_wait * (1.5**retry_count) + random.uniform(
+                  0.5, 2.0
+              )
+              time.sleep(backoff)
+              retry_count += 1
+              continue
+            else:
+              print(
+                  f"[Autorater failure - sample #{idx}] Gemini API failed with"
+                  f" error: {error_str[:120]}. No score assigned."
+              )
+              return idx, None
+
+        print(
+            f"[Autorater failure - sample #{idx}] Failed to score entry after"
+            f" {server_max_retries} attempts. No score assigned."
+        )
+        return idx, None
+
       try:
-        torch.save(scores, checkpoint_path)
-      except Exception as save_error:
-        print(f"Error saving progress locally: {save_error}")
-      raise e
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers
+        ) as executor:
+          future_to_idx = {
+              executor.submit(score_single_entry, idx): idx
+              for idx in entries_to_score
+          }
+          for future in tqdm(
+              concurrent.futures.as_completed(future_to_idx),
+              total=len(entries_to_score),
+              desc="Scoring with Gemini API (parallel)",
+          ):
+            try:
+              idx, score = future.result()
+            except Exception as thread_err:
+              idx = future_to_idx[future]
+              score = None
+              print(
+                  f"[Autorater failure - sample #{idx}] Thread execution error:"
+                  f" {thread_err}. No score assigned."
+              )
+            with lock:
+              scores[idx] = score
+              completed_count += 1
+              if checkpoint_path and completed_count % save_frequency == 0:
+                try:
+                  torch.save(scores, checkpoint_path)
+                except Exception as save_err:
+                  print(
+                      "Warning: Could not save intermediate progress locally:"
+                      f" {save_err}"
+                  )
 
-    # Clean up local checkpoint after scoring is complete
-    if os.path.exists(checkpoint_path):
-      os.remove(checkpoint_path)
-
-    # Convert scores to tensor, replacing any remaining None with 0
-    scores_tensor = torch.tensor([s if s is not None else 0 for s in scores])
+      except Exception as e:
+        print(f"\nError encountered during parallel scoring: {str(e)}")
+        if checkpoint_path:
+          print("Saving current progress locally...")
+          try:
+            torch.save(scores, checkpoint_path)
+          except Exception as save_error:
+            print(f"Error saving progress locally: {save_error}")
+        raise e
 
     # Summary of score distribution
-    n_total = len(scores_tensor)
-    n_exact_half = int((scores_tensor == 0.5).sum().item())
-    n_ones = int((scores_tensor == 1.0).sum().item())
-    n_zeros = int((scores_tensor == 0.0).sum().item())
-    n_probabilistic = n_total - n_exact_half - n_ones - n_zeros
+    n_total = len(scores)
+    unscored_count = sum(1 for s in scores if s is None)
+    scored_count = n_total - unscored_count
+
+    scored_vals = [s for s in scores if s is not None]
+    n_ones = sum(1 for s in scored_vals if s == 1.0)
+    n_zeros = sum(1 for s in scored_vals if s == 0.0)
+    n_probabilistic = scored_count - n_ones - n_zeros
+
+    if unscored_count > 0:
+      border = "=" * 70
+      hf_repo = getattr(
+          script_args, "dataset_with_completions", None
+      ) or getattr(script_args, "dataset_labels", None)
+      print(
+          f"\n{border}\n"
+          f"[WARNING] {unscored_count} out of {n_total} entries could not be"
+          " scored by the autorater.\n"
+          "These entries have NO score set (kept empty/None)."
+      )
+      if hf_repo:
+        print(
+            f"All progress is preserved directly on Hugging Face Hub:"
+            f" {hf_repo}\n"
+            "You can relaunch the evaluator on any VM to retry scoring only"
+            " the missing entries\n"
+            "without re-scoring already scored samples."
+        )
+      if checkpoint_path:
+        print(f"Local checkpoint saved to: {checkpoint_path}")
+        try:
+          torch.save(scores, checkpoint_path)
+        except Exception as save_err:
+          print(f"Warning: Could not save scores checkpoint locally: {save_err}")
+      print(f"{border}\n")
+    else:
+      print("\n[Autorater Scoring] All entries successfully scored!")
+      # Clean up local checkpoint after scoring is complete
+      if checkpoint_path and os.path.exists(checkpoint_path):
+        try:
+          os.remove(checkpoint_path)
+        except Exception:
+          pass
+
     print(
-        f"[Autorater Scoring Complete] {n_total} samples scored: "
-        f"{n_probabilistic} continuous probabilities, {n_ones} No (1.0), "
-        f"{n_zeros} Yes (0.0), {n_exact_half} neutral fallbacks (0.5)."
+        f"[Autorater Scoring Complete] {scored_count}/{n_total} samples"
+        f" scored: {n_probabilistic} continuous probabilities, {n_ones} No"
+        f" (1.0), {n_zeros} Yes (0.0). ({unscored_count} entries"
+        " unscored/empty)."
     )
-    return scores_tensor
+    return scores
 
 
 class EvaluationAutoraterPipeline(EvaluationPipeline):
@@ -2938,7 +3024,8 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
       client = self.create_gemini_client()
       scores = self.gemini_score_dataset(client, self.data, self.args)
     else:
-      # Tokenize in batches and compute scores using tokenizer token ids for Yes/No
+      # Tokenize in batches and compute scores using tokenizer token ids
+      # for Yes/No
       yes_token_id = self.tokenizer.convert_tokens_to_ids("Yes")
       no_token_id = self.tokenizer.convert_tokens_to_ids("No")
       scores = self.evaluator_score(
@@ -2987,24 +3074,62 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
     print(f"Ground truth labels saved to {filepath}")
 
     # Save scores
+    scores_list = (
+        scores.tolist() if isinstance(scores, torch.Tensor) else list(scores)
+    )
+    scores_list = [
+        float(s)
+        if s is not None and not (isinstance(s, float) and math.isnan(s))
+        else None
+        for s in scores_list
+    ]
+
     filepath = f"logs/{name_for_saving}/eval_autorater_scores.txt"
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     with open(filepath, "w") as f:
-      for score in scores:
-        f.write(f"{score.item():.5f}\n")
+      for score in scores_list:
+        if score is None:
+          f.write("None\n")
+        else:
+          f.write(f"{score:.5f}\n")
     print(f"Scores saved to {filepath}")
 
-    auc = roc_auc_score(ground_truth, scores.numpy())
-    metrics = compute_best_roc_threshold(ground_truth, scores.numpy())
+    valid_indices = [i for i, s in enumerate(scores_list) if s is not None]
+    unscored_count = len(scores_list) - len(valid_indices)
+    if unscored_count > 0:
+      print(
+          f"\n[WARNING] {unscored_count} out of {len(scores_list)} samples"
+          " could not be scored. Excluding unscored samples from ROC-AUC and"
+          " threshold metrics."
+      )
+
+    if not valid_indices:
+      print(
+          "\n[WARNING] No samples were successfully scored. Skipping ROC-AUC"
+          " metric calculation."
+      )
+      return
+
+    clean_gt = [ground_truth[i] for i in valid_indices]
+    clean_scores = np.array(
+        [scores_list[i] for i in valid_indices], dtype=np.float64
+    )
+
+    auc = roc_auc_score(clean_gt, clean_scores)
+    metrics = compute_best_roc_threshold(clean_gt, clean_scores)
     threshold = metrics["best_threshold"]
     tpr = metrics["tpr_at_best_threshold"]
     fpr = metrics["fpr_at_best_threshold"]
     accuracy = metrics["accuracy_at_best_threshold"]
-    classif_at_threshold = [0 if score < threshold else 1 for score in scores]
+    classif_at_threshold = [
+        0 if score < threshold else 1 for score in clean_scores
+    ]
 
     metrics_filepath = f"logs/{name_for_saving}/eval_autorater_metrics.txt"
     os.makedirs(os.path.dirname(metrics_filepath), exist_ok=True)
     with open(metrics_filepath, "w") as f:
+      f.write(f"Scored Samples: {len(valid_indices)}/{len(scores_list)}\n")
+      f.write(f"Unscored Samples: {unscored_count}\n")
       f.write("AUC: {:.5f}\n".format(auc))
       f.write("Threshold: {:.5f}\n".format(threshold))
       f.write("TPR (recall): {:.5f}\n".format(tpr))
@@ -3012,7 +3137,7 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
       f.write("Accuracy: {:.5f}\n".format(accuracy))
       f.write(
           "Precision: {:.5f}\n".format(
-              precision_score(ground_truth, classif_at_threshold)
+              precision_score(clean_gt, classif_at_threshold)
           )
       )
     print(f"Metrics saved to {metrics_filepath}")
@@ -3024,12 +3149,12 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
     print("Accuracy: {:.5f}".format(accuracy))
     print(
         "Precision: {:.5f}".format(
-            precision_score(ground_truth, classif_at_threshold)
+            precision_score(clean_gt, classif_at_threshold)
         )
     )
 
     # ROC-AUC plot
-    RocCurveDisplay.from_predictions(ground_truth, scores.numpy())
+    RocCurveDisplay.from_predictions(clean_gt, clean_scores)
     plt.title(f"ROC Curve (Threshold: {threshold:.5f})")
     plt.scatter([fpr], [tpr], c="r")
     os.makedirs(f"logs/{name_for_saving}/", exist_ok=True)
@@ -3042,24 +3167,26 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
     # Histogram of scores
     bins = np.arange(0, 1, 0.05)
     scores_no = [
-        score.item()
-        for idx, score in enumerate(scores)
-        if ground_truth[idx] == 1
+        clean_scores[idx]
+        for idx, gt_val in enumerate(clean_gt)
+        if gt_val == 1
     ]
     scores_yes = [
-        score.item()
-        for idx, score in enumerate(scores)
-        if ground_truth[idx] == 0
+        clean_scores[idx]
+        for idx, gt_val in enumerate(clean_gt)
+        if gt_val == 0
     ]
     plt.vlines(x=threshold, ymin=0, ymax=175, colors="r")
-    plt.hist(scores_no, bins=bins, alpha=0.5, label="No")
-    plt.hist(scores_yes, bins=bins, alpha=0.5, label="Yes")
+    if scores_no:
+      plt.hist(scores_no, bins=bins, alpha=0.5, label="No")
+    if scores_yes:
+      plt.hist(scores_yes, bins=bins, alpha=0.5, label="Yes")
     plt.legend()
     plt.savefig(
         f"logs/{name_for_saving}/"
         + f"eval_autorater_{self.args.evaluator_num_fewshot}_shot"
     )
-
+    plt.clf()
 
 class EvaluationGenerationPipeline(EvaluationPipeline):
   """Pipeline for generation: create completions with writer model."""
@@ -3314,22 +3441,44 @@ class EvaluationScoringPipeline(EvaluationPipeline):
             yes_token_id,
             no_token_id,
         )
-      # Compute simple rate and push dataset updated
-      t = torch.nn.Threshold(self.args.threshold, 0, inplace=False)
-      classifs = torch.ceil(t(scores)).clamp(0, 1)
+      # Extract list of scores, properly handling both list and torch.Tensor
+      scores_list = (
+          scores.tolist() if isinstance(scores, torch.Tensor) else list(scores)
+      )
+      # Ensure unscored / missing entries are strictly None (no numeric fallback)
+      scores_list = [
+          float(s)
+          if s is not None and not (isinstance(s, float) and math.isnan(s))
+          else None
+          for s in scores_list
+      ]
+      # Compute classifications: 1 for non-hallucination (>= threshold),
+      # 0 for hallucination (< threshold), and None for entries that could
+      # not be scored by the autorater.
+      classifs_list = [
+          (1 if s >= self.args.threshold else 0)
+          if s is not None
+          else None
+          for s in scores_list
+      ]
       if "scores" in self.val_data.column_names:
         self.val_data = self.val_data.remove_columns("scores")
-      self.val_data = self.val_data.add_column("scores", scores.tolist())
+      self.val_data = self.val_data.add_column("scores", scores_list)
       if "classifications" in self.val_data.column_names:
         self.val_data = self.val_data.remove_columns("classifications")
       self.val_data = self.val_data.add_column(
-          "classifications", classifs.tolist()
+          "classifications", classifs_list
       )
-      autorater_score_list = scores.tolist()
+      autorater_score_list = scores_list
     elif "scores" in self.val_data.column_names:
-      autorater_score_list = list(self.val_data["scores"])
+      autorater_score_list = [
+          float(s)
+          if s is not None and not (isinstance(s, float) and math.isnan(s))
+          else None
+          for s in self.val_data["scores"]
+      ]
 
-    # Compute comprehensive generation metrics (ROUGE, BERTScore, lengths, distinct-n, repetition, PPL)
+    # Compute generation metrics (ROUGE, BERTScore, lengths, PPL)
     if getattr(self.args, "compute_generation_metrics", True):
       evaluator = GenerationMetricsEvaluator(
           bertscore_model=getattr(
@@ -3409,7 +3558,8 @@ class EvaluationScoringPipeline(EvaluationPipeline):
             full_col_vals[orig_idx] = self.val_data[col_name][idx_in_val]
           final_dict[col_name] = full_col_vals
 
-      # Remove any stale reference metric columns from prior runs if not evaluated now
+      # Remove any stale reference metric columns from prior runs if not
+      # evaluated now
       for metric_col in [
           "rouge1_f1",
           "rouge1_precision",

@@ -920,7 +920,14 @@ class GenerationMetricsEvaluator:
     summary_path = os.path.join(output_dir, f"{dataset_name}_summary.json")
 
     if autorater_scores:
-      clean_autorater = [float(s) for s in autorater_scores if s is not None]
+      clean_autorater = [
+          float(s)
+          for s in autorater_scores
+          if s is not None and not (isinstance(s, float) and math.isnan(s))
+      ]
+      unscored_count = len(autorater_scores) - len(clean_autorater)
+      summary["autorater_scored_count"] = len(clean_autorater)
+      summary["autorater_unscored_count"] = unscored_count
       if clean_autorater:
         hallu_rate = float(
             sum(1.0 for s in clean_autorater if s < threshold)

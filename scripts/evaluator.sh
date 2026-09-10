@@ -24,6 +24,8 @@ COMPUTE_PERPLEXITY="True"
 FLUENCY_MODEL="${BASE_MODEL}"
 LOG_TO_WANDB="True"
 WANDB_PROJECT="new_perl_eval"
+OVERWRITE_SCORES="${OVERWRITE_SCORES:-False}"
+SCORES_CHECKPOINT_PATH="${SCORES_CHECKPOINT_PATH:-}"
 
 # Parameters derived from above
 TASK_NAME="$1"
@@ -93,6 +95,8 @@ elif [ "$2" == "score" ]; then
         --temperature "$TEMPERATURE" \
         --writer_num_fewshot $WRITER_NUM_FEWSHOT \
         ${DATASET_WITH_COMPLETIONS:+--dataset_with_completions "$DATASET_WITH_COMPLETIONS"} \
+        ${OVERWRITE_SCORES:+--overwrite_scores "$OVERWRITE_SCORES"} \
+        ${SCORES_CHECKPOINT_PATH:+--scores_checkpoint_path "$SCORES_CHECKPOINT_PATH"} \
         --compute_bertscore "$COMPUTE_BERTSCORE" \
         --bertscore_model "$BERTSCORE_MODEL" \
         --compute_perplexity "$COMPUTE_PERPLEXITY" \
@@ -117,7 +121,9 @@ elif [ "$2" == "autoratereval" ]; then
         --gemini_api_key ${GEMINI_API_KEY} \
         --evaluator_num_fewshot $EVALUATOR_NUM_FEWSHOT \
         --evaluate_evaluator True \
-        --threshold $THRESHOLD
+        --threshold $THRESHOLD \
+        ${OVERWRITE_SCORES:+--overwrite_scores "$OVERWRITE_SCORES"} \
+        ${SCORES_CHECKPOINT_PATH:+--scores_checkpoint_path "$SCORES_CHECKPOINT_PATH"}
 else
     echo "Invalid mode. Use 'generate', 'score', or 'autoratereval'"
     exit 1

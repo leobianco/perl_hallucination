@@ -3,8 +3,11 @@
 import json
 import math
 import os
+import pickle
 import shutil
+import sys
 import tempfile
+import types
 from typing import Any
 import unittest
 from unittest.mock import MagicMock, patch
@@ -20,15 +23,6 @@ from src.metrics import (
     compute_summary_statistics,
     tokenize_words,
 )
-try:
-  from src.pipelines import EvaluationScoringPipeline
-except ImportError:
-  EvaluationScoringPipeline = None
-from src.utils import (
-    build_eval_dataset_repo_id,
-    compact_model_name,
-    sanitize_hf_repo_id,
-)
 
 
 class MockDataset:
@@ -38,8 +32,16 @@ class MockDataset:
     self._data = dict(data)
     self.column_names = list(data.keys())
 
-  def __getitem__(self, key: str):
-    return self._data[key]
+  @classmethod
+  def from_dict(cls, d: dict[str, list[Any]]):
+    return cls(d)
+
+  def __getitem__(self, key: Any):
+    if isinstance(key, str):
+      return self._data[key]
+    elif isinstance(key, int):
+      return {col: self._data[col][key] for col in self.column_names}
+    raise TypeError(f"Invalid key type: {type(key)}")
 
   def __len__(self):
     first_col = next(iter(self._data.values()))
@@ -65,6 +67,83 @@ class MockDataset:
     r = random.Random(seed)
     r.shuffle(indices)
     return self.select(indices)
+
+
+class DatasetDict(dict):
+
+  def push_to_hub(self, repo_id: str, **kwargs):
+    pass
+
+  def save_to_disk(self, path: str, **kwargs):
+    pass
+
+
+datasets_mod = types.ModuleType("datasets")
+datasets_mod.Dataset = MockDataset
+datasets_mod.DatasetDict = DatasetDict
+datasets_mod.Value = MagicMock()
+datasets_mod.load_dataset = MagicMock()
+datasets_mod.concatenate_datasets = MagicMock()
+sys.modules["datasets"] = datasets_mod
+
+tqdm_mod = types.ModuleType("tqdm")
+tqdm_mod.tqdm = lambda it, *args, **kwargs: it
+sys.modules["tqdm"] = tqdm_mod
+
+def _safe_pickle_save(obj, path):
+  with open(path, "wb") as f:
+    pickle.dump(obj, f)
+
+
+def _safe_pickle_load(path):
+  with open(path, "rb") as f:
+    return pickle.load(f)
+
+
+torch_mod = types.ModuleType("torch")
+torch_mod.save = _safe_pickle_save
+torch_mod.load = _safe_pickle_load
+sys.modules["torch"] = torch_mod
+sys.modules["torch.nn"] = types.ModuleType("torch.nn")
+
+for _mod_name in [
+    "transformers",
+    "transformers.trainer_utils",
+    "transformers.configuration_utils",
+    "transformers.integrations",
+    "transformers.integrations.heterogeneity",
+    "transformers.integrations.heterogeneity.configuration_utils",
+    "trl",
+    "peft",
+    "vllm",
+    "vllm.lora",
+    "vllm.lora.request",
+    "evaluate",
+    "scipy",
+    "scipy.special",
+    "sklearn",
+    "sklearn.metrics",
+    "google",
+    "google.genai",
+    "google.genai.types",
+    "huggingface_hub",
+    "matplotlib",
+    "matplotlib.pyplot",
+    "numpy",
+]:
+  if _mod_name not in sys.modules:
+    sys.modules[_mod_name] = MagicMock()
+
+try:
+  from src.pipelines import EvaluationScoringPipeline
+except ImportError:
+  EvaluationScoringPipeline = None
+
+from src.utils import (
+    build_eval_dataset_repo_id,
+    compact_model_name,
+    sanitize_hf_repo_id,
+)
 
 
 class MockTokenizer:
@@ -375,6 +454,8 @@ class TestMetrics(unittest.TestCase):
     self.assertIn("hallucination_rate", saved_data)
     self.assertIn("faithfulness_rate", saved_data)
     self.assertAlmostEqual(saved_data["faithfulness_rate"], 0.5, places=2)
+    self.assertEqual(saved_data["autorater_scored_count"], 2)
+    self.assertEqual(saved_data["autorater_unscored_count"], 1)
 
   def test_evaluate_dataset_idempotent_recalculation(self):
     """Verifies that calling evaluate_dataset multiple times cleanly updates existing metric columns."""
@@ -442,7 +523,7 @@ class TestMetrics(unittest.TestCase):
     except ImportError:
       torch = None
 
-    if torch is None:
+    if torch is None or not hasattr(torch, "__file__"):
       res = compute_conditional_perplexity(
           ["Prompt"],
           ["Completion"],
@@ -634,7 +715,225 @@ class TestGeminiScoreResponse(unittest.TestCase):
   def test_empty_response_fallback(self):
     response = MagicMock(candidates=[])
     score = self.pipeline.gemini_score_response(response)
-    self.assertEqual(score, 0.5)
+    self.assertIsNone(score)
+
+  def test_safety_blocked_candidate(self):
+    candidate = MagicMock()
+    candidate.finish_reason = "SAFETY"
+    candidate.content.parts = []
+    candidate.logprobs_result = None
+    response = MagicMock(candidates=[candidate], text="")
+    score = self.pipeline.gemini_score_response(response)
+    self.assertIsNone(score)
+
+  def test_unresolved_text_fallback(self):
+    candidate = MagicMock(logprobs_result=None)
+    response = MagicMock(
+        candidates=[candidate],
+        text="I cannot determine faithfulness for this sample.",
+    )
+    score = self.pipeline.gemini_score_response(response)
+    self.assertIsNone(score)
+
+
+class TestGeminiScoreDataset(unittest.TestCase):
+  """Unit tests for gemini_score_dataset error handling and resumption."""
+
+  def setUp(self):
+    if EvaluationScoringPipeline is None:
+      self.skipTest("pipelines module not available in lightweight test env")
+    self.pipeline = EvaluationScoringPipeline()
+    self.temp_dir = tempfile.mkdtemp()
+
+  def tearDown(self):
+    shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+  def _make_dummy_dataset(self, prompts: list[str]):
+    return MockDataset({
+        "evaluator_prompt": prompts,
+        "prompt": [f"P{i}" for i in range(len(prompts))],
+        "completion": [f"C{i}" for i in range(len(prompts))],
+    })
+
+  def test_dataset_scoring_with_api_failures_returns_none_and_checkpoints(self):
+    ckpt_file = os.path.join(self.temp_dir, "test_checkpoint.pt")
+    script_args = MagicMock(
+        seed=42,
+        evaluator_model="gemini-2.5-flash",
+        evaluator_num_fewshot=0,
+        overwrite_scores=False,
+        max_workers=1,
+        dataset_with_completions=None,
+        dataset_labels="test_eval",
+        scores_checkpoint_path=ckpt_file,
+    )
+    dataset = self._make_dummy_dataset(["Prompt 0", "Prompt 1", "Prompt 2"])
+
+    def mock_generate(model, contents, config):
+      p = str(contents)
+      if "Prompt 1" in p:
+        raise RuntimeError("Simulated unrecoverable API error")
+      cand = MagicMock()
+      cand.logprobs_result.top_candidates = [
+          MagicMock(candidates=[MagicMock(token="No", log_prob=-0.01)])
+      ]
+      return MagicMock(candidates=[cand], text='"No"')
+
+    client = MagicMock()
+    client.models.generate_content.side_effect = mock_generate
+
+    scores = self.pipeline.gemini_score_dataset(client, dataset, script_args)
+    self.assertEqual(scores, [1.0, None, 1.0])
+    # Checkpoint must be saved because unscored_count > 0
+    self.assertTrue(os.path.exists(ckpt_file))
+
+  def test_dataset_scoring_resumes_missing_entries_from_checkpoint(self):
+    ckpt_file = os.path.join(self.temp_dir, "resume_checkpoint.pt")
+    # Pre-save checkpoint with sample 0 and 2 scored, sample 1 missing
+    sys.modules["torch"].save([1.0, None, 1.0], ckpt_file)
+
+    script_args = MagicMock(
+        seed=42,
+        evaluator_model="gemini-2.5-flash",
+        evaluator_num_fewshot=0,
+        overwrite_scores=False,
+        max_workers=1,
+        dataset_with_completions=None,
+        dataset_labels="test_eval",
+        scores_checkpoint_path=ckpt_file,
+    )
+    dataset = self._make_dummy_dataset(["Prompt 0", "Prompt 1", "Prompt 2"])
+
+    called_prompts = []
+
+    def mock_generate(model, contents, config):
+      p = str(contents)
+      called_prompts.append(p)
+      cand = MagicMock()
+      cand.logprobs_result.top_candidates = [
+          MagicMock(candidates=[MagicMock(token="Yes", log_prob=-0.01)])
+      ]
+      return MagicMock(candidates=[cand], text='"Yes"')
+
+    client = MagicMock()
+    client.models.generate_content.side_effect = mock_generate
+
+    scores = self.pipeline.gemini_score_dataset(client, dataset, script_args)
+    # Only Prompt 1 should have been called
+    self.assertEqual(len(called_prompts), 1)
+    self.assertIn("Prompt 1", called_prompts[0])
+    self.assertEqual(scores, [1.0, 0.0, 1.0])
+    # Checkpoint deleted upon 100% completion
+    self.assertFalse(os.path.exists(ckpt_file))
+
+  def test_dataset_scoring_resumes_missing_entries_from_dataset_column(self):
+    ckpt_file = os.path.join(self.temp_dir, "nonexistent_ckpt.pt")
+    script_args = MagicMock(
+        seed=42,
+        evaluator_model="gemini-2.5-flash",
+        evaluator_num_fewshot=0,
+        overwrite_scores=False,
+        max_workers=1,
+        dataset_with_completions=None,
+        dataset_labels="test_eval",
+        scores_checkpoint_path=ckpt_file,
+    )
+    dataset = MockDataset({
+        "evaluator_prompt": ["Prompt 0", "Prompt 1", "Prompt 2"],
+        "scores": [0.85, None, 0.15],
+    })
+
+    called_prompts = []
+
+    def mock_generate(model, contents, config):
+      p = str(contents)
+      called_prompts.append(p)
+      cand = MagicMock()
+      cand.logprobs_result.top_candidates = [
+          MagicMock(candidates=[MagicMock(token="No", log_prob=-0.01)])
+      ]
+      return MagicMock(candidates=[cand], text='"No"')
+
+    client = MagicMock()
+    client.models.generate_content.side_effect = mock_generate
+
+    scores = self.pipeline.gemini_score_dataset(client, dataset, script_args)
+    self.assertEqual(len(called_prompts), 1)
+    self.assertIn("Prompt 1", called_prompts[0])
+    self.assertEqual(scores, [0.85, 1.0, 0.15])
+
+  def test_dataset_scoring_overwrite_scores_forces_full_rescore(self):
+    ckpt_file = os.path.join(self.temp_dir, "overwrite_ckpt.pt")
+    sys.modules["torch"].save([0.2, 0.3, 0.4], ckpt_file)
+
+    script_args = MagicMock(
+        seed=42,
+        evaluator_model="gemini-2.5-flash",
+        evaluator_num_fewshot=0,
+        overwrite_scores=True,
+        max_workers=1,
+        dataset_with_completions=None,
+        dataset_labels="test_eval",
+        scores_checkpoint_path=ckpt_file,
+    )
+    dataset = self._make_dummy_dataset(["Prompt 0", "Prompt 1", "Prompt 2"])
+
+    called_prompts = []
+
+    def mock_generate(model, contents, config):
+      p = str(contents)
+      called_prompts.append(p)
+      cand = MagicMock()
+      cand.logprobs_result.top_candidates = [
+          MagicMock(candidates=[MagicMock(token="No", log_prob=-0.01)])
+      ]
+      return MagicMock(candidates=[cand], text='"No"')
+
+    client = MagicMock()
+    client.models.generate_content.side_effect = mock_generate
+
+    scores = self.pipeline.gemini_score_dataset(client, dataset, script_args)
+    # With overwrite_scores=True, all 3 must be scored
+    self.assertEqual(len(called_prompts), 3)
+    self.assertEqual(scores, [1.0, 1.0, 1.0])
+
+  def test_huggingface_only_resumption_no_local_checkpoint(self):
+    """Verify Hugging Face-only resumption with zero local checkpoint files."""
+    script_args = MagicMock(
+        seed=42,
+        evaluator_model="gemini-2.5-flash",
+        evaluator_num_fewshot=0,
+        overwrite_scores=False,
+        max_workers=1,
+        dataset_with_completions="leobianco/test_completions",
+        dataset_labels=None,
+        scores_checkpoint_path=None,
+    )
+    # Simulate dataset loaded from HF Hub with 2 existing scores and 1 missing
+    dataset = MockDataset({
+        "evaluator_prompt": ["Prompt 0", "Prompt 1", "Prompt 2"],
+        "scores": [0.95, None, 0.05],
+    })
+
+    called_prompts = []
+
+    def mock_generate(model, contents, config):
+      p = str(contents)
+      called_prompts.append(p)
+      cand = MagicMock()
+      cand.logprobs_result.top_candidates = [
+          MagicMock(candidates=[MagicMock(token="No", log_prob=-0.01)])
+      ]
+      return MagicMock(candidates=[cand], text='"No"')
+
+    client = MagicMock()
+    client.models.generate_content.side_effect = mock_generate
+
+    scores = self.pipeline.gemini_score_dataset(client, dataset, script_args)
+    # Only Prompt 1 should have been called
+    self.assertEqual(len(called_prompts), 1)
+    self.assertIn("Prompt 1", called_prompts[0])
+    self.assertEqual(scores, [0.95, 1.0, 0.05])
 
 
 if __name__ == "__main__":

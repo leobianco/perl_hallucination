@@ -518,6 +518,26 @@ class EvalArguments:
       metadata={"help": "Optional WandB run name."},
   )
 
+  overwrite_scores: bool = field(
+      default=False,
+      metadata={
+          "help": (
+              "Whether to overwrite existing autorater scores and re-score"
+              " all entries from scratch."
+          )
+      },
+  )
+
+  scores_checkpoint_path: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Custom path to save/load autorater scores checkpoints for"
+              " resuming incomplete scoring runs."
+          )
+      },
+  )
+
 
 def hallucination_rate_from_score_file(
     filepath: str, threshold: float
