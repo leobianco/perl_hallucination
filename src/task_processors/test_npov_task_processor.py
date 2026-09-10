@@ -42,6 +42,17 @@ except ImportError:
       new_data = {k: v for k, v in self._data.items() if k != column_name}
       return _MockDataset(new_data)
 
+    def rename_column(self, original_column_name, new_column_name):
+      new_data = {
+          (new_column_name if k == original_column_name else k): v
+          for k, v in self._data.items()
+      }
+      return _MockDataset(new_data)
+
+    def select_columns(self, column_names):
+      new_data = {k: v for k, v in self._data.items() if k in column_names}
+      return _MockDataset(new_data)
+
     def select(self, indices):
       new_data = {k: [v[i] for i in indices] for k, v in self._data.items()}
       return _MockDataset(new_data)
@@ -68,6 +79,27 @@ except ImportError:
 
   class DatasetDict(dict):
     pass
+
+  datasets_mock = types.ModuleType("datasets")
+  datasets_mock.Dataset = Dataset
+  datasets_mock.DatasetDict = DatasetDict
+  datasets_mock.concatenate_datasets = lambda d_list: _MockDataset(
+      {k: [item for d in d_list for item in d._data[k]] for k in d_list[0]._data}
+  )
+  datasets_mock.load_dataset = MagicMock()
+  sys.modules["datasets"] = datasets_mock
+
+if "google" not in sys.modules:
+  google_mock = types.ModuleType("google")
+  genai_mock = types.ModuleType("genai")
+  genai_mock.Client = MagicMock
+  types_mock = types.ModuleType("types")
+  types_mock.GenerateContentConfig = MagicMock
+  genai_mock.types = types_mock
+  google_mock.genai = genai_mock
+  sys.modules["google"] = google_mock
+  sys.modules["google.genai"] = genai_mock
+  sys.modules["google.genai.types"] = types_mock
 
 from src.task_processors.npov_task_processor import NPOVTaskProcessor
 

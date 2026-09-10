@@ -10,6 +10,9 @@ SYNTH_LLM="False"
 NUM_SYNTH_HALLUS=70
 SYNTH_LLM_TEMPERATURE=0.7
 SYNTH_LLM_NUM_FEWSHOT=5
+SYNTH_STRUCT_TOP_K="${SYNTH_STRUCT_TOP_K:-3}"
+SYNTH_STRUCT_HALLU_THRESHOLD="${SYNTH_STRUCT_HALLU_THRESHOLD:-0.20}"
+SYNTH_STRUCT_IRRELEVANT_THRESHOLD="${SYNTH_STRUCT_IRRELEVANT_THRESHOLD:-0.15}"
 
 # Checks
 if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ]; then
@@ -32,4 +35,7 @@ python3 -m src.data_processing \
     --num_synth_hallus $NUM_SYNTH_HALLUS \
     --gemini_api_key "${GEMINI_API_KEY}" \
     --synth_llm_temperature $SYNTH_LLM_TEMPERATURE \
-    --synth_llm_num_fewshot $SYNTH_LLM_NUM_FEWSHOT
+    --synth_llm_num_fewshot $SYNTH_LLM_NUM_FEWSHOT \
+    --synth_struct_top_k "$SYNTH_STRUCT_TOP_K" \
+    --synth_struct_hallu_threshold "$SYNTH_STRUCT_HALLU_THRESHOLD" \
+    --synth_struct_irrelevant_threshold "$SYNTH_STRUCT_IRRELEVANT_THRESHOLD"
