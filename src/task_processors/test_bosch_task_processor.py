@@ -195,7 +195,7 @@ class TestBoschTaskProcessorSynthetic(unittest.TestCase):
     self.mock_args.seed = 12345
     self.mock_args.num_synth_hallus = 10
     self.mock_args.synth_struct_top_k = 3
-    self.mock_args.synth_struct_hallu_threshold = 0.20
+    self.mock_args.synth_struct_hallu_threshold = 0.40
     self.mock_args.synth_struct_irrelevant_threshold = 0.15
     self.mock_args.synth_struct_max_nonhall_per_entry = 2
     self.mock_args.synth_struct_balance_ratio = 1.30

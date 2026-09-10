@@ -39,7 +39,7 @@ def main():
   parser.add_argument(
       "--synth_struct_hallu_threshold",
       type=float,
-      default=0.20,
+      default=0.40,
       help="Minimum ROUGE-1 score for context sentence to count as hallucination.",
   )
   parser.add_argument(

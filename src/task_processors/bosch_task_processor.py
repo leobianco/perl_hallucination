@@ -120,9 +120,9 @@ class BoschTaskProcessor(BaseTaskProcessor):
         seed = getattr(args, "seed", 12345)
         num_synth_hallus = getattr(args, "num_synth_hallus", 0)
         top_k = getattr(args, "synth_struct_top_k", 3)
-        hallu_threshold = getattr(args, "synth_struct_hallu_threshold", 0.20)
+        hallu_threshold = getattr(args, "synth_struct_hallu_threshold", 0.40)
         irrelevant_threshold = getattr(
-            args, "synth_struct_irrelevant_threshold", 0.10
+            args, "synth_struct_irrelevant_threshold", 0.15
         )
         max_nonhall_per_entry = getattr(
             args, "synth_struct_max_nonhall_per_entry", 2
@@ -777,7 +777,7 @@ class BoschTaskProcessor(BaseTaskProcessor):
         response: str,
         scores: list[dict[str, Any]],
         top_k: int = 3,
-        hallu_threshold: float = 0.20,
+        hallu_threshold: float = 0.40,
     ) -> list[dict[str, Any]]:
         """Idea 2: Remove top-k matching context sentences individually to induce hallucinations."""
         if len(sentences_context) < 2:
