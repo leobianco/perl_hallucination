@@ -1,4 +1,6 @@
+import collections
 import random
+import re
 from typing import Any, Callable, Optional, Tuple
 
 import evaluate
@@ -14,7 +16,80 @@ nltk.download("punkt_tab", quiet=True)
 nltk.download("punkt", quiet=True)
 
 
+class _PurePythonRougeScorer:
+    """Pure-Python in-memory ROUGE-1 F1 scorer with zero network or filesystem overhead."""
+
+    def __init__(self, use_stemmer: bool = True):
+        self.stemmer = None
+        if use_stemmer:
+            try:
+                import nltk
+                from nltk.stem import PorterStemmer
+
+                self.stemmer = PorterStemmer()
+            except Exception:
+                self.stemmer = None
+
+    def _tokenize_and_stem(self, text: str) -> list[str]:
+        tokens = re.findall(r"\b\w+\b", text.lower())
+        stemmer = self.stemmer
+        if stemmer is not None:
+            try:
+                return [stemmer.stem(t) for t in tokens]
+            except Exception:
+                return tokens
+        return tokens
+
+    def score(self, target: str, prediction: str) -> dict[str, Any]:
+        """Compute ROUGE-1 F1 between target (reference) and prediction."""
+        ref_tokens = self._tokenize_and_stem(target)
+        pred_tokens = self._tokenize_and_stem(prediction)
+
+        ScoreType = collections.namedtuple(
+            "Score", ["precision", "recall", "fmeasure"]
+        )
+        if not ref_tokens or not pred_tokens:
+            return {
+                "rouge1": ScoreType(precision=0.0, recall=0.0, fmeasure=0.0)
+            }
+
+        ref_counts = collections.Counter(ref_tokens)
+        pred_counts = collections.Counter(pred_tokens)
+
+        overlap = sum(
+            min(count, pred_counts[token])
+            for token, count in ref_counts.items()
+        )
+        precision = overlap / len(pred_tokens) if pred_tokens else 0.0
+        recall = overlap / len(ref_tokens) if ref_tokens else 0.0
+
+        if precision + recall > 0.0:
+            fmeasure = 2.0 * (precision * recall) / (precision + recall)
+        else:
+            fmeasure = 0.0
+
+        return {
+            "rouge1": ScoreType(
+                precision=precision, recall=recall, fmeasure=fmeasure
+            )
+        }
+
+
 class BoschTaskProcessor(BaseTaskProcessor):
+    @staticmethod
+    def _get_rouge_scorer() -> Any:
+        """Return an in-memory ROUGE-1 scorer.
+
+        Prefers google-research's official `rouge_score.rouge_scorer.RougeScorer`
+        for fast, in-memory computation (~0.05ms per pair).
+        Falls back to `_PurePythonRougeScorer` if `rouge_score` is not installed.
+        """
+        try:
+            from rouge_score import rouge_scorer
+
+            return rouge_scorer.RougeScorer(["rouge1"], use_stemmer=True)
+        except ImportError:
+            return _PurePythonRougeScorer(use_stemmer=True)
     def _load_data(self) -> DatasetDict:
         data = load_dataset(
             self.args.hf_repo,
@@ -150,12 +225,21 @@ class BoschTaskProcessor(BaseTaskProcessor):
             source_pool = shuffled_source
             rest_pool = None
 
-        rouge_metric = evaluate.load("rouge")
+        rouge_metric = self._get_rouge_scorer()
 
         hallucinations: list[dict[str, Any]] = []
         non_hallucinations: list[dict[str, Any]] = []
 
-        for entry in source_pool:
+        total_source = len(source_pool)
+        print(
+            f"[Structured Synth] Generating synthetic hallucinations from {total_source} validation samples..."
+        )
+
+        for entry_idx, entry in enumerate(source_pool):
+            if (entry_idx + 1) % 10 == 0 or (entry_idx + 1) == total_source:
+                print(
+                    f"[Structured Synth] Processing sample {entry_idx + 1}/{total_source}..."
+                )
             question = entry.get("Question", "")
             context = entry.get("Context", "")
             response = entry.get("response", "")
@@ -243,6 +327,11 @@ class BoschTaskProcessor(BaseTaskProcessor):
             hallucinations.extend(entry_hallus)
             non_hallucinations.extend(entry_nonhallus)
 
+        print(
+            f"[Structured Synth] Generated {len(hallucinations)} hallucinated and "
+            f"{len(non_hallucinations)} non-hallucinated candidates before balancing."
+        )
+
         # Include remaining unedited non-hallucinated samples if split
         if rest_pool is not None:
             for entry in rest_pool:
@@ -284,6 +373,11 @@ class BoschTaskProcessor(BaseTaskProcessor):
 
         combined_train = hallucinations + non_hallucinations
         rng.shuffle(combined_train)
+
+        print(
+            f"[Structured Synth] Balanced dataset: {len(hallucinations)} hallucinated and "
+            f"{len(non_hallucinations)} non-hallucinated samples (total train: {len(combined_train)})."
+        )
 
         train_dataset = Dataset.from_list(combined_train)
 
@@ -696,15 +790,27 @@ class BoschTaskProcessor(BaseTaskProcessor):
         # Compute the ROUGE-1 score between this and sentences in context
         # and pick sentence in context with maximal ROUGE-1 score to erase
         best_idx = 0
-        max_rouge = 0
+        max_rouge = 0.0
+        has_score_method = hasattr(rouge_metric, "score")
         for idx_context, sentence_context in enumerate(sentences_context):
-            rouge_results = rouge_metric.compute(
-                predictions=random_sentence_response,
-                references=[sentence_context],
-            )
-            if rouge_results["rouge1"] > max_rouge:
+            if has_score_method:
+                res = rouge_metric.score(
+                    target=sentence_context,
+                    prediction=random_sentence_response[0]
+                    if random_sentence_response
+                    else "",
+                )
+                val = res.get("rouge1", 0.0)
+                r1 = float(val.fmeasure if hasattr(val, "fmeasure") else val)
+            else:
+                rouge_results = rouge_metric.compute(
+                    predictions=random_sentence_response,
+                    references=[sentence_context],
+                )
+                r1 = float(rouge_results.get("rouge1", 0.0))
+            if r1 > max_rouge:
                 best_idx = idx_context
-                max_rouge = rouge_results["rouge1"]
+                max_rouge = r1
 
         # Store information about erased sentence
         entry["erased_context"] = sentences_context[best_idx]
@@ -749,15 +855,23 @@ class BoschTaskProcessor(BaseTaskProcessor):
     ) -> list[dict[str, Any]]:
         """Compute peak ROUGE-1 score for each context sentence against all response sentences."""
         scores = []
+        has_score_method = hasattr(rouge_metric, "score")
         for ctx_idx, c_sent in enumerate(sentences_context):
             max_rouge = 0.0
             best_resp_idx = 0
             for resp_idx, r_sent in enumerate(sentences_response):
-                res = rouge_metric.compute(
-                    predictions=[r_sent],
-                    references=[c_sent],
-                )
-                r1 = float(res.get("rouge1", 0.0))
+                if has_score_method:
+                    res = rouge_metric.score(target=c_sent, prediction=r_sent)
+                    val = res.get("rouge1", 0.0)
+                    r1 = float(
+                        val.fmeasure if hasattr(val, "fmeasure") else val
+                    )
+                else:
+                    res = rouge_metric.compute(
+                        predictions=[r_sent],
+                        references=[c_sent],
+                    )
+                    r1 = float(res.get("rouge1", 0.0))
                 if r1 > max_rouge:
                     max_rouge = r1
                     best_resp_idx = resp_idx

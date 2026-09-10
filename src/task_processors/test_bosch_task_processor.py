@@ -185,7 +185,10 @@ if "datasets" not in sys.modules:
   sys.modules["datasets"] = datasets_mock
 
 
-from src.task_processors.bosch_task_processor import BoschTaskProcessor
+from src.task_processors.bosch_task_processor import (
+    _PurePythonRougeScorer,
+    BoschTaskProcessor,
+)
 
 
 class TestBoschTaskProcessorSynthetic(unittest.TestCase):
@@ -562,6 +565,47 @@ class TestBoschTaskProcessorSynthetic(unittest.TestCase):
     )
     self.assertEqual(len(to_become), 4)
     self.assertEqual(len(rest), 0)
+
+  def test_pure_python_rouge_scorer_exact_match(self):
+    scorer = _PurePythonRougeScorer()
+    res = scorer.score(
+        "Check engine oil level regularly.", "Check engine oil level regularly."
+    )
+    score = res["rouge1"]
+    self.assertAlmostEqual(score.precision, 1.0)
+    self.assertAlmostEqual(score.recall, 1.0)
+    self.assertAlmostEqual(score.fmeasure, 1.0)
+
+  def test_pure_python_rouge_scorer_disjoint(self):
+    scorer = _PurePythonRougeScorer()
+    res = scorer.score("Apples and oranges.", "Jupiter orbit spacecraft.")
+    score = res["rouge1"]
+    self.assertEqual(score.fmeasure, 0.0)
+
+  def test_pure_python_rouge_scorer_partial_overlap(self):
+    scorer = _PurePythonRougeScorer()
+    res = scorer.score(
+        "Check engine oil level.", "Check engine oil dipstick markings."
+    )
+    score = res["rouge1"]
+    self.assertGreater(score.fmeasure, 0.4)
+    self.assertLess(score.fmeasure, 1.0)
+
+  def test_compute_sentence_rouge_scores_with_in_memory_scorer(self):
+    scorer = _PurePythonRougeScorer()
+    context_sentences = [
+        "Check the engine oil level using the yellow dipstick.",
+        "The tire pressure should be checked every month.",
+    ]
+    response_sentences = [
+        "To check the engine oil, pull the yellow dipstick and wipe it.",
+    ]
+    scores = BoschTaskProcessor._compute_sentence_rouge_scores(
+        context_sentences, response_sentences, scorer
+    )
+    self.assertEqual(len(scores), 2)
+    self.assertGreater(scores[0]["max_rouge"], 0.3)
+    self.assertLess(scores[1]["max_rouge"], scores[0]["max_rouge"])
 
 
 if __name__ == "__main__":
