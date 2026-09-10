@@ -403,10 +403,36 @@ class BoschTaskProcessor(BaseTaskProcessor):
                 "rouge1_score", [0.0] * test_len
             )
 
+        test_rows = []
+        train_cols = train_dataset.column_names
+        for entry in organic_test_split:
+            row = {}
+            for col in train_cols:
+                val = entry.get(col)
+                if val is None:
+                    if col == "rouge1_score":
+                        val = 0.0
+                    elif col == "label":
+                        val = 1
+                    else:
+                        val = ""
+                row[col] = val
+            test_rows.append(row)
+
+        try:
+            if hasattr(train_dataset, "features") and train_dataset.features:
+                test_dataset = Dataset.from_list(
+                    test_rows, features=train_dataset.features
+                )
+            else:
+                test_dataset = Dataset.from_list(test_rows)
+        except TypeError:
+            test_dataset = Dataset.from_list(test_rows)
+
         synthetic_hallucinations_struct_data = DatasetDict(
             {
                 "train": train_dataset,
-                "test": organic_test_split,
+                "test": test_dataset,
             }
         )
 

@@ -164,7 +164,7 @@ if "datasets" not in sys.modules:
       return _MockDataset(d)
 
     @classmethod
-    def from_list(cls, lst):
+    def from_list(cls, lst, **kwargs):
       return _MockDataset(lst)
 
   class DatasetDict(dict):
@@ -606,6 +606,33 @@ class TestBoschTaskProcessorSynthetic(unittest.TestCase):
     self.assertEqual(len(scores), 2)
     self.assertGreater(scores[0]["max_rouge"], 0.3)
     self.assertLess(scores[1]["max_rouge"], scores[0]["max_rouge"])
+
+  def test_features_alignment_between_train_and_test(self):
+    validation_rows = [
+        {
+            "Question": "Q?",
+            "Context": "Context sentence 1. Context sentence 2.",
+            "response": "Response sentence 1.",
+            "class_hall": "No",
+            "label": 1,
+            "prompt": "p",
+            "sample_id": "sid_1",
+            "Retreival Setting": "setting_a",
+            "Answer_sent_tokenized": "tok_a",
+            "Sentence_labels": "labels_a",
+            "Does_not_answer": False,
+        }
+    ]
+    mock_data = DatasetDict({
+        "validation": Dataset.from_list(validation_rows),
+        "test": Dataset.from_list(validation_rows),
+        "train": Dataset.from_list(validation_rows),
+    })
+
+    result = self.processor._make_structured_hallucinations_data(mock_data)
+    train_cols = result["train"].column_names
+    test_cols = result["test"].column_names
+    self.assertEqual(train_cols, test_cols)
 
 
 if __name__ == "__main__":
