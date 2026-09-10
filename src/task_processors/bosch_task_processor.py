@@ -135,7 +135,13 @@ class BoschTaskProcessor(BaseTaskProcessor):
         )
         shuffled_source = non_hallucinated_data.shuffle(seed=seed)
 
-        if num_synth_hallus is not None and 0 < num_synth_hallus < len(shuffled_source):
+        # If num_synth_hallus is -1 or exceeds source length, use all available samples
+        use_all = (
+            num_synth_hallus is None
+            or num_synth_hallus == -1
+            or num_synth_hallus >= len(shuffled_source)
+        )
+        if not use_all and num_synth_hallus > 0:
             source_pool = shuffled_source.select(range(num_synth_hallus))
             rest_pool = shuffled_source.select(
                 range(num_synth_hallus, len(shuffled_source))
@@ -521,12 +527,20 @@ class BoschTaskProcessor(BaseTaskProcessor):
         non_hallucinated_data = data_split.filter(
             lambda entry: entry["class_hall"] == "No"
         )
-        to_become_hallus = non_hallucinated_data.shuffle(seed=seed).select(
-            range(num_synth_hallus)
+        shuffled = non_hallucinated_data.shuffle(seed=seed)
+        use_all = (
+            num_synth_hallus is None
+            or num_synth_hallus == -1
+            or num_synth_hallus >= len(shuffled)
         )
-        non_hallucinated_data_rest = non_hallucinated_data.filter(
-            lambda x: x not in to_become_hallus
-        )
+        if not use_all and num_synth_hallus > 0:
+            to_become_hallus = shuffled.select(range(num_synth_hallus))
+            non_hallucinated_data_rest = shuffled.select(
+                range(num_synth_hallus, len(shuffled))
+            )
+        else:
+            to_become_hallus = shuffled
+            non_hallucinated_data_rest = shuffled.select([])
 
         return to_become_hallus, non_hallucinated_data_rest
 

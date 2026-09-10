@@ -527,6 +527,42 @@ class TestBoschTaskProcessorSynthetic(unittest.TestCase):
     self.assertEqual(res1["train"]["prompt"], res2["train"]["prompt"])
     self.assertEqual(res1["train"]["label"], res2["train"]["label"])
 
+  def test_num_synth_hallus_all_with_negative_one(self):
+    validation_rows = [
+        {
+            "Question": f"Q{i}?",
+            "Context": f"Sentence {i} is relevant. Sentence {i}b is irrelevant astronomy text.",
+            "response": f"Sentence {i} is relevant.",
+            "class_hall": "No",
+            "label": 1,
+            "prompt": f"p{i}",
+        }
+        for i in range(5)
+    ]
+    mock_data = DatasetDict({
+        "validation": Dataset.from_list(validation_rows),
+        "test": Dataset.from_list(validation_rows[:2]),
+        "train": Dataset.from_list(validation_rows[:2]),
+    })
+
+    self.mock_args.num_synth_hallus = -1
+    res = self.processor._make_structured_hallucinations_data(mock_data)
+    # Verify all 5 entries were processed through synthetic generation
+    train_prompts = res["train"]["prompt"]
+    self.assertGreater(len(train_prompts), 5)
+
+  def test_split_nonhallucinated_negative_one(self):
+    rows = [
+        {"class_hall": "No", "text": f"item_{i}"}
+        for i in range(4)
+    ]
+    split_dataset = Dataset.from_list(rows)
+    to_become, rest = BoschTaskProcessor._split_nonhallucinated_for_synthetic(
+        split_dataset, num_synth_hallus=-1, seed=12345
+    )
+    self.assertEqual(len(to_become), 4)
+    self.assertEqual(len(rest), 0)
+
 
 if __name__ == "__main__":
   unittest.main()

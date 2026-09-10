@@ -18,7 +18,15 @@ def main():
       default=False,
       type=lambda x: (str(x).lower() == "true"),
   )
-  parser.add_argument("--num_synth_hallus", type=int, default=0)
+  parser.add_argument(
+      "--num_synth_hallus",
+      type=int,
+      default=0,
+      help=(
+          "Number of non-hallucinated samples to use as basis (-1 to use all"
+          " available samples)."
+      ),
+  )
   parser.add_argument("--gemini_api_key", type=str)
   parser.add_argument("--synth_llm_temperature", type=float, default=0.7)
   parser.add_argument("--synth_llm_num_fewshot", type=int, default=2)
