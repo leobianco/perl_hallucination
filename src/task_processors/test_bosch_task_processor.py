@@ -183,6 +183,8 @@ if "datasets" not in sys.modules:
   )
   datasets_mock.load_dataset = MagicMock()
   sys.modules["datasets"] = datasets_mock
+else:
+  from datasets import Dataset, DatasetDict
 
 
 from src.task_processors.bosch_task_processor import (

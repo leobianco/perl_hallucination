@@ -3335,6 +3335,7 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
           writer_model_lora=self.args.writer_model_lora,
           temperature=self.args.temperature,
           writer_num_fewshot=self.args.writer_num_fewshot,
+          task_name=getattr(self.args, "task_name", None),
       )
 
     print(f"Pushing dataset with generations to {repo_id}...")
@@ -3378,6 +3379,7 @@ class EvaluationScoringPipeline(EvaluationPipeline):
           writer_model_lora=self.args.writer_model_lora,
           temperature=self.args.temperature,
           writer_num_fewshot=self.args.writer_num_fewshot,
+          task_name=getattr(self.args, "task_name", None),
       )
     elif self.args.dataset_with_completions:
       self.args.dataset_with_completions = sanitize_hf_repo_id(

@@ -8,7 +8,7 @@ import shutil
 import sys
 import tempfile
 import types
-from typing import Any
+from typing import Any, Optional
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -28,22 +28,36 @@ from src.metrics import (
 class MockDataset:
   """Mock Dataset for testing when Hugging Face datasets is mocked or unavailable."""
 
-  def __init__(self, data: dict[str, list[Any]]):
-    self._data = dict(data)
-    self.column_names = list(data.keys())
+  def __init__(self, data: Any):
+    if isinstance(data, list):
+      keys = list(data[0].keys()) if data else []
+      self._data = {k: [d.get(k) for d in data] for k in keys}
+    elif isinstance(data, dict):
+      self._data = dict(data)
+    else:
+      self._data = {}
+    self.column_names = list(self._data.keys())
 
   @classmethod
   def from_dict(cls, d: dict[str, list[Any]]):
     return cls(d)
+
+  @classmethod
+  def from_list(cls, lst: list[dict[str, Any]], **kwargs):
+    return cls(lst)
 
   def __getitem__(self, key: Any):
     if isinstance(key, str):
       return self._data[key]
     elif isinstance(key, int):
       return {col: self._data[col][key] for col in self.column_names}
+    elif isinstance(key, slice):
+      return {col: self._data[col][key] for col in self.column_names}
     raise TypeError(f"Invalid key type: {type(key)}")
 
   def __len__(self):
+    if not self._data:
+      return 0
     first_col = next(iter(self._data.values()))
     return len(first_col)
 
@@ -51,8 +65,12 @@ class MockDataset:
   def num_rows(self):
     return len(self)
 
-  def remove_columns(self, column_name: str):
-    new_data = {k: v for k, v in self._data.items() if k != column_name}
+  def to_dict(self):
+    return dict(self._data)
+
+  def remove_columns(self, column_name: Any):
+    cols = [column_name] if isinstance(column_name, str) else column_name
+    new_data = {k: v for k, v in self._data.items() if k not in cols}
     return MockDataset(new_data)
 
   def add_column(self, column_name: str, values: list[Any]):
@@ -60,17 +78,56 @@ class MockDataset:
     new_data[column_name] = values
     return MockDataset(new_data)
 
+  def rename_column(self, original_column_name: str, new_column_name: str):
+    new_data = {
+        (new_column_name if k == original_column_name else k): v
+        for k, v in self._data.items()
+    }
+    return MockDataset(new_data)
+
+  def select_columns(self, column_names: list[str]):
+    new_data = {k: v for k, v in self._data.items() if k in column_names}
+    return MockDataset(new_data)
+
   def select(self, indices: Any):
-    new_data = {k: [v[i] for i in indices] for k, v in self._data.items()}
+    new_data = {k: [self._data[k][i] for i in indices] for k in self.column_names}
     return MockDataset(new_data)
 
   def shuffle(self, seed: int = 42):
-    import random
+    return self
 
-    indices = list(range(len(self)))
-    r = random.Random(seed)
-    r.shuffle(indices)
-    return self.select(indices)
+  def filter(self, fn: Any):
+    num_rows = len(self)
+    new_rows = []
+    for i in range(num_rows):
+      entry = {k: self._data[k][i] for k in self.column_names}
+      if fn(entry):
+        new_rows.append(entry)
+    if not new_rows:
+      return MockDataset({k: [] for k in self.column_names})
+    new_data = {k: [row[k] for row in new_rows] for k in self.column_names}
+    return MockDataset(new_data)
+
+  def map(self, fn: Any, fn_kwargs: Optional[dict] = None):
+    kwargs = fn_kwargs or {}
+    num_rows = len(self)
+    new_rows = []
+    for i in range(num_rows):
+      entry = {k: self._data[k][i] for k in self.column_names}
+      res = fn(entry, **kwargs)
+      if isinstance(res, dict):
+        entry.update(res)
+      new_rows.append(entry)
+    if not new_rows:
+      return MockDataset({k: [] for k in self.column_names})
+    all_keys = list(new_rows[0].keys())
+    new_data = {k: [row[k] for row in new_rows] for k in all_keys}
+    return MockDataset(new_data)
+
+  def __iter__(self):
+    num_rows = len(self)
+    for i in range(num_rows):
+      yield {k: self._data[k][i] for k in self.column_names}
 
 
 class DatasetDict(dict):
@@ -81,13 +138,25 @@ class DatasetDict(dict):
   def save_to_disk(self, path: str, **kwargs):
     pass
 
+  def map(self, fn, **kwargs):
+    return DatasetDict({k: v.map(fn, **kwargs) for k, v in self.items()})
+
+
+def _mock_concatenate_datasets(d_list):
+  if not d_list:
+    return MockDataset({})
+  all_keys = d_list[0].column_names
+  return MockDataset(
+      {k: [item for d in d_list for item in d._data[k]] for k in all_keys}
+  )
+
 
 datasets_mod = types.ModuleType("datasets")
 datasets_mod.Dataset = MockDataset
 datasets_mod.DatasetDict = DatasetDict
 datasets_mod.Value = MagicMock()
 datasets_mod.load_dataset = MagicMock()
-datasets_mod.concatenate_datasets = MagicMock()
+datasets_mod.concatenate_datasets = _mock_concatenate_datasets
 sys.modules["datasets"] = datasets_mod
 
 tqdm_mod = types.ModuleType("tqdm")
@@ -659,6 +728,47 @@ class TestEvalRepoNaming(unittest.TestCase):
     self.assertTrue(repo_id.startswith("leobianco/eval_"))
     self.assertTrue(repo_id.endswith("_gens_T0_7_wfs2"))
 
+  def test_build_eval_dataset_repo_id_distinct_for_different_tasks(self):
+    base_model = "google/gemma-4-E4B-it"
+    bosch_id = build_eval_dataset_repo_id(
+        user="leobianco",
+        writer_model_lora=base_model,
+        temperature=0.0,
+        writer_num_fewshot=0,
+        task_name="bosch",
+    )
+    npov_id = build_eval_dataset_repo_id(
+        user="leobianco",
+        writer_model_lora=base_model,
+        temperature=0.0,
+        writer_num_fewshot=0,
+        task_name="npov",
+    )
+    ragtruth_id = build_eval_dataset_repo_id(
+        user="leobianco",
+        writer_model_lora=base_model,
+        temperature=0.0,
+        writer_num_fewshot=0,
+        task_name="ragtruth",
+    )
+    self.assertNotEqual(bosch_id, npov_id)
+    self.assertNotEqual(bosch_id, ragtruth_id)
+    self.assertEqual(bosch_id, "leobianco/eval_bosch_gemma-4-E4B-it_gens_T0_wfs0")
+    self.assertEqual(npov_id, "leobianco/eval_npov_gemma-4-E4B-it_gens_T0_wfs0")
+    self.assertEqual(ragtruth_id, "leobianco/eval_ragtruth_gemma-4-E4B-it_gens_T0_wfs0")
+
+  def test_build_eval_dataset_repo_id_no_duplicate_task_prefix(self):
+    adapter = "leobianco/bosch_PERL_gemma-4-E2B-it_S130104"
+    repo_id = build_eval_dataset_repo_id(
+        user="leobianco",
+        writer_model_lora=adapter,
+        temperature=0.0,
+        writer_num_fewshot=0,
+        task_name="bosch",
+    )
+    self.assertFalse(repo_id.startswith("leobianco/eval_bosch_bosch_"))
+    self.assertTrue(repo_id.startswith("leobianco/eval_bosch_PERL_gemma-4-E2B-it_S130104"))
+
 
 class TestGeminiScoreResponse(unittest.TestCase):
   """Unit tests for gemini_score_response in EvaluationPipeline."""
@@ -1005,8 +1115,19 @@ class TestGeminiScoreDataset(unittest.TestCase):
     self.assertEqual(scores, [1.0])
 
     call_config = captured_calls[0]
-    self.assertGreaterEqual(getattr(call_config, "max_output_tokens", 0), 64)
-    sys_inst = getattr(call_config, "system_instruction", "")
+    from google.genai import types as genai_types
+
+    if (
+        hasattr(genai_types.GenerateContentConfig, "call_args")
+        and genai_types.GenerateContentConfig.call_args is not None
+    ):
+      kwargs = genai_types.GenerateContentConfig.call_args.kwargs
+      max_tokens = kwargs.get("max_output_tokens", 0)
+      sys_inst = kwargs.get("system_instruction", "")
+    else:
+      max_tokens = getattr(call_config, "max_output_tokens", 0)
+      sys_inst = getattr(call_config, "system_instruction", "")
+    self.assertGreaterEqual(max_tokens, 64)
     self.assertIn("Yes", str(sys_inst))
     self.assertIn("No", str(sys_inst))
 

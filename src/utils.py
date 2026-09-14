@@ -910,6 +910,7 @@ def build_eval_dataset_repo_id(
     writer_model_lora: str,
     temperature: float = 0.0,
     writer_num_fewshot: int = 0,
+    task_name: Optional[str] = None,
     max_length: int = 96,
 ) -> str:
   """Constructs a deterministic and valid Hugging Face dataset repo ID for generation completions.
@@ -919,13 +920,15 @@ def build_eval_dataset_repo_id(
       writer_model_lora (str): Writer model LoRA adapter path or repo ID.
       temperature (float): Sampling temperature used for generation.
       writer_num_fewshot (int): Number of fewshot examples prepended to prompts.
+      task_name (Optional[str]): Task name (e.g., 'npov', 'bosch', 'ragtruth').
+        Prefixes the repository name to prevent collision between tasks.
       max_length (int): Maximum allowed repo ID length (default 96).
 
   Returns:
       str: A compliant Hugging Face dataset repository identifier (<= max_length
         chars).
   """
-  cleaned_path = writer_model_lora.rstrip("/")
+  cleaned_path = (writer_model_lora or "").rstrip("/")
   if f"{user}/" in cleaned_path:
     model_name = cleaned_path.split(f"{user}/", 1)[1]
   elif "/" in cleaned_path:
@@ -944,7 +947,18 @@ def build_eval_dataset_repo_id(
       else f"{temp_val:.2g}".replace(".", "_")
   )
   suffix = f"_gens_T{temp_str}_wfs{writer_num_fewshot}"
-  prefix = "eval_"
+
+  if task_name:
+    task_clean = re.sub(r"[^a-zA-Z0-9_\-]", "_", task_name.strip().lower())
+    if not (
+        compacted_model.lower().startswith(f"{task_clean}_")
+        or compacted_model.lower() == task_clean
+    ):
+      prefix = f"eval_{task_clean}_"
+    else:
+      prefix = "eval_"
+  else:
+    prefix = "eval_"
 
   allowed_model_len = max_length - len(user) - 1 - len(prefix) - len(suffix)
   if len(compacted_model) > allowed_model_len and allowed_model_len > 0:
