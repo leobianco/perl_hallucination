@@ -222,6 +222,40 @@ class TestScopeDataGeneration(unittest.TestCase):
     self.assertEqual(prompt, "Another prompt")
     self.assertEqual(chosen, "Another chosen")
 
+  def test_extract_prompts_ragtruth_subtasks(self):
+    """Test _extract_prompts for ragtruth-qa and ragtruth-summarization in SCOPE."""
+    # QA subtask
+    self.pipeline.args.task_name = "ragtruth-qa"
+    entry_qa = {
+        "user_query": "What causes earthquakes?",
+        "passage": "Tectonic plates shift along faults.",
+        "completion": "Tectonic plate movements cause earthquakes.",
+    }
+    prompt_ctx, prompt_no_ctx, gt = self.pipeline._extract_prompts(entry_qa)
+    self.assertIn("Context: Tectonic plates shift along faults.", prompt_ctx)
+    self.assertIn("Question: What causes earthquakes?", prompt_ctx)
+    self.assertEqual(
+        prompt_no_ctx,
+        "<start_of_turn>user\nWhat causes earthquakes?<end_of_turn>\n<start_of_turn>model\n",
+    )
+    self.assertEqual(gt, "Tectonic plate movements cause earthquakes.")
+
+    # Summarization subtask
+    self.pipeline.args.task_name = "ragtruth-summarization"
+    entry_sum = {
+        "user_query": "Summarize the above document.",
+        "context": "Solar energy is harnessed using photovoltaic cells.",
+        "completion": "Solar cells capture sunlight for energy.",
+    }
+    prompt_ctx, prompt_no_ctx, gt = self.pipeline._extract_prompts(entry_sum)
+    self.assertIn("Context: Solar energy is harnessed using photovoltaic cells.", prompt_ctx)
+    self.assertIn("Question: Summarize the above document.", prompt_ctx)
+    self.assertEqual(
+        prompt_no_ctx,
+        "<start_of_turn>user\nSummarize the above document.<end_of_turn>\n<start_of_turn>model\n",
+    )
+    self.assertEqual(gt, "Solar cells capture sunlight for energy.")
+
   def test_noisy_decoding_simulation(self):
     """Test noisy decoding step with mocked SFT and Base models."""
     mock_tokenizer = MagicMock()
@@ -324,7 +358,10 @@ class TestScopeDataGeneration(unittest.TestCase):
     }
     p_ctx, p_no_ctx, gt = self.pipeline._extract_prompts(entry)
     self.assertIn("Context: Plants convert light energy into chemical energy.", p_ctx)
-    self.assertEqual(p_no_ctx, "Question: What is photosynthesis?\nAnswer:\n")
+    self.assertEqual(
+        p_no_ctx,
+        "<start_of_turn>user\nWhat is photosynthesis?<end_of_turn>\n<start_of_turn>model\n",
+    )
     self.assertEqual(gt, "Photosynthesis produces glucose from sunlight.")
 
   def test_batched_noisy_decoding(self):

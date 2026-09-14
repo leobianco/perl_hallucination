@@ -108,8 +108,9 @@ if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
 fi
 
 # Checks
-if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ]; then
+if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ] && [ "$TASK_NAME" != "ragtruth-qa" ] && [ "$TASK_NAME" != "ragtruth-summarization" ]; then
     echo "Invalid task name: $TASK_NAME"
+    echo "Valid choices: npov, bosch, ragtruth, ragtruth-qa, ragtruth-summarization"
     exit 1
 fi
 

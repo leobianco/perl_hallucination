@@ -83,7 +83,7 @@ if [ -n "$SFT_MODEL_PATH" ] && [ "$SFT_MODEL_PATH" != "none" ] && [ "$SFT_MODEL_
 fi
 
 # Checks
-if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ]; then
+if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ] && [ "$TASK_NAME" != "ragtruth-qa" ] && [ "$TASK_NAME" != "ragtruth-summarization" ]; then
     echo "Invalid task name" 
     echo "$TASK_NAME"
     exit 1

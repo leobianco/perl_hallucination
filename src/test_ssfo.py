@@ -270,6 +270,40 @@ class TestSSFODataGeneration(unittest.TestCase):
     )
     self.assertEqual(gt, "Tectonic plate movements cause earthquakes.")
 
+  def test_extract_prompts_ragtruth_subtasks(self):
+    """Test _extract_prompts for ragtruth-qa and ragtruth-summarization."""
+    # QA subtask
+    self.pipeline.args.task_name = "ragtruth-qa"
+    entry_qa = {
+        "user_query": "What causes earthquakes?",
+        "passage": "Tectonic plates shift along faults.",
+        "completion": "Tectonic plate movements cause earthquakes.",
+    }
+    prompt_ctx, prompt_no_ctx, gt = self.pipeline._extract_prompts(entry_qa)
+    self.assertIn("Context: Tectonic plates shift along faults.", prompt_ctx)
+    self.assertIn("Question: What causes earthquakes?", prompt_ctx)
+    self.assertEqual(
+        prompt_no_ctx,
+        "<start_of_turn>user\nWhat causes earthquakes?<end_of_turn>\n<start_of_turn>model\n",
+    )
+    self.assertEqual(gt, "Tectonic plate movements cause earthquakes.")
+
+    # Summarization subtask
+    self.pipeline.args.task_name = "ragtruth-summarization"
+    entry_sum = {
+        "user_query": "Summarize the above document.",
+        "context": "Solar energy is harnessed using photovoltaic cells.",
+        "completion": "Solar cells capture sunlight for energy.",
+    }
+    prompt_ctx, prompt_no_ctx, gt = self.pipeline._extract_prompts(entry_sum)
+    self.assertIn("Context: Solar energy is harnessed using photovoltaic cells.", prompt_ctx)
+    self.assertIn("Question: Summarize the above document.", prompt_ctx)
+    self.assertEqual(
+        prompt_no_ctx,
+        "<start_of_turn>user\nSummarize the above document.<end_of_turn>\n<start_of_turn>model\n",
+    )
+    self.assertEqual(gt, "Solar cells capture sunlight for energy.")
+
   def test_ssfo_output_dataset_repo_id_formatting(self):
     """Test default preference dataset repo ID construction contains model and timestamp."""
     self.pipeline.args.output_dataset_repo_id = None

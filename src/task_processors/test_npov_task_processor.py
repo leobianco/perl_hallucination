@@ -20,10 +20,22 @@ except ImportError:
   class _MockDataset:
 
     def __init__(self, data):
-      self._data = dict(data)
-      self.column_names = list(data.keys())
+      if isinstance(data, list):
+        keys = []
+        for d in data:
+          for k in d.keys():
+            if k not in keys:
+              keys.append(k)
+        self._data = {k: [d.get(k) for d in data] for k in keys}
+      elif isinstance(data, dict):
+        self._data = dict(data)
+      else:
+        self._data = {}
+      self.column_names = list(self._data.keys())
 
     def __getitem__(self, key):
+      if isinstance(key, int):
+        return {k: self._data[k][key] for k in self._data}
       return self._data[key]
 
     def __len__(self):
@@ -54,22 +66,44 @@ except ImportError:
       return _MockDataset(new_data)
 
     def select(self, indices):
-      new_data = {k: [v[i] for i in indices] for k, v in self._data.items()}
+      new_data = {k: [self._data[k][i] for i in indices] for k in self._data}
       return _MockDataset(new_data)
 
     def shuffle(self, seed=42):
       return self
 
-    def map(self, fn):
-      num_rows = len(next(iter(self._data.values())))
+    def filter(self, fn):
+      num_rows = len(self)
       new_rows = []
       for i in range(num_rows):
         entry = {k: self._data[k][i] for k in self._data}
-        res = fn(entry)
-        entry.update(res)
-        new_rows.append(entry)
-      new_data = {k: [row[k] for row in new_rows] for k in new_rows[0]}
+        if fn(entry):
+          new_rows.append(entry)
+      if not new_rows:
+        return _MockDataset({k: [] for k in self._data})
+      new_data = {k: [row[k] for row in new_rows] for k in self._data}
       return _MockDataset(new_data)
+
+    def map(self, fn, fn_kwargs=None):
+      kwargs = fn_kwargs or {}
+      num_rows = len(self)
+      new_rows = []
+      for i in range(num_rows):
+        entry = {k: self._data[k][i] for k in self._data}
+        res = fn(entry, **kwargs)
+        if isinstance(res, dict):
+          entry.update(res)
+        new_rows.append(entry)
+      if not new_rows:
+        return _MockDataset({k: [] for k in self._data})
+      all_keys = list(new_rows[0].keys())
+      new_data = {k: [row[k] for row in new_rows] for k in all_keys}
+      return _MockDataset(new_data)
+
+    def __iter__(self):
+      num_rows = len(self)
+      for i in range(num_rows):
+        yield {k: self._data[k][i] for k in self._data}
 
   class Dataset:
 
@@ -77,8 +111,14 @@ except ImportError:
     def from_dict(cls, d):
       return _MockDataset(d)
 
+    @classmethod
+    def from_list(cls, l):
+      return _MockDataset(l)
+
   class DatasetDict(dict):
-    pass
+
+    def map(self, fn, **kwargs):
+      return DatasetDict({k: v.map(fn, **kwargs) for k, v in self.items()})
 
   datasets_mock = types.ModuleType("datasets")
   datasets_mock.Dataset = Dataset

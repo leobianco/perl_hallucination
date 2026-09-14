@@ -36,7 +36,7 @@ fi
 OUTPUT_DATASET_REPO_ID="${USER}/${TASK_NAME}_scope_preference_${MODEL_NAME}_alpha_${ALPHA}${SAMPLES_TAG}_${TIMESTAMP}"
 
 # Checks
-if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ]; then
+if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ] && [ "$TASK_NAME" != "ragtruth-qa" ] && [ "$TASK_NAME" != "ragtruth-summarization" ]; then
     echo "Invalid task name: $TASK_NAME"
     echo "Usage: ./scripts/scope_data_generation.sh <task_name> [max_samples]"
     echo "Valid choices: npov, bosch, ragtruth"

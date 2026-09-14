@@ -37,7 +37,7 @@ DATASET_LABELS="${USER}/${TASK_NAME}_autorater"
 DATASET_LABELS_SPLIT="test"
 
 # Checks
-if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ]; then
+if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ] && [ "$TASK_NAME" != "ragtruth-qa" ] && [ "$TASK_NAME" != "ragtruth-summarization" ]; then
     echo "Invalid task name" 
     echo "$TASK_NAME"
     exit 1

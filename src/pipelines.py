@@ -1766,7 +1766,7 @@ class ScopeDataGenerationPipeline(Pipeline):
       )
       return prompt_with_context, prompt_without_context, gt
 
-    elif task_name == "ragtruth":
+    elif task_name == "ragtruth" or (isinstance(task_name, str) and task_name.startswith("ragtruth")):
       if "prompt" in entry and entry["prompt"]:
         prompt_raw = entry["prompt"]
         if gt and prompt_raw.endswith(gt):
@@ -2194,7 +2194,7 @@ class SSFODataGenerationPipeline(Pipeline):
       )
       return prompt_with_context, prompt_without_context, gt
 
-    elif task_name == "ragtruth":
+    elif task_name == "ragtruth" or (isinstance(task_name, str) and task_name.startswith("ragtruth")):
       if "prompt" in entry and entry["prompt"]:
         prompt_raw = entry["prompt"]
         if gt and prompt_raw.endswith(gt):

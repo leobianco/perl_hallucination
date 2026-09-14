@@ -77,7 +77,7 @@ else
   exit 1
 fi
 
-if [ "$TASK_NAME" != "ragtruth" ] && [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ]; then
+if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ] && [ "$TASK_NAME" != "ragtruth-qa" ] && [ "$TASK_NAME" != "ragtruth-summarization" ]; then
     echo "Invalid task name"
     exit 1
 fi

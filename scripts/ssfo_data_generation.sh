@@ -35,7 +35,7 @@ fi
 OUTPUT_DATASET_REPO_ID="${USER}/${TASK_NAME}_ssfo_preference_${MODEL_NAME}${SAMPLES_TAG}_${TIMESTAMP}"
 
 # Checks
-if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ]; then
+if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ] && [ "$TASK_NAME" != "ragtruth-qa" ] && [ "$TASK_NAME" != "ragtruth-summarization" ]; then
     echo "Invalid task name: $TASK_NAME"
     echo "Usage: ./scripts/ssfo_data_generation.sh <task_name> [max_samples]"
     echo "Valid choices: npov, bosch, ragtruth"

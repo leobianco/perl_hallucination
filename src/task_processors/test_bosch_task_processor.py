@@ -79,7 +79,11 @@ if "datasets" not in sys.modules:
 
     def __init__(self, data):
       if isinstance(data, list):
-        keys = list(data[0].keys()) if data else []
+        keys = []
+        for d in data:
+          for k in d.keys():
+            if k not in keys:
+              keys.append(k)
         self._data = {k: [d.get(k) for d in data] for k in keys}
       elif isinstance(data, dict):
         self._data = dict(data)
@@ -88,6 +92,8 @@ if "datasets" not in sys.modules:
       self.column_names = list(self._data.keys())
 
     def __getitem__(self, key):
+      if isinstance(key, int):
+        return {k: self._data[k][key] for k in self._data}
       return self._data[key]
 
     def __len__(self):

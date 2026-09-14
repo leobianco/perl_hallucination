@@ -57,7 +57,7 @@ if [ -n "$3" ]; then
 fi
 
 # Checks
-if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ]; then
+if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ] && [ "$TASK_NAME" != "ragtruth-qa" ] && [ "$TASK_NAME" != "ragtruth-summarization" ]; then
     echo "Invalid task name: $TASK_NAME"
     echo "Usage: ./scripts/scope_baseline.sh <task_name> [stage: all|sft|generate_data|dpo] [max_samples]"
     echo "Valid task choices: npov, bosch, ragtruth"

@@ -8,12 +8,18 @@ This module is completely self-contained and does not modify any core codebase f
 It can be safely deleted or modified without impacting other experiments.
 """
 
-from src.token_mismatch.pipelines import (
-    TokenMismatchPERLPipeline,
-    TokenMismatchRewardModelPipeline,
-    apply_terminal_token_formatting,
-    resolve_terminal_token_string,
-)
+try:
+  from src.token_mismatch.pipelines import (
+      TokenMismatchPERLPipeline,
+      TokenMismatchRewardModelPipeline,
+      apply_terminal_token_formatting,
+      resolve_terminal_token_string,
+  )
+except ImportError:
+  TokenMismatchPERLPipeline = None  # type: ignore
+  TokenMismatchRewardModelPipeline = None  # type: ignore
+  apply_terminal_token_formatting = None  # type: ignore
+  resolve_terminal_token_string = None  # type: ignore
 
 __all__ = [
     "TokenMismatchRewardModelPipeline",

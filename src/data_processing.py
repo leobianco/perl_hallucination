@@ -60,7 +60,38 @@ def main():
       default=1.25,
       help="Maximum allowable ratio between majority and minority classes.",
   )
+  parser.add_argument(
+      "--subtask",
+      type=str,
+      default=None,
+      help=(
+          "Optional subtask override (e.g. 'qa' or 'summarization' for"
+          " ragtruth)."
+      ),
+  )
   args = parser.parse_args()
+
+  if args.subtask and args.task_name in (
+      "ragtruth",
+      "ragtruth-qa",
+      "ragtruth-summarization",
+  ):
+    sub = args.subtask.lower().strip()
+    if "sum" in sub:
+      args.task_name = "ragtruth-summarization"
+    elif "data" in sub:
+      raise ValueError(
+          "Data-to-text subtask has been dropped from RAGTruth in this codebase. "
+          "Supported task names are 'ragtruth-qa' and 'ragtruth-summarization'."
+      )
+    else:
+      args.task_name = "ragtruth-qa"
+
+  if "data" in (args.task_name or "").lower():
+    raise ValueError(
+        "Data-to-text subtask has been dropped from RAGTruth in this codebase. "
+        "Supported task names are 'ragtruth-qa' and 'ragtruth-summarization'."
+    )
 
   processor_cls = get_task_processor(args.task_name)
   processor = processor_cls(args)

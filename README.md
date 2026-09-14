@@ -5,7 +5,7 @@ This project studies the reduction of hallucinations via RLAIF with *synthetic* 
 ## Usage
 
 Here is a brief description about the usage of each script, roughly in the order that they should be executed.
-Substitute `TASK` by `npov`, `bosch`, or `ragtruth` to select the correct dataset. 
+Substitute `TASK` by `npov`, `bosch`, `ragtruth-qa`, or `ragtruth-summarization` (or `ragtruth`, which defaults to `ragtruth-qa`) to select the correct dataset. 
 Every `.sh` script in the `/scripts` folder runs the corresponding Python entrypoint located under `src/` (for example `src/writer_sft.py`).
 **Run the scripts from the project folder (not from within the `scripts` folder) so paths resolve correctly.**
 

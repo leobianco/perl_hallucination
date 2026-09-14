@@ -771,7 +771,8 @@ def get_task_processor(task_name: str) -> Any:
   when pipelines import utils.
 
   Args:
-      task_name (str): One of 'npov', 'bosch', 'ragtruth'.
+      task_name (str): One of 'npov', 'bosch', 'ragtruth', 'ragtruth-qa',
+        'ragtruth-summarization'.
 
   Returns:
       class: The TaskProcessor class corresponding to task_name.
@@ -779,20 +780,20 @@ def get_task_processor(task_name: str) -> Any:
   Raises:
       ValueError: If an unknown task_name is provided.
   """
-  from src.task_processors.bosch_task_processor import BoschTaskProcessor
-  from src.task_processors.npov_task_processor import NPOVTaskProcessor
-  from src.task_processors.ragtruth_task_processor import RagtruthTaskProcessor
-
-  task_map = {
-      "npov": NPOVTaskProcessor,
-      "bosch": BoschTaskProcessor,
-      "ragtruth": RagtruthTaskProcessor,
-  }
-
-  processor_cls = task_map.get(task_name)
-  if processor_cls is None:
+  if task_name == "npov":
+    from src.task_processors.npov_task_processor import NPOVTaskProcessor
+    return NPOVTaskProcessor
+  elif task_name == "bosch":
+    from src.task_processors.bosch_task_processor import BoschTaskProcessor
+    return BoschTaskProcessor
+  elif (
+      task_name in ("ragtruth", "ragtruth-qa", "ragtruth-summarization")
+      or task_name.startswith("ragtruth")
+  ):
+    from src.task_processors.ragtruth_task_processor import RagtruthTaskProcessor
+    return RagtruthTaskProcessor
+  else:
     raise ValueError(f"Unknown task: {task_name}")
-  return processor_cls
 
 
 def compact_model_name(model_name: str) -> str:
