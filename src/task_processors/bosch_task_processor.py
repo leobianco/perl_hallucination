@@ -550,6 +550,7 @@ class BoschTaskProcessor(BaseTaskProcessor):
         autorater_dataset = concatenate_datasets(
             [data["train"], data["validation"], data["test"]]
         )
+        autorater_dataset = autorater_dataset.map(self._rm_prompt)
 
         return autorater_dataset
 
@@ -793,6 +794,23 @@ class BoschTaskProcessor(BaseTaskProcessor):
             return entry
 
         return bosch_evaluator_prompt
+
+    @classmethod
+    def format_writer_fewshot_example(cls, example: dict) -> str:
+        """Format a single few-shot demonstration for the Bosch writer model.
+
+        Ensures the demonstration includes both the prompt (question/context)
+        and the ground-truth response answer.
+        """
+        prompt = example.get("prompt", "")
+        response = example.get("response") or example.get("Answer") or ""
+        if not prompt and "Question" in example and "Context" in example:
+            prompt = cls._format_prompt(example["Question"], example["Context"])
+        if response and not prompt.rstrip().endswith(str(response).strip()):
+            if not prompt.endswith("\n"):
+                prompt += "\n"
+            prompt += str(response).strip()
+        return prompt
 
     @staticmethod
     def _synthetic_hall_structured(entry: dict, rouge_metric: Any) -> dict:

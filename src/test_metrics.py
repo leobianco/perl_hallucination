@@ -47,6 +47,10 @@ class MockDataset:
     first_col = next(iter(self._data.values()))
     return len(first_col)
 
+  @property
+  def num_rows(self):
+    return len(self)
+
   def remove_columns(self, column_name: str):
     new_data = {k: v for k, v in self._data.items() if k != column_name}
     return MockDataset(new_data)
@@ -1000,13 +1004,11 @@ class TestGeminiScoreDataset(unittest.TestCase):
     self.assertEqual(len(captured_calls), 1)
     self.assertEqual(scores, [1.0])
 
-    from google.genai import types as genai_types
-
-    call_kwargs = genai_types.GenerateContentConfig.call_args.kwargs
-    self.assertGreaterEqual(call_kwargs.get("max_output_tokens", 0), 64)
-    self.assertIn("system_instruction", call_kwargs)
-    self.assertIn("Yes", call_kwargs["system_instruction"])
-    self.assertIn("No", call_kwargs["system_instruction"])
+    call_config = captured_calls[0]
+    self.assertGreaterEqual(getattr(call_config, "max_output_tokens", 0), 64)
+    sys_inst = getattr(call_config, "system_instruction", "")
+    self.assertIn("Yes", str(sys_inst))
+    self.assertIn("No", str(sys_inst))
 
 
 class TestCpuCompatibility(unittest.TestCase):
@@ -1052,6 +1054,41 @@ class TestCpuCompatibility(unittest.TestCase):
         pipe.run_and_save()
       self.assertIn("vLLM is required", str(ctx.exception))
 
+  def test_generation_pipeline_process_data_bosch_fewshot(self):
+    """Test that EvaluationGenerationPipeline properly includes responses in Bosch few-shot."""
+    pipe = EvaluationGenerationPipeline()
+    pipe.args = MagicMock(
+        task_name="bosch",
+        writer_num_fewshot=2,
+        dataset_labels="dummy_labels",
+        dataset_labels_split="test",
+        seed=42,
+    )
+    pipe.dataset_prompts = MockDataset.from_dict({
+        "prompt": ["Test Q\nManual:\nC\nAnswer to user's question:\n"]
+    })
+    fewshot_list = [
+        {
+            "prompt": "Q1\nManual:\nC1\nAnswer to user's question:\n",
+            "response": "Response 1",
+            "class_hall": "No",
+        },
+        {
+            "prompt": "Q2\nManual:\nC2\nAnswer to user's question:\n",
+            "response": "Response 2",
+            "class_hall": "No",
+        },
+    ]
+    pipe.safe_load_dataset = MagicMock(return_value=fewshot_list)
+    pipe.get_fewshot_examples = MagicMock(return_value=fewshot_list)
+    pipe.process_data()
+    self.assertEqual(len(pipe.prompts), 1)
+    prompt = pipe.prompts[0]
+    self.assertIn("Answer to user's question:\nResponse 1", prompt)
+    self.assertIn("Answer to user's question:\nResponse 2", prompt)
+    self.assertTrue(prompt.endswith("Test Q\nManual:\nC\nAnswer to user's question:\n"))
+
 
 if __name__ == "__main__":
   unittest.main()
+

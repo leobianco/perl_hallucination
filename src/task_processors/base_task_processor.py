@@ -180,6 +180,27 @@ class BaseTaskProcessor(abc.ABC):
         raise NotImplementedError()
 
     @classmethod
+    def format_writer_fewshot_example(cls, example: dict) -> str:
+        """Format a single few-shot demonstration for the writer model.
+
+        Ensures that the prompt text includes the target non-hallucinated response.
+        If the prompt already contains the response, it is returned unchanged.
+        """
+        prompt = example.get("prompt", "")
+        response = (
+            example.get("response")
+            or example.get("completion")
+            or example.get("npov_response")
+            or example.get("Answer")
+            or ""
+        )
+        if response and not prompt.rstrip().endswith(str(response).strip()):
+            if not prompt.endswith("\n"):
+                prompt += "\n"
+            prompt += str(response).strip()
+        return prompt
+
+    @classmethod
     def augment_training_split(
         cls,
         train_split: Dataset,

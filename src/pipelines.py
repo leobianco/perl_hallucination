@@ -3236,7 +3236,37 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
           n_no=self.args.writer_num_fewshot,
           seed=self.args.seed,
       )
-      fewshot_prompts = "\n".join([ex["prompt"] for ex in fewshot_examples])
+      processor_cls = None
+      if hasattr(self.args, "task_name") and self.args.task_name:
+        try:
+          processor_cls = get_task_processor(self.args.task_name)
+        except Exception:
+          processor_cls = None
+
+      formatted_fewshot = []
+      for ex in fewshot_examples:
+        if processor_cls and hasattr(
+            processor_cls, "format_writer_fewshot_example"
+        ):
+          formatted_fewshot.append(
+              processor_cls.format_writer_fewshot_example(ex)
+          )
+        else:
+          prompt = ex.get("prompt", "")
+          response = (
+              ex.get("response")
+              or ex.get("completion")
+              or ex.get("npov_response")
+              or ex.get("Answer")
+              or ""
+          )
+          if response and not prompt.rstrip().endswith(str(response).strip()):
+            if not prompt.endswith("\n"):
+              prompt += "\n"
+            prompt += str(response).strip()
+          formatted_fewshot.append(prompt)
+
+      fewshot_prompts = "\n".join(formatted_fewshot)
       prompts = [fewshot_prompts + "\n" + p for p in prompts]
 
     self.prompts = prompts

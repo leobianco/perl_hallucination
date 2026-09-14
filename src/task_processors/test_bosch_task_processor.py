@@ -634,6 +634,72 @@ class TestBoschTaskProcessorSynthetic(unittest.TestCase):
     test_cols = result["test"].column_names
     self.assertEqual(train_cols, test_cols)
 
+  def test_format_writer_fewshot_example_appends_response(self):
+    example = {
+        "Question": "How to check oil?",
+        "Context": "Pull dipstick.",
+        "prompt": (
+            "You are a helpful assistant...\n"
+            "User question:\nHow to check oil?\n"
+            "Manual information:\nPull dipstick.\n"
+            "Answer to user's question:\n"
+        ),
+        "response": "Pull the yellow dipstick and wipe it.",
+    }
+    formatted = BoschTaskProcessor.format_writer_fewshot_example(example)
+    self.assertTrue(formatted.endswith("Pull the yellow dipstick and wipe it."))
+    self.assertIn("Answer to user's question:\nPull the yellow dipstick and wipe it.", formatted)
+
+  def test_format_writer_fewshot_example_no_duplicate(self):
+    example = {
+        "Question": "How to check oil?",
+        "Context": "Pull dipstick.",
+        "prompt": (
+            "You are a helpful assistant...\n"
+            "User question:\nHow to check oil?\n"
+            "Manual information:\nPull dipstick.\n"
+            "Answer to user's question:\n"
+            "Pull the yellow dipstick and wipe it."
+        ),
+        "response": "Pull the yellow dipstick and wipe it.",
+    }
+    formatted = BoschTaskProcessor.format_writer_fewshot_example(example)
+    # Ensure the response is not duplicated at the end
+    self.assertEqual(formatted, example["prompt"])
+
+  def test_format_writer_fewshot_example_from_question_context(self):
+    example = {
+        "Question": "How to check tire pressure?",
+        "Context": "Tire pressure is 32 PSI.",
+        "response": "Set tire pressure to 32 PSI.",
+    }
+    formatted = BoschTaskProcessor.format_writer_fewshot_example(example)
+    self.assertIn("How to check tire pressure?", formatted)
+    self.assertIn("Tire pressure is 32 PSI.", formatted)
+    self.assertTrue(formatted.endswith("Set tire pressure to 32 PSI."))
+
+  def test_make_autorater_data_applies_rm_prompt(self):
+    mock_split = Dataset.from_list([
+        {
+            "Question": "Q?",
+            "Context": "C.",
+            "prompt": "Prefix:\nAnswer to user's question:\n",
+            "response": "Verified answer.",
+            "class_hall": "No",
+            "label": 1,
+        }
+    ])
+    mock_data = DatasetDict({
+        "train": mock_split,
+        "validation": mock_split,
+        "test": mock_split,
+    })
+    autorater_data = self.processor._make_autorater_data(mock_data)
+    self.assertEqual(len(autorater_data), 3)
+    for entry in autorater_data:
+      self.assertEqual(entry["prompt"], "Prefix:\nAnswer to user's question:\nVerified answer.")
+
 
 if __name__ == "__main__":
   unittest.main()
+
