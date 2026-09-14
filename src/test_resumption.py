@@ -629,6 +629,88 @@ class TestPipelineArgumentSetup(unittest.TestCase):
       )
       self.assertIn("r4", pipeline.training_args.run_name)
 
+  def test_perl_pipeline_setup_arguments_with_gradient_accumulation(self):
+    pipeline = PERLPipeline()
+    mock_script_args = MagicMock()
+    mock_script_args.task_name = "npov"
+    mock_training_args = MagicMock()
+    mock_training_args.seed = 130104
+    mock_training_args.learning_rate = 2e-5
+    mock_training_args.beta = 0.05
+    mock_training_args.temperature = 0.7
+    mock_training_args.num_train_epochs = 1.0
+    mock_training_args.gradient_accumulation_steps = 4
+    mock_training_args.steps_per_generation = 16
+    mock_training_args.run_name = None
+
+    with patch("src.pipelines.HfArgumentParser") as mock_parser_cls:
+      mock_parser = MagicMock()
+      mock_parser.parse_args_into_dataclasses.return_value = (
+          mock_script_args,
+          mock_training_args,
+      )
+      mock_parser_cls.return_value = mock_parser
+
+      pipeline.setup_arguments(
+          "--task_name=npov",
+          "--dataset_repo_id=leobianco/npov_perl",
+          "--model_repo_id=google/gemma-4-E2B-it",
+          "--gradient_accumulation_steps=4",
+          "--steps_per_generation=16",
+          "--temperature=0.7",
+      )
+      self.assertEqual(pipeline.training_args.gradient_accumulation_steps, 4)
+      self.assertIn("gas4", pipeline.training_args.run_name)
+      self.assertIn("T0.7", pipeline.training_args.run_name)
+
+  def test_perl_pipeline_setup_arguments_invalid_steps_per_gen(self):
+    pipeline = PERLPipeline()
+    mock_script_args = MagicMock()
+    mock_script_args.task_name = "npov"
+    mock_training_args = MagicMock()
+    mock_training_args.seed = 130104
+    mock_training_args.learning_rate = 2e-5
+    mock_training_args.beta = 0.05
+    mock_training_args.temperature = 0.7
+    mock_training_args.num_train_epochs = 1.0
+    mock_training_args.gradient_accumulation_steps = 5
+    mock_training_args.steps_per_generation = 16
+    mock_training_args.run_name = None
+
+    with patch("src.pipelines.HfArgumentParser") as mock_parser_cls:
+      mock_parser = MagicMock()
+      mock_parser.parse_args_into_dataclasses.return_value = (
+          mock_script_args,
+          mock_training_args,
+      )
+      mock_parser_cls.return_value = mock_parser
+
+      with self.assertRaises(ValueError) as ctx:
+        pipeline.setup_arguments(
+            "--task_name=npov",
+            "--dataset_repo_id=leobianco/npov_perl",
+            "--model_repo_id=google/gemma-4-E2B-it",
+            "--gradient_accumulation_steps=5",
+            "--steps_per_generation=16",
+        )
+      self.assertIn("steps_per_generation (16) must be an integer multiple",
+                    str(ctx.exception))
+
+  def test_warmup_steps_configuration_with_gradient_accumulation(self):
+    pipeline = PERLPipeline()
+    pipeline.training_args = MagicMock()
+    pipeline.training_args.warmup_ratio = 0.1
+    pipeline.training_args.warmup_steps = 0
+    pipeline.training_args.per_device_train_batch_size = 8
+    pipeline.training_args.gradient_accumulation_steps = 4
+    pipeline.training_args.num_train_epochs = 1
+    pipeline.training_args.world_size = 2
+    pipeline.data = {"train": list(range(640))}
+
+    pipeline._configure_warmup_steps()
+    self.assertEqual(pipeline.training_args.warmup_steps, 1)
+    self.assertEqual(pipeline.training_args.warmup_ratio, 0.0)
+
   def test_perl_pipeline_setup_model_direct_from_base(self):
     pipeline = PERLPipeline()
     pipeline.args = MagicMock()

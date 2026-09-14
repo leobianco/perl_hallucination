@@ -25,8 +25,9 @@ STEPS_PER_GENERATION=16
 PER_DEVICE_BATCH_SIZE=8
 PER_DEVICE_EVAL_BATCH_SIZE=16
 AUTO_FIND_BATCH_SIZE=False
-TEMPERATURE=0.1
+TEMPERATURE="${TEMPERATURE:-0.7}"
 NUM_FEWSHOT=0
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-4}"
 SAVE_STRATEGY="steps"
 SAVE_STEPS=50
 DO_EVAL=True
@@ -114,7 +115,7 @@ accelerate launch \
   --warmup_ratio "$WARMUP_RATIO" \
   --max_completion_length "$MAX_COMPLETION_LENGTH" \
   --weight_decay 0.0 \
-  --gradient_accumulation_steps 1 \
+  --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
   --per_device_eval_batch_size "$PER_DEVICE_EVAL_BATCH_SIZE" \
   --reward_model_path "${REWARD_MODEL_PATH}" \
   --beta "$BETA" \

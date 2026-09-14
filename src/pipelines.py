@@ -1107,6 +1107,19 @@ class PERLPipeline(Pipeline):
     temp = getattr(training_args, "temperature", None)
     epochs = getattr(training_args, "num_train_epochs", None)
     r = getattr(lora_args, "lora_r", None)
+    gas = getattr(training_args, "gradient_accumulation_steps", 1)
+    steps_per_gen = getattr(training_args, "steps_per_generation", None)
+    if (
+        isinstance(steps_per_gen, int)
+        and isinstance(gas, int)
+        and gas > 1
+    ):
+      if steps_per_gen % gas != 0:
+        raise ValueError(
+            f"steps_per_generation ({steps_per_gen}) must be an integer "
+            f"multiple of gradient_accumulation_steps ({gas}) for RLOOTrainer."
+        )
+
     run_name_parts = [f"{task}_PERL", f"lr{lr:.1e}"]
     if r is not None:
       run_name_parts.append(f"r{r}")
@@ -1115,6 +1128,8 @@ class PERLPipeline(Pipeline):
       run_name_parts.append(f"beta{name_beta}")
     if temp is not None:
       run_name_parts.append(f"T{temp}")
+    if isinstance(gas, int) and gas > 1:
+      run_name_parts.append(f"gas{gas}")
     if epochs is not None:
       run_name_parts.append(f"epo{epochs}")
     run_name = "_".join(run_name_parts)
