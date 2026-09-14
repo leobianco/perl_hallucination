@@ -43,13 +43,13 @@ command:
   - --lr_scheduler_type=cosine
   - --warmup_ratio=0.1
   - --max_completion_length=256
-  - --num_generations=4
+  - --num_generations=8
   - --num_iterations=1
   - --steps_per_generation=16
-  - --per_device_train_batch_size=8
+  - --per_device_train_batch_size=4
   - --per_device_eval_batch_size=16
   - --auto_find_batch_size=False
-  - --gradient_accumulation_steps=4
+  - --gradient_accumulation_steps=8
   - ${args}
 
 parameters:

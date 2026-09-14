@@ -64,10 +64,11 @@ return rewards
 ### 1. Problem: Sparse Signals in Rollout Batches
 Because the reward model measures rare events (hallucinations), rollouts at low batch sizes ($B_{\text{eff}} = 16$ prompts across 2 GPUs) frequently yield batches where zero prompts exhibit hallucination variance. Under RLOO's leave-one-out baseline ($A_i = r_i - \frac{1}{K-1}\sum_{j \neq i} r_j$), homogeneous rollouts produce zero advantage ($A_i \approx 0$), resulting in uninformative policy updates dominated by KL drift.
 
-### 2. Solution: Gradient Accumulation ($G = 4$)
-* **Effective Batch Size**: With `per_device_train_batch_size = 8` on 2 GPUs and $G = 4$, the effective batch size scales to $8 \times 2 \times 4 = 64$ prompts (256 rollouts per update).
-* **Signal Coverage**: At a ~5% event probability, the chance that an update contains at least one informative prompt increases from ~56% ($G=1$) to >96% ($G=4$).
-* **Rollout Divisibility**: Neatly divides `steps_per_generation = 16`, producing exactly 4 optimizer updates per rollout phase.
-* **HBM Neutral**: Accumulates gradients in-place in `param.grad` and discards activations after each micro-batch backward pass, preventing OOM on 80GB HBM.
+### 2. Solution: High-Exploration Rollouts ($K = 8$) with Gradient Accumulation ($G = 8$)
+* **Intra-Prompt Exploration ($K = 8$)**: Sampling 8 completions per prompt nearly doubles the probability of encountering rare hallucinations within each prompt compared to $K=4$ ($~33.7\%$ vs $~18.5\%$ at $p=0.05$), unlocking non-zero RLOO leave-one-out baselines.
+* **Invariant Peak HBM Memory ($B = 4, K = 8$)**: Halving `per_device_train_batch_size` to 4 while doubling $K$ to 8 keeps simultaneous parallel sequences per device at exactly $4 \times 8 = 32$ (identical to the previous $8 \times 4 = 32$). Peak KV-cache and backprop activation memory remain completely unchanged.
+* **Effective Batch Size ($G = 8$)**: With $B=4$ per device across 2 GPUs (8 prompts / micro-batch), accumulating over $G=8$ steps maintains the canonical effective batch size of $4 \times 2 \times 8 = 64$ prompts (512 rollouts per optimizer step).
+* **Rollout Divisibility**: $16 \div 8 = 2$ optimizer updates per 16-step generation phase ($16 \% 8 == 0$).
 * **DeepSpeed Integration**: Configured `gradient_accumulation_steps: auto` in `scripts/deepspeed_config.yaml` to dynamically synchronize with CLI and Accelerate arguments.
+
 
