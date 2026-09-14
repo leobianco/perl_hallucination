@@ -69,3 +69,9 @@ parameters:
       - 0.3
       - 0.6
       - 1.0
+  reward_penalty_alpha:
+    values:
+      - 1.0
+      - 1.5
+      - 2.0
+      - 3.0

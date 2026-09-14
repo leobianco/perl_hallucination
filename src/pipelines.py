@@ -1130,6 +1130,9 @@ class PERLPipeline(Pipeline):
       run_name_parts.append(f"T{temp}")
     if isinstance(gas, int) and gas > 1:
       run_name_parts.append(f"gas{gas}")
+    alpha = getattr(script_args, "reward_penalty_alpha", 1.0)
+    if isinstance(alpha, (int, float)) and alpha > 1.0:
+      run_name_parts.append(f"a{alpha}")
     if epochs is not None:
       run_name_parts.append(f"epo{epochs}")
     run_name = "_".join(run_name_parts)
@@ -1412,7 +1415,13 @@ class PERLPipeline(Pipeline):
           logits = reward_model(**inputs).logits
 
         # Logit difference: r(x, y) = logits[:, 1] - logits[:, 0]
-        rewards = (logits[:, 1] - logits[:, 0]).cpu().tolist()
+        # When reward_penalty_alpha > 1.0, asymmetrically penalize negative
+        # logit differences (hallucinations): r_alpha = alpha * diff if diff < 0
+        diff = logits[:, 1] - logits[:, 0]
+        alpha = getattr(self.args, "reward_penalty_alpha", 1.0)
+        if isinstance(alpha, (int, float)) and alpha > 1.0:
+          diff = torch.where(diff < 0, alpha * diff, diff)
+        rewards = diff.cpu().tolist()
       return rewards
 
     self.trainer = RLOOTrainer(

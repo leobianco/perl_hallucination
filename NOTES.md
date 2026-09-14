@@ -71,4 +71,26 @@ Because the reward model measures rare events (hallucinations), rollouts at low 
 * **Rollout Divisibility**: $16 \div 8 = 2$ optimizer updates per 16-step generation phase ($16 \% 8 == 0$).
 * **DeepSpeed Integration**: Configured `gradient_accumulation_steps: auto` in `scripts/deepspeed_config.yaml` to dynamically synchronize with CLI and Accelerate arguments.
 
+---
+
+## Asymmetric Reward Penalty ($\alpha$) for Sparse Negative Signals
+
+### 1. Motivation
+Because hallucinations are rare events, positive rollouts ($z_1 - z_0 > 0$) vastly outnumber negative rollouts ($z_1 - z_0 < 0$). Even when a rollout prompt contains a hallucination, its relative gradient impact under standard symmetric Bradley-Terry reward scoring can be muted against the majority of non-hallucinatory rollouts.
+
+### 2. Mathematical Formulation
+To amplify the penalty for rare hallucinations without altering the factual baseline:
+$$r_\alpha(x, y) = \begin{cases} \alpha (z_1 - z_0), & \text{if } z_1 - z_0 < 0 \\ z_1 - z_0, & \text{otherwise} \end{cases}$$
+
+Where:
+* $z_1 - z_0$ is the unnormalized log-odds of label 1 ("No" hallucination) vs label 0 ("Yes" hallucination).
+* $\alpha \ge 1.0$ is the penalty multiplier (`reward_penalty_alpha`).
+* When $\alpha = 1.0$, $r_\alpha(x, y) = z_1 - z_0$ (exact standard symmetric Bradley-Terry logit difference).
+* When $\alpha > 1.0$, negative differences are deepened, producing larger leave-one-out advantage $|A_i|$ and stronger gradient updates repelling hallucinations.
+
+### 3. Hyperparameter Sweep Grid
+The sweep configuration (`scripts/sweep_perl.yaml`) sweeps:
+* `reward_penalty_alpha`: `[1.0, 1.5, 2.0, 3.0]`
+
+
 

@@ -40,6 +40,8 @@ class ScriptArguments:
       sft_model_path (Optional[str]): Path to the SFT model adapter checkpoint.
       sft_data_fraction (Optional[float]): Fraction of SFT training data to use
         (e.g. 0.5 for SCOPE Stage 1).
+      reward_penalty_alpha (float): Multiplier on negative logit differences to
+        asymmetrically penalize hallucinations (defaults to 1.0, symmetric).
   """
 
   task_name: str
@@ -49,6 +51,7 @@ class ScriptArguments:
   reward_model_path: Optional[str] = None
   sft_model_path: Optional[str] = None
   sft_data_fraction: Optional[float] = None
+  reward_penalty_alpha: float = 1.0
 
 
 

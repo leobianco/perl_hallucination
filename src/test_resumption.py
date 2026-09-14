@@ -663,6 +663,69 @@ class TestPipelineArgumentSetup(unittest.TestCase):
       self.assertIn("gas4", pipeline.training_args.run_name)
       self.assertIn("T0.7", pipeline.training_args.run_name)
 
+  def test_perl_pipeline_setup_arguments_with_reward_penalty_alpha(self):
+    pipeline = PERLPipeline()
+    mock_script_args = MagicMock()
+    mock_script_args.task_name = "npov"
+    mock_script_args.reward_penalty_alpha = 2.0
+    mock_training_args = MagicMock()
+    mock_training_args.seed = 130104
+    mock_training_args.learning_rate = 2e-5
+    mock_training_args.beta = 0.05
+    mock_training_args.temperature = 0.7
+    mock_training_args.num_train_epochs = 1.0
+    mock_training_args.gradient_accumulation_steps = 8
+    mock_training_args.steps_per_generation = 16
+    mock_training_args.run_name = None
+
+    with patch("src.pipelines.HfArgumentParser") as mock_parser_cls:
+      mock_parser = MagicMock()
+      mock_parser.parse_args_into_dataclasses.return_value = (
+          mock_script_args,
+          mock_training_args,
+      )
+      mock_parser_cls.return_value = mock_parser
+
+      pipeline.setup_arguments(
+          "--task_name=npov",
+          "--dataset_repo_id=leobianco/npov_perl",
+          "--model_repo_id=google/gemma-4-E2B-it",
+          "--reward_penalty_alpha=2.0",
+      )
+      self.assertEqual(pipeline.args.reward_penalty_alpha, 2.0)
+      self.assertIn("a2.0", pipeline.training_args.run_name)
+
+  def test_perl_pipeline_setup_arguments_default_alpha_no_suffix(self):
+    pipeline = PERLPipeline()
+    mock_script_args = MagicMock()
+    mock_script_args.task_name = "npov"
+    mock_script_args.reward_penalty_alpha = 1.0
+    mock_training_args = MagicMock()
+    mock_training_args.seed = 130104
+    mock_training_args.learning_rate = 2e-5
+    mock_training_args.beta = 0.05
+    mock_training_args.temperature = 0.7
+    mock_training_args.num_train_epochs = 1.0
+    mock_training_args.gradient_accumulation_steps = 1
+    mock_training_args.steps_per_generation = 16
+    mock_training_args.run_name = None
+
+    with patch("src.pipelines.HfArgumentParser") as mock_parser_cls:
+      mock_parser = MagicMock()
+      mock_parser.parse_args_into_dataclasses.return_value = (
+          mock_script_args,
+          mock_training_args,
+      )
+      mock_parser_cls.return_value = mock_parser
+
+      pipeline.setup_arguments(
+          "--task_name=npov",
+          "--dataset_repo_id=leobianco/npov_perl",
+          "--model_repo_id=google/gemma-4-E2B-it",
+      )
+      self.assertEqual(pipeline.args.reward_penalty_alpha, 1.0)
+      self.assertNotIn("_a", pipeline.training_args.run_name)
+
   def test_perl_pipeline_setup_arguments_invalid_steps_per_gen(self):
     pipeline = PERLPipeline()
     mock_script_args = MagicMock()
@@ -858,6 +921,81 @@ class TestPipelineArgumentSetup(unittest.TestCase):
     pipeline.data = {"train": mock_dataset}
     pipeline.process_data()
     self.assertEqual(pipeline.data["train"]["prompt"], ["p1", "p2"])
+
+
+class TestRewardPenaltyAlpha(unittest.TestCase):
+  """Unit tests for asymmetric reward penalty alpha scaling."""
+
+  def test_reward_penalty_alpha_applied_to_negative_diffs(self):
+    pipeline = PERLPipeline()
+    pipeline.args = MagicMock()
+    pipeline.args.reward_penalty_alpha = 2.0
+    pipeline.reward_model = MagicMock()
+    pipeline.reward_tokenizer = MagicMock()
+    pipeline.policy = MagicMock()
+    pipeline.training_args = MagicMock()
+    pipeline.data = {"train": [], "test": None}
+    pipeline.tokenizer = MagicMock()
+
+    mock_diff = MagicMock()
+    mock_where_result = MagicMock()
+    mock_where_result.cpu.return_value.tolist.return_value = [1.5, -2.0]
+
+    with patch("src.pipelines.RLOOTrainer") as mock_rloo_cls, patch(
+        "src.pipelines.torch.where", return_value=mock_where_result
+    ) as mock_torch_where:
+      pipeline.setup_trainer()
+      reward_fn = mock_rloo_cls.call_args.kwargs["reward_funcs"]
+
+      mock_logits = MagicMock()
+      mock_logits.__getitem__.side_effect = lambda idx: (
+          mock_diff if idx[1] in (0, 1) else MagicMock()
+      )
+      mock_diff.__sub__.return_value = mock_diff
+      mock_diff.__lt__.return_value = MagicMock()
+      mock_diff.__mul__.return_value = MagicMock()
+      pipeline.reward_model.return_value.logits = mock_logits
+
+      rewards = reward_fn(["prompt"], ["completion"])
+      self.assertEqual(rewards, [1.5, -2.0])
+      mock_torch_where.assert_called_once()
+
+  def test_reward_penalty_alpha_identity_when_1(self):
+    pipeline = PERLPipeline()
+    pipeline.args = MagicMock()
+    pipeline.args.reward_penalty_alpha = 1.0
+    pipeline.reward_model = MagicMock()
+    pipeline.reward_tokenizer = MagicMock()
+    pipeline.policy = MagicMock()
+    pipeline.training_args = MagicMock()
+    pipeline.data = {"train": [], "test": None}
+    pipeline.tokenizer = MagicMock()
+
+    mock_diff = MagicMock()
+    mock_diff.cpu.return_value.tolist.return_value = [1.5, -1.0]
+
+    with patch("src.pipelines.RLOOTrainer") as mock_rloo_cls, patch(
+        "src.pipelines.torch.where"
+    ) as mock_torch_where:
+      pipeline.setup_trainer()
+      reward_fn = mock_rloo_cls.call_args.kwargs["reward_funcs"]
+
+      mock_logits = MagicMock()
+      mock_logits.__getitem__.return_value = mock_diff
+      mock_diff.__sub__.return_value = mock_diff
+      pipeline.reward_model.return_value.logits = mock_logits
+
+      rewards = reward_fn(["prompt"], ["completion"])
+      self.assertEqual(rewards, [1.5, -1.0])
+      mock_torch_where.assert_not_called()
+
+  def test_asymmetric_reward_penalty_math(self):
+    diffs = [1.5, 0.2, 0.0, -0.5, -1.2]
+    alpha = 2.0
+    expected = [1.5, 0.2, 0.0, -1.0, -2.4]
+    computed = [alpha * d if d < 0 else d for d in diffs]
+    for c, e in zip(computed, expected):
+      self.assertAlmostEqual(c, e)
 
 
 if __name__ == "__main__":
