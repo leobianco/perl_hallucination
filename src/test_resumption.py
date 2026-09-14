@@ -1,6 +1,7 @@
 """Unit tests for checkpoint and WandB run resumption."""
 
 import contextlib
+import json
 import os
 import shutil
 import sys
@@ -586,6 +587,195 @@ class TestPipelineArgumentSetup(unittest.TestCase):
       self.assertEqual(pipeline.args.task_name, "bosch")
       self.assertEqual(pipeline.training_args.max_completion_length, 256)
       self.assertEqual(pipeline.training_args.learning_rate, 2e-5)
+
+  def test_perl_pipeline_setup_arguments_with_lora(self):
+    pipeline = PERLPipeline()
+    mock_script_args = MagicMock()
+    mock_script_args.task_name = "npov"
+    mock_training_args = MagicMock()
+    mock_training_args.seed = 130104
+    mock_training_args.learning_rate = 2e-5
+    mock_training_args.beta = 0.05
+    mock_training_args.temperature = 0.3
+    mock_training_args.num_train_epochs = 1.0
+    mock_training_args.run_name = None
+
+    with patch("src.pipelines.HfArgumentParser") as mock_parser_cls:
+      mock_parser = MagicMock()
+      mock_parser.parse_args_into_dataclasses.return_value = (
+          mock_script_args,
+          mock_training_args,
+      )
+      mock_parser_cls.return_value = mock_parser
+
+      pipeline.setup_arguments(
+          "--task_name=npov",
+          "--dataset_repo_id=leobianco/npov_perl",
+          "--model_repo_id=google/gemma-4-E4B-it",
+          "--lora_r=4",
+          "--lora_alpha=8",
+          "--lora_dropout=0.05",
+      )
+      self.assertEqual(pipeline._lora_args.lora_r, 4)
+      self.assertEqual(pipeline._lora_args.lora_alpha, 8)
+      self.assertEqual(pipeline._lora_args.lora_dropout, 0.05)
+      import peft
+      peft.LoraConfig.assert_called_with(
+          task_type="CAUSAL_LM",
+          peft_type="LORA",
+          r=4,
+          lora_alpha=8,
+          lora_dropout=0.05,
+      )
+      self.assertIn("r4", pipeline.training_args.run_name)
+
+  def test_perl_pipeline_setup_model_direct_from_base(self):
+    pipeline = PERLPipeline()
+    pipeline.args = MagicMock()
+    pipeline.args.reward_model_path = "leobianco/reward_model"
+    pipeline.args.sft_model_path = None
+    pipeline.args.model_repo_id = "google/gemma-4-E4B-it"
+    pipeline.training_args = MagicMock()
+    pipeline.training_args.reward_model_path = None
+    pipeline.training_args.sft_model_path = None
+    pipeline.tokenizer = MagicMock()
+    pipeline.tokenizer.pad_token_id = 0
+    pipeline._lora_args = MagicMock()
+    pipeline._lora_args.lora_r = 8
+    pipeline._lora_args.lora_alpha = 16
+    pipeline._lora_args.lora_dropout = 0.0
+    pipeline._lora_args.task_type = "CAUSAL_LM"
+    pipeline._lora_args.peft_type = "LORA"
+
+    mock_policy_base = MagicMock()
+    mock_fresh_peft = MagicMock()
+
+    with patch(
+        "src.pipelines.AutoModelForSequenceClassification.from_pretrained"
+    ), patch("src.pipelines.AutoTokenizer.from_pretrained"), patch(
+        "src.pipelines.AutoModelForCausalLM.from_pretrained",
+        return_value=mock_policy_base,
+    ), patch(
+        "src.pipelines.get_peft_model", return_value=mock_fresh_peft
+    ) as mock_get_peft:
+      pipeline.setup_model()
+      mock_get_peft.assert_called_once_with(
+          mock_policy_base, pipeline._lora_config
+      )
+      self.assertEqual(pipeline.policy, mock_fresh_peft)
+
+  def test_perl_pipeline_setup_model_with_sft_lora_merge(self):
+    pipeline = PERLPipeline()
+    pipeline.args = MagicMock()
+    pipeline.args.reward_model_path = "leobianco/reward_model"
+    pipeline.args.model_repo_id = "google/gemma-4-E4B-it"
+    pipeline.training_args = MagicMock()
+    pipeline.training_args.reward_model_path = None
+    pipeline.training_args.sft_model_path = None
+    pipeline.tokenizer = MagicMock()
+    pipeline.tokenizer.pad_token_id = 0
+
+    temp_sft_dir = tempfile.mkdtemp()
+    try:
+      config_path = os.path.join(temp_sft_dir, "adapter_config.json")
+      with open(config_path, "w") as f:
+        json.dump({"r": 8, "lora_alpha": 16}, f)
+
+      pipeline.args.sft_model_path = temp_sft_dir
+      pipeline._lora_args = MagicMock()
+      pipeline._lora_args.lora_r = 8
+      pipeline._lora_args.lora_alpha = 16
+      pipeline._lora_args.lora_dropout = 0.0
+      pipeline._lora_args.task_type = "CAUSAL_LM"
+      pipeline._lora_args.peft_type = "LORA"
+
+      mock_policy_base = MagicMock()
+      mock_sft_peft = MagicMock()
+      mock_merged_base = MagicMock()
+      mock_sft_peft.merge_and_unload.return_value = mock_merged_base
+      mock_fresh_peft = MagicMock()
+
+      with patch(
+          "src.pipelines.AutoModelForSequenceClassification.from_pretrained"
+      ), patch("src.pipelines.AutoTokenizer.from_pretrained"), patch(
+          "src.pipelines.AutoModelForCausalLM.from_pretrained",
+          return_value=mock_policy_base,
+      ), patch(
+          "src.pipelines.PeftModel.from_pretrained", return_value=mock_sft_peft
+      ) as mock_peft_from_pretrained, patch(
+          "src.pipelines.get_peft_model", return_value=mock_fresh_peft
+      ) as mock_get_peft:
+        pipeline.setup_model()
+        mock_peft_from_pretrained.assert_called_once_with(
+            mock_policy_base, temp_sft_dir
+        )
+        mock_sft_peft.merge_and_unload.assert_called_once()
+        mock_get_peft.assert_called_once_with(
+            mock_merged_base, pipeline._lora_config
+        )
+        self.assertEqual(pipeline.policy, mock_fresh_peft)
+    finally:
+      shutil.rmtree(temp_sft_dir, ignore_errors=True)
+
+  def test_perl_pipeline_setup_model_warns_on_rank_mismatch(self):
+    pipeline = PERLPipeline()
+    pipeline.args = MagicMock()
+    pipeline.args.reward_model_path = "leobianco/reward_model"
+    pipeline.args.model_repo_id = "google/gemma-4-E4B-it"
+    pipeline.training_args = MagicMock()
+    pipeline.training_args.reward_model_path = None
+    pipeline.training_args.sft_model_path = None
+    pipeline.tokenizer = MagicMock()
+    pipeline.tokenizer.pad_token_id = 0
+
+    temp_sft_dir = tempfile.mkdtemp()
+    try:
+      config_path = os.path.join(temp_sft_dir, "adapter_config.json")
+      with open(config_path, "w") as f:
+        json.dump({"r": 8, "lora_alpha": 16}, f)
+
+      pipeline.args.sft_model_path = temp_sft_dir
+      pipeline._lora_args = MagicMock()
+      pipeline._lora_args.lora_r = 4
+      pipeline._lora_args.lora_alpha = 8
+      pipeline._lora_args.lora_dropout = 0.0
+      pipeline._lora_args.task_type = "CAUSAL_LM"
+      pipeline._lora_args.peft_type = "LORA"
+
+      mock_policy_base = MagicMock()
+      mock_sft_peft = MagicMock()
+      mock_merged_base = MagicMock()
+      mock_sft_peft.merge_and_unload.return_value = mock_merged_base
+
+      with patch(
+          "src.pipelines.AutoModelForSequenceClassification.from_pretrained"
+      ), patch("src.pipelines.AutoTokenizer.from_pretrained"), patch(
+          "src.pipelines.AutoModelForCausalLM.from_pretrained",
+          return_value=mock_policy_base,
+      ), patch(
+          "src.pipelines.PeftModel.from_pretrained", return_value=mock_sft_peft
+      ), patch(
+          "src.pipelines.get_peft_model"
+      ), patch(
+          "builtins.print"
+      ) as mock_print:
+        pipeline.setup_model()
+        warning_printed = any(
+            "[WARNING] LoRA Rank Mismatch Detected in PE-RL:" in str(call)
+            for call in mock_print.call_args_list
+        )
+        self.assertTrue(warning_printed)
+    finally:
+      shutil.rmtree(temp_sft_dir, ignore_errors=True)
+
+  def test_perl_pipeline_process_data_zero_fewshot(self):
+    pipeline = PERLPipeline()
+    pipeline.args = MagicMock()
+    pipeline.args.num_fewshot = 0
+    mock_dataset = _TestMockDataset({"prompt": ["p1", "p2"]})
+    pipeline.data = {"train": mock_dataset}
+    pipeline.process_data()
+    self.assertEqual(pipeline.data["train"]["prompt"], ["p1", "p2"])
 
 
 if __name__ == "__main__":

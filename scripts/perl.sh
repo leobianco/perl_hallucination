@@ -4,8 +4,13 @@
 USER="leobianco"
 SEED=130104
 MODEL_REPO_ID="google/gemma-4-E2B-it"
-SFT_MODEL_PATH="${USER}/"
-REWARD_MODEL_PATH="${USER}/"
+SFT_MODEL_PATH="${SFT_MODEL_PATH:-}"
+REWARD_MODEL_PATH="${REWARD_MODEL_PATH:-${USER}/}"
+
+# LoRA Parameters
+LORA_RANK=8
+LORA_ALPHA=16
+LORA_DROPOUT=0.0
 
 # Training Parameters
 NUM_TRAIN_EPOCHS=1
@@ -21,6 +26,7 @@ PER_DEVICE_BATCH_SIZE=8
 PER_DEVICE_EVAL_BATCH_SIZE=16
 AUTO_FIND_BATCH_SIZE=False
 TEMPERATURE=0.1
+NUM_FEWSHOT=0
 SAVE_STRATEGY="steps"
 SAVE_STEPS=50
 DO_EVAL=True
@@ -39,7 +45,7 @@ MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
 FORMATTED_LR=$(python3 -c "import sys; lr=float('${LEARNING_RATE}'); print(f'{lr:.1e}')" 2>/dev/null || echo "$LEARNING_RATE")
 FORMATTED_BETA=$(python3 -c "import sys; b=float('${BETA}'); print(f'{b:.2g}' if b>=0.001 else f'{b:.1e}')" 2>/dev/null || echo "$BETA")
 FORMATTED_EPOCHS=$(python3 -c "import sys; e=float('${NUM_TRAIN_EPOCHS}'); print(f'{e:.2g}')" 2>/dev/null || echo "$NUM_TRAIN_EPOCHS")
-RUN_IDENTIFIER="${USER}/${TASK_NAME}_PERL_${MODEL_NAME}_S${SEED}_epo${FORMATTED_EPOCHS}_lr${FORMATTED_LR}_beta${FORMATTED_BETA}_${TIMESTAMP}"
+RUN_IDENTIFIER="${USER}/${TASK_NAME}_PERL_${MODEL_NAME}_S${SEED}_epo${FORMATTED_EPOCHS}_lr${FORMATTED_LR}_beta${FORMATTED_BETA}_r${LORA_RANK}_${TIMESTAMP}"
 
 # Resumption configuration (can be passed via environment variable or second argument)
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
@@ -65,6 +71,9 @@ fi
 EXTRA_ARGS=()
 if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
     EXTRA_ARGS+=(--resume_from_checkpoint "$RESUME_FROM_CHECKPOINT")
+fi
+if [ -n "$SFT_MODEL_PATH" ] && [ "$SFT_MODEL_PATH" != "none" ] && [ "$SFT_MODEL_PATH" != "None" ] && [ "$SFT_MODEL_PATH" != "${USER}/" ]; then
+    EXTRA_ARGS+=(--sft_model_path "$SFT_MODEL_PATH")
 fi
 
 # Checks
@@ -108,7 +117,6 @@ accelerate launch \
   --gradient_accumulation_steps 1 \
   --per_device_eval_batch_size "$PER_DEVICE_EVAL_BATCH_SIZE" \
   --reward_model_path "${REWARD_MODEL_PATH}" \
-  --sft_model_path "${SFT_MODEL_PATH}" \
   --beta "$BETA" \
   --num_generations "$NUM_GENERATIONS" \
   --num_iterations "$NUM_ITERATIONS" \
@@ -116,6 +124,12 @@ accelerate launch \
   --per_device_train_batch_size "$PER_DEVICE_BATCH_SIZE" \
   --auto_find_batch_size "$AUTO_FIND_BATCH_SIZE" \
   --temperature "$TEMPERATURE" \
+  --peft_type "LORA" \
+  --task_type "CAUSAL_LM" \
+  --lora_r "$LORA_RANK" \
+  --lora_alpha "$LORA_ALPHA" \
+  --lora_dropout "$LORA_DROPOUT" \
+  --num_fewshot "$NUM_FEWSHOT" \
   "${EXTRA_ARGS[@]}"
 
 if [ "$SHUTDOWN" = true ]; then

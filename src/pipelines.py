@@ -502,6 +502,11 @@ class Pipeline(abc.ABC):
       return False, None
 
     cleaned_ref = str(adapter_path_or_repo).strip()
+    if cleaned_ref.lower() in ("none", "false", "null", "no", '""', "''"):
+      return False, None
+    if cleaned_ref.endswith("/") and "/" not in cleaned_ref[:-1]:
+      return False, None
+
     if base_model_id and cleaned_ref == str(base_model_id).strip():
       return False, None
 
@@ -1077,18 +1082,34 @@ class PERLPipeline(Pipeline):
 
   def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
     clean_args = _clean_cli_args(cli_args)
+    parser_lora = create_lora_argument_parser()
+    lora_args, remaining_args = parser_lora.parse_known_args(clean_args)
+    clean_remaining = [a for a in remaining_args if a != "--"]
     parser = HfArgumentParser((ScriptArguments, RLOOConfig))
-    script_args, training_args = parser.parse_args_into_dataclasses(clean_args)
+    script_args, training_args = parser.parse_args_into_dataclasses(
+        clean_remaining
+    )
     self.args = script_args
     self.training_args = training_args
     set_seed(training_args.seed)
+    self._lora_args = lora_args
+    self._lora_config = LoraConfig(
+        task_type=self._lora_args.task_type,
+        peft_type=self._lora_args.peft_type,
+        r=self._lora_args.lora_r,
+        lora_alpha=self._lora_args.lora_alpha,
+        lora_dropout=self._lora_args.lora_dropout,
+    )
 
     task = script_args.task_name or "perl"
     lr = training_args.learning_rate
     beta = getattr(training_args, "beta", None)
     temp = getattr(training_args, "temperature", None)
     epochs = getattr(training_args, "num_train_epochs", None)
+    r = getattr(lora_args, "lora_r", None)
     run_name_parts = [f"{task}_PERL", f"lr{lr:.1e}"]
+    if r is not None:
+      run_name_parts.append(f"r{r}")
     if beta is not None:
       name_beta = f"{beta:.2g}" if beta >= 0.001 else f"{beta:.1e}"
       run_name_parts.append(f"beta{name_beta}")
@@ -1110,9 +1131,73 @@ class PERLPipeline(Pipeline):
     self.data = load_dataset(self.args.dataset_repo_id)
 
   def process_data(self) -> None:
-    # In modern TRL RLOOTrainer, datasets only need a 'prompt' column
-    # with raw text or standard format, and tokenization is handled by processing_class.
-    pass
+    # Ensure _lora_config is initialized even if setup_arguments was bypassed
+    if not hasattr(self, "_lora_config") or self._lora_config is None:
+      lora_r = (
+          getattr(self._lora_args, "lora_r", 8)
+          if hasattr(self, "_lora_args")
+          else 8
+      )
+      lora_alpha = (
+          getattr(self._lora_args, "lora_alpha", 16)
+          if hasattr(self, "_lora_args")
+          else 16
+      )
+      lora_dropout = (
+          getattr(self._lora_args, "lora_dropout", 0.0)
+          if hasattr(self, "_lora_args")
+          else 0.0
+      )
+      task_type = (
+          getattr(self._lora_args, "task_type", "CAUSAL_LM")
+          if hasattr(self, "_lora_args")
+          else "CAUSAL_LM"
+      )
+      peft_type = (
+          getattr(self._lora_args, "peft_type", "LORA")
+          if hasattr(self, "_lora_args")
+          else "LORA"
+      )
+      self._lora_config = LoraConfig(
+          task_type=task_type,
+          peft_type=peft_type,
+          r=lora_r,
+          lora_alpha=lora_alpha,
+          lora_dropout=lora_dropout,
+      )
+
+    # In modern TRL RLOOTrainer, datasets only need a 'prompt' column.
+    # By default, num_fewshot is 0/None, preserving clean zero-shot prompts.
+    # If explicitly requested via --num_fewshot > 0, fewshot examples are prepended.
+    if (
+        getattr(self.args, "num_fewshot", None) is not None
+        and self.args.num_fewshot > 0
+    ):
+      processor_cls = None
+      if hasattr(self.args, "task_name") and self.args.task_name:
+        try:
+          processor_cls = get_task_processor(self.args.task_name)
+        except Exception:
+          processor_cls = None
+
+      if processor_cls is not None and "train" in self.data:
+        fewshot_data = self.data["train"].shuffle(seed=self.training_args.seed)
+        n_ex = min(self.args.num_fewshot, len(fewshot_data))
+        fewshot_examples = fewshot_data.select(range(n_ex))
+        formatted_fewshot = []
+        for ex in fewshot_examples:
+          if hasattr(processor_cls, "format_writer_fewshot_example"):
+            formatted_fewshot.append(
+                processor_cls.format_writer_fewshot_example(ex)
+            )
+        if formatted_fewshot:
+          prefix = "\n".join(formatted_fewshot) + "\n"
+          for split in ("train", "test"):
+            if split in self.data and hasattr(self.data[split], "column_names"):
+              if "prompt" in self.data[split].column_names:
+                self.data[split] = self.data[split].map(
+                    lambda x: {"prompt": prefix + x["prompt"]}
+                )
 
   def setup_model(self) -> None:
     id2label = {0: "Yes", 1: "No"}
@@ -1173,9 +1258,100 @@ class PERLPipeline(Pipeline):
     if self.tokenizer.pad_token_id is not None:
       policy_base.config.pad_token_id = self.tokenizer.pad_token_id
 
-    self.policy = PeftModel.from_pretrained(
-        policy_base, sft_model_path, is_trainable=True
+    enable_lora, resolved_adapter_path = self._resolve_lora_adapter_path(
+        sft_model_path, self.args.model_repo_id
     )
+
+    # Ensure _lora_config exists
+    if not hasattr(self, "_lora_config") or self._lora_config is None:
+      lora_r = (
+          getattr(self._lora_args, "lora_r", 8)
+          if hasattr(self, "_lora_args")
+          else 8
+      )
+      lora_alpha = (
+          getattr(self._lora_args, "lora_alpha", 16)
+          if hasattr(self, "_lora_args")
+          else 16
+      )
+      lora_dropout = (
+          getattr(self._lora_args, "lora_dropout", 0.0)
+          if hasattr(self, "_lora_args")
+          else 0.0
+      )
+      task_type = (
+          getattr(self._lora_args, "task_type", "CAUSAL_LM")
+          if hasattr(self, "_lora_args")
+          else "CAUSAL_LM"
+      )
+      peft_type = (
+          getattr(self._lora_args, "peft_type", "LORA")
+          if hasattr(self, "_lora_args")
+          else "LORA"
+      )
+      self._lora_config = LoraConfig(
+          task_type=task_type,
+          peft_type=peft_type,
+          r=lora_r,
+          lora_alpha=lora_alpha,
+          lora_dropout=lora_dropout,
+      )
+
+    if enable_lora and resolved_adapter_path:
+      # Check and warn if SFT LoRA rank differs from RL LoRA rank
+      sft_config_path = os.path.join(
+          resolved_adapter_path, "adapter_config.json"
+      )
+      if os.path.isfile(sft_config_path):
+        try:
+          with open(sft_config_path, "r", encoding="utf-8") as f:
+            sft_config_json = json.load(f)
+          sft_r = sft_config_json.get("r")
+          sft_alpha = sft_config_json.get("lora_alpha")
+          rl_r = (
+              getattr(self._lora_args, "lora_r", self._lora_config.r)
+              if hasattr(self, "_lora_args")
+              else self._lora_config.r
+          )
+          rl_alpha = (
+              getattr(self._lora_args, "lora_alpha", self._lora_config.lora_alpha)
+              if hasattr(self, "_lora_args")
+              else self._lora_config.lora_alpha
+          )
+          if sft_r is not None and rl_r is not None and int(sft_r) != int(rl_r):
+            print(
+                "\n"
+                + "=" * 80
+                + "\n"
+                + "[WARNING] LoRA Rank Mismatch Detected in PE-RL:\n"
+                + f"  - SFT Checkpoint Rank: r = {sft_r} (alpha = {sft_alpha})\n"
+                + f"  - RL Policy LoRA Rank: r = {rl_r} (alpha = {rl_alpha})\n"
+                + f"The SFT adapter ({resolved_adapter_path}) will be merged"
+                " into base weights,\n"
+                f"and RL will train a NEW adapter with rank r = {rl_r}.\n"
+                f"If you intended to maintain the same dimension, pass"
+                f" --lora_r {sft_r}.\n"
+                + "=" * 80
+                + "\n"
+            )
+        except Exception as e:
+          print(f"[INFO] Could not inspect SFT adapter_config.json: {e}")
+
+      print(
+          f"Loading SFT LoRA adapter from '{resolved_adapter_path}' and"
+          " merging into base weights..."
+      )
+      sft_peft = PeftModel.from_pretrained(policy_base, resolved_adapter_path)
+      merged_base = sft_peft.merge_and_unload()
+      self.policy = get_peft_model(merged_base, self._lora_config)
+    else:
+      print(
+          f"Initializing fresh LoRA adapter (r={self._lora_config.r},"
+          f" alpha={self._lora_config.lora_alpha}) directly on model"
+          f" '{self.args.model_repo_id}'..."
+      )
+      self.policy = get_peft_model(policy_base, self._lora_config)
+
     self.policy.to(torch.bfloat16)
 
   def setup_trainer(self) -> None:
