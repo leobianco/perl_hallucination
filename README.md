@@ -23,6 +23,29 @@ python3 scripts/run_campaign.py status --task npov --watch
 python3 scripts/run_campaign.py resume --task npov
 ```
 
+### Resuming vs. restarting (read this if your config pins `name:`)
+
+A campaign's `name` determines its state file
+(`./checkpoints/<task>/<name>_state.json`). If your YAML pins `name:`, every
+`run` targets the same campaign, and **`run` will not guess** whether you want
+to continue it or start it over — guessing wrong either re-burns hours of GPU
+time or throws away a finished campaign. Say which:
+
+```bash
+# Continue the existing campaign (same as `resume`).
+python3 scripts/run_campaign.py run --task bosch --config configs/campaign_bosch.yaml --resume
+
+# Start over. The old state file is archived, never deleted, under
+# ./checkpoints/bosch/archive/.
+python3 scripts/run_campaign.py run --task bosch --config configs/campaign_bosch.yaml --fresh
+```
+
+Without a flag, an interactive terminal prompts `[r]esume / [f]resh / [a]bort`;
+a non-interactive one (piped output, `nohup`, CI) refuses with exit code `2`.
+`--yes` does *not* answer this question — it only skips the launch
+confirmation. Omit `name:` from your config and every launch is a new,
+timestamped campaign, so none of this applies.
+
 For complete documentation on the orchestrator, interactive dashboard hotkeys, declarative YAML configs, and remote VM/tmux setups, see [**`src/orchestrator/README.md`**](src/orchestrator/README.md).
 
 ---

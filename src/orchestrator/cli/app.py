@@ -8,12 +8,13 @@ argument vectors and an in-memory console, and assert on the rendered text.
 from __future__ import annotations
 
 import argparse
+import datetime
 import glob
 import json
 import logging
 import os
-import signal
 import shutil
+import signal
 import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -145,6 +146,24 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Skip the pre-launch confirmation.")
   run_parser.add_argument("--interactive", "-i", action="store_true",
                           help="Start from the guided wizard.")
+  # What to do when a state file for this campaign already exists. Neither
+  # answer is safe to guess: resuming silently adopts stale sweep ids and
+  # finished stages, starting over silently discards hours of GPU time.
+  existing = run_parser.add_mutually_exclusive_group()
+  existing.add_argument(
+      "--fresh", action="store_true",
+      help=(
+          "Start this campaign from scratch, archiving any existing state "
+          "for the same campaign name."
+      ),
+  )
+  existing.add_argument(
+      "--resume", action="store_true",
+      help=(
+          "Continue an existing campaign of the same name, keeping completed "
+          "stages and running sweeps."
+      ),
+  )
 
   # --- wizard ---
   subparsers.add_parser(
@@ -262,6 +281,150 @@ def state_progress(state: CampaignState, config: CampaignConfig) -> Tuple[int, i
   views = renderables.build_stage_views(config, state)
   done = sum(1 for v in views if str(v.status).upper() in ("COMPLETED", "SKIPPED"))
   return done, len(views)
+
+
+def archive_state_file(state_file: str) -> str:
+  """Moves ``state_file`` aside so a fresh campaign can reuse its name.
+
+  The file is *moved*, never deleted: it is the only record of which
+  checkpoints and sweeps a previous campaign produced, and a campaign
+  represents hours of GPU time. The archive lives one directory deeper than
+  the glob used by ``status``/``resume``/``list`` so archived runs stop
+  showing up as live campaigns.
+
+  Args:
+    state_file: Path to the state file to retire.
+
+  Returns:
+    The path the state file was moved to.
+  """
+  directory, filename = os.path.split(os.path.abspath(state_file))
+  archive_dir = os.path.join(directory, "archive")
+  os.makedirs(archive_dir, exist_ok=True)
+  stem, extension = os.path.splitext(filename)
+  stamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+  destination = os.path.join(archive_dir, f"{stem}_{stamp}{extension}")
+  # Collisions only happen when archiving twice inside one second.
+  counter = 1
+  while os.path.exists(destination):
+    destination = os.path.join(
+        archive_dir, f"{stem}_{stamp}_{counter}{extension}"
+    )
+    counter += 1
+  shutil.move(state_file, destination)
+  return destination
+
+
+def describe_existing_state(state_file: str) -> List[str]:
+  """Summarizes an existing campaign so the user can choose knowingly.
+
+  Args:
+    state_file: Path to the campaign state JSON.
+
+  Returns:
+    Human-readable lines; a single fallback line if the file is unreadable.
+  """
+  try:
+    state = CampaignState.load(state_file)
+  except (OSError, ValueError, KeyError, TypeError):
+    return [f"An unreadable state file already exists at {state_file}."]
+
+  config = config_for_state(state)
+  done, total = state_progress(state, config)
+  lines = [
+      f"Campaign : {state.campaign_id}",
+      f"Status   : {getattr(state, 'status', 'UNKNOWN')}",
+      f"Progress : {done}/{total} stages completed",
+      f"State    : {state_file}",
+  ]
+  stage_bits = []
+  for key in getattr(config, "stages", []) or []:
+    result = (getattr(state, "stages", {}) or {}).get(key)
+    raw = getattr(result, "status", None) if result else None
+    status = getattr(raw, "value", raw) or "PENDING"
+    stage_bits.append(f"{key}={str(status).lower()}")
+  if stage_bits:
+    lines.append("Stages   : " + ", ".join(stage_bits))
+  return lines
+
+
+def resolve_existing_campaign(
+    config: CampaignConfig,
+    args: argparse.Namespace,
+    console: UiConsole,
+) -> Optional[int]:
+  """Decides what ``run`` should do about a pre-existing state file.
+
+  ``run`` used to load whatever state file matched the campaign name, which
+  made two very different operations look identical: continuing a campaign
+  and starting one. That is only harmless until the state is stale - a
+  deleted W&B sweep, an edited config, a half-finished stage - at which point
+  the silent adoption turns into a confusing mid-run failure. Neither answer
+  is safe to guess, so this asks (interactively) or refuses (otherwise).
+
+  Args:
+    config: The campaign config, already validated. ``config.state_file``
+      determines which campaign we might be colliding with.
+    args: Parsed ``run`` arguments; reads ``resume``, ``fresh`` and ``yes``.
+    console: Console used for the explanation.
+
+  Returns:
+    ``None`` when ``run`` should proceed, otherwise the exit code to return.
+  """
+  state_file = config.state_file
+  exists = bool(state_file) and os.path.exists(state_file)
+
+  if not exists:
+    if getattr(args, "resume", False):
+      # Silently starting fresh here would look like a successful resume and
+      # quietly re-run stages the user believed were already done.
+      console.error(f"Nothing to resume: no state file at {state_file}.")
+      console.hint(
+          f"List known campaigns with: {PROGRAM} list. "
+          "Start a new one by dropping --resume."
+      )
+      return EXIT_NOT_FOUND
+    return None
+
+  if getattr(args, "resume", False):
+    console.info("Resuming the existing campaign:")
+    console.print_lines(describe_existing_state(state_file))
+    return None
+
+  if getattr(args, "fresh", False):
+    destination = archive_state_file(state_file)
+    console.info(f"Archived the previous campaign state to {destination}")
+    return None
+
+  # No flag: the user has not said which of the two they meant.
+  console.warn(f"A campaign named '{config.name}' already exists.")
+  console.print_lines(describe_existing_state(state_file))
+
+  if _is_interactive() and not getattr(args, "yes", False):
+    console.blank()
+    answer = input(
+        "[r]esume it, start [f]resh (archives the old state), or [a]bort? "
+    ).strip().lower()
+    if answer.startswith("r"):
+      args.resume = True
+      console.info("Resuming the existing campaign.")
+      return None
+    if answer.startswith("f"):
+      args.fresh = True
+      destination = archive_state_file(state_file)
+      console.info(f"Archived the previous campaign state to {destination}")
+      return None
+    console.info("Aborted before launch.")
+    return EXIT_OK
+
+  console.error("Refusing to guess whether to resume it or start over.")
+  console.hint(
+      "Re-run with one of:\n"
+      "  --resume   continue it, keeping completed stages and sweeps\n"
+      "  --fresh    start over, archiving the state file shown above\n"
+      "Or pick a different campaign name in your config's 'name:' field."
+  )
+  return EXIT_USAGE
 
 
 # --------------------------------------------------------------------------
@@ -471,6 +634,13 @@ def cmd_run(args: argparse.Namespace, console: UiConsole) -> int:
         "--reward-model with an existing repo id."
     )
     return EXIT_USAGE
+
+  # An existing state file means `run` would otherwise silently continue a
+  # previous campaign. Settle that before printing a preview that would
+  # describe a launch which may not happen.
+  gate = resolve_existing_campaign(config, args, console)
+  if gate is not None:
+    return gate
 
   _print_launch_preview(config, console)
   if not args.yes and not config.dry_run and _is_interactive():

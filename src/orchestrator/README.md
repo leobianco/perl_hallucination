@@ -96,11 +96,83 @@ Omitting a required checkpoint is caught before launch, not three hours in.
 python3 scripts/run_campaign.py run --task npov --preset smoke --dry-run
 ```
 
-### 6. Resuming an Interrupted Run
-```bash
-python3 scripts/run_campaign.py resume --task npov
+### 6. Resuming vs. Restarting a Campaign
+
+A campaign is identified by its **name**, and its name determines its **state
+file**:
+
 ```
-Prints a resume plan (what will be skipped, what will run) before doing anything.
+./checkpoints/<task>/<name>_state.json
+```
+
+If you do not set `name:` in your YAML, one is generated from the clock
+(`bosch_campaign_2609151127`), so every launch is a brand-new campaign and
+this section never concerns you. **If you *do* pin `name:` in your config,
+every `run` points at the same state file** — and the orchestrator then has to
+know whether you meant "continue that campaign" or "start it over".
+
+It will not guess. The two answers are expensive in opposite directions:
+
+| You meant | If the orchestrator guesses wrong |
+|---|---|
+| **Continue** | It re-runs finished stages and re-burns hours of GPU time. |
+| **Start over** | It attaches to stale sweep ids and silently discards a campaign's results. |
+
+So `run` behaves as follows:
+
+| Situation | Behaviour |
+|---|---|
+| No state file exists | Starts a new campaign. Normal case, nothing to decide. |
+| State file exists, `--resume` given | Continues it. Prints what it adopted. |
+| State file exists, `--fresh` given | Archives the old state, starts over. |
+| State file exists, no flag, **interactive TTY** | Prompts `[r]esume / [f]resh / [a]bort`. |
+| State file exists, no flag, **no TTY** (piped, `nohup`, CI) | **Refuses**, exit code `2`, and tells you the three ways out. |
+| No state file, `--resume` given | **Refuses**, exit code `3` (`Nothing to resume`). |
+
+```bash
+# Continue where you left off.
+python3 scripts/run_campaign.py run --task bosch --config configs/campaign_bosch.yaml --resume
+
+# Throw the old attempt away and start clean.
+python3 scripts/run_campaign.py run --task bosch --config configs/campaign_bosch.yaml --fresh
+
+# Equivalent to --resume, and the preferred spelling when you are only resuming.
+python3 scripts/run_campaign.py resume --task bosch
+```
+
+`--fresh` and `--resume` are mutually exclusive; argparse rejects passing both.
+
+> **`--yes` does not answer this question.** `--yes` only skips the *launch*
+> confirmation. With an existing state file and no `--resume`/`--fresh`, the
+> run is still refused — `--yes` must never be able to destroy a campaign.
+
+#### `--fresh` archives, it never deletes
+
+The old state file is **moved**, not removed:
+
+```
+./checkpoints/<task>/archive/<name>_state_<YYYYmmddHHMMSS>.json
+```
+
+It is the only record of which sweeps a campaign registered and which
+checkpoints it pushed, so it is worth keeping. `status`, `list` and `resume`
+glob one directory level deep, so archived campaigns disappear from those
+listings but remain on disk for you to inspect or restore by moving the file
+back.
+
+#### Recipe: I deleted the W&B sweep from the web UI
+
+You do not need `--fresh` for this. On resume, the orchestrator probes each
+recorded sweep id before reusing it:
+
+* **Sweep is gone (404)** → the stale pointer is cleared and a new sweep is
+  registered automatically. Completed stages are still skipped.
+* **W&B is unreachable** (503, network drop) → the sweep id is *kept*, because
+  abandoning a live sweep over a transient error would throw away paid-for
+  trials.
+
+Use `--fresh` when you want to discard the campaign's *results*, not merely
+its sweeps.
 
 ### 7. Monitoring from a second tmux pane
 ```bash
@@ -189,6 +261,10 @@ Split your tmux window (`Ctrl-B, %`):
 
 ```yaml
 campaign:
+  # Pinning a name pins the state file to
+  # ./checkpoints/npov/npov_production_v1_state.json, so re-running this
+  # config requires --resume or --fresh. See "Resuming vs. Restarting"
+  # above. Omit `name` to get a timestamped, always-new campaign.
   name: "npov_production_v1"
   task: "npov"
   seed: 130104

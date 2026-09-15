@@ -525,6 +525,164 @@ class RunCommandTest(CommandTestBase):
     w.assert_called_once()
 
 
+class RunExistingCampaignGateTest(CommandTestBase):
+  """``run`` must never silently adopt an existing campaign's state.
+
+  A state file records which sweeps were registered and which stages already
+  finished. Resuming and restarting are therefore very different operations,
+  and picking the wrong one either re-burns hours of GPU time or attaches to
+  a sweep that no longer exists.
+  """
+
+  CAMPAIGN = "pinned_campaign"
+
+  def setUp(self):
+    super().setUp()
+    self.executed = {}
+
+    def fake_execute(config, console, state=None, plain=False):
+      del console, state, plain
+      self.executed["config"] = config
+      return app.EXIT_OK
+
+    patcher = mock.patch.object(app, "_execute_campaign", fake_execute)
+    patcher.start()
+    self.addCleanup(patcher.stop)
+
+    # Default to a non-TTY shell (tmux over SSH with output piped, CI, ...).
+    # Individual tests opt into the interactive prompt explicitly.
+    tty_patcher = mock.patch.object(app, "_is_interactive", return_value=False)
+    tty_patcher.start()
+    self.addCleanup(tty_patcher.stop)
+
+    self.state_file = os.path.join(
+        app.CHECKPOINTS_ROOT, "bosch", f"{self.CAMPAIGN}_state.json"
+    )
+    config = CampaignConfig.create_default(task_name="bosch", sft_runs=1)
+    config.name = self.CAMPAIGN
+    config.state_file = self.state_file
+    config.to_yaml("campaign.yaml")
+
+  def seed_state(self) -> str:
+    """Writes a half-finished campaign at the pinned state path."""
+    return write_state(
+        app.CHECKPOINTS_ROOT,
+        task="bosch",
+        campaign_id=self.CAMPAIGN,
+        stages={"sft": StageResult(status=StageStatus.COMPLETED)},
+    )
+
+  def run_pinned(self, *extra):
+    return self.run_cli(
+        ["run", "--config", "campaign.yaml", "--dry-run", "--yes", *extra]
+    )
+
+  def test_a_first_run_is_unaffected(self):
+    self.assertEqual(self.run_pinned(), app.EXIT_OK)
+    self.assertIn("config", self.executed)
+
+  def test_existing_state_without_a_flag_is_refused(self):
+    self.seed_state()
+    code = self.run_pinned()
+    self.assertEqual(code, app.EXIT_USAGE)
+    self.assertNotIn("config", self.executed)
+    self.assertIn("already exists", self.output)
+    self.assertIn("--resume", self.output)
+    self.assertIn("--fresh", self.output)
+    # The refusal must not have touched the state it is protecting.
+    self.assertTrue(os.path.exists(self.state_file))
+
+  def test_the_refusal_describes_the_existing_campaign(self):
+    self.seed_state()
+    self.run_pinned()
+    self.assertIn(self.CAMPAIGN, self.output)
+    self.assertIn("1/4 stages completed", self.output)
+
+  def test_resume_proceeds_and_announces_itself(self):
+    self.seed_state()
+    code = self.run_pinned("--resume")
+    self.assertEqual(code, app.EXIT_OK)
+    self.assertIn("Resuming", self.output)
+    self.assertTrue(os.path.exists(self.state_file))
+    self.assertEqual(self.executed["config"].state_file, self.state_file)
+
+  def test_resume_without_any_state_is_not_found(self):
+    code = self.run_pinned("--resume")
+    self.assertEqual(code, app.EXIT_NOT_FOUND)
+    self.assertNotIn("config", self.executed)
+    self.assertIn("Nothing to resume", self.output)
+
+  def test_fresh_archives_instead_of_deleting(self):
+    self.seed_state()
+    code = self.run_pinned("--fresh")
+    self.assertEqual(code, app.EXIT_OK)
+    self.assertFalse(os.path.exists(self.state_file))
+    archive_dir = os.path.join(app.CHECKPOINTS_ROOT, "bosch", "archive")
+    archived = os.listdir(archive_dir)
+    self.assertEqual(len(archived), 1)
+    self.assertIn(self.CAMPAIGN, archived[0])
+    self.assertIn("Archived", self.output)
+
+  def test_fresh_on_a_clean_slate_is_a_no_op(self):
+    self.assertEqual(self.run_pinned("--fresh"), app.EXIT_OK)
+    self.assertNotIn("Archived", self.output)
+
+  def test_archived_state_is_not_listed_as_a_campaign(self):
+    self.seed_state()
+    self.run_pinned("--fresh")
+    # ``status``/``list``/``resume`` glob one level deep, so the archive
+    # subdirectory must stay invisible to them.
+    self.assertEqual(app.find_state_files("bosch"), [])
+
+  def test_archiving_twice_keeps_both_copies(self):
+    self.seed_state()
+    first = app.archive_state_file(self.state_file)
+    self.seed_state()
+    second = app.archive_state_file(self.state_file)
+    self.assertNotEqual(first, second)
+    self.assertTrue(os.path.exists(first))
+    self.assertTrue(os.path.exists(second))
+
+  def test_fresh_and_resume_cannot_be_combined(self):
+    parser = app.build_parser()
+    with contextlib.redirect_stderr(io.StringIO()):
+      with self.assertRaises(SystemExit):
+        parser.parse_args(["run", "--fresh", "--resume"])
+
+  def test_interactive_prompt_can_resume(self):
+    self.seed_state()
+    with mock.patch.object(app, "_is_interactive", return_value=True):
+      with mock.patch("builtins.input", return_value="r"):
+        code = self.run_cli(["run", "--config", "campaign.yaml", "--dry-run"])
+    self.assertEqual(code, app.EXIT_OK)
+    self.assertTrue(os.path.exists(self.state_file))
+
+  def test_interactive_prompt_can_start_fresh(self):
+    self.seed_state()
+    with mock.patch.object(app, "_is_interactive", return_value=True):
+      with mock.patch("builtins.input", return_value="f"):
+        code = self.run_cli(["run", "--config", "campaign.yaml", "--dry-run"])
+    self.assertEqual(code, app.EXIT_OK)
+    self.assertFalse(os.path.exists(self.state_file))
+
+  def test_interactive_prompt_can_abort(self):
+    self.seed_state()
+    with mock.patch.object(app, "_is_interactive", return_value=True):
+      with mock.patch("builtins.input", return_value="a"):
+        code = self.run_cli(["run", "--config", "campaign.yaml", "--dry-run"])
+    self.assertEqual(code, app.EXIT_OK)
+    self.assertNotIn("config", self.executed)
+    self.assertTrue(os.path.exists(self.state_file))
+
+  def test_an_unreadable_state_file_still_blocks_the_run(self):
+    os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
+    with open(self.state_file, "w", encoding="utf-8") as handle:
+      handle.write("{not json")
+    code = self.run_pinned()
+    self.assertEqual(code, app.EXIT_USAGE)
+    self.assertIn("unreadable state file", self.output)
+
+
 class ResumeCommandTest(CommandTestBase):
   """``resume``."""
 
