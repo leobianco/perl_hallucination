@@ -286,6 +286,10 @@ class TrialRecord:
   state: str = "running"
   started_at: float = field(default_factory=time.time)
   finished_at: Optional[float] = None
+  #: True while ``run_id`` is a placeholder synthesized before W&B disclosed
+  #: the real id. Such a record is adopted (not duplicated) as soon as the
+  #: real id appears on a later line.
+  provisional: bool = False
 
   @property
   def elapsed(self) -> float:
@@ -294,15 +298,90 @@ class TrialRecord:
     return max(0.0, end - self.started_at)
 
 
-# ``wandb agent`` prints run boundaries in a stable, documented format.
-_RUN_START_RE = re.compile(
-    r"agent\s+starting\s+run:?\s*([\w\-]+)", re.IGNORECASE
+# ``wandb agent`` announces run boundaries in *two* different shapes and the
+# parser has to understand both, because which one you get depends on the
+# wandb version and on whether the terminal is a TTY:
+#
+#   1. The ``termlog`` shape, carrying the run id:
+#        wandb: Agent Starting Run: k8jd92la with config:
+#        wandb: Agent Finished Run: k8jd92la
+#   2. The ``logging`` shape emitted by the ``wandb.wandb_agent`` logger,
+#      which is what a piped, non-interactive agent actually prints:
+#        2026-09-15 11:30:46,457 - wandb.wandb_agent - INFO - Agent starting
+#            run with config:
+#        2026-09-15 11:45:10,000 - wandb.wandb_agent - INFO - Cleaning up
+#            finished run: k8jd92la
+#
+# Matching only shape (1) is what used to freeze the trial counter at 00/N:
+# "Agent starting run with config:" was captured as a run named ``with`` and
+# no line ever matched "agent finished run", so no trial ever left the
+# ``running`` state.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_LOGGER_PREFIX_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\s-\s[\w.]+\s-\s\w+\s-\s"
 )
+_TERM_PREFIX_RE = re.compile(r"^wandb:[ ]?")
+
+#: Shape (1): an explicit run id follows the colon.
+_RUN_START_ID_RE = re.compile(
+    r"agent\s+starting\s+run:\s*([\w\-]+)", re.IGNORECASE
+)
+#: Shape (2): the run id is not known yet on this line.
+_RUN_START_ANON_RE = re.compile(r"agent\s+starting\s+run\b", re.IGNORECASE)
 _RUN_FINISH_RE = re.compile(
-    r"agent\s+finished\s+run:?\s*([\w\-]+)", re.IGNORECASE
+    r"(?:agent\s+finished\s+run|cleaning\s+up\s+finished\s+run)\s*:?\s*([\w\-]*)",
+    re.IGNORECASE,
 )
-_PARAM_RE = re.compile(r"^\s*(?:wandb:)?\s*\t?\s*([A-Za-z_][\w./-]*)\s*[:=]\s*(.+?)\s*$")
+_RUN_FAILED_RE = re.compile(
+    r"run\s+([\w\-]+)\s+(?:failed|errored|crashed)", re.IGNORECASE
+)
+_PARAM_RE = re.compile(r"^\s*\t?\s*([A-Za-z_][\w./-]*)\s*[:=]\s*(.+?)\s*$")
 _DRY_TRIAL_RE = re.compile(r"trial\s+(\d+)\s*/\s*(\d+)", re.IGNORECASE)
+_NUMBER = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
+
+
+def strip_log_prefix(text: str) -> str:
+  """Removes ANSI colors and the ``wandb:``/logging prefixes from a line.
+
+  Both prefixes can be stacked, so stripping repeats until it is a no-op.
+
+  Args:
+    text: A raw line of agent output.
+
+  Returns:
+    The line without decoration, with meaningful leading tabs preserved.
+  """
+  cleaned = _ANSI_RE.sub("", str(text))
+  previous = None
+  while previous != cleaned:
+    previous = cleaned
+    cleaned = _LOGGER_PREFIX_RE.sub("", cleaned, count=1)
+    cleaned = _TERM_PREFIX_RE.sub("", cleaned, count=1)
+  return cleaned
+
+
+def _metric_aliases(metric_name: str) -> List[str]:
+  """Returns the spellings a training script may use for ``metric_name``.
+
+  ``eval/loss`` is logged as ``eval/loss`` by W&B, as ``eval_loss`` by the HF
+  ``Trainer``, and sometimes bare as ``loss`` in a summary block.
+
+  Args:
+    metric_name: The configured metric key.
+
+  Returns:
+    Candidate keys, longest first so the most specific one wins.
+  """
+  target = (metric_name or "").strip()
+  if not target:
+    return []
+  aliases = {
+      target,
+      target.replace("/", "_"),
+      target.replace("_", "/"),
+      target.split("/")[-1],
+  }
+  return sorted({a for a in aliases if a}, key=len, reverse=True)
 
 
 class SweepProgressParser:
@@ -321,6 +400,30 @@ class SweepProgressParser:
     self._by_run: Dict[str, TrialRecord] = {}
     self._active: Optional[TrialRecord] = None
     self._reading_params = False
+    self._metric_re = self._build_metric_re(self.metric_name)
+
+  @staticmethod
+  def _build_metric_re(metric_name: str) -> Optional[re.Pattern]:
+    """Compiles a matcher for ``metric_name`` in any of its usual spellings.
+
+    The separator is optional so that the W&B run-summary block
+    (``eval/loss 0.285``, no colon) is picked up alongside the usual
+    ``eval_loss: 0.285`` / ``'eval_loss': 0.285`` forms.
+
+    Args:
+      metric_name: The configured metric key.
+
+    Returns:
+      A compiled pattern, or None when no metric is configured.
+    """
+    aliases = _metric_aliases(metric_name)
+    if not aliases:
+      return None
+    alternation = "|".join(re.escape(alias) for alias in aliases)
+    return re.compile(
+        r"(?:^|[^\w/])['\"]?(?:" + alternation + r")['\"]?(?![\w/])"
+        r"\s*[:=]?\s*(" + _NUMBER + r")\b"
+    )
 
   @property
   def completed_count(self) -> int:
@@ -356,15 +459,24 @@ class SweepProgressParser:
     """Consumes one output line; returns the affected trial, if any."""
     if not line:
       return None
-    text = str(line).rstrip()
+    text = strip_log_prefix(line).rstrip()
+    if not text:
+      return None
 
-    start_match = _RUN_START_RE.search(text)
-    if start_match:
-      return self._start_trial(start_match.group(1))
+    start_id = _RUN_START_ID_RE.search(text)
+    if start_id:
+      return self._start_trial(start_id.group(1))
+
+    if _RUN_START_ANON_RE.search(text):
+      return self._start_trial(None)
 
     finish_match = _RUN_FINISH_RE.search(text)
     if finish_match:
-      return self._finish_trial(finish_match.group(1))
+      return self._finish_trial(finish_match.group(1) or None)
+
+    failed_match = _RUN_FAILED_RE.search(text)
+    if failed_match:
+      return self._finish_trial(failed_match.group(1), state="failed")
 
     dry_match = _DRY_TRIAL_RE.search(text)
     if dry_match and "trial" in text.lower():
@@ -378,17 +490,21 @@ class SweepProgressParser:
     if self._active is None:
       return None
 
+    # A metric can be logged by the training script long after the config
+    # block ended, so it is checked before the (block-scoped) param parsing.
+    if self._metric_re is not None:
+      metric_match = self._metric_re.search(text)
+      if metric_match:
+        try:
+          self._active.metric = float(metric_match.group(1))
+          return self._active
+        except ValueError:
+          pass
+
     param_match = _PARAM_RE.match(text)
     if param_match:
       key, raw_value = param_match.group(1), param_match.group(2)
       value = _coerce(raw_value)
-      if self.metric_name and key in (
-          self.metric_name,
-          self.metric_name.split("/")[-1],
-      ):
-        if isinstance(value, (int, float)):
-          self._active.metric = float(value)
-          return self._active
       if isinstance(value, (int, float, str)) and self._reading_params:
         # Only the indented block right after "Starting Run" holds params.
         self._active.params[key] = value
@@ -397,26 +513,83 @@ class SweepProgressParser:
       self._reading_params = False
     return None
 
-  def _start_trial(self, run_id: str, index: Optional[int] = None) -> TrialRecord:
-    if run_id in self._by_run:
+  def _start_trial(
+      self, run_id: Optional[str], index: Optional[int] = None
+  ) -> TrialRecord:
+    """Opens (or re-opens) the trial identified by ``run_id``.
+
+    Args:
+      run_id: The W&B run id, or None when the agent has not disclosed it yet.
+      index: Explicit 1-based trial number (used by the dry-run path).
+
+    Returns:
+      The trial the subsequent lines belong to.
+    """
+    if run_id and run_id in self._by_run:
       self._active = self._by_run[run_id]
       self._reading_params = True
       return self._active
+
+    # The logging and termlog shapes both announce the *same* trial. When the
+    # real id finally shows up, rename the provisional record instead of
+    # double counting it.
+    if (
+        run_id
+        and self._active is not None
+        and self._active.provisional
+        and self._active.state == "running"
+    ):
+      trial = self._active
+      self._by_run.pop(trial.run_id, None)
+      trial.run_id = run_id
+      trial.provisional = False
+      self._by_run[run_id] = trial
+      self._reading_params = True
+      return trial
+
+    if (
+        run_id is None
+        and self._active is not None
+        and self._active.state == "running"
+    ):
+      # A second announcement for a trial that is already open.
+      self._reading_params = True
+      return self._active
+
+    position = index if index is not None else len(self.trials) + 1
     trial = TrialRecord(
-        index=index if index is not None else len(self.trials) + 1,
-        run_id=run_id,
+        index=position,
+        run_id=run_id or f"run-{position}",
+        provisional=run_id is None,
     )
     self.trials.append(trial)
-    self._by_run[run_id] = trial
+    self._by_run[trial.run_id] = trial
     self._active = trial
     self._reading_params = True
     return trial
 
-  def _finish_trial(self, run_id: str) -> Optional[TrialRecord]:
-    trial = self._by_run.get(run_id) or self._active
+  def _finish_trial(
+      self, run_id: Optional[str], state: str = "done"
+  ) -> Optional[TrialRecord]:
+    """Closes a trial, falling back to the active one for unknown ids.
+
+    Args:
+      run_id: The W&B run id reported on the closing line, if any.
+      state: Terminal state to record.
+
+    Returns:
+      The closed trial, or None when there was nothing open.
+    """
+    trial = (self._by_run.get(run_id) if run_id else None) or self._active
     if trial is None:
       return None
-    trial.state = "done"
+    if run_id and trial.provisional:
+      # The closing line is the first place the real id appeared.
+      self._by_run.pop(trial.run_id, None)
+      trial.run_id = run_id
+      trial.provisional = False
+      self._by_run[run_id] = trial
+    trial.state = state
     trial.finished_at = time.time()
     self._reading_params = False
     if self._active is trial:

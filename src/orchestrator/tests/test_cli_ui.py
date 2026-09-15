@@ -391,6 +391,145 @@ class SweepProgressParserTest(unittest.TestCase):
     self.assertEqual([t.run_id for t in board], ["a", "b"])
 
 
+class RealAgentOutputParserTest(unittest.TestCase):
+  """The output a piped, non-interactive ``wandb agent`` actually produces.
+
+  This is the shape that froze the dashboard at ``00/N``: the agent logs
+  through the ``wandb.wandb_agent`` logger, announces runs without an id
+  ("Agent starting run with config:") and closes them with "Cleaning up
+  finished run: <id>" rather than "Agent Finished Run: <id>".
+  """
+
+  #: One complete two-trial SFT sweep, interleaving the logger shape, the
+  #: termlog shape and HF Trainer output, exactly as it reaches the parser.
+  AGENT_OUTPUT = [
+      "wandb: Starting wandb agent",
+      "2026-09-15 11:30:46,123 - wandb.wandb_agent - INFO - Running runs: []",
+      "2026-09-15 11:30:46,456 - wandb.wandb_agent - INFO - Agent received"
+      " command: run",
+      "2026-09-15 11:30:46,457 - wandb.wandb_agent - INFO - Agent starting run"
+      " with config:",
+      "2026-09-15 11:30:46,457 - wandb.wandb_agent - INFO - \tlearning_rate:"
+      " 0.0003",
+      "2026-09-15 11:30:46,457 - wandb.wandb_agent - INFO - \tlora_r: 8",
+      "2026-09-15 11:30:46,458 - wandb.wandb_agent - INFO - About to run"
+      " command: /usr/bin/env python train_sft.py",
+      "wandb: Agent Starting Run: k8jd92la with config:",
+      "wandb: \tlearning_rate: 0.0003",
+      "{'eval_loss': 0.42, 'eval_runtime': 12.3, 'epoch': 1.0}",
+      "2026-09-15 11:45:10,000 - wandb.wandb_agent - INFO - Cleaning up"
+      " finished run: k8jd92la",
+      "2026-09-15 11:45:11,000 - wandb.wandb_agent - INFO - Agent received"
+      " command: run",
+      "2026-09-15 11:45:11,001 - wandb.wandb_agent - INFO - Agent starting run"
+      " with config:",
+      "2026-09-15 11:45:11,001 - wandb.wandb_agent - INFO - \tlearning_rate:"
+      " 0.001",
+      "wandb: Agent Starting Run: p2mx77qq with config:",
+      "{'eval_loss': 0.31, 'epoch': 1.0}",
+      "2026-09-15 12:02:00,000 - wandb.wandb_agent - INFO - Cleaning up"
+      " finished run: p2mx77qq",
+  ]
+
+  def feed_all(self, metric_name="eval/loss", max_trials=15):
+    parser = events_mod.SweepProgressParser(
+        metric_name=metric_name, max_trials=max_trials
+    )
+    for line in self.AGENT_OUTPUT:
+      parser.feed(line)
+    return parser
+
+  def test_trial_counter_advances(self):
+    parser = self.feed_all()
+    # The regression: this used to stay at 0 for the whole sweep.
+    self.assertEqual(parser.completed_count, 2)
+    self.assertEqual(parser.max_trials, 15)
+
+  def test_logger_and_termlog_announcements_are_one_trial(self):
+    parser = self.feed_all()
+    self.assertEqual(len(parser.trials), 2)
+    self.assertEqual(
+        [t.run_id for t in parser.trials], ["k8jd92la", "p2mx77qq"]
+    )
+    self.assertFalse(any(t.provisional for t in parser.trials))
+
+  def test_metrics_and_params_populate_the_leaderboard(self):
+    parser = self.feed_all()
+    board = parser.leaderboard(goal="minimize")
+    self.assertEqual([t.run_id for t in board], ["p2mx77qq", "k8jd92la"])
+    self.assertAlmostEqual(board[0].metric, 0.31)
+    self.assertAlmostEqual(board[1].metric, 0.42)
+    first = parser.trials[0]
+    self.assertAlmostEqual(first.params["learning_rate"], 0.0003)
+    self.assertEqual(first.params["lora_r"], 8)
+
+  def test_best_trial_tracks_goal(self):
+    parser = self.feed_all()
+    self.assertEqual(parser.best_trial("minimize").run_id, "p2mx77qq")
+    self.assertEqual(parser.best_trial("maximize").run_id, "k8jd92la")
+
+  def test_trial_is_counted_only_once_finished(self):
+    parser = events_mod.SweepProgressParser(
+        metric_name="eval/loss", max_trials=15
+    )
+    for line in self.AGENT_OUTPUT[:9]:
+      parser.feed(line)
+    self.assertEqual(parser.completed_count, 0)
+    self.assertIsNotNone(parser.active_trial)
+    self.assertEqual(parser.active_trial.run_id, "k8jd92la")
+
+  def test_anonymous_run_survives_without_a_termlog_line(self):
+    parser = events_mod.SweepProgressParser(metric_name="eval/loss")
+    parser.feed(
+        "2026-09-15 11:30:46,457 - wandb.wandb_agent - INFO - Agent starting"
+        " run with config:"
+    )
+    self.assertEqual(parser.completed_count, 0)
+    parser.feed(
+        "2026-09-15 11:45:10,000 - wandb.wandb_agent - INFO - Cleaning up"
+        " finished run: abc999"
+    )
+    self.assertEqual(parser.completed_count, 1)
+    self.assertEqual(parser.trials[0].run_id, "abc999")
+
+  def test_failed_run_is_terminal(self):
+    parser = events_mod.SweepProgressParser(metric_name="eval/loss")
+    parser.feed("wandb: Agent Starting Run: bad001 with config:")
+    parser.feed("wandb: Run bad001 failed with exit code 1")
+    self.assertEqual(parser.completed_count, 1)
+    self.assertEqual(parser.trials[0].state, "failed")
+    self.assertIsNone(parser.active_trial)
+
+  def test_wandb_summary_block_metric(self):
+    parser = events_mod.SweepProgressParser(metric_name="eval/roc_auc")
+    parser.feed("wandb: Agent Starting Run: rm001 with config:")
+    parser.feed("wandb: Run summary:")
+    parser.feed("wandb:   eval/roc_auc 0.9651")
+    self.assertAlmostEqual(parser.trials[0].metric, 0.9651)
+
+  def test_metric_alias_does_not_match_a_longer_key(self):
+    parser = events_mod.SweepProgressParser(metric_name="eval/loss")
+    parser.feed("wandb: Agent Starting Run: x1 with config:")
+    parser.feed("wandb: \teval_loss_weight: 3")
+    self.assertIsNone(parser.trials[0].metric)
+
+  def test_ansi_colored_lines_are_parsed(self):
+    parser = events_mod.SweepProgressParser(metric_name="eval/loss")
+    parser.feed("\x1b[34m\x1b[1mwandb\x1b[0m: Agent Starting Run: c1 with"
+                " config:")
+    parser.feed("\x1b[34mwandb\x1b[0m: Agent Finished Run: c1")
+    self.assertEqual(parser.completed_count, 1)
+
+  def test_strip_log_prefix_keeps_indentation(self):
+    stripped = events_mod.strip_log_prefix(
+        "2026-09-15 11:30:46,457 - wandb.wandb_agent - INFO - \tlora_r: 8"
+    )
+    self.assertEqual(stripped, "\tlora_r: 8")
+    self.assertEqual(
+        events_mod.strip_log_prefix("wandb: \tlora_r: 8"), "\tlora_r: 8"
+    )
+
+
 class StageViewTest(unittest.TestCase):
   """Derivation of DAG rows from config + state."""
 
