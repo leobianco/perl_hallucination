@@ -664,21 +664,59 @@ def cmd_wizard(args: argparse.Namespace, console: UiConsole) -> int:
   return _execute_campaign(config, console, plain=bool(getattr(args, "plain", False)))
 
 
+def _render_status_safely(
+    state_file: Optional[str],
+    console: UiConsole,
+    task: str,
+) -> bool:
+  """Renders one status frame, tolerating a campaign in flux.
+
+  A watcher is a read-only observer of a file another process is actively
+  rewriting, and it typically runs unattended in a tmux pane for hours. It
+  must therefore never die on a transient condition: the campaign may not
+  have started yet, may have just been archived by ``run --fresh``, or the
+  file may have been hand-edited into something unparseable.
+
+  Args:
+    state_file: Path to render, or None when no campaign was found.
+    console: Output console.
+    task: Task name, used in the "nothing yet" message.
+
+  Returns:
+    True when a campaign was rendered, False when the frame was a placeholder.
+  """
+  if not state_file or not os.path.exists(state_file):
+    console.blank()
+    console.info(f"No campaign state for task '{task}' yet.")
+    console.hint(f"Waiting for one to appear. Start it with: {PROGRAM} run --task {task}")
+    return False
+  try:
+    state = CampaignState.load(state_file)
+    config = config_for_state(state)
+  except (OSError, ValueError, KeyError, TypeError) as exc:
+    console.blank()
+    console.warn(f"Could not read {state_file}: {exc}")
+    console.hint("Retrying on the next refresh.")
+    return False
+  _render_status(state, config, console, state_file)
+  return True
+
+
 def cmd_status(args: argparse.Namespace, console: UiConsole) -> int:
   """Implements ``status``."""
-  state_file = args.state_file or find_latest_state(args.task)
-  if not state_file or not os.path.exists(state_file):
+  explicit_state = getattr(args, "state_file", None)
+  state_file = explicit_state or find_latest_state(args.task)
+  # A watcher is allowed to start before the campaign does; a one-shot status
+  # is not - it has nothing to wait for.
+  watching = bool(getattr(args, "watch", False)) and not args.json
+
+  if (not state_file or not os.path.exists(state_file)) and not watching:
     if args.json:
       print(json.dumps({"error": "no_state_file", "task": args.task}))
       return EXIT_NOT_FOUND
     console.error(f"No campaign state found for task '{args.task}'.")
     console.hint(f"Start one with: {PROGRAM} run --task {args.task}")
     return EXIT_NOT_FOUND
-
-  def render_once() -> None:
-    state = CampaignState.load(state_file)
-    config = config_for_state(state)
-    _render_status(state, config, console, state_file)
 
   if args.json:
     state = CampaignState.load(state_file)
@@ -698,18 +736,25 @@ def cmd_status(args: argparse.Namespace, console: UiConsole) -> int:
     print(json.dumps(payload, indent=2))
     return EXIT_OK
 
-  if not args.watch:
-    render_once()
+  if not watching:
+    state = CampaignState.load(state_file)
+    config = config_for_state(state)
+    _render_status(state, config, console, state_file)
     return EXIT_OK
 
   refreshes = 0
   try:
     while True:
+      # Re-resolved every refresh: the common workflow is to split the pane
+      # and start watching *before* launching, and pinning the path once
+      # would leave the watcher stuck on the previous campaign forever.
+      current = explicit_state or find_latest_state(args.task)
       if console.is_rich and console.rich is not None:
         console.rich.clear()
-      render_once()
+      _render_status_safely(current, console, args.task)
+      label = os.path.basename(current) if current else f"task {args.task}"
       console.hint(
-          f"watching {os.path.basename(state_file)} - refresh every "
+          f"watching {label} - refresh every "
           f"{args.interval:g}s - Ctrl-C to exit"
       )
       refreshes += 1

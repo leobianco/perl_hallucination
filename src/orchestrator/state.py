@@ -37,6 +37,14 @@ class StageResult:
   error_message: Optional[str] = None
   start_time: Optional[str] = None
   end_time: Optional[str] = None
+  #: Sweep trials finished so far, refreshed *while the stage runs*. The
+  #: process that owns the dashboard knows this from its own log parser, but
+  #: a second process (``status --watch`` in another tmux pane) can only see
+  #: what reached the state file - without these it shows a frozen ``00/N``.
+  trials_done: int = 0
+  #: Trial budget, mirrored here so the counter is meaningful even if the
+  #: config is later edited or unavailable.
+  trials_total: int = 0
 
   def to_dict(self) -> Dict[str, Any]:
     res = dataclasses.asdict(self)
@@ -48,7 +56,11 @@ class StageResult:
     data = dict(data)
     if "status" in data:
       data["status"] = StageStatus(data["status"])
-    return cls(**data)
+    # A campaign can outlive the code that started it: a state file written
+    # by a newer build (or a hand-edited one) must not make `status` crash in
+    # a watching pane. Unknown keys are dropped rather than fatal.
+    known = {f.name for f in dataclasses.fields(cls)}
+    return cls(**{k: v for k, v in data.items() if k in known})
 
 
 @dataclass
@@ -78,16 +90,73 @@ class CampaignState:
     self.stages[stage_name].status = StageStatus.RUNNING
     self.stages[stage_name].start_time = datetime.datetime.now().isoformat()
 
+  def update_stage_progress(
+      self,
+      stage_name: str,
+      trials_done: Optional[int] = None,
+      trials_total: Optional[int] = None,
+      best_metric_val: Optional[float] = None,
+  ) -> bool:
+    """Records in-flight sweep progress for a running stage.
+
+    This is what makes ``status``/``status --watch`` usable from a second
+    tmux pane: that process has no access to the running campaign's in-memory
+    log parser, so anything it is meant to display has to be on disk.
+
+    Args:
+      stage_name: Stage currently running.
+      trials_done: Trials that reached a terminal state, if known.
+      trials_total: Trial budget, if known.
+      best_metric_val: Best metric observed so far, if known.
+
+    Returns:
+      True when something actually changed, so callers can avoid rewriting
+      the state file on every single line of agent output.
+    """
+    result = self.stages.get(stage_name)
+    if result is None:
+      result = StageResult(status=StageStatus.RUNNING)
+      self.stages[stage_name] = result
+
+    changed = False
+    if trials_done is not None and int(trials_done) != result.trials_done:
+      result.trials_done = int(trials_done)
+      changed = True
+    if trials_total and int(trials_total) != result.trials_total:
+      result.trials_total = int(trials_total)
+      changed = True
+    if best_metric_val is not None and best_metric_val != result.best_metric_val:
+      result.best_metric_val = float(best_metric_val)
+      changed = True
+
+    if changed:
+      self.updated_at = datetime.datetime.now().isoformat()
+    return changed
+
   def record_stage_result(self, stage_name: str, result: StageResult) -> None:
     """Updates stage outcome and timestamps.
 
     The ``start_time`` recorded by :meth:`mark_stage_running` is preserved
     when the stage does not set one itself, so elapsed times survive in the
-    state file and can be shown by the CLI.
+    state file and can be shown by the CLI. The live trial counters are
+    carried over for the same reason: a stage that failed on trial 7 of 15
+    should keep saying so instead of resetting to 0.
+
+    Args:
+      stage_name: Stage that finished.
+      result: Its outcome.
     """
     previous = self.stages.get(stage_name)
     if result.start_time is None and previous is not None:
       result.start_time = previous.start_time
+    if previous is not None:
+      # Stages report their outcome, not their progress; without this the
+      # counters tracked during the sweep would be thrown away on the last
+      # line of the stage.
+      if not result.trials_done:
+        result.trials_done = previous.trials_done
+      if not result.trials_total:
+        result.trials_total = previous.trials_total
     result.end_time = datetime.datetime.now().isoformat()
     self.stages[stage_name] = result
     self.updated_at = datetime.datetime.now().isoformat()

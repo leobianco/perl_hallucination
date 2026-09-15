@@ -406,6 +406,138 @@ class TestEngineControls(unittest.TestCase):
     self.assertEqual(result["status"], "STOPPED")
 
 
+#: A recorded two-trial transcript in the shape a *piped* (non-TTY) wandb
+#: agent really emits. Hand-written fixtures hid a parser bug once already,
+#: so this is kept verbatim.
+AGENT_TRANSCRIPT = [
+    "wandb: Starting wandb agent",
+    "2026-09-15 11:30:46,123 - wandb.wandb_agent - INFO - Running runs: []",
+    "2026-09-15 11:30:46,457 - wandb.wandb_agent - INFO - Agent starting run"
+    " with config:",
+    "2026-09-15 11:30:46,457 - wandb.wandb_agent - INFO - \tlearning_rate:"
+    " 0.0003",
+    "wandb: Agent Starting Run: k8jd92la with config:",
+    "wandb:   eval_loss: 0.42",
+    "2026-09-15 11:45:10,000 - wandb.wandb_agent - INFO - Cleaning up finished"
+    " run: k8jd92la",
+    "2026-09-15 11:45:11,000 - wandb.wandb_agent - INFO - Agent starting run"
+    " with config:",
+    "wandb: Agent Starting Run: p2mq71zz with config:",
+    "wandb:   eval_loss: 0.31",
+    "2026-09-15 11:58:02,000 - wandb.wandb_agent - INFO - Cleaning up finished"
+    " run: p2mq71zz",
+]
+
+
+class TestProgressIsMirroredToDisk(unittest.TestCase):
+  """Sweep progress must be readable by a process that is not the engine.
+
+  The dashboard parses agent output in memory, which is invisible to a
+  ``status --watch`` running in a second tmux pane. These tests assert on the
+  *reloaded* state file, never on engine internals, because the file is the
+  entire contract between the two panes.
+  """
+
+  def setUp(self):
+    super().setUp()
+    self.temp = tempfile.TemporaryDirectory()
+    self.addCleanup(self.temp.cleanup)
+    self.config = CampaignConfig.create_default(
+        task_name="npov", sft_runs=15, dry_run=True
+    )
+    self.config.state_file = os.path.join(self.temp.name, "camp_state.json")
+    self.config.reporting.reports_dir = os.path.join(self.temp.name, "reports")
+    self.config.no_tui = True
+    self.engine = CampaignEngine(config=self.config)
+    self.engine.state.mark_stage_running("sft")
+    self.engine.state.save(self.engine.state_path)
+
+  @property
+  def sink(self):
+    """The stage's line sink.
+
+    The engine builds exactly one callback per stage execution, and the
+    parser behind it is stateful, so tests must reuse it rather than build a
+    fresh one per line.
+    """
+    if getattr(self, "_sink", None) is None:
+      self._sink = self.engine._stage_line_callback("sft")  # pylint: disable=protected-access
+    return self._sink
+
+  def feed(self, lines):
+    for line in lines:
+      self.sink(line)
+
+  def reload(self):
+    """Reads the state file back, as the watching pane would."""
+    return CampaignState.load(self.engine.state_path).stages["sft"]
+
+  def test_trial_counts_reach_the_state_file(self):
+    self.feed(AGENT_TRANSCRIPT)
+    result = self.reload()
+    self.assertEqual(result.trials_done, 2)
+    self.assertEqual(result.trials_total, 15)
+
+  def test_counter_advances_one_trial_at_a_time(self):
+    observed = []
+    for line in AGENT_TRANSCRIPT:
+      self.feed([line])
+      observed.append(self.reload().trials_done)
+    # Never goes backwards, and ends where the transcript ends.
+    self.assertEqual(observed, sorted(observed))
+    self.assertEqual(observed[-1], 2)
+    self.assertIn(1, observed)
+
+  def test_best_metric_is_mirrored_for_a_minimize_goal(self):
+    self.feed(AGENT_TRANSCRIPT)
+    self.assertAlmostEqual(self.reload().best_metric_val, 0.31)
+
+  def test_a_finished_trial_is_written_through_immediately(self):
+    # Trial boundaries bypass the throttle: they are rare and are exactly
+    # what the watching pane is waiting for.
+    self.feed(AGENT_TRANSCRIPT[:7])
+    self.assertEqual(self.reload().trials_done, 1)
+
+  def test_noise_does_not_rewrite_the_state_file(self):
+    self.feed(AGENT_TRANSCRIPT)
+    before = os.path.getmtime(self.engine.state_path)
+    for _ in range(500):
+      self.feed(["2026-09-15 12:00:00,000 - wandb - INFO - some chatter"])
+    self.assertEqual(os.path.getmtime(self.engine.state_path), before)
+
+  def test_a_resumed_stage_does_not_restart_the_counter(self):
+    # A resumed stage spawns a fresh agent counting from zero. The pane must
+    # not appear to lose the trials a previous attempt already paid for.
+    self.feed(AGENT_TRANSCRIPT)
+    self.assertEqual(self.reload().trials_done, 2)
+    resumed = self.engine._stage_line_callback("sft")  # pylint: disable=protected-access
+    for line in AGENT_TRANSCRIPT[:7]:
+      resumed(line)
+    self.assertEqual(self.reload().trials_done, 3)
+
+  def test_tracking_never_breaks_the_log_stream(self):
+    # The progress mirror is cosmetic; if it explodes, the campaign and its
+    # log must carry on regardless.
+    seen = []
+    with mock.patch.object(
+        self.engine, "_persist_progress", side_effect=RuntimeError("boom")
+    ):
+      sink = self.engine._stage_line_callback("sft")  # pylint: disable=protected-access
+      self.engine.bus.subscribe(seen.append)
+      sink("wandb: Agent Starting Run: abc123 with config:")
+    self.assertTrue(seen)
+
+  def test_progress_is_tracked_per_stage(self):
+    self.engine.state.mark_stage_running("rm")
+    rm_sink = self.engine._stage_line_callback("rm")  # pylint: disable=protected-access
+    self.feed(AGENT_TRANSCRIPT)
+    for line in AGENT_TRANSCRIPT[:7]:
+      rm_sink(line)
+    stages = CampaignState.load(self.engine.state_path).stages
+    self.assertEqual(stages["sft"].trials_done, 2)
+    self.assertEqual(stages["rm"].trials_done, 1)
+
+
 class TestSweepNaming(unittest.TestCase):
   """Tests for descriptive sweep name generation across SFT, RM, and PE-RL."""
 

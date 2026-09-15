@@ -5,10 +5,12 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import threading
 import time
 from typing import Any, Callable, Dict, Optional
 
 from src.orchestrator.cli.events import ControlSignals, EventBus, EventType
+from src.orchestrator.cli.events import SweepProgressParser
 from src.orchestrator.config import CampaignConfig
 from src.orchestrator import logging_setup
 from src.orchestrator.model_manager import ModelManager
@@ -25,6 +27,11 @@ logger = logging.getLogger(__name__)
 
 #: Free disk below this (GiB) triggers a warning before each stage.
 LOW_DISK_WARNING_GB = 25.0
+
+#: Minimum seconds between state-file writes triggered by an improving metric
+#: alone. A finished trial always writes immediately; this only throttles the
+#: noisy intra-trial updates.
+PROGRESS_SAVE_INTERVAL_S = 5.0
 
 
 class CampaignEngine:
@@ -94,6 +101,14 @@ class CampaignEngine:
     self._external_stop = stop_requested_callback
     self.stop_requested_callback = self._should_interrupt_stage
 
+    # Live sweep progress, mirrored to the state file. The dashboard keeps its
+    # own parser for the pane it draws in; this one exists for every *other*
+    # reader - `status --watch` in a second tmux pane, `status --json | jq`,
+    # and plain/nohup runs that have no dashboard at all.
+    self._progress_parsers: Dict[str, Any] = {}
+    self._progress_lock = threading.Lock()
+    self._progress_saved_at = 0.0
+
     # Context shared across all stages
     self.context = CampaignContext(
         config=self.config,
@@ -105,10 +120,102 @@ class CampaignEngine:
     )
 
   def _stage_line_callback(self, stage_name: str) -> Callable[[str], None]:
-    """Line sink for a stage: the event bus plus the durable campaign log."""
-    return logging_setup.tee_line_callback(
+    """Line sink for a stage: event bus, durable log, and progress mirror."""
+    downstream = logging_setup.tee_line_callback(
         self.log_path, self.bus.as_line_callback(stage_name)
     )
+    track = self._progress_tracker(stage_name)
+
+    def callback(line: str) -> None:
+      downstream(line)
+      track(line)
+
+    return callback
+
+  def _progress_tracker(self, stage_name: str) -> Callable[[str], None]:
+    """Builds the line sink that mirrors sweep progress into the state file.
+
+    Args:
+      stage_name: Stage whose output will be fed to the returned callable.
+
+    Returns:
+      A callable consuming one output line at a time. It never raises: a
+      cosmetic progress counter must not be able to kill a running campaign.
+    """
+    payload = self._stage_payload(stage_name)
+    goal = payload.get("goal") or "minimize"
+    parser = SweepProgressParser(
+        metric_name=payload.get("metric") or "",
+        max_trials=int(payload.get("max_runs") or 0),
+    )
+    self._progress_parsers[stage_name] = parser
+
+    # A resumed stage starts a *new* agent, whose own counter restarts at
+    # zero even though the sweep already has finished trials. The state file
+    # describes the campaign, not one agent process, so the counter is
+    # offset by what a previous attempt already achieved - otherwise the
+    # watching pane would appear to go backwards on every resume.
+    previous = self.state.stages.get(stage_name)
+    baseline = int(getattr(previous, "trials_done", 0) or 0)
+
+    def track(line: str) -> None:
+      try:
+        parser.feed(line)
+        best = parser.best_trial(goal)
+        self._persist_progress(
+            stage_name,
+            trials_done=baseline + parser.completed_count,
+            trials_total=parser.max_trials,
+            best_metric_val=best.metric if best is not None else None,
+        )
+      except Exception:  # pylint: disable=broad-exception-caught
+        logger.debug("Progress tracking failed for %s", stage_name, exc_info=True)
+
+    return track
+
+  def _persist_progress(
+      self,
+      stage_name: str,
+      trials_done: int,
+      trials_total: int,
+      best_metric_val: Optional[float],
+  ) -> None:
+    """Writes progress to the state file, throttled by time.
+
+    A trial finishing is rare and important, so it is written immediately. A
+    metric improving mid-trial is neither, and the agent can emit thousands of
+    lines a minute - those writes are rate limited to keep the campaign from
+    turning into a disk-thrashing loop.
+
+    Args:
+      stage_name: Stage being tracked.
+      trials_done: Trials that reached a terminal state.
+      trials_total: Trial budget.
+      best_metric_val: Best metric seen so far, or None.
+    """
+    with self._progress_lock:
+      result = self.state.stages.get(stage_name)
+      trial_completed = (
+          result is None or int(trials_done) != int(result.trials_done)
+      )
+      changed = self.state.update_stage_progress(
+          stage_name,
+          trials_done=trials_done,
+          trials_total=trials_total,
+          best_metric_val=best_metric_val,
+      )
+      if not changed:
+        return
+      now = time.time()
+      if not trial_completed and (
+          now - self._progress_saved_at < PROGRESS_SAVE_INTERVAL_S
+      ):
+        return
+      self._progress_saved_at = now
+      try:
+        self.state.save(self.state_path)
+      except OSError as exc:
+        logger.debug("Could not persist progress for %s: %s", stage_name, exc)
 
   def _warn_on_low_disk(self, stage_name: str) -> None:
     """Publishes a notice when free disk space is running out.

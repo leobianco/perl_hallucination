@@ -140,6 +140,21 @@ def build_stage_views(
         model_repo_id=getattr(result, "model_repo_id", None) if result else None,
         error=getattr(result, "error_message", None) if result else None,
     )
+    # Progress of the *running* campaign, mirrored into the state file.
+    # Without this, any reader that is not the process owning the dashboard -
+    # a `status --watch` in a second tmux pane, `status --json`, a plain run -
+    # would draw a permanently frozen 00/N for the active stage.
+    if result is not None:
+      persisted_total = int(getattr(result, "trials_total", 0) or 0)
+      if persisted_total:
+        # The budget the sweep actually committed to, recorded by the process
+        # that ran it. It beats `stage_budget`, which may come from a config
+        # rebuilt from defaults because the state file predates config
+        # persistence, or one the user has edited since.
+        view.trials_total = persisted_total
+      view.trials_done = min(
+          int(getattr(result, "trials_done", 0) or 0), view.trials_total or 0
+      )
     if str(view.status).upper() == "COMPLETED" and view.trials_total:
       view.trials_done = view.trials_total
 

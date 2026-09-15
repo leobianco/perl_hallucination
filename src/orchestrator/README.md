@@ -181,6 +181,37 @@ python3 scripts/run_campaign.py status --task npov --json | jq .stages_completed
 python3 scripts/run_campaign.py list
 ```
 
+The watcher is a **separate process**. It cannot see the launching pane's
+in-memory log parser, so everything it shows is read from the state file,
+which the running campaign mirrors its progress into:
+
+| Shown in the watch pane | Refreshed |
+|---|---|
+| Stage statuses, elapsed times, model repo ids | On every stage transition |
+| `NN/total` trial counter | The moment a trial finishes |
+| Best metric so far | At most every 5s while a trial runs |
+| Final eval metrics | When the eval stage completes |
+
+The per-trial leaderboard is **not** mirrored - it stays exclusive to the
+launching pane's dashboard, because writing every trial's parameters to disk
+on every refresh is not worth the I/O.
+
+Three behaviours worth knowing:
+
+* **You can start the watcher first.** With `--watch` it waits for a campaign
+  to appear rather than exiting, so the natural `split-window` → `watch` →
+  `run` order works.
+* **It follows the newest campaign** for the task, re-resolved on every
+  refresh. Pass `--state-file` to pin it to one campaign instead.
+* **It never dies on a transient read.** A campaign archived by
+  `run --fresh`, or a half-written file, produces a message and a retry on
+  the next refresh - not a traceback in a pane you stopped looking at.
+
+> [!NOTE]
+> On resume the counter continues from where the previous attempt stopped
+> rather than restarting at zero, because a new `wandb agent` counts only its
+> own trials while the state file tracks the whole stage.
+
 ### 8. Headless Mode (for `nohup` or logging to file)
 ```bash
 python3 scripts/run_campaign.py run --task npov --no-tui > campaign.log 2>&1 &

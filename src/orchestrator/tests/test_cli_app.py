@@ -315,6 +315,165 @@ class StatusCommandTest(CommandTestBase):
     self.assertIn("camp_npov_1", self.output)
 
 
+class WatchPaneTest(CommandTestBase):
+  """``status`` as run from a *second* tmux pane.
+
+  This process does not own the campaign, so it has no event bus and no log
+  parser: everything it displays has to come off the state file. These are
+  regressions for a watcher that showed a frozen ``00/N``, stayed pinned to
+  the previous campaign, and died on a transient read.
+  """
+
+  def watch(self, *extra, refreshes=1):
+    return self.run_cli(
+        ["status", "--task", "npov", "--watch", "--interval", "0.5",
+         "--max-refreshes", str(refreshes), *extra]
+    )
+
+  def test_live_trial_counts_are_read_from_the_state_file(self):
+    write_state(
+        app.CHECKPOINTS_ROOT,
+        stages={
+            "sft": StageResult(
+                status=StageStatus.RUNNING, trials_done=7, trials_total=15
+            )
+        },
+    )
+    self.assertEqual(self.run_cli(["status", "--task", "npov"]), app.EXIT_OK)
+    self.assertIn("07/15", self.output)
+
+  def test_a_running_stage_without_progress_reads_zero(self):
+    write_state(
+        app.CHECKPOINTS_ROOT,
+        stages={"sft": StageResult(status=StageStatus.RUNNING)},
+    )
+    self.run_cli(["status", "--task", "npov"])
+    self.assertIn("00/", self.output)
+
+  def test_live_best_metric_is_shown_while_running(self):
+    write_state(
+        app.CHECKPOINTS_ROOT,
+        stages={
+            "sft": StageResult(
+                status=StageStatus.RUNNING,
+                trials_done=2,
+                trials_total=15,
+                best_metric_val=0.3125,
+            )
+        },
+    )
+    self.run_cli(["status", "--task", "npov"])
+    self.assertIn("0.31", self.output)
+
+  def test_progress_survives_a_stage_failure(self):
+    state = CampaignState(campaign_id="camp_npov_1", task_name="npov")
+    state.stages_order = ["sft", "rm", "perl", "eval"]
+    state.update_stage_progress("sft", trials_done=7, trials_total=15)
+    state.mark_stage_failed("sft", "boom")
+    path = os.path.join(app.CHECKPOINTS_ROOT, "npov", "camp_npov_1_state.json")
+    state.save(path)
+    self.run_cli(["status", "--task", "npov"])
+    self.assertIn("07/15", self.output)
+
+  def test_watch_waits_instead_of_exiting_when_nothing_exists_yet(self):
+    # Splitting the pane and starting the watcher *before* launching is the
+    # normal workflow; exiting immediately made it useless.
+    code = self.watch()
+    self.assertEqual(code, app.EXIT_OK)
+    self.assertIn("No campaign state for task 'npov' yet", self.output)
+
+  def test_one_shot_status_still_fails_fast_when_nothing_exists(self):
+    # Only the watcher has something to wait for.
+    code = self.run_cli(["status", "--task", "npov"])
+    self.assertEqual(code, app.EXIT_NOT_FOUND)
+
+  def test_watch_picks_up_a_campaign_launched_after_it_started(self):
+    calls = []
+    real = app.find_latest_state
+
+    # cmd_status resolves once before entering the loop, so call 1 is that
+    # pre-flight and call 2 is the first rendered frame.
+    def appearing(task, root=app.CHECKPOINTS_ROOT):
+      calls.append(task)
+      if len(calls) <= 2:
+        return None  # The campaign has not been created yet.
+      return real(task, root=root)
+
+    write_state(app.CHECKPOINTS_ROOT, campaign_id="launched_later")
+    with mock.patch.object(app, "find_latest_state", appearing):
+      self.watch(refreshes=2)
+    self.assertIn("No campaign state for task 'npov' yet", self.output)
+    self.assertIn("launched_later", self.output)
+
+  def test_watch_follows_the_newest_campaign(self):
+    older = write_state(app.CHECKPOINTS_ROOT, campaign_id="old_campaign")
+    self.watch(refreshes=1)
+    self.assertIn("old_campaign", self.output)
+    # A second campaign starts while the watcher is up.
+    newer = write_state(app.CHECKPOINTS_ROOT, campaign_id="new_campaign")
+    stamp = os.path.getmtime(older) + 10
+    os.utime(newer, (stamp, stamp))
+    self.watch(refreshes=1)
+    self.assertIn("new_campaign", self.output)
+
+  def test_an_explicit_state_file_is_not_re_resolved(self):
+    pinned = write_state(app.CHECKPOINTS_ROOT, campaign_id="pinned_one")
+    newer = write_state(app.CHECKPOINTS_ROOT, campaign_id="newer_one")
+    stamp = os.path.getmtime(pinned) + 10
+    os.utime(newer, (stamp, stamp))
+    code = self.run_cli(
+        ["status", "--state-file", pinned, "--watch", "--interval", "0.5",
+         "--max-refreshes", "1"]
+    )
+    self.assertEqual(code, app.EXIT_OK)
+    self.assertIn("pinned_one", self.output)
+    self.assertNotIn("newer_one", self.output)
+
+  def test_watch_survives_an_unreadable_state_file(self):
+    path = os.path.join(app.CHECKPOINTS_ROOT, "npov", "camp_state.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+      handle.write("{truncated")
+    code = self.watch()
+    self.assertEqual(code, app.EXIT_OK)
+    self.assertIn("Could not read", self.output)
+    self.assertIn("Retrying", self.output)
+
+  def test_watch_survives_the_campaign_being_archived_mid_flight(self):
+    state_file = write_state(app.CHECKPOINTS_ROOT, campaign_id="doomed")
+    real = app.find_latest_state
+    seen = []
+
+    def vanishing(task, root=app.CHECKPOINTS_ROOT):
+      seen.append(task)
+      # Call 1 is the pre-loop resolution, call 2 renders the first frame;
+      # the campaign is archived out from under the watcher after that.
+      if len(seen) == 3:
+        app.archive_state_file(state_file)
+      return real(task, root=root)
+
+    with mock.patch.object(app, "find_latest_state", vanishing):
+      code = self.watch(refreshes=3)
+    self.assertEqual(code, app.EXIT_OK)
+    self.assertIn("doomed", self.output)
+    self.assertIn("No campaign state for task 'npov' yet", self.output)
+
+  def test_json_mode_exposes_trial_counts(self):
+    write_state(
+        app.CHECKPOINTS_ROOT,
+        stages={
+            "sft": StageResult(
+                status=StageStatus.RUNNING, trials_done=4, trials_total=15
+            )
+        },
+    )
+    _, payload = self.run_cli_json(["status", "--task", "npov", "--json"])
+    sft = json.loads(payload)["stages"]["sft"]
+    self.assertEqual(sft["trials_done"], 4)
+    self.assertEqual(sft["trials_total"], 15)
+
+
+
 class ListCommandTest(CommandTestBase):
   """``list``/``ls``."""
 
