@@ -2,9 +2,34 @@
 
 This project studies the reduction of hallucinations via RLAIF with *synthetic* data. More precisely, we use Parameter-Efficient Reinforcement Learning [PE-RL](https://arxiv.org/abs/2403.10704).
 
-## Usage
+## Automated Campaign Orchestrator (Auto-PERL)
 
-Here is a brief description about the usage of each script, roughly in the order that they should be executed.
+Rather than manually managing and chaining individual training scripts, you can run an end-to-end automated scientific campaign (SFT sweep $\to$ RM sweep $\to$ PE-RL sweep $\to$ Evaluation $\to$ Markdown Report) using the Auto-PERL orchestrator:
+
+```bash
+# 1. Pre-flight environment check (CUDA, W&B, HF tokens, disk space)
+python3 scripts/run_campaign.py doctor --task npov
+
+# 2. Guided interactive setup wizard
+python3 scripts/run_campaign.py wizard
+
+# 3. Launch with a budget preset (smoke, quick, standard, thorough)
+python3 scripts/run_campaign.py run --task npov --preset standard
+
+# 4. Monitor from a second tmux pane
+python3 scripts/run_campaign.py status --task npov --watch
+
+# 5. Seamlessly resume after VM preemption or disconnect
+python3 scripts/run_campaign.py resume --task npov
+```
+
+For complete documentation on the orchestrator, interactive dashboard hotkeys, declarative YAML configs, and remote VM/tmux setups, see [**`src/orchestrator/README.md`**](src/orchestrator/README.md).
+
+---
+
+## Manual Script Execution
+
+If running scripts individually, here is a brief description about the usage of each script, roughly in the order that they should be executed.
 Substitute `TASK` by `npov`, `bosch`, `ragtruth-qa`, or `ragtruth-summarization` (or `ragtruth`, which defaults to `ragtruth-qa`) to select the correct dataset. 
 Every `.sh` script in the `/scripts` folder runs the corresponding Python entrypoint located under `src/` (for example `src/writer_sft.py`).
 **Run the scripts from the project folder (not from within the `scripts` folder) so paths resolve correctly.**

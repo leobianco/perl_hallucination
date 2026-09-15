@@ -142,6 +142,49 @@ always restored on exit.
 
 ---
 
+## 🖥️ Running in `tmux` on Cloud / GCP VMs
+
+When executing long, multi-stage campaigns on a remote Google Cloud Compute Engine VM:
+
+### 1. Launch Inside `tmux` with UTF-8 Support
+To ensure proper rendering of box-drawing glyphs and borders:
+```bash
+tmux -u new -s auto-perl
+```
+Ensure your shell locale supports UTF-8:
+```bash
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+```
+
+### 2. SIGHUP Immunity & Disconnect Protection
+The orchestrator explicitly ignores `SIGHUP` (`_survive_terminal_hangup`), so your campaign will continue running even if an SSH connection drops. You can safely detach anytime (`Ctrl-B, d`) and reattach (`tmux attach -t auto-perl`).
+
+### 3. Recommended 2-Pane Workflow
+Split your tmux window (`Ctrl-B, %`):
+* **Pane 1 (Runner)**:
+  ```bash
+  python3 scripts/run_campaign.py run --task npov --preset standard
+  ```
+* **Pane 2 (Monitor)**:
+  ```bash
+  python3 scripts/run_campaign.py status --task npov --watch
+  ```
+  `--watch` polls `state.json` every 5 seconds without touching GPU resources or interfering with the runner.
+
+### 4. Low-Bandwidth & Terminal Fallbacks
+* If your terminal font garbles box glyphs, force ASCII rendering:
+  ```bash
+  python3 scripts/run_campaign.py run --task npov --preset standard --ascii
+  ```
+* For slow SSH connections or plain streaming logs without full-screen redraws:
+  ```bash
+  python3 scripts/run_campaign.py run --task npov --preset standard --plain
+  # or --no-tui
+  ```
+
+---
+
 ## 📝 Declarative Configuration Example (`configs/campaign.yaml`)
 
 ```yaml
