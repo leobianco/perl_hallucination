@@ -1,0 +1,382 @@
+"""Unit and integration tests for the Auto-PERL orchestrator."""
+
+import os
+import tempfile
+import threading
+import time
+import unittest
+
+from src.orchestrator.cli import events as events_mod
+from src.orchestrator.config import CampaignConfig
+from src.orchestrator.engine import CampaignEngine
+from src.orchestrator.model_manager import ModelManager
+from src.orchestrator.reporter import CampaignReporter
+from src.orchestrator.state import CampaignState
+from src.orchestrator.state import StageResult
+from src.orchestrator.state import StageStatus
+from src.orchestrator.sweep_controller import SweepController
+
+
+class TestOrchestratorConfig(unittest.TestCase):
+  """Tests for configuration serialization, defaults, and validation."""
+
+  def test_defaults(self):
+    config = CampaignConfig.create_default(task_name="npov")
+    self.assertEqual(config.task_name, "npov")
+    self.assertEqual(config.sft.max_runs, 30)
+    self.assertEqual(config.rm.max_runs, 30)
+    self.assertEqual(config.perl.max_runs, 10)
+    self.assertEqual(config.stages, ["sft", "rm", "perl", "eval"])
+
+  def test_task_validation(self):
+    valid_cfg = CampaignConfig.create_default(task_name="bosch")
+    valid_cfg.validate()
+
+    with self.assertRaises(ValueError):
+      invalid_cfg = CampaignConfig.create_default(task_name="nonexistent_task")
+      invalid_cfg.validate()
+
+  def test_yaml_roundtrip(self):
+    config = CampaignConfig.create_default(task_name="npov", sft_runs=15)
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as tf:
+      yaml_path = tf.name
+
+    try:
+      config.to_yaml(yaml_path)
+      loaded_cfg = CampaignConfig.from_yaml(yaml_path)
+      self.assertEqual(loaded_cfg.task_name, config.task_name)
+      self.assertEqual(loaded_cfg.sft.max_runs, 15)
+    finally:
+      if os.path.exists(yaml_path):
+        os.remove(yaml_path)
+
+
+class TestOrchestratorState(unittest.TestCase):
+  """Tests for atomic state persistence, resumption, and stage tracking."""
+
+  def test_state_lifecycle(self):
+    with tempfile.TemporaryDirectory() as temp_dir:
+      state_file = os.path.join(temp_dir, "test_state.json")
+      state = CampaignState(campaign_id="test_camp", task_name="npov")
+
+      # Initially no stages completed
+      self.assertFalse(state.is_stage_completed("sft"))
+      self.assertEqual(state.get_next_pending_stage(["sft", "rm"]), "sft")
+
+      # Mark SFT running
+      state.mark_stage_running("sft")
+      self.assertEqual(state.stages["sft"].status, StageStatus.RUNNING)
+
+      # Record SFT completed
+      res = StageResult(
+          status=StageStatus.COMPLETED,
+          best_run_id="run_123",
+          best_metric_val=0.25,
+          model_repo_id="leobianco/npov_SFT_test",
+      )
+      state.record_stage_result("sft", res)
+      state.save(state_file)
+
+      # Reload state from disk
+      loaded = CampaignState.load(state_file)
+      self.assertTrue(loaded.is_stage_completed("sft"))
+      self.assertEqual(loaded.get_model_repo_id("sft"), "leobianco/npov_SFT_test")
+      self.assertEqual(loaded.get_next_pending_stage(["sft", "rm"]), "rm")
+
+
+class TestSweepController(unittest.TestCase):
+  """Tests for sweep registration, bounded execution, and best-run query in dry-run mode."""
+
+  def test_dry_run_sweep_flow(self):
+    ctrl = SweepController(entity="leobianco", project="test", dry_run=True)
+    sweep_id = ctrl.create_sweep({"method": "bayes"})
+    self.assertIn("mock_sweep", sweep_id)
+
+    # Test agent execution with max_runs=2
+    exit_code = ctrl.run_sweep_agent(sweep_id, max_runs=2)
+    self.assertEqual(exit_code, 0)
+
+    # Test best-run extraction
+    run_id, val, params = ctrl.fetch_best_run(sweep_id, "eval/loss", "minimize")
+    self.assertIsNotNone(run_id)
+    self.assertLess(val, 1.0)
+    self.assertIn("learning_rate", params)
+
+
+class TestModelManager(unittest.TestCase):
+  """Tests for model materialization in dry-run mode."""
+
+  def test_dry_run_materialize(self):
+    mgr = ModelManager(user="leobianco", dry_run=True)
+    repo_id = mgr.materialize_and_push(
+        stage_name="sft",
+        task_name="npov",
+        base_model="google/gemma-4-E2B-it",
+        best_params={"learning_rate": 0.003, "lora_r": 8},
+        seed=130104,
+    )
+    self.assertIn("leobianco/npov_SFT_gemma-4-E2B-it", repo_id)
+
+
+class TestReporter(unittest.TestCase):
+  """Tests for scientific report generation."""
+
+  def test_markdown_report_generation(self):
+    with tempfile.TemporaryDirectory() as temp_dir:
+      config = CampaignConfig.create_default(task_name="npov", dry_run=True)
+      config.reporting.reports_dir = temp_dir
+      state = CampaignState(campaign_id="test_camp", task_name="npov")
+
+      # Populate state with completed SFT and RM results
+      state.stages["sft"] = StageResult(
+          status=StageStatus.COMPLETED,
+          sweep_id="sweep_sft_123",
+          best_run_id="run_1",
+          best_metric_val=0.312,
+          model_repo_id="leobianco/npov_SFT_test",
+          best_params={"learning_rate": 0.002, "lora_r": 8},
+      )
+      state.stages["eval"] = StageResult(
+          status=StageStatus.COMPLETED,
+          model_repo_id="leobianco/npov_PERL_test",
+          metrics={"hallucination_rate": 0.052, "win_rate_vs_base": 0.76},
+      )
+
+      reporter = CampaignReporter(config, state)
+      md_path = reporter.generate_markdown_report()
+
+      self.assertTrue(os.path.exists(md_path))
+      with open(md_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+      self.assertIn("Executive Performance Scorecard", content)
+      self.assertIn("leobianco/npov_SFT_test", content)
+      self.assertIn("hallucination_rate", content)
+
+
+class TestFullEngineDryRun(unittest.TestCase):
+  """End-to-end integration test of CampaignEngine in dry-run mode."""
+
+  def test_complete_dry_run_campaign(self):
+    with tempfile.TemporaryDirectory() as temp_dir:
+      state_file = os.path.join(temp_dir, "test_camp_state.json")
+      reports_dir = os.path.join(temp_dir, "reports")
+
+      config = CampaignConfig.create_default(
+          task_name="npov",
+          sft_runs=2,
+          rm_runs=2,
+          perl_runs=2,
+          dry_run=True,
+      )
+      config.state_file = state_file
+      config.reporting.reports_dir = reports_dir
+      config.no_tui = True
+
+      logs = []
+
+      def log_cb(line):
+        logs.append(line)
+
+      engine = CampaignEngine(config=config, live_line_callback=log_cb)
+      res = engine.run()
+
+      self.assertEqual(res["status"], "COMPLETED")
+      self.assertTrue(os.path.exists(state_file))
+
+      # Verify all 4 stages completed
+      final_state = CampaignState.load(state_file)
+      self.assertTrue(final_state.is_stage_completed("sft"))
+      self.assertTrue(final_state.is_stage_completed("rm"))
+      self.assertTrue(final_state.is_stage_completed("perl"))
+      self.assertTrue(final_state.is_stage_completed("eval"))
+
+      # Verify model IDs were chained
+      sft_model = final_state.get_model_repo_id("sft")
+      rm_model = final_state.get_model_repo_id("rm")
+      perl_model = final_state.get_model_repo_id("perl")
+      self.assertIsNotNone(sft_model)
+      self.assertIsNotNone(rm_model)
+      self.assertIsNotNone(perl_model)
+
+      # Verify Markdown report created
+      md_report = res["artifacts"].get("markdown_report")
+      self.assertTrue(os.path.exists(md_report))
+
+
+class TestEngineEvents(unittest.TestCase):
+  """The structured event stream published by the engine."""
+
+  def setUp(self):
+    super().setUp()
+    self.temp = tempfile.TemporaryDirectory()
+    self.addCleanup(self.temp.cleanup)
+    self.config = CampaignConfig.create_default(
+        task_name="npov", sft_runs=1, rm_runs=1, perl_runs=1, dry_run=True
+    )
+    self.config.state_file = os.path.join(self.temp.name, "camp_state.json")
+    self.config.reporting.reports_dir = os.path.join(self.temp.name, "reports")
+    self.config.no_tui = True
+
+  def run_engine(self, **kwargs):
+    bus = events_mod.EventBus()
+    seen = []
+    bus.subscribe(seen.append)
+    engine = CampaignEngine(config=self.config, event_bus=bus, **kwargs)
+    result = engine.run()
+    return result, seen, engine
+
+  def types_of(self, seen):
+    return [event.type for event in seen]
+
+  def test_campaign_lifecycle_events_are_published(self):
+    _, seen, _ = self.run_engine()
+    types = self.types_of(seen)
+    self.assertEqual(types[0], events_mod.EventType.CAMPAIGN_STARTED)
+    self.assertEqual(types[-1], events_mod.EventType.CAMPAIGN_FINISHED)
+    self.assertEqual(seen[-1].payload["status"], "COMPLETED")
+
+  def test_every_stage_reports_start_and_completion(self):
+    _, seen, _ = self.run_engine()
+    started = {
+        e.stage for e in seen
+        if e.type == events_mod.EventType.STAGE_STARTED
+    }
+    completed = {
+        e.stage for e in seen
+        if e.type == events_mod.EventType.STAGE_COMPLETED
+    }
+    self.assertEqual(started, {"sft", "rm", "perl", "eval"})
+    self.assertEqual(completed, {"sft", "rm", "perl", "eval"})
+
+  def test_stage_started_carries_sweep_metadata(self):
+    _, seen, _ = self.run_engine()
+    sft = next(
+        e for e in seen
+        if e.type == events_mod.EventType.STAGE_STARTED and e.stage == "sft"
+    )
+    self.assertEqual(sft.payload["max_runs"], 1)
+    self.assertTrue(sft.payload["metric"])
+    self.assertIn(sft.payload["goal"], ("minimize", "maximize"))
+
+  def test_stage_completed_carries_artifacts(self):
+    _, seen, _ = self.run_engine()
+    sft = next(
+        e for e in seen
+        if e.type == events_mod.EventType.STAGE_COMPLETED and e.stage == "sft"
+    )
+    self.assertIsNotNone(sft.payload["model_repo_id"])
+    self.assertIn("duration_s", sft.payload)
+
+  def test_stage_logs_are_tagged_with_their_stage(self):
+    _, seen, _ = self.run_engine()
+    logs = [e for e in seen if e.type == events_mod.EventType.LOG]
+    self.assertTrue(logs)
+    self.assertTrue(all(e.stage for e in logs))
+
+  def test_legacy_line_callback_still_receives_text(self):
+    lines = []
+    _, _, _ = self.run_engine(live_line_callback=lines.append)
+    self.assertTrue(lines)
+    self.assertTrue(any("Starting Campaign" in line for line in lines))
+
+  def test_config_is_persisted_for_resume(self):
+    self.run_engine()
+    state = CampaignState.load(self.config.state_file)
+    self.assertIsNotNone(state.config_dict)
+    self.assertEqual(state.stages_order, ["sft", "rm", "perl", "eval"])
+    restored = CampaignConfig.from_dict(state.config_dict)
+    self.assertEqual(restored.sft.max_runs, 1)
+    self.assertTrue(restored.dry_run)
+
+  def test_stage_durations_are_persisted(self):
+    self.run_engine()
+    state = CampaignState.load(self.config.state_file)
+    sft = state.stages["sft"]
+    # Regression: start_time used to be dropped, so the UI showed "-".
+    self.assertIsNotNone(sft.start_time)
+    self.assertIsNotNone(sft.end_time)
+
+  def test_resuming_skips_completed_stages(self):
+    self.run_engine()
+    bus = events_mod.EventBus()
+    seen = []
+    bus.subscribe(seen.append)
+    state = CampaignState.load(self.config.state_file)
+    CampaignEngine(config=self.config, state=state, event_bus=bus).run()
+    skipped = {
+        e.stage for e in seen
+        if e.type == events_mod.EventType.STAGE_SKIPPED
+    }
+    self.assertEqual(skipped, {"sft", "rm", "perl", "eval"})
+    self.assertFalse(
+        any(e.type == events_mod.EventType.STAGE_STARTED for e in seen)
+    )
+
+
+class TestEngineControls(unittest.TestCase):
+  """Pause, stop and abort semantics."""
+
+  def setUp(self):
+    super().setUp()
+    self.temp = tempfile.TemporaryDirectory()
+    self.addCleanup(self.temp.cleanup)
+    self.config = CampaignConfig.create_default(
+        task_name="npov", sft_runs=1, rm_runs=1, perl_runs=1, dry_run=True
+    )
+    self.config.state_file = os.path.join(self.temp.name, "camp_state.json")
+    self.config.reporting.reports_dir = os.path.join(self.temp.name, "reports")
+    self.config.no_tui = True
+
+  def test_stop_before_the_first_stage_still_reports(self):
+    controls = events_mod.ControlSignals()
+    controls.request_stop()
+    result = CampaignEngine(config=self.config, controls=controls).run()
+    self.assertEqual(result["status"], "STOPPED")
+    self.assertIn("artifacts", result)
+    state = CampaignState.load(self.config.state_file)
+    self.assertEqual(state.status, "STOPPED")
+
+  def test_abort_skips_reporting(self):
+    controls = events_mod.ControlSignals()
+    controls.request_abort()
+    result = CampaignEngine(config=self.config, controls=controls).run()
+    self.assertEqual(result["status"], "STOPPED")
+    self.assertNotIn("artifacts", result)
+
+  def test_pause_does_not_end_the_campaign(self):
+    controls = events_mod.ControlSignals()
+    controls.pause()
+    engine = CampaignEngine(config=self.config, controls=controls)
+    outcome = {}
+
+    def worker():
+      outcome["result"] = engine.run()
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    time.sleep(0.2)
+    # Still alive and parked, not stopped.
+    self.assertTrue(thread.is_alive())
+    self.assertNotIn("result", outcome)
+    controls.resume()
+    thread.join(timeout=30)
+    self.assertFalse(thread.is_alive())
+    self.assertEqual(outcome["result"]["status"], "COMPLETED")
+
+  def test_advance_flag_is_cleared_between_stages(self):
+    controls = events_mod.ControlSignals()
+    controls.request_advance()
+    CampaignEngine(config=self.config, controls=controls).run()
+    self.assertFalse(controls.advance_requested)
+
+  def test_legacy_stop_callback_is_honored(self):
+    result = CampaignEngine(
+        config=self.config, stop_requested_callback=lambda: True
+    ).run()
+    self.assertEqual(result["status"], "STOPPED")
+
+
+if __name__ == "__main__":
+  unittest.main()
+

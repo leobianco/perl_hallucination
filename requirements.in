@@ -17,3 +17,9 @@ nltk
 scikit-learn
 vllm
 rouge-score
+# --- Interactive CLI / dashboard ---
+# rich: styled tables, panels and the pinned live dashboard (tmux friendly).
+# questionary: arrow-key driven setup wizard. Both are optional at runtime:
+# the CLI degrades to plain text if they are missing.
+rich
+questionary

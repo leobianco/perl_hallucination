@@ -1,0 +1,871 @@
+"""Command line application for the Auto-PERL campaign orchestrator.
+
+Living in the package (rather than inside ``scripts/``) keeps the CLI
+importable and therefore testable: the unit tests call :func:`main` with
+argument vectors and an in-memory console, and assert on the rendered text.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import shutil
+import sys
+import time
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from src.orchestrator.cli import renderables
+from src.orchestrator.cli import theme as theme_mod
+from src.orchestrator.cli.console import UiConsole
+from src.orchestrator.config import CampaignConfig, VALID_TASKS
+from src.orchestrator.state import CampaignState
+
+PROGRAM = "run_campaign.py"
+CHECKPOINTS_ROOT = "./checkpoints"
+
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_USAGE = 2
+EXIT_NOT_FOUND = 3
+
+
+# --------------------------------------------------------------------------
+# Argument parsing
+# --------------------------------------------------------------------------
+def _global_flags() -> argparse.ArgumentParser:
+  """Flags accepted both before and after the subcommand.
+
+  ``default=SUPPRESS`` is essential: these options are registered on both the
+  top-level parser and every subparser, and without it the subparser would
+  re-apply its own ``False`` default on top of a flag the user typed *before*
+  the subcommand (``run_campaign.py --no-color status``).
+
+  Returns:
+    A parent parser holding the shared appearance/debug flags.
+  """
+  parent = argparse.ArgumentParser(add_help=False)
+  parent.add_argument(
+      "--no-color",
+      action="store_true",
+      default=argparse.SUPPRESS,
+      help="Disable ANSI colors (also honors the NO_COLOR env var).",
+  )
+  parent.add_argument(
+      "--ascii",
+      action="store_true",
+      default=argparse.SUPPRESS,
+      help="Use ASCII-only glyphs for terminals without Unicode support.",
+  )
+  parent.add_argument(
+      "--plain",
+      action="store_true",
+      default=argparse.SUPPRESS,
+      help="Plain text output: no live dashboard, no styling.",
+  )
+  parent.add_argument(
+      "--debug",
+      action="store_true",
+      default=argparse.SUPPRESS,
+      help="Show full tracebacks instead of friendly error messages.",
+  )
+  return parent
+
+
+def _apply_global_defaults(args: argparse.Namespace) -> argparse.Namespace:
+  """Fills in the suppressed global flags so callers can read them freely."""
+  for name in ("no_color", "ascii", "plain", "debug"):
+    if not hasattr(args, name):
+      setattr(args, name, False)
+  return args
+
+
+def build_parser() -> argparse.ArgumentParser:
+  """Builds the full argument parser."""
+  parent = _global_flags()
+  parser = argparse.ArgumentParser(
+      prog=PROGRAM,
+      parents=[parent],
+      description=(
+          "Auto-PERL: automated scientific campaign orchestrator.\n"
+          "Run 'wizard' for a guided setup, 'doctor' for a pre-flight check."
+      ),
+      formatter_class=argparse.RawDescriptionHelpFormatter,
+      epilog=(
+          "Examples:\n"
+          f"  {PROGRAM} wizard\n"
+          f"  {PROGRAM} doctor --task npov\n"
+          f"  {PROGRAM} run --task npov --preset quick\n"
+          f"  {PROGRAM} run --task npov --stages perl,eval --sft-model owner/m\n"
+          f"  {PROGRAM} status --task npov --watch\n"
+          f"  {PROGRAM} resume --task npov\n"
+      ),
+  )
+  subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+  # --- run ---
+  run_parser = subparsers.add_parser(
+      "run", parents=[parent], help="Launch a campaign."
+  )
+  run_parser.add_argument("--task", "-t", default="npov", choices=VALID_TASKS,
+                          help="Task identifier.")
+  run_parser.add_argument("--config", "-c", default=None,
+                          help="Path to a YAML campaign configuration.")
+  run_parser.add_argument("--stages", "-s", default=None,
+                          help="Comma-separated stages, e.g. 'sft,rm,perl,eval'.")
+  run_parser.add_argument("--preset", default=None,
+                          choices=["smoke", "quick", "standard", "thorough"],
+                          help="Trial budget preset (overridden by explicit flags).")
+  run_parser.add_argument("--sft-runs", type=int, default=None,
+                          help="Max trials for the SFT sweep.")
+  run_parser.add_argument("--rm-runs", type=int, default=None,
+                          help="Max trials for the reward model sweep.")
+  run_parser.add_argument("--perl-runs", type=int, default=None,
+                          help="Max trials for the PE-RL sweep.")
+  run_parser.add_argument("--eval-samples", type=int, default=None,
+                          help="Number of evaluation samples.")
+  run_parser.add_argument("--sft-model", default=None,
+                          help="Existing SFT checkpoint (skips SFT training).")
+  run_parser.add_argument("--reward-model", default=None,
+                          help="Existing reward model checkpoint.")
+  run_parser.add_argument("--dry-run", action="store_true",
+                          help="Simulate the DAG without GPU workloads.")
+  run_parser.add_argument("--no-tui", action="store_true",
+                          help="Disable the live dashboard (plain streaming).")
+  run_parser.add_argument("--yes", "-y", action="store_true",
+                          help="Skip the pre-launch confirmation.")
+  run_parser.add_argument("--interactive", "-i", action="store_true",
+                          help="Start from the guided wizard.")
+
+  # --- wizard ---
+  subparsers.add_parser(
+      "wizard", parents=[parent], help="Guided interactive setup."
+  )
+
+  # --- status ---
+  status_parser = subparsers.add_parser(
+      "status", parents=[parent], help="Inspect campaign progress."
+  )
+  status_parser.add_argument("--task", "-t", default="npov", help="Task name.")
+  status_parser.add_argument("--state-file", default=None,
+                             help="Explicit path to a campaign state JSON.")
+  status_parser.add_argument("--json", action="store_true",
+                             help="Emit machine-readable JSON.")
+  status_parser.add_argument("--watch", action="store_true",
+                             help="Refresh continuously (great in a tmux pane).")
+  status_parser.add_argument("--interval", type=float, default=5.0,
+                             help="Seconds between refreshes in --watch mode.")
+  status_parser.add_argument("--max-refreshes", type=int, default=0,
+                             help=argparse.SUPPRESS)
+
+  # --- resume ---
+  resume_parser = subparsers.add_parser(
+      "resume", parents=[parent], help="Resume an interrupted campaign."
+  )
+  resume_parser.add_argument("--task", "-t", default="npov", help="Task name.")
+  resume_parser.add_argument("--state-file", default=None,
+                             help="Explicit path to a campaign state JSON.")
+  resume_parser.add_argument("--dry-run", action="store_true",
+                             help="Simulate the resumed stages.")
+  resume_parser.add_argument("--no-tui", action="store_true",
+                             help="Disable the live dashboard.")
+  resume_parser.add_argument("--yes", "-y", action="store_true",
+                             help="Skip the confirmation prompt.")
+
+  # --- report ---
+  report_parser = subparsers.add_parser(
+      "report", parents=[parent], help="Regenerate reports for a campaign."
+  )
+  report_parser.add_argument("--task", "-t", default="npov", help="Task name.")
+  report_parser.add_argument("--state-file", default=None,
+                             help="Explicit path to a campaign state JSON.")
+
+  # --- list ---
+  list_parser = subparsers.add_parser(
+      "list", parents=[parent], aliases=["ls"], help="List known campaigns."
+  )
+  list_parser.add_argument("--task", "-t", default=None,
+                           help="Restrict the listing to one task.")
+  list_parser.add_argument("--json", action="store_true",
+                           help="Emit machine-readable JSON.")
+
+  # --- doctor ---
+  doctor_parser = subparsers.add_parser(
+      "doctor", parents=[parent],
+      help="Pre-flight environment check before a long campaign."
+  )
+  doctor_parser.add_argument("--task", "-t", default="npov", choices=VALID_TASKS,
+                             help="Task the checks should assume.")
+  doctor_parser.add_argument("--json", action="store_true",
+                             help="Emit machine-readable JSON.")
+  return parser
+
+
+# --------------------------------------------------------------------------
+# State discovery helpers
+# --------------------------------------------------------------------------
+def find_state_files(task_name: Optional[str] = None, root: str = CHECKPOINTS_ROOT) -> List[str]:
+  """Returns campaign state files, newest first."""
+  pattern = os.path.join(root, task_name or "*", "*_state.json")
+  candidates = [path for path in glob.glob(pattern) if os.path.isfile(path)]
+  candidates.sort(key=os.path.getmtime, reverse=True)
+  return candidates
+
+
+def find_latest_state(task_name: str, root: str = CHECKPOINTS_ROOT) -> Optional[str]:
+  """Returns the most recently modified state file for a task."""
+  matches = find_state_files(task_name, root=root)
+  return matches[0] if matches else None
+
+
+def config_for_state(state: CampaignState) -> CampaignConfig:
+  """Rebuilds the campaign config from the state file.
+
+  Falls back to task defaults for campaigns created before configs were
+  persisted, so ``status``/``resume`` keep working on old state files.
+  """
+  data = getattr(state, "config_dict", None)
+  if data:
+    try:
+      config = CampaignConfig.from_dict(dict(data))
+      # A hand-edited or truncated state file must not produce a config that
+      # only explodes later, halfway through a stage.
+      config.validate()
+      config.name = state.campaign_id
+      return config
+    except (TypeError, ValueError, KeyError, AttributeError):
+      pass
+  config = CampaignConfig.create_default(task_name=state.task_name)
+  config.name = state.campaign_id
+  if getattr(state, "stages_order", None):
+    config.stages = list(state.stages_order)
+  return config
+
+
+def state_progress(state: CampaignState, config: CampaignConfig) -> Tuple[int, int]:
+  """Returns ``(completed_stages, total_stages)``."""
+  views = renderables.build_stage_views(config, state)
+  done = sum(1 for v in views if str(v.status).upper() in ("COMPLETED", "SKIPPED"))
+  return done, len(views)
+
+
+# --------------------------------------------------------------------------
+# Diagnostics (doctor)
+# --------------------------------------------------------------------------
+def run_diagnostics(config: CampaignConfig) -> List[Dict[str, str]]:
+  """Runs environment pre-flight checks.
+
+  Returns:
+    A list of ``{"name", "status", "detail"}`` dicts where status is one of
+    ``ok`` / ``warn`` / ``fail``.
+  """
+  checks: List[Dict[str, str]] = []
+
+  def add(name: str, status: str, detail: str) -> None:
+    checks.append({"name": name, "status": status, "detail": detail})
+
+  # Python packages.
+  required = {
+      "wandb": "sweep orchestration",
+      "huggingface_hub": "checkpoint publishing",
+      "yaml": "sweep/config parsing",
+  }
+  optional = {
+      "rich": "styled dashboard",
+      "questionary": "interactive wizard",
+      "torch": "training",
+  }
+  for module, purpose in required.items():
+    try:
+      __import__(module)
+      add(f"package: {module}", "ok", purpose)
+    except ImportError:
+      add(f"package: {module}", "fail", f"missing - needed for {purpose}")
+  for module, purpose in optional.items():
+    try:
+      __import__(module)
+      add(f"package: {module}", "ok", purpose)
+    except ImportError:
+      add(f"package: {module}", "warn", f"missing - {purpose} will degrade")
+
+  # Credentials.
+  if os.environ.get("WANDB_API_KEY") or os.path.exists(
+      os.path.expanduser("~/.netrc")
+  ):
+    add("W&B credentials", "ok", "API key or ~/.netrc found")
+  else:
+    add("W&B credentials", "fail", "run 'wandb login' before launching")
+
+  if (
+      os.environ.get("HF_TOKEN")
+      or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+      or os.path.exists(os.path.expanduser("~/.cache/huggingface/token"))
+  ):
+    add("Hugging Face token", "ok", "token available for pushes")
+  else:
+    add("Hugging Face token", "warn", "no token: model pushes will fail")
+
+  # Sweep configuration files.
+  for stage in theme_mod.iter_stage_names(config.stages):
+    stage_cfg = getattr(config, stage, None)
+    path = getattr(stage_cfg, "sweep_config_path", None)
+    if not path:
+      continue
+    if os.path.exists(path):
+      add(f"sweep config: {stage}", "ok", path)
+    else:
+      add(f"sweep config: {stage}", "fail", f"missing file {path}")
+
+  # Writable output directories.
+  for label, path in (
+      ("checkpoints dir", os.path.dirname(config.state_file or "./checkpoints/x")),
+      ("reports dir", config.reporting.reports_dir),
+  ):
+    try:
+      os.makedirs(path, exist_ok=True)
+      add(label, "ok", f"writable: {path}")
+    except OSError as exc:
+      add(label, "fail", f"cannot create {path}: {exc}")
+
+  # Disk space.
+  try:
+    usage = shutil.disk_usage(".")
+    free_gb = usage.free / (1024**3)
+    status = "ok" if free_gb >= 50 else ("warn" if free_gb >= 20 else "fail")
+    add("disk space", status, f"{free_gb:.0f} GB free")
+  except OSError as exc:
+    add("disk space", "warn", str(exc))
+
+  # GPU.
+  if shutil.which("nvidia-smi"):
+    add("GPU", "ok", "nvidia-smi found")
+  else:
+    add("GPU", "warn", "nvidia-smi not found: only --dry-run will work")
+
+  # tmux, because a multi-hour SSH session without it is a bad idea.
+  if os.environ.get("TMUX"):
+    add("tmux session", "ok", "running inside tmux")
+  else:
+    add("tmux session", "warn", "not in tmux: an SSH drop would kill the run")
+
+  return checks
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+def cmd_run(args: argparse.Namespace, console: UiConsole) -> int:
+  """Implements ``run``."""
+  if args.interactive:
+    return cmd_wizard(args, console)
+
+  if args.config:
+    if not os.path.exists(args.config):
+      console.error(f"Config file not found: {args.config}")
+      return EXIT_NOT_FOUND
+    config = CampaignConfig.from_yaml(args.config)
+  else:
+    from src.orchestrator.cli.wizard import PRESETS  # pylint: disable=g-import-not-at-top
+
+    sft_runs, rm_runs, perl_runs, eval_samples = PRESETS.get(
+        args.preset or "standard", PRESETS["standard"]
+    )
+    config = CampaignConfig.create_default(
+        task_name=args.task,
+        sft_runs=args.sft_runs if args.sft_runs is not None else sft_runs,
+        rm_runs=args.rm_runs if args.rm_runs is not None else rm_runs,
+        perl_runs=args.perl_runs if args.perl_runs is not None else perl_runs,
+        dry_run=args.dry_run,
+    )
+    config.eval.max_eval_samples = (
+        args.eval_samples if args.eval_samples is not None else eval_samples
+    )
+
+  if args.stages:
+    config.stages = theme_mod.iter_stage_names(args.stages.split(","))
+  if args.sft_model:
+    config.perl.sft_model_path = args.sft_model
+  if args.reward_model:
+    config.perl.reward_model_path = args.reward_model
+  if args.dry_run:
+    config.dry_run = True
+  if args.no_tui or args.plain:
+    config.no_tui = True
+
+  try:
+    config.validate()
+  except ValueError as exc:
+    console.error(str(exc))
+    return EXIT_USAGE
+
+  missing = _missing_upstream_checkpoints(config)
+  if missing:
+    console.error(
+        "PE-RL needs upstream checkpoints: "
+        + ", ".join(missing)
+        + "."
+    )
+    console.hint(
+        "Add the stage(s) back with --stages, or pass --sft-model / "
+        "--reward-model with an existing repo id."
+    )
+    return EXIT_USAGE
+
+  _print_launch_preview(config, console)
+  if not args.yes and not config.dry_run and _is_interactive():
+    answer = input("Launch this campaign? [Y/n]: ").strip().lower()
+    if answer and not answer.startswith("y"):
+      console.info("Aborted before launch.")
+      return EXIT_OK
+
+  return _execute_campaign(config, console, plain=bool(args.no_tui or args.plain))
+
+
+def cmd_wizard(args: argparse.Namespace, console: UiConsole) -> int:
+  """Implements ``wizard``."""
+  from src.orchestrator.cli.wizard import run_setup_wizard  # pylint: disable=g-import-not-at-top
+
+  config = run_setup_wizard(console=console)
+  if config is None:
+    return EXIT_OK
+  if getattr(args, "plain", False):
+    config.no_tui = True
+  return _execute_campaign(config, console, plain=bool(getattr(args, "plain", False)))
+
+
+def cmd_status(args: argparse.Namespace, console: UiConsole) -> int:
+  """Implements ``status``."""
+  state_file = args.state_file or find_latest_state(args.task)
+  if not state_file or not os.path.exists(state_file):
+    if args.json:
+      print(json.dumps({"error": "no_state_file", "task": args.task}))
+      return EXIT_NOT_FOUND
+    console.error(f"No campaign state found for task '{args.task}'.")
+    console.hint(f"Start one with: {PROGRAM} run --task {args.task}")
+    return EXIT_NOT_FOUND
+
+  def render_once() -> None:
+    state = CampaignState.load(state_file)
+    config = config_for_state(state)
+    _render_status(state, config, console, state_file)
+
+  if args.json:
+    state = CampaignState.load(state_file)
+    config = config_for_state(state)
+    done, total = state_progress(state, config)
+    payload = {
+        "campaign_id": state.campaign_id,
+        "task": state.task_name,
+        "status": state.status,
+        "current_stage": state.current_stage,
+        "stages_completed": done,
+        "stages_total": total,
+        "updated_at": state.updated_at,
+        "state_file": state_file,
+        "stages": {name: result.to_dict() for name, result in state.stages.items()},
+    }
+    print(json.dumps(payload, indent=2))
+    return EXIT_OK
+
+  if not args.watch:
+    render_once()
+    return EXIT_OK
+
+  refreshes = 0
+  try:
+    while True:
+      if console.is_rich and console.rich is not None:
+        console.rich.clear()
+      render_once()
+      console.hint(
+          f"watching {os.path.basename(state_file)} - refresh every "
+          f"{args.interval:g}s - Ctrl-C to exit"
+      )
+      refreshes += 1
+      if args.max_refreshes and refreshes >= args.max_refreshes:
+        break
+      time.sleep(max(0.5, args.interval))
+  except KeyboardInterrupt:
+    console.blank()
+    console.info("Stopped watching.")
+  return EXIT_OK
+
+
+def cmd_resume(args: argparse.Namespace, console: UiConsole) -> int:
+  """Implements ``resume``."""
+  state_file = args.state_file or find_latest_state(args.task)
+  if not state_file or not os.path.exists(state_file):
+    console.error(f"No campaign state found to resume for task '{args.task}'.")
+    console.hint(f"Start a new one with: {PROGRAM} run --task {args.task}")
+    return EXIT_NOT_FOUND
+
+  state = CampaignState.load(state_file)
+  config = config_for_state(state)
+  config.state_file = state_file
+  if args.dry_run:
+    config.dry_run = True
+  if args.no_tui or args.plain:
+    config.no_tui = True
+
+  views = renderables.build_stage_views(config, state)
+  completed = [v.title for v in views if str(v.status).upper() == "COMPLETED"]
+  remaining = [v.title for v in views if str(v.status).upper() != "COMPLETED"]
+
+  console.blank()
+  console.panel(
+      [
+          f"{console.theme.markup('Campaign', 'muted')}  {state.campaign_id}",
+          f"{console.theme.markup('State   ', 'muted')}  {state_file}",
+          f"{console.theme.markup('Updated ', 'muted')}  {state.updated_at}",
+          f"{console.theme.markup('Skipping', 'muted')}  "
+          + (", ".join(completed) if completed else "nothing - starting from the top"),
+          f"{console.theme.markup('Will run', 'muted')}  "
+          + (", ".join(remaining) if remaining else "nothing - already complete"),
+      ],
+      title="Resume plan",
+      style="accent",
+  )
+  if not remaining:
+    console.success("This campaign is already complete.")
+    console.hint(f"Regenerate its report with: {PROGRAM} report --task {args.task}")
+    return EXIT_OK
+
+  if not args.yes and _is_interactive():
+    answer = input("Resume this campaign? [Y/n]: ").strip().lower()
+    if answer and not answer.startswith("y"):
+      console.info("Resume cancelled.")
+      return EXIT_OK
+
+  return _execute_campaign(
+      config, console, state=state, plain=bool(args.no_tui or args.plain)
+  )
+
+
+def cmd_report(args: argparse.Namespace, console: UiConsole) -> int:
+  """Implements ``report``."""
+  state_file = args.state_file or find_latest_state(args.task)
+  if not state_file or not os.path.exists(state_file):
+    console.error(f"No campaign state found for task '{args.task}'.")
+    return EXIT_NOT_FOUND
+  state = CampaignState.load(state_file)
+  config = config_for_state(state)
+  from src.orchestrator.reporter import CampaignReporter  # pylint: disable=g-import-not-at-top
+
+  artifacts = CampaignReporter(config, state).generate_all()
+  console.blank()
+  console.success("Reports generated:")
+  for key, value in artifacts.items():
+    console.print(
+        f"  {console.theme.markup(key, 'muted')}  "
+        f"{console.theme.markup(str(value), 'accent')}"
+    )
+  return EXIT_OK
+
+
+def cmd_list(args: argparse.Namespace, console: UiConsole) -> int:
+  """Implements ``list``/``ls``."""
+  state_files = find_state_files(args.task)
+  entries: List[Dict[str, Any]] = []
+  for path in state_files:
+    try:
+      state = CampaignState.load(path)
+    except (OSError, ValueError, KeyError):
+      continue
+    config = config_for_state(state)
+    done, total = state_progress(state, config)
+    entries.append({
+        "campaign_id": state.campaign_id,
+        "task": state.task_name,
+        "status": state.status,
+        "progress": f"{done}/{total}",
+        "updated_at": state.updated_at,
+        "state_file": path,
+    })
+
+  if args.json:
+    print(json.dumps(entries, indent=2))
+    return EXIT_OK
+
+  if not entries:
+    console.info("No campaigns found yet.")
+    console.hint(f"Create one with: {PROGRAM} wizard")
+    return EXIT_OK
+
+  theme = console.theme
+  if console.is_rich:
+    from rich.table import Table  # pylint: disable=g-import-not-at-top
+    from rich import box  # pylint: disable=g-import-not-at-top
+
+    table = Table(
+        box=box.ROUNDED if theme.use_unicode else box.ASCII,
+        header_style=theme.style("heading") or None,
+        border_style=theme.style("border") or None,
+        title=theme.markup("Campaigns", "heading"),
+    )
+    for column in ("Campaign", "Task", "Status", "Stages", "Updated"):
+      table.add_column(column, no_wrap=(column != "Campaign"))
+    for entry in entries:
+      status_style = {
+          "COMPLETED": "success",
+          "FAILED": "error",
+          "IN_PROGRESS": "running",
+      }.get(entry["status"], "muted")
+      table.add_row(
+          entry["campaign_id"],
+          entry["task"],
+          theme.markup(entry["status"], status_style),
+          entry["progress"],
+          str(entry["updated_at"])[:19].replace("T", " "),
+      )
+    console.print_renderable(table)
+  else:
+    for entry in entries:
+      console.print(
+          f"{entry['campaign_id']:<34} {entry['task']:<10} "
+          f"{entry['status']:<12} {entry['progress']:<6} {entry['updated_at'][:19]}"
+      )
+  console.hint(f"Inspect one with: {PROGRAM} status --task <task>")
+  return EXIT_OK
+
+
+def cmd_doctor(args: argparse.Namespace, console: UiConsole) -> int:
+  """Implements ``doctor``."""
+  config = CampaignConfig.create_default(task_name=args.task)
+  checks = run_diagnostics(config)
+  if args.json:
+    print(json.dumps(checks, indent=2))
+    return EXIT_OK if not any(c["status"] == "fail" for c in checks) else EXIT_ERROR
+
+  theme = console.theme
+  console.blank()
+  console.rule("Pre-flight check")
+  marks = {
+      "ok": theme.markup(theme.glyphs.completed, "success"),
+      "warn": theme.markup("!", "warning"),
+      "fail": theme.markup(theme.glyphs.failed, "error"),
+  }
+  width = max(len(check["name"]) for check in checks)
+  for check in checks:
+    console.print(
+        f"  {marks.get(check['status'], '?')} "
+        f"{theme.markup(check['name'].ljust(width), 'value')}  "
+        f"{theme.markup(check['detail'], 'muted')}"
+    )
+  failures = [c for c in checks if c["status"] == "fail"]
+  warnings = [c for c in checks if c["status"] == "warn"]
+  console.blank()
+  if failures:
+    console.error(
+        f"{len(failures)} blocking issue(s) found - fix them before launching."
+    )
+    return EXIT_ERROR
+  if warnings:
+    console.warn(f"{len(warnings)} warning(s); a dry-run is still recommended.")
+  else:
+    console.success("Environment looks healthy. Boa viagem!")
+  console.hint(f"Next: {PROGRAM} run --task {args.task} --preset smoke --dry-run")
+  return EXIT_OK
+
+
+# --------------------------------------------------------------------------
+# Shared helpers
+# --------------------------------------------------------------------------
+def _is_interactive() -> bool:
+  """True when we can safely ask the user a blocking question."""
+  try:
+    return bool(sys.stdin.isatty() and sys.stdout.isatty())
+  except Exception:  # pylint: disable=broad-except
+    return False
+
+
+def _missing_upstream_checkpoints(config: CampaignConfig) -> List[str]:
+  """Returns the upstream models PE-RL needs but cannot obtain."""
+  stages = theme_mod.iter_stage_names(config.stages)
+  if "perl" not in stages:
+    return []
+  missing = []
+  if "sft" not in stages and (
+      not config.perl.sft_model_path or config.perl.sft_model_path == "auto"
+  ):
+    missing.append("--sft-model")
+  if "rm" not in stages and (
+      not config.perl.reward_model_path or config.perl.reward_model_path == "auto"
+  ):
+    missing.append("--reward-model")
+  return missing
+
+
+def _print_launch_preview(config: CampaignConfig, console: UiConsole) -> None:
+  """Shows what is about to happen before the campaign starts."""
+  from src.orchestrator.cli.wizard import config_summary_lines  # pylint: disable=g-import-not-at-top
+
+  console.blank()
+  console.panel(
+      config_summary_lines(config, console.theme),
+      title="Launching campaign",
+      style="accent",
+  )
+
+
+def _render_status(
+    state: CampaignState,
+    config: CampaignConfig,
+    console: UiConsole,
+    state_file: str,
+) -> None:
+  """Renders the status view for one campaign."""
+  theme = console.theme
+  done, total = state_progress(state, config)
+  status_style = {
+      "COMPLETED": "success",
+      "FAILED": "error",
+      "IN_PROGRESS": "running",
+      "PAUSED": "warning",
+      "STOPPED": "warning",
+  }.get(str(state.status).upper(), "muted")
+
+  console.blank()
+  console.print(
+      f"{theme.markup(state.campaign_id, 'heading')}  "
+      f"{theme.markup(state.status, status_style)}  "
+      f"{theme.markup(f'{done}/{total} stages', 'muted')}"
+  )
+  console.print(
+      theme.markup(
+          f"task {state.task_name} {theme.glyphs.bullet} updated "
+          f"{str(state.updated_at)[:19].replace('T', ' ')} "
+          f"{theme.glyphs.bullet} {state_file}",
+          "muted",
+      )
+  )
+  console.blank()
+  if console.is_rich:
+    console.print_renderable(
+        renderables.status_table(config, state, theme, width=console.width)
+    )
+  else:
+    console.print_lines(
+        renderables.dag_lines(
+            renderables.build_stage_views(config, state), theme, width=console.width
+        )
+    )
+  eval_result = state.stages.get("eval")
+  if eval_result is not None and eval_result.metrics:
+    console.blank()
+    console.print(theme.markup("Final metrics", "heading"))
+    for name, value in eval_result.metrics.items():
+      console.print(
+          f"  {theme.markup(str(name).ljust(22), 'muted')} "
+          f"{theme.markup(theme_mod.format_metric(value), 'metric')}"
+      )
+
+
+def _execute_campaign(
+    config: CampaignConfig,
+    console: UiConsole,
+    state: Optional[CampaignState] = None,
+    plain: bool = False,
+) -> int:
+  """Runs the campaign with the dashboard or the plain streamer."""
+  from src.orchestrator.cli.dashboard import run_campaign_with_dashboard  # pylint: disable=g-import-not-at-top
+
+  use_plain = plain or config.no_tui
+  if use_plain:
+    console = UiConsole(theme=console.theme, force_plain=not console.is_rich)
+  result = run_campaign_with_dashboard(
+      config=config,
+      state=state,
+      console=console,
+      enable_keys=not use_plain and _is_interactive(),
+  )
+  _print_outcome(result, config, console)
+  status = str(result.get("status", "")).upper()
+  return EXIT_OK if status in ("COMPLETED", "STOPPED", "") else EXIT_ERROR
+
+
+def _print_outcome(
+    result: Dict[str, Any], config: CampaignConfig, console: UiConsole
+) -> None:
+  """Prints the closing summary and the natural next steps."""
+  theme = console.theme
+  status = str(result.get("status", "DETACHED")).upper()
+  console.blank()
+  if status == "COMPLETED":
+    console.success("Campaign completed.")
+  elif status == "STOPPED":
+    console.warn("Campaign stopped early; progress was saved.")
+  else:
+    console.info(f"Campaign finished with status {status}.")
+
+  artifacts = result.get("artifacts") or {}
+  if artifacts:
+    console.blank()
+    console.print(theme.markup("Artifacts", "heading"))
+    for key, value in artifacts.items():
+      console.print(
+          f"  {theme.markup(key.ljust(18), 'muted')} "
+          f"{theme.markup(str(value), 'accent')}"
+      )
+  console.blank()
+  console.print(theme.markup("Next steps", "heading"))
+  console.hint(f"{PROGRAM} status --task {config.task_name}")
+  if status != "COMPLETED":
+    console.hint(f"{PROGRAM} resume --task {config.task_name}")
+  console.hint(f"{PROGRAM} report --task {config.task_name}")
+
+
+# --------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------
+def main(argv: Optional[Sequence[str]] = None, console: Optional[UiConsole] = None) -> int:
+  """CLI entry point. Returns the process exit code."""
+  parser = build_parser()
+  args = _apply_global_defaults(
+      parser.parse_args(list(argv) if argv is not None else None)
+  )
+
+  if console is None:
+    theme = theme_mod.detect_theme(
+        force_color=False if args.no_color else None,
+        force_ascii=True if args.ascii else None,
+    )
+    console = UiConsole(theme=theme, force_plain=bool(args.plain and args.no_color))
+
+  if not args.command:
+    console.blank()
+    console.print(renderables.banner(console.theme, "Automated PE-RL campaigns"))
+    console.blank()
+    parser.print_help()
+    console.blank()
+    console.hint(f"Tip: start with '{PROGRAM} doctor' then '{PROGRAM} wizard'.")
+    return EXIT_OK
+
+  handlers = {
+      "run": cmd_run,
+      "wizard": cmd_wizard,
+      "status": cmd_status,
+      "resume": cmd_resume,
+      "report": cmd_report,
+      "list": cmd_list,
+      "ls": cmd_list,
+      "doctor": cmd_doctor,
+  }
+  handler = handlers.get(args.command)
+  if handler is None:
+    parser.print_help()
+    return EXIT_USAGE
+
+  try:
+    return handler(args, console)
+  except KeyboardInterrupt:
+    console.blank()
+    console.warn("Interrupted by user.")
+    return EXIT_ERROR
+  except Exception as exc:  # pylint: disable=broad-except
+    if getattr(args, "debug", False):
+      raise
+    console.blank()
+    console.error(f"{type(exc).__name__}: {exc}")
+    console.hint("Re-run with --debug to see the full traceback.")
+    return EXIT_ERROR
