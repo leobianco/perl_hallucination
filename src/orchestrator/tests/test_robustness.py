@@ -13,11 +13,13 @@ import types
 import unittest
 
 from src.orchestrator import model_manager as model_manager_mod
+from src.orchestrator.cli import events as events_mod
 from src.orchestrator.config import CampaignConfig
 from src.orchestrator.model_manager import ModelManager
 from src.orchestrator.process import ProcessOutcome
 from src.orchestrator.stages.base import BaseStage
 from src.orchestrator.stages.base import CampaignContext
+from src.orchestrator.stages.sft_stage import SftStage
 from src.orchestrator.state import CampaignState
 from src.orchestrator.state import StageResult
 from src.orchestrator.state import StageStatus
@@ -323,6 +325,112 @@ class TestSweepTimeoutBudgets(unittest.TestCase):
     )
     self.assertEqual(config.sft.timeout_minutes, 240)
     self.assertEqual(config.perl.timeout_minutes, 240)
+
+
+class _InterruptibleStream:
+  """``stream_subprocess`` stand-in that honors the stop predicate.
+
+  Mirrors the real loop closely enough to reproduce the campaign-killer: a
+  predicate that is already True when the subprocess starts yields an
+  ``interrupted`` outcome, which ``materialize_and_push`` turns into a
+  non-retryable ``RuntimeError``.
+  """
+
+  def __init__(self):
+    self.calls = []
+
+  def __call__(self, cmd, on_line=None, stop_requested=None, **kwargs):
+    self.calls.append(list(cmd))
+    if stop_requested is not None and stop_requested():
+      return ProcessOutcome(returncode=-15, interrupted=True)
+    return ProcessOutcome(returncode=0)
+
+
+class TestAdvanceDoesNotKillMaterialization(unittest.TestCase):
+  """``[a]`` seals the sweep; it must not kill the winner's retraining.
+
+  Regression test for a campaign that failed with "Materialization of the
+  best sft model was interrupted before the checkpoint could be pushed":
+  the advance flag stayed set while the stage retrained the best trial, so
+  the training subprocess was terminated on its first poll.
+  """
+
+  def setUp(self):
+    super().setUp()
+    self.original = model_manager_mod.stream_subprocess
+    self.stream = _InterruptibleStream()
+    model_manager_mod.stream_subprocess = self.stream
+    self.addCleanup(
+        setattr, model_manager_mod, "stream_subprocess", self.original
+    )
+
+    self.temp = tempfile.TemporaryDirectory()
+    self.addCleanup(self.temp.cleanup)
+    # materialize_and_push creates ./checkpoints/...; keep it out of the tree.
+    cwd = os.getcwd()
+    os.chdir(self.temp.name)
+    self.addCleanup(os.chdir, cwd)
+
+    self.sweep_yaml = os.path.join(self.temp.name, "sweep_sft.yaml")
+    with open(self.sweep_yaml, "w", encoding="utf-8") as f:
+      f.write(
+          "program: src/writer_sft.py\n"
+          "method: bayes\n"
+          "metric:\n"
+          "  name: eval/loss\n"
+          "  goal: minimize\n"
+          "parameters:\n"
+          "  learning_rate:\n"
+          "    values: [0.001]\n"
+      )
+
+  def _stage(self, controls):
+    config = CampaignConfig.create_default(task_name="ragtruth", sft_runs=15)
+    config.sft.sweep_config_path = self.sweep_yaml
+    context = CampaignContext(
+        config=config,
+        state=CampaignState(campaign_id="c", task_name="ragtruth"),
+        sweep_controller=_FakeSweepController(),
+        # Not a dry run: this is the code path that pushes the checkpoint.
+        model_manager=ModelManager(user="leobianco", dry_run=False),
+        state_path=os.path.join(self.temp.name, "state.json"),
+        abort_requested_callback=lambda: controls.abort_requested,
+    )
+    return SftStage(context)
+
+  def test_advance_lets_the_winner_be_retrained_and_pushed(self):
+    controls = events_mod.ControlSignals()
+    controls.request_advance()
+    stage = self._stage(controls)
+
+    result = stage.execute(
+        stop_requested_callback=controls.should_interrupt_stage
+    )
+
+    self.assertEqual(result.status, StageStatus.COMPLETED)
+    self.assertTrue(result.model_repo_id)
+    self.assertEqual(len(self.stream.calls), 1)
+
+  def test_abort_still_stops_the_materialization(self):
+    controls = events_mod.ControlSignals()
+    controls.request_abort()
+    stage = self._stage(controls)
+
+    with self.assertRaises(RuntimeError) as ctx:
+      stage.execute(stop_requested_callback=controls.should_interrupt_stage)
+    self.assertIn("interrupted", str(ctx.exception))
+
+  def test_materialization_predicate_ignores_advance_and_stop(self):
+    controls = events_mod.ControlSignals()
+    stage = self._stage(controls)
+    predicate = stage.materialization_stop_callback()
+
+    controls.request_advance()
+    self.assertFalse(predicate())
+    controls.request_stop()
+    self.assertFalse(predicate())
+    controls.request_abort()
+    self.assertTrue(predicate())
 
 
 if __name__ == "__main__":

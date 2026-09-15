@@ -243,17 +243,38 @@ class DashboardModel:
     return " | ".join(parts)
 
 
+#: Byte that introduces every ANSI escape sequence (arrow keys, function
+#: keys, mouse reports, bracketed paste, terminal status replies).
+ESC = "\x1b"
+
+#: Grace period for the remaining bytes of an escape sequence to arrive.
+#: Terminals emit them back-to-back, so this only needs to cover scheduling
+#: jitter; a lone ``ESC`` (the user pressed Escape) costs at most this wait.
+ESCAPE_SEQUENCE_TIMEOUT_S = 0.05
+
+
 class KeyReader:
   """Non-blocking single-keystroke reader for terminals in cbreak mode.
 
   Safe by construction: if stdin is not a TTY (nohup, CI, piped input) the
   reader silently does nothing, and the original terminal attributes are
   always restored in :meth:`stop`, including on exceptions.
+
+  Escape sequences are consumed as a unit and never dispatched. Reading them
+  byte by byte used to turn *Up arrow* (``ESC [ A``) into the ``[a]`` advance
+  hotkey, which sealed a running sweep and killed the campaign; mouse reports
+  and terminal replies could likewise synthesize ``[s]``/``[x]``.
   """
 
-  def __init__(self, callback: Callable[[str], None], stream=None):
+  def __init__(
+      self,
+      callback: Callable[[str], None],
+      stream=None,
+      escape_timeout_s: float = ESCAPE_SEQUENCE_TIMEOUT_S,
+  ):
     self.callback = callback
     self._stream = stream
+    self._escape_timeout_s = escape_timeout_s
     self._thread: Optional[threading.Thread] = None
     self._stop = threading.Event()
     self._old_attrs = None
@@ -296,20 +317,87 @@ class KeyReader:
     self._thread.start()
     return True
 
+  def _read_char(self, stream) -> str:
+    """Reads one character, bypassing Python's text-layer buffering.
+
+    ``select`` only sees the file descriptor, while ``stream.read(1)`` may
+    pull a whole chunk into the ``TextIOWrapper`` buffer. Everything that
+    followed an escape sequence in the same chunk would then sit invisible
+    until the next keypress. Reading the fd directly keeps ``select`` and the
+    data in sync.
+
+    Args:
+      stream: Fallback stream used when no file descriptor is available.
+
+    Returns:
+      A single character, or the empty string on EOF.
+    """
+    if self._fd is None:
+      return stream.read(1)
+    import os  # pylint: disable=g-import-not-at-top
+
+    return os.read(self._fd, 1).decode("utf-8", errors="ignore")
+
   def _loop(self, stream) -> None:
     import select  # pylint: disable=g-import-not-at-top
 
+    source = stream if self._fd is None else self._fd
     while not self._stop.is_set():
       try:
-        ready, _, _ = select.select([stream], [], [], 0.2)
+        ready, _, _ = select.select([source], [], [], 0.2)
         if not ready:
           continue
-        char = stream.read(1)
+        char = self._read_char(stream)
         if not char:
+          continue
+        if char == ESC:
+          # Arrow keys, function keys, mouse reports and paste markers all
+          # start here. Consume the whole sequence and dispatch nothing.
+          self._swallow_escape_sequence(stream, select)
+          continue
+        if not char.isprintable():
+          # Control bytes (Ctrl-*, CR/LF, backspace) are not hotkeys.
           continue
         self.callback(char)
       except Exception:  # pylint: disable=broad-except
         return
+
+  def _swallow_escape_sequence(self, stream, select_mod) -> None:
+    """Consumes the remainder of an ANSI escape sequence, discarding it.
+
+    Handles the three shapes a terminal can send after ``ESC``:
+    CSI (``ESC [`` params final), SS3 (``ESC O`` final), and a bare
+    Alt-chord (``ESC`` + one character). A lone ``ESC`` keypress simply
+    times out.
+
+    Args:
+      stream: The (cbreak-mode) input stream being read.
+      select_mod: The ``select`` module, injected to keep the import local.
+    """
+    source = stream if self._fd is None else self._fd
+    deadline = time.monotonic() + self._escape_timeout_s
+    saw_introducer = False
+    while not self._stop.is_set():
+      remaining = deadline - time.monotonic()
+      if remaining <= 0:
+        return
+      ready, _, _ = select_mod.select([source], [], [], remaining)
+      if not ready:
+        return
+      char = self._read_char(stream)
+      if not char:
+        return
+      if not saw_introducer:
+        if char in ("[", "O"):
+          saw_introducer = True
+          continue
+        # Alt-<key> or an unknown two-byte sequence: already consumed.
+        return
+      # Parameter (0x30-0x3F) and intermediate (0x20-0x2F) bytes continue the
+      # sequence; anything else is the final byte that terminates it.
+      if "\x20" <= char <= "\x3f":
+        continue
+      return
 
   def stop(self) -> None:
     """Restores the terminal attributes and stops the listener."""
@@ -340,8 +428,15 @@ def handle_key(key: str, model: DashboardModel, controls: ControlSignals) -> Opt
 
   Kept as a free function so that keyboard semantics are unit testable
   without spawning a terminal.
+
+  Only a single printable character counts as a hotkey. ``KeyReader`` already
+  swallows escape sequences, but this second guard makes sure a stray
+  ``ESC``/``[``/control byte from any other caller cannot be mistaken for
+  ``[a]``, ``[s]`` or ``[x]``.
   """
-  key = (key or "").lower()
+  if not key or len(key) != 1 or not key.isprintable():
+    return None
+  key = key.lower()
   if key == "p":
     return "Paused: no new stage will start." if controls.toggle_pause() else "Resumed."
   if key == "a":

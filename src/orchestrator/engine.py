@@ -101,6 +101,7 @@ class CampaignEngine:
         sweep_controller=self.sweep_controller,
         model_manager=self.model_manager,
         state_path=self.state_path,
+        abort_requested_callback=self._should_abort_stage,
     )
 
   def _stage_line_callback(self, stage_name: str) -> Callable[[str], None]:
@@ -141,6 +142,19 @@ class CampaignEngine:
     if self._external_stop is not None and self._external_stop():
       return True
     return self.controls.should_interrupt_stage()
+
+  def _should_abort_stage(self) -> bool:
+    """Predicate for work that must survive ``[a]`` advance and ``[s]`` stop.
+
+    Advancing or stopping seals the *sweep*; the winning configuration still
+    has to be retrained and pushed, otherwise the stage dies with
+    "Materialization ... was interrupted". Only an explicit abort (``[x]``,
+    double Ctrl-C, or the legacy caller-supplied stop callback) is allowed to
+    kill that final training subprocess.
+    """
+    if self._external_stop is not None and self._external_stop():
+      return True
+    return self.controls.abort_requested
 
   def _instantiate_stage(self, stage_name: str) -> BaseStage:
     """Instantiates the concrete stage implementation by name."""

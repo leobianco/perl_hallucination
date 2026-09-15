@@ -107,6 +107,8 @@ class RmStage(BaseStage):
       live_line_callback(f"Best RM Run: {best_run_id} ({target_metric}={best_val:.5f})")
 
     # 4. Materialize and Push to Hugging Face Hub
+    # NOTE: the sweep-agent predicate is deliberately *not* reused here; see
+    # BaseStage.materialization_stop_callback.
     if live_line_callback:
       live_line_callback("Materializing and pushing best RM to Hugging Face...")
     rm_repo_id = self.model_manager.materialize_and_push(
@@ -117,7 +119,7 @@ class RmStage(BaseStage):
         seed=self.config.seed,
         live_line_callback=live_line_callback,
         tunable_keys=self.tunable_keys(sweep_dict),
-        stop_requested_callback=stop_requested_callback,
+        stop_requested_callback=self.materialization_stop_callback(),
     )
 
     logger.info("RM model pushed to: %s", rm_repo_id)

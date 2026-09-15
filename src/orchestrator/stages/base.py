@@ -27,6 +27,10 @@ class CampaignContext:
   #: Where the engine persists ``state``; lets stages checkpoint a sweep id
   #: as soon as it exists, so a crash mid-sweep is resumable.
   state_path: Optional[str] = None
+  #: Predicate that is True only for a *hard* abort (``[x]`` / Ctrl-C twice).
+  #: Stages use it for the post-sweep materialization, which must survive the
+  #: ``[a]`` advance and ``[s]`` stop intents that cut the sweep agent short.
+  abort_requested_callback: Optional[Callable[[], bool]] = None
 
   @property
   def sft_model_repo_id(self) -> Optional[str]:
@@ -93,6 +97,22 @@ class BaseStage(abc.ABC):
     if isinstance(params, dict):
       return {str(key) for key in params}
     return set()
+
+  def materialization_stop_callback(self) -> Optional[Callable[[], bool]]:
+    """Returns the predicate that may interrupt the winner's retraining.
+
+    The predicate handed to the *sweep agent* is True for ``[a]`` advance and
+    ``[s]`` stop, because both mean "seal the sweep now". Reusing it for the
+    materialization made the retraining subprocess die on its very first
+    poll, raising "Materialization ... was interrupted before the checkpoint
+    could be pushed" - a non-retryable error that failed the whole campaign
+    precisely when the user asked to *keep going* with the current best run.
+
+    Only a hard abort may kill the retraining; when no abort predicate was
+    supplied (e.g. a stage constructed directly in a test), materialization
+    simply runs to completion.
+    """
+    return self.context.abort_requested_callback
 
   def resolve_sweep_id(
       self,

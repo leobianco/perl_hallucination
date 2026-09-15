@@ -142,6 +142,8 @@ class PerlStage(BaseStage):
       live_line_callback(f"Best PE-RL Run: {best_run_id} ({target_metric}={best_val:.5f})")
 
     # 4. Materialize and Push to Hugging Face Hub
+    # NOTE: the sweep-agent predicate is deliberately *not* reused here; see
+    # BaseStage.materialization_stop_callback.
     if live_line_callback:
       live_line_callback("Materializing and pushing best PE-RL policy to Hugging Face...")
     perl_repo_id = self.model_manager.materialize_and_push(
@@ -154,7 +156,7 @@ class PerlStage(BaseStage):
         reward_model_path=rm_model,
         live_line_callback=live_line_callback,
         tunable_keys=self.tunable_keys(sweep_dict),
-        stop_requested_callback=stop_requested_callback,
+        stop_requested_callback=self.materialization_stop_callback(),
     )
 
     logger.info("PE-RL model pushed to: %s", perl_repo_id)

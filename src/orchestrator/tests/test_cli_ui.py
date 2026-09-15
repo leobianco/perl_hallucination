@@ -9,6 +9,7 @@ a bare GCP VM before ``pip install -r requirements.txt`` has finished.
 from __future__ import annotations
 
 import io
+import os
 import threading
 import time
 import unittest
@@ -969,6 +970,16 @@ class HotkeyTest(unittest.TestCase):
         {"paused": False, "advance": False, "stop": False, "abort": False},
     )
 
+  def test_escape_sequence_fragments_are_not_hotkeys(self):
+    # Whole sequences, and the control bytes a terminal can emit, must never
+    # reach a control signal - an Up arrow is not an "advance" request.
+    for fragment in ("\x1b[A", "\x1bOP", "\x1b[<0;1;1M", "\x03", "\x7f"):
+      self.assertIsNone(self.press(fragment), fragment)
+    self.assertEqual(
+        self.controls.snapshot(),
+        {"paused": False, "advance": False, "stop": False, "abort": False},
+    )
+
 
 class KeyReaderTest(unittest.TestCase):
   """The key reader must be inert whenever stdin is not a terminal."""
@@ -1004,6 +1015,61 @@ class KeyReaderTest(unittest.TestCase):
     reader = dashboard_mod.KeyReader(lambda _: None, stream=FakeTty())
     self.assertTrue(reader.enabled)
     self.assertFalse(reader.start())
+
+
+class KeyReaderEscapeSequenceTest(unittest.TestCase):
+  """Arrow keys must never be mistaken for hotkeys.
+
+  ``ESC [ A`` (Up arrow) used to be delivered byte by byte, so its final
+  ``A`` was lowercased into the ``[a]`` advance hotkey: a single arrow press
+  sealed a running sweep and killed the campaign during materialization.
+  A real pty is used here because the reader only arms itself on a TTY.
+  """
+
+  def setUp(self):
+    self.master_fd, slave_fd = os.openpty()
+    self.addCleanup(os.close, self.master_fd)
+    self.stream = os.fdopen(slave_fd, "r", buffering=1)
+    self.addCleanup(self.stream.close)
+    self.seen = []
+    self.reader = dashboard_mod.KeyReader(
+        self.seen.append, stream=self.stream
+    )
+    self.assertTrue(self.reader.start())
+    self.addCleanup(self.reader.stop)
+
+  def _send(self, payload, expected=0):
+    os.write(self.master_fd, payload.encode())
+    deadline = time.time() + 2.0
+    while time.time() < deadline and len(self.seen) < expected:
+      time.sleep(0.01)
+    # Give a rejected sequence the same grace period before asserting.
+    if not expected:
+      time.sleep(0.2)
+    return list(self.seen)
+
+  def test_up_arrow_is_not_the_advance_hotkey(self):
+    self.assertEqual(self._send("\x1b[A"), [])
+
+  def test_all_arrows_are_ignored(self):
+    self.assertEqual(self._send("\x1b[A\x1b[B\x1b[C\x1b[D"), [])
+
+  def test_function_and_home_keys_are_ignored(self):
+    # F1 (SS3), Home/End/Delete (CSI with parameters).
+    self.assertEqual(self._send("\x1bOP\x1b[1~\x1b[4~\x1b[3~"), [])
+
+  def test_sgr_mouse_report_is_ignored(self):
+    self.assertEqual(self._send("\x1b[<64;10;5M"), [])
+
+  def test_control_bytes_are_ignored(self):
+    self.assertEqual(self._send("\r\n\t\x03"), [])
+
+  def test_typed_keys_still_reach_the_callback(self):
+    self.assertEqual(self._send("a", expected=1), ["a"])
+
+  def test_typed_key_after_an_arrow_still_works(self):
+    self.assertEqual(self._send("\x1b[Aq", expected=1), ["q"])
+
 
 
 class LiveDashboardTest(unittest.TestCase):
