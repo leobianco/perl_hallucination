@@ -137,6 +137,41 @@ class CampaignEngine:
 
     return callback
 
+  def _resume_baseline(self, stage_name: str) -> int:
+    """Returns the trials this stage had already completed before now.
+
+    Two sources disagree and both can be wrong. The state file only knows
+    what the previous process managed to flush before it died, so a campaign
+    killed mid-trial - or one whose stage crashed before the first progress
+    write - reports too few. W&B knows the truth but may be unreachable, and
+    the stage may not have registered a sweep yet.
+
+    The larger of the two wins: a counter that jumps back to ``00/10`` after
+    a resume is the single most alarming thing the dashboard can do, and it
+    is exactly what a user sees when the disk value is stale.
+
+    Args:
+      stage_name: Stage about to run.
+
+    Returns:
+      Number of trials to add to the new agent's own count. Never negative.
+    """
+    previous = self.state.stages.get(stage_name)
+    baseline = int(getattr(previous, "trials_done", 0) or 0)
+    sweep_id = getattr(previous, "sweep_id", None)
+    if not sweep_id:
+      return baseline
+    try:
+      counted = self.sweep_controller.count_finished_runs(sweep_id)
+    except Exception:  # pylint: disable=broad-exception-caught
+      # A cosmetic counter must never be able to stop a campaign.
+      logger.debug("Resume baseline lookup failed for %s", stage_name,
+                   exc_info=True)
+      return baseline
+    if counted is None:
+      return baseline
+    return max(baseline, int(counted))
+
   def _progress_tracker(self, stage_name: str) -> Callable[[str], None]:
     """Builds the line sink that mirrors sweep progress into the state file.
 
@@ -160,8 +195,7 @@ class CampaignEngine:
     # describes the campaign, not one agent process, so the counter is
     # offset by what a previous attempt already achieved - otherwise the
     # watching pane would appear to go backwards on every resume.
-    previous = self.state.stages.get(stage_name)
-    baseline = int(getattr(previous, "trials_done", 0) or 0)
+    baseline = self._resume_baseline(stage_name)
     #: A silent "-" in the Best column is indistinguishable from "the sweep
     #: has not scored anything yet". Say it once, out loud, naming the key
     #: that was searched for, so a metric renamed in the sweep YAML is a

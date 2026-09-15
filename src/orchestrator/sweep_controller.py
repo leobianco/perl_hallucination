@@ -265,7 +265,7 @@ class SweepController:
       return None
 
   def count_finished_runs(self, sweep_id: str) -> Optional[int]:
-    """Counts the trials a sweep has already completed.
+    """Counts the trials a sweep has already completed *successfully*.
 
     ``wandb agent --count N`` is a budget for *that agent process*, not for
     the sweep. A resumed stage that asked for the full ``max_runs`` again
@@ -273,12 +273,19 @@ class SweepController:
     for. W&B is the only place that knows the real total, since trials may
     also have been run by an agent this campaign never saw.
 
+    Only ``finished`` runs are counted. A crashed, failed or killed trial
+    consumed GPU time but produced no candidate model, and "10 trials" in a
+    campaign config means "10 models to choose the best from", not "10
+    attempts". Counting the wreckage would silently shrink the search - and
+    since aborting the campaign (``[x]``) kills the trial in flight, every
+    interruption would otherwise cost the user a trial.
+
     Args:
       sweep_id: Sweep id in any accepted shape.
 
     Returns:
-      The number of runs in a terminal state, or None when the count could
-      not be established (the caller must then not reduce its budget).
+      The number of successfully completed runs, or None when the count
+      could not be established (the caller must then not reduce its budget).
     """
     if not sweep_id:
       return None
@@ -290,14 +297,10 @@ class SweepController:
 
       api = wandb.Api()
       sweep = api.sweep(self.qualify_sweep_id(sweep_id))
-      # "crashed"/"failed" trials consumed their slot as far as the agent's
-      # --count is concerned, so they count here too. Only "running" and
-      # "pending" do not.
       return sum(
           1
           for run in sweep.runs
-          if str(getattr(run, "state", "")).lower()
-          in ("finished", "failed", "crashed", "killed")
+          if str(getattr(run, "state", "")).lower() == "finished"
       )
     except Exception as e:  # pylint: disable=broad-exception-caught
       logger.warning(

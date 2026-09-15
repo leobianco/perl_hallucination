@@ -82,12 +82,20 @@ class CampaignState:
   )
 
   def mark_stage_running(self, stage_name: str) -> None:
-    """Marks a stage as active and running."""
+    """Marks a stage as active and running.
+
+    The failure message of the attempt that preceded this one is cleared.
+    It describes a run that is over; leaving it in place makes the dashboard
+    show a resumed, healthy stage with a red "Materialization ... was
+    interrupted" next to it for the rest of the campaign. Progress, sweep id
+    and best-so-far are deliberately *kept* - those still hold.
+    """
     self.current_stage = stage_name
     self.updated_at = datetime.datetime.now().isoformat()
     if stage_name not in self.stages:
       self.stages[stage_name] = StageResult()
     self.stages[stage_name].status = StageStatus.RUNNING
+    self.stages[stage_name].error_message = None
     self.stages[stage_name].start_time = datetime.datetime.now().isoformat()
 
   def update_stage_progress(

@@ -189,6 +189,25 @@ goes straight to picking its winner. If W&B cannot be reached the full budget
 is used unchanged - overshooting costs GPU hours, but undershooting would
 silently give you a smaller search than you asked for.
 
+**Only trials in W&B state `finished` count against the budget.** A
+`crashed`, `failed` or `killed` trial burned GPU time but produced no
+candidate model, so it is retried. `10 trials` means "10 models to choose the
+best from", not "10 attempts". This matters in practice: aborting with `[x]`
+kills the trial in flight, so the opposite rule would make every interruption
+quietly cost you one point of your hyperparameter search.
+
+#### What the dashboard shows right after a resume
+
+| Column | Behaviour |
+| --- | --- |
+| `Trials` | Starts from the trials the sweep **already** has, not from `00`. The new agent counts from zero internally; the displayed number is offset by the larger of the state file's counter and W&B's `finished` count, so it can never appear to go backwards. |
+| `Artifact` | The previous attempt's failure (e.g. a red *"Materialization ... was interrupted"*) is cleared the moment the stage re-enters `RUNNING`. It described a run that is over. Seeing it persist on a healthy resumed stage is a bug, not a live error. |
+| `Best` | Carried over from the previous attempt until the new agent reports something better. |
+
+Progress, sweep id and best-so-far survive a resume; only the *verdict* of the
+failed attempt is discarded.
+
+
 ### 7. Monitoring from a second tmux pane
 ```bash
 python3 scripts/run_campaign.py status --task npov --watch

@@ -229,6 +229,96 @@ class TestSealedSweepIsReactivated(unittest.TestCase):
     )
 
 
+class TestCrashedTrialsDoNotConsumeBudget(unittest.TestCase):
+  """A trial that crashed produced no model, so it bought the user nothing.
+
+  `[x]` kills the trial in flight, so counting the wreckage would make every
+  interruption quietly cost one trial of the search the user configured.
+  """
+
+  def _controller_seeing(self, states):
+    fake_wandb = mock.MagicMock()
+    fake_sweep = mock.MagicMock()
+    fake_sweep.runs = [mock.MagicMock(state=s) for s in states]
+    fake_wandb.Api.return_value.sweep.return_value = fake_sweep
+    with mock.patch.dict("sys.modules", {"wandb": fake_wandb}):
+      ctrl = SweepController(entity="e", project="p", dry_run=False)
+      return ctrl.count_finished_runs("sweep-abc")
+
+  def test_only_successful_trials_are_counted(self):
+    count = self._controller_seeing(
+        ["finished", "finished", "crashed", "failed", "killed", "running"]
+    )
+    self.assertEqual(count, 2)
+
+  def test_state_casing_is_irrelevant(self):
+    self.assertEqual(self._controller_seeing(["Finished", "FINISHED"]), 2)
+
+
+class TestResumeBaseline(unittest.TestCase):
+  """A resumed counter must never appear to go backwards.
+
+  The new agent counts from zero. Without a baseline the dashboard shows
+  `00/10` for a sweep that already has six trials, which reads as "it threw
+  my work away" - the single most alarming thing the UI can do.
+  """
+
+  def make_engine(self, persisted, counted, sweep_id="sweep-abc"):
+    config = CampaignConfig.create_default(
+        task_name="npov", sft_runs=10, dry_run=True
+    )
+    state = CampaignState(campaign_id="c", task_name="npov")
+    state.mark_stage_running("sft")
+    state.stages["sft"].sweep_id = sweep_id
+    state.stages["sft"].trials_done = persisted
+    engine = CampaignEngine(config=config, state=state)
+    engine.sweep_controller = mock.MagicMock()
+    engine.sweep_controller.count_finished_runs.return_value = counted
+    return engine
+
+  def test_wandb_wins_over_a_stale_state_file(self):
+    # The previous process died before flushing its progress.
+    engine = self.make_engine(persisted=0, counted=6)
+    self.assertEqual(engine._resume_baseline("sft"), 6)
+
+  def test_the_state_file_wins_when_it_knows_more(self):
+    # W&B may not have reconciled a just-finished run yet.
+    engine = self.make_engine(persisted=6, counted=4)
+    self.assertEqual(engine._resume_baseline("sft"), 6)
+
+  def test_an_unreachable_api_falls_back_to_disk(self):
+    engine = self.make_engine(persisted=6, counted=None)
+    self.assertEqual(engine._resume_baseline("sft"), 6)
+
+  def test_a_raising_api_never_breaks_the_campaign(self):
+    engine = self.make_engine(persisted=6, counted=0)
+    engine.sweep_controller.count_finished_runs.side_effect = RuntimeError("x")
+    self.assertEqual(engine._resume_baseline("sft"), 6)
+
+  def test_a_stage_without_a_sweep_does_not_call_wandb(self):
+    engine = self.make_engine(persisted=0, counted=6, sweep_id=None)
+    self.assertEqual(engine._resume_baseline("sft"), 0)
+    engine.sweep_controller.count_finished_runs.assert_not_called()
+
+
+class TestStaleErrorIsCleared(unittest.TestCase):
+  """A resumed stage must not wear the previous attempt's failure."""
+
+  def test_re_running_a_failed_stage_clears_its_error(self):
+    state = CampaignState(campaign_id="c", task_name="npov")
+    state.mark_stage_running("sft")
+    state.update_stage_progress("sft", trials_done=6, trials_total=10)
+    state.stages["sft"].sweep_id = "sweep-abc"
+    state.mark_stage_failed("sft", "Materialization ... was interrupted.")
+
+    state.mark_stage_running("sft")
+
+    self.assertIsNone(state.stages["sft"].error_message)
+    # Progress and sweep identity still hold; only the verdict is stale.
+    self.assertEqual(state.stages["sft"].trials_done, 6)
+    self.assertEqual(state.stages["sft"].sweep_id, "sweep-abc")
+
+
 class TestSweepController(unittest.TestCase):
   """Tests for sweep registration, bounded execution, and best-run query in dry-run mode."""
 
