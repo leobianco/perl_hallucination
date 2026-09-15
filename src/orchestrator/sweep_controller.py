@@ -270,13 +270,7 @@ class SweepController:
       logger.info("[DRY-RUN] Sealed sweep: %s", sweep_id)
       return
 
-    entity = self.resolve_entity()
-    full_sweep_id = sweep_id.strip()
-    parts = full_sweep_id.split("/")
-    if len(parts) == 1:
-      full_sweep_id = f"{entity}/{self.project}/{parts[0]}"
-    elif len(parts) == 2:
-      full_sweep_id = f"{entity}/{parts[0]}/{parts[1]}"
+    full_sweep_id = self.qualify_sweep_id(sweep_id)
 
     # Attempt 1: Via wandb.Api
     try:
@@ -364,13 +358,7 @@ class SweepController:
       import wandb  # pylint: disable=g-import-not-at-top
 
       api = wandb.Api()
-      entity = self.resolve_entity()
-      full_sweep_id = sweep_id.strip()
-      parts = full_sweep_id.split("/")
-      if len(parts) == 1:
-        full_sweep_id = f"{entity}/{self.project}/{parts[0]}"
-      elif len(parts) == 2:
-        full_sweep_id = f"{entity}/{parts[0]}/{parts[1]}"
+      full_sweep_id = self.qualify_sweep_id(sweep_id)
 
       sweep = api.sweep(full_sweep_id)
       runs = list(sweep.runs)
