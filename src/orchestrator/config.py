@@ -155,6 +155,7 @@ class CampaignConfig:
   seed: int = 130104
   user: str = "leobianco"
   project: str = "new_perl"
+  wandb_entity: Optional[str] = None
   base_model: str = "google/gemma-4-E2B-it"
   stages: List[str] = field(
       default_factory=lambda: ["sft", "rm", "perl", "eval"]
@@ -246,6 +247,7 @@ class CampaignConfig:
       cls,
       task_name: str = "npov",
       user: str = "leobianco",
+      wandb_entity: Optional[str] = None,
       seed: int = 130104,
       sft_runs: int = 30,
       rm_runs: int = 30,
@@ -256,6 +258,7 @@ class CampaignConfig:
     return cls(
         task_name=task_name,
         user=user,
+        wandb_entity=wandb_entity,
         seed=seed,
         dry_run=dry_run,
         sft=SweepStageConfig(

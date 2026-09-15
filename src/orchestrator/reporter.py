@@ -73,7 +73,7 @@ class CampaignReporter:
         f"> **Generated At**: {now_str}  ",
         f"> **Base Model**: `{self.config.base_model}`  ",
         f"> **Random Seed**: `{self.config.seed}`  ",
-        f"> **W&B Project**: `{self.config.user}/{self.config.project}`",
+        f"> **W&B Project**: `{self.config.wandb_entity or self.config.user}/{self.config.project}`",
         "",
         "---",
         "",
@@ -307,19 +307,20 @@ class CampaignReporter:
 
   def publish_wandb_report(self) -> Optional[str]:
     """Publishes an interactive W&B Report via wandb-workspaces if available."""
+    target_entity = self.config.wandb_entity or self.config.user
     if self.config.dry_run:
       logger.info(
           "[DRY-RUN] Simulating W&B Report creation: https://wandb.ai/%s/%s/reports/mock",
-          self.config.user,
+          target_entity,
           self.config.project,
       )
-      return f"https://wandb.ai/{self.config.user}/{self.config.project}/reports/mock"
+      return f"https://wandb.ai/{target_entity}/{self.config.project}/reports/mock"
 
     try:
       import wandb_workspaces.reports.v2 as wr  # pylint: disable=g-import-not-at-top
 
       report = wr.Report(
-          entity=self.config.user,
+          entity=self.config.wandb_entity or self.config.user,
           project=self.config.project,
           title=f"Auto-PERL Campaign: {self.config.task_name} ({self.config.name})",
           description=f"Automated PE-RL science report for task '{self.config.task_name}' on model {self.config.base_model}.",

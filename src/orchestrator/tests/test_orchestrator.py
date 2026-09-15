@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 from src.orchestrator.cli import events as events_mod
 from src.orchestrator.config import CampaignConfig
@@ -101,6 +102,33 @@ class TestSweepController(unittest.TestCase):
     self.assertIsNotNone(run_id)
     self.assertLess(val, 1.0)
     self.assertIn("learning_rate", params)
+
+  def test_resolve_entity_precedence(self):
+    # 1. Explicit entity (when not 'auto')
+    ctrl1 = SweepController(entity="explicit_team", dry_run=True)
+    self.assertEqual(ctrl1.resolve_entity(), "explicit_team")
+
+    # 2. Environment variable
+    with mock.patch.dict(os.environ, {"WANDB_ENTITY": "env_user"}):
+      ctrl2 = SweepController(entity=None, dry_run=True)
+      self.assertEqual(ctrl2.resolve_entity(), "env_user")
+
+    # 3. Auto-detected default entity from wandb.Api()
+    fake_wandb = mock.MagicMock()
+    fake_api = mock.MagicMock()
+    fake_api.default_entity = "api_user"
+    fake_wandb.Api.return_value = fake_api
+    with mock.patch.dict(os.environ, {}, clear=True):
+      os.environ.pop("WANDB_ENTITY", None)
+      with mock.patch.dict("sys.modules", {"wandb": fake_wandb}):
+        ctrl3 = SweepController(entity=None, dry_run=False)
+        self.assertEqual(ctrl3.resolve_entity(), "api_user")
+
+    # 4. Fallback to 'leobianco'
+    with mock.patch.dict(os.environ, {}, clear=True):
+      os.environ.pop("WANDB_ENTITY", None)
+      ctrl4 = SweepController(entity=None, dry_run=True)
+      self.assertEqual(ctrl4.resolve_entity(), "leobianco")
 
 
 class TestModelManager(unittest.TestCase):

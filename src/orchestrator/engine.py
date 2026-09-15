@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import time
 from typing import Any, Callable, Dict, Optional
@@ -58,12 +59,15 @@ class CampaignEngine:
           task_name=config.task_name,
       )
 
+    wandb_ent = config.wandb_entity or os.environ.get("WANDB_ENTITY")
     self.sweep_controller = SweepController(
-        entity=config.user,
+        entity=wandb_ent,
         project=config.project,
         dry_run=config.dry_run,
         robustness=config.robustness,
     )
+    if self.sweep_controller.entity and not self.config.wandb_entity:
+      self.config.wandb_entity = self.sweep_controller.entity
     self.model_manager = ModelManager(
         user=config.user,
         dry_run=config.dry_run,

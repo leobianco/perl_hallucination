@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -20,7 +21,7 @@ class SweepController:
 
   def __init__(
       self,
-      entity: str = "leobianco",
+      entity: Optional[str] = None,
       project: str = "new_perl",
       dry_run: bool = False,
       robustness: Optional[RobustnessConfig] = None,
@@ -31,6 +32,38 @@ class SweepController:
     # Every W&B call below crosses the network during a day-long run, so they
     # all go through the shared retry policy.
     self.robustness = robustness or RobustnessConfig()
+
+  def resolve_entity(self) -> str:
+    """Resolves the active W&B entity with auto-detection fallback.
+
+    Precedence:
+    1. Explicitly configured entity (if provided and != 'auto')
+    2. WANDB_ENTITY environment variable
+    3. wandb.Api().default_entity (authenticated account default from .netrc / WANDB_API_KEY)
+    4. Fallback to 'leobianco'
+    """
+    if self.entity and self.entity != "auto":
+      return self.entity
+    env_entity = os.environ.get("WANDB_ENTITY")
+    if env_entity and env_entity.strip():
+      self.entity = env_entity.strip()
+      return self.entity
+    if not self.dry_run:
+      try:
+        import wandb  # pylint: disable=g-import-not-at-top
+
+        api = wandb.Api()
+        default_ent = getattr(api, "default_entity", None)
+        if default_ent and str(default_ent).strip():
+          self.entity = str(default_ent).strip()
+          logger.info(
+              "Auto-detected W&B entity from credentials: %s", self.entity
+          )
+          return self.entity
+      except Exception as e:
+        logger.debug("Could not auto-detect W&B default_entity: %s", e)
+    self.entity = self.entity or "leobianco"
+    return self.entity
 
   def create_sweep(
       self,
@@ -49,23 +82,25 @@ class SweepController:
       The fully qualified sweep id.
     """
     proj = project_override or self.project
+    entity = self.resolve_entity()
     if self.dry_run:
       mock_id = f"mock_sweep_{int(time.time())}"
       logger.info(
           "[DRY-RUN] Registered simulated sweep: %s/%s/%s",
-          self.entity,
+          entity,
           proj,
           mock_id,
       )
-      return f"{self.entity}/{proj}/{mock_id}"
+      return f"{entity}/{proj}/{mock_id}"
 
     def _register() -> str:
       import wandb  # pylint: disable=g-import-not-at-top
 
-      sweep_id = wandb.sweep(sweep_config, entity=self.entity, project=proj)
+      active_entity = self.resolve_entity()
+      sweep_id = wandb.sweep(sweep_config, entity=active_entity, project=proj)
       # Ensure sweep_id has full path
       if "/" not in str(sweep_id):
-        return f"{self.entity}/{proj}/{sweep_id}"
+        return f"{active_entity}/{proj}/{sweep_id}"
       return str(sweep_id)
 
     try:
@@ -120,9 +155,10 @@ class SweepController:
       return 0
 
     # Format full sweep path
+    entity = self.resolve_entity()
     full_sweep_id = sweep_id
     if "/" not in sweep_id:
-      full_sweep_id = f"{self.entity}/{self.project}/{sweep_id}"
+      full_sweep_id = f"{entity}/{self.project}/{sweep_id}"
 
     cmd = ["wandb", "agent", "--count", str(max_runs), full_sweep_id]
     logger.info("Launching sweep agent: %s", " ".join(cmd))
@@ -170,12 +206,13 @@ class SweepController:
       logger.info("[DRY-RUN] Sealed sweep: %s", sweep_id)
       return
 
+    entity = self.resolve_entity()
     full_sweep_id = sweep_id.strip()
     parts = full_sweep_id.split("/")
     if len(parts) == 1:
-      full_sweep_id = f"{self.entity}/{self.project}/{parts[0]}"
+      full_sweep_id = f"{entity}/{self.project}/{parts[0]}"
     elif len(parts) == 2:
-      full_sweep_id = f"{self.entity}/{parts[0]}/{parts[1]}"
+      full_sweep_id = f"{entity}/{parts[0]}/{parts[1]}"
 
     # Attempt 1: Via wandb.Api
     try:
@@ -263,12 +300,13 @@ class SweepController:
       import wandb  # pylint: disable=g-import-not-at-top
 
       api = wandb.Api()
+      entity = self.resolve_entity()
       full_sweep_id = sweep_id.strip()
       parts = full_sweep_id.split("/")
       if len(parts) == 1:
-        full_sweep_id = f"{self.entity}/{self.project}/{parts[0]}"
+        full_sweep_id = f"{entity}/{self.project}/{parts[0]}"
       elif len(parts) == 2:
-        full_sweep_id = f"{self.entity}/{parts[0]}/{parts[1]}"
+        full_sweep_id = f"{entity}/{parts[0]}/{parts[1]}"
 
       sweep = api.sweep(full_sweep_id)
       runs = list(sweep.runs)

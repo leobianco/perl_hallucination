@@ -137,6 +137,10 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Simulate the DAG without GPU workloads.")
   run_parser.add_argument("--no-tui", action="store_true",
                           help="Disable the live dashboard (plain streaming).")
+  run_parser.add_argument("--entity", "--wandb-entity", default=None,
+                          help="Weights & Biases entity (username or team). Defaults to WANDB_ENTITY or authenticated user.")
+  run_parser.add_argument("--user", "--hf-user", default=None,
+                          help="Hugging Face Hub username/namespace for model uploads (default: leobianco).")
   run_parser.add_argument("--yes", "-y", action="store_true",
                           help="Skip the pre-launch confirmation.")
   run_parser.add_argument("--interactive", "-i", action="store_true",
@@ -170,6 +174,10 @@ def build_parser() -> argparse.ArgumentParser:
   resume_parser.add_argument("--task", "-t", default="npov", help="Task name.")
   resume_parser.add_argument("--state-file", default=None,
                              help="Explicit path to a campaign state JSON.")
+  resume_parser.add_argument("--entity", "--wandb-entity", default=None,
+                             help="Weights & Biases entity (username or team).")
+  resume_parser.add_argument("--user", "--hf-user", default=None,
+                             help="Hugging Face Hub username/namespace for model uploads.")
   resume_parser.add_argument("--dry-run", action="store_true",
                              help="Simulate the resumed stages.")
   resume_parser.add_argument("--no-tui", action="store_true",
@@ -201,6 +209,8 @@ def build_parser() -> argparse.ArgumentParser:
   )
   doctor_parser.add_argument("--task", "-t", default="npov", choices=VALID_TASKS,
                              help="Task the checks should assume.")
+  doctor_parser.add_argument("--entity", "--wandb-entity", default=None,
+                             help="W&B entity to verify.")
   doctor_parser.add_argument("--json", action="store_true",
                              help="Emit machine-readable JSON.")
   return parser
@@ -297,7 +307,26 @@ def run_diagnostics(config: CampaignConfig) -> List[Dict[str, str]]:
   if os.environ.get("WANDB_API_KEY") or os.path.exists(
       os.path.expanduser("~/.netrc")
   ):
-    add("W&B credentials", "ok", "API key or ~/.netrc found")
+    try:
+      import wandb  # pylint: disable=g-import-not-at-top
+
+      api = wandb.Api()
+      default_ent = getattr(api, "default_entity", None)
+      target_ent = (
+          config.wandb_entity
+          or os.environ.get("WANDB_ENTITY")
+          or default_ent
+      )
+      if default_ent:
+        add(
+            "W&B entity",
+            "ok",
+            f"authenticated as '{default_ent}' (target: '{target_ent}')",
+        )
+      else:
+        add("W&B credentials", "ok", "API key or ~/.netrc found")
+    except Exception as e:
+      add("W&B credentials", "ok", f"API key or ~/.netrc found ({e})")
   else:
     add("W&B credentials", "fail", "run 'wandb login' before launching")
 
@@ -415,6 +444,10 @@ def cmd_run(args: argparse.Namespace, console: UiConsole) -> int:
     config.perl.sft_model_path = args.sft_model
   if args.reward_model:
     config.perl.reward_model_path = args.reward_model
+  if getattr(args, "entity", None):
+    config.wandb_entity = args.entity
+  if getattr(args, "user", None):
+    config.user = args.user
   if args.dry_run:
     config.dry_run = True
   if args.no_tui or args.plain:
@@ -530,6 +563,10 @@ def cmd_resume(args: argparse.Namespace, console: UiConsole) -> int:
   state = CampaignState.load(state_file)
   config = config_for_state(state)
   config.state_file = state_file
+  if getattr(args, "entity", None):
+    config.wandb_entity = args.entity
+  if getattr(args, "user", None):
+    config.user = args.user
   if args.dry_run:
     config.dry_run = True
   if args.no_tui or args.plain:
@@ -659,6 +696,10 @@ def cmd_list(args: argparse.Namespace, console: UiConsole) -> int:
 def cmd_doctor(args: argparse.Namespace, console: UiConsole) -> int:
   """Implements ``doctor``."""
   config = CampaignConfig.create_default(task_name=args.task)
+  if getattr(args, "entity", None):
+    config.wandb_entity = args.entity
+  if getattr(args, "user", None):
+    config.user = args.user
   checks = run_diagnostics(config)
   if args.json:
     print(json.dumps(checks, indent=2))

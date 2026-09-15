@@ -401,6 +401,12 @@ class DoctorCommandTest(CommandTestBase):
     self.assertEqual(code, app.EXIT_OK)
     self.assertIn("healthy", self.output)
 
+  def test_doctor_entity_flag(self):
+    with mock.patch.object(app, "run_diagnostics", return_value=[]) as mock_diag:
+      self.run_cli(["doctor", "--entity", "my-wandb-team"])
+      config_arg = mock_diag.call_args[0][0]
+      self.assertEqual(config_arg.wandb_entity, "my-wandb-team")
+
 
 class RunCommandTest(CommandTestBase):
   """``run`` argument handling, with execution stubbed out."""
@@ -467,6 +473,23 @@ class RunCommandTest(CommandTestBase):
     self.assertEqual(
         self.executed["config"].perl.sft_model_path, "leobianco/npov_SFT_x"
     )
+
+  def test_entity_and_user_flags(self):
+    self.run_cli(
+        [
+            "run",
+            "--preset",
+            "smoke",
+            "--entity",
+            "team-alpha",
+            "--user",
+            "hf-tester",
+            "--dry-run",
+            "--yes",
+        ]
+    )
+    self.assertEqual(self.executed["config"].wandb_entity, "team-alpha")
+    self.assertEqual(self.executed["config"].user, "hf-tester")
 
   def test_launch_preview_is_printed(self):
     self.run_cli(["run", "--preset", "smoke", "--dry-run", "--yes"])
@@ -541,6 +564,26 @@ class ResumeCommandTest(CommandTestBase):
     write_state(app.CHECKPOINTS_ROOT, config_dict=config.to_dict())
     self.run_cli(["resume", "--task", "npov", "--yes"])
     self.assertEqual(self.executed["config"].perl.max_runs, 13)
+
+  def test_resume_entity_and_user_flags(self):
+    write_state(
+        app.CHECKPOINTS_ROOT,
+        stages={"sft": StageResult(status=StageStatus.COMPLETED)},
+    )
+    code = self.run_cli([
+        "resume",
+        "--task",
+        "npov",
+        "--entity",
+        "resumed-team",
+        "--user",
+        "resumed-user",
+        "--yes",
+        "--dry-run",
+    ])
+    self.assertEqual(code, app.EXIT_OK)
+    self.assertEqual(self.executed["config"].wandb_entity, "resumed-team")
+    self.assertEqual(self.executed["config"].user, "resumed-user")
 
   def test_completed_campaign_is_not_resumed(self):
     done = {
