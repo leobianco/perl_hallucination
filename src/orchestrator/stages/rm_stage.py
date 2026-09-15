@@ -76,20 +76,25 @@ class RmStage(BaseStage):
     yaml_metric = sweep_dict.get("metric", {}).get("name")
     target_metric = yaml_metric or cfg.metric
 
-    # 1. Register Sweep
-    sweep_id = self.sweep_controller.create_sweep(sweep_dict)
+    # 1. Register Sweep (or resume the one an interrupted attempt created)
+    sweep_id = self.resolve_sweep_id(sweep_dict, live_line_callback)
     logger.info("Registered RM Sweep: %s", sweep_id)
     if live_line_callback:
       live_line_callback(f"Registered RM Sweep: {sweep_id}")
 
     # 2. Run Sweep Agent with max_runs bound (default: 30)
-    self.sweep_controller.run_sweep_agent(
+    exit_code = self.sweep_controller.run_sweep_agent(
         sweep_id=sweep_id,
         max_runs=cfg.max_runs,
         timeout_minutes=cfg.timeout_minutes,
         live_line_callback=live_line_callback,
         stop_requested_callback=stop_requested_callback,
     )
+    if exit_code != 0 and live_line_callback:
+      live_line_callback(
+          f"[WARNING] RM sweep agent exited with code {exit_code}; scoring "
+          "the trials that did finish."
+      )
 
     # 3. Query Best Run (maximizing eval/roc_auc)
     best_run_id, best_val, best_params = self.sweep_controller.fetch_best_run(
@@ -111,7 +116,10 @@ class RmStage(BaseStage):
         best_params=best_params,
         seed=self.config.seed,
         live_line_callback=live_line_callback,
+        tunable_keys=self.tunable_keys(sweep_dict),
+        stop_requested_callback=stop_requested_callback,
     )
+
     logger.info("RM model pushed to: %s", rm_repo_id)
     if live_line_callback:
       live_line_callback(f"RM model published to Hub: {rm_repo_id}")

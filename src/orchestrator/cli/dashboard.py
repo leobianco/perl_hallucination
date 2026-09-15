@@ -568,6 +568,7 @@ def run_campaign_with_dashboard(
   result: Dict[str, Any] = {}
   error: List[BaseException] = []
   done = threading.Event()
+  detached = threading.Event()
 
   def _worker() -> None:
     try:
@@ -580,10 +581,16 @@ def run_campaign_with_dashboard(
   def _on_key(char: str) -> None:
     notice = handle_key(char, model, controls)
     if notice == "detach":
-      model.notices.append("Detaching dashboard; campaign continues headless.")
-      done.set()
+      # Only the rendering loop is torn down here. The campaign itself keeps
+      # running in the worker thread and switches to plain log streaming; the
+      # engine thread is a daemon, so returning from this function would kill
+      # a multi-hour run outright.
+      detached.set()
     elif notice:
       bus.publish(EventType.NOTICE, message=notice)
+
+  def _ui_finished() -> bool:
+    return done.is_set() or detached.is_set()
 
   thread = threading.Thread(target=_worker, name="perl-campaign", daemon=True)
   thread.start()
@@ -596,12 +603,12 @@ def run_campaign_with_dashboard(
         message="Hotkeys unavailable (stdin is not a TTY); running unattended.",
     )
   try:
-    dashboard.run(is_done=done.is_set)
+    dashboard.run(is_done=_ui_finished)
   except KeyboardInterrupt:
     controls.request_stop()
     console.warn("Interrupt received - stopping after the current stage (Ctrl-C again to abort).")
     try:
-      dashboard.run(is_done=done.is_set)
+      dashboard.run(is_done=_ui_finished)
     except KeyboardInterrupt:
       controls.request_abort()
   finally:
@@ -609,6 +616,9 @@ def run_campaign_with_dashboard(
       reader.stop()
     if reporting is not None and previous_summary_flag is not None:
       reporting.render_console_summary = previous_summary_flag
+
+  if detached.is_set() and not done.is_set():
+    _stream_plain_until_done(bus, console, controls, done)
 
   thread.join(timeout=1.0 if model.finished or done.is_set() else 0.1)
   if error:
@@ -620,6 +630,61 @@ def run_campaign_with_dashboard(
     console.info(notice)
   result.setdefault("ui_status", model.final_status or "DETACHED")
   return result
+
+
+def _stream_plain_until_done(
+    bus: EventBus,
+    console: UiConsole,
+    controls: Any,
+    done: threading.Event,
+    poll_interval: float = 0.5,
+) -> None:
+  """Keeps the campaign in the foreground with plain (non-live) log output.
+
+  Closing the live region does not stop the engine, so after a detach we must
+  block the main thread until the worker finishes. Exiting here would kill the
+  daemon worker thread and orphan the ``wandb agent`` subprocess with no state
+  updates.
+
+  Args:
+    bus: Event bus the engine publishes to.
+    console: Output surface used for the plain log stream.
+    controls: ``ControlSignals`` used to honour Ctrl-C.
+    done: Set by the worker thread once the campaign terminates.
+    poll_interval: Seconds between liveness checks.
+  """
+  console.blank()
+  console.info(
+      "Dashboard detached. The campaign keeps running here in plain-log mode; "
+      "press Ctrl-C to stop after the current stage."
+  )
+
+  def _echo(event: CampaignEvent) -> None:
+    if event.type in (EventType.LOG, EventType.NOTICE):
+      text = event.message
+    else:
+      text = f"[{event.type.value}] {event.stage or ''} {event.message}".strip()
+    if text:
+      console.info(f"{event.clock} {text}")
+
+  unsubscribe = bus.subscribe(_echo)
+  try:
+    while not done.wait(poll_interval):
+      pass
+  except KeyboardInterrupt:
+    controls.request_stop()
+    console.warn(
+        "Interrupt received - stopping after the current stage "
+        "(Ctrl-C again to abort)."
+    )
+    try:
+      while not done.wait(poll_interval):
+        pass
+    except KeyboardInterrupt:
+      controls.request_abort()
+      done.wait(30.0)
+  finally:
+    unsubscribe()
 
 
 def render_final_scorecard(model: DashboardModel, console: UiConsole) -> None:

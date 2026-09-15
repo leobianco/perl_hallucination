@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import logging
-import os
 import subprocess
 import time
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from src.orchestrator.config import RobustnessConfig
+from src.orchestrator.process import stream_subprocess
+from src.orchestrator.retry import run_with_retries
 
 logger = logging.getLogger(__name__)
+
 
 
 class SweepController:
@@ -19,17 +23,31 @@ class SweepController:
       entity: str = "leobianco",
       project: str = "new_perl",
       dry_run: bool = False,
+      robustness: Optional[RobustnessConfig] = None,
   ):
     self.entity = entity
     self.project = project
     self.dry_run = dry_run
+    # Every W&B call below crosses the network during a day-long run, so they
+    # all go through the shared retry policy.
+    self.robustness = robustness or RobustnessConfig()
 
   def create_sweep(
       self,
       sweep_config: Dict[str, Any],
       project_override: Optional[str] = None,
+      live_line_callback: Optional[Callable[[str], None]] = None,
   ) -> str:
-    """Registers a new sweep configuration with the W&B backend."""
+    """Registers a new sweep configuration with the W&B backend.
+
+    Args:
+      sweep_config: Parsed sweep YAML.
+      project_override: Register in a different project than the default.
+      live_line_callback: Optional sink notified about retries.
+
+    Returns:
+      The fully qualified sweep id.
+    """
     proj = project_override or self.project
     if self.dry_run:
       mock_id = f"mock_sweep_{int(time.time())}"
@@ -41,7 +59,7 @@ class SweepController:
       )
       return f"{self.entity}/{proj}/{mock_id}"
 
-    try:
+    def _register() -> str:
       import wandb  # pylint: disable=g-import-not-at-top
 
       sweep_id = wandb.sweep(sweep_config, entity=self.entity, project=proj)
@@ -49,6 +67,16 @@ class SweepController:
       if "/" not in str(sweep_id):
         return f"{self.entity}/{proj}/{sweep_id}"
       return str(sweep_id)
+
+    try:
+      return run_with_retries(
+          _register,
+          description="W&B sweep registration",
+          attempts=self.robustness.api_attempts,
+          base_delay_s=self.robustness.retry_base_delay_s,
+          max_delay_s=self.robustness.max_delay_s,
+          on_notice=live_line_callback,
+      )
     except Exception as e:
       logger.error("Failed to register W&B sweep: %s", e)
       raise
@@ -73,7 +101,8 @@ class SweepController:
           early stop.
 
     Returns:
-        Exit code of the agent process.
+        Exit code of the agent process (0 when the agent was deliberately cut
+        short by the timeout or by a user stop request).
     """
     if self.dry_run:
       logger.info(
@@ -98,64 +127,42 @@ class SweepController:
     cmd = ["wandb", "agent", "--count", str(max_runs), full_sweep_id]
     logger.info("Launching sweep agent: %s", " ".join(cmd))
 
-    timeout_seconds = timeout_minutes * 60
-    start_time = time.time()
-
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        universal_newlines=True,
-    )
-
     try:
-      while process.poll() is None:
-        if stop_requested_callback and stop_requested_callback():
-          logger.info("Early stop requested by user. Terminating sweep agent...")
-          process.terminate()
-          try:
-            process.wait(timeout=10)
-          except subprocess.TimeoutExpired:
-            process.kill()
-          break
-
-        if time.time() - start_time > timeout_seconds:
-          logger.warning(
-              "Sweep exceeded timeout threshold of %d minutes. Terminating...",
-              timeout_minutes,
-          )
-          process.terminate()
-          try:
-            process.wait(timeout=15)
-          except subprocess.TimeoutExpired:
-            process.kill()
-          break
-
-        line = process.stdout.readline() if process.stdout else ""
-        if line:
-          clean_line = line.rstrip()
-          if live_line_callback:
-            live_line_callback(clean_line)
-        else:
-          time.sleep(0.1)
-
-      # Drain any remaining lines in buffer
-      if process.stdout:
-        for remaining in process.stdout.readlines():
-          clean = remaining.rstrip()
-          if clean and live_line_callback:
-            live_line_callback(clean)
-
-      return process.returncode or 0
+      outcome = stream_subprocess(
+          cmd,
+          on_line=live_line_callback,
+          stop_requested=stop_requested_callback,
+          timeout_s=timeout_minutes * 60,
+          stall_warning_s=self.robustness.stall_warning_minutes * 60,
+      )
     except Exception as e:
       logger.error("Error during sweep agent execution: %s", e)
-      if process.poll() is None:
-        process.kill()
-      raise
-    finally:
       self.stop_sweep(full_sweep_id)
+      raise
+
+    if outcome.timed_out:
+      msg = (
+          f"Sweep exceeded its {timeout_minutes} minute budget; sealing the "
+          "sweep and promoting the best trial completed so far."
+      )
+      logger.warning(msg)
+      if live_line_callback:
+        live_line_callback(f"[WARNING] {msg}")
+    elif outcome.interrupted:
+      logger.info("Sweep agent stopped early on user request.")
+    elif outcome.returncode != 0:
+      msg = (
+          f"wandb agent exited with code {outcome.returncode}. The sweep will "
+          "still be scored on whatever trials finished."
+      )
+      logger.warning(msg)
+      if live_line_callback:
+        live_line_callback(f"[WARNING] {msg}")
+
+    self.stop_sweep(full_sweep_id)
+    # A deliberate termination is not a failure of the campaign.
+    return 0 if outcome.cut_short else outcome.returncode
+
 
   def stop_sweep(self, sweep_id: str) -> None:
     """Closes and seals a sweep on the W&B backend, transitioning state to STOPPED."""
@@ -200,6 +207,7 @@ class SweepController:
       sweep_id: str,
       metric_name: str,
       goal: str = "minimize",
+      live_line_callback: Optional[Callable[[str], None]] = None,
   ) -> Tuple[str, float, Dict[str, Any]]:
     """Retrieves the best run, its metric value, and configuration from the sweep.
 
@@ -208,6 +216,7 @@ class SweepController:
         metric_name: Target metric key (e.g. 'eval/loss', 'eval/roc_auc',
           'rewards/reward_fn/mean').
         goal: 'minimize' or 'maximize'.
+        live_line_callback: Optional sink notified about retries.
 
     Returns:
         Tuple of (best_run_id, best_metric_val, best_hyperparameters_dict).
@@ -231,6 +240,25 @@ class SweepController:
       )
       return mock_run_id, mock_metric, mock_params
 
+    # This query happens right after hours of sweeping: a transient API error
+    # here would throw away the whole stage, so it is worth retrying. A
+    # genuinely missing metric raises a message flagged non-retryable.
+    return run_with_retries(
+        lambda: self._fetch_best_run_once(sweep_id, metric_name, goal),
+        description="W&B best-run query",
+        attempts=self.robustness.api_attempts,
+        base_delay_s=self.robustness.retry_base_delay_s,
+        max_delay_s=self.robustness.max_delay_s,
+        on_notice=live_line_callback,
+    )
+
+  def _fetch_best_run_once(
+      self,
+      sweep_id: str,
+      metric_name: str,
+      goal: str,
+  ) -> Tuple[str, float, Dict[str, Any]]:
+    """Single attempt of :meth:`fetch_best_run` (see it for the contract)."""
     try:
       import wandb  # pylint: disable=g-import-not-at-top
 
@@ -289,13 +317,25 @@ class SweepController:
       valid_runs = finished_runs if finished_runs else other_runs
 
       if not valid_runs:
-        logger.warning(
-            "No runs in sweep %s logged metric '%s'. Inspecting first available run.",
-            full_sweep_id,
-            metric_name,
+        # Returning a sentinel here used to be silent data corruption: the
+        # stage would materialize and publish a checkpoint trained with an
+        # arbitrary run's hyperparameters and report a metric of 0.0.
+        observed_keys = sorted(
+            {
+                str(key)
+                for run in runs[:5]
+                for key in dict(run.summary).keys()
+                if not str(key).startswith("_")
+            }
         )
-        fallback_run = runs[0]
-        return fallback_run.id, 0.0, fallback_run.config
+        raise ValueError(
+            f"No run in sweep {full_sweep_id} logged the metric "
+            f"'{metric_name}' ({len(runs)} run(s) inspected). "
+            "Check that the training script logs this key, or fix "
+            "'metric.name' in the sweep YAML. Observed summary keys: "
+            f"{observed_keys[:40]}"
+        )
+
 
       # Sort by metric
       reverse = goal == "maximize"

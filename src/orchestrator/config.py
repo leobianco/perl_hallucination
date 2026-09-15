@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass, field
 import datetime
+import math
 import os
 from typing import Any, Dict, List, Optional
 import yaml
@@ -17,6 +18,39 @@ VALID_TASKS = [
     "ragtruth-qa",
     "ragtruth-summarization",
 ]
+
+#: Rough per-trial wall-clock estimates (minutes) for each sweep stage. These
+#: feed both the wizard's ETA preview and the sweep timeout budgets, so the two
+#: can never drift apart.
+MINUTES_PER_TRIAL: Dict[str, float] = {"sft": 12.0, "rm": 8.0, "perl": 35.0}
+
+#: Headroom applied on top of the estimate when sizing a sweep timeout. The
+#: timeout is a safety net against a wedged agent, not a scheduling target, so
+#: it must sit comfortably above the expected duration.
+TIMEOUT_SAFETY_FACTOR = 1.5
+
+#: No sweep is ever given a smaller budget than this.
+MIN_TIMEOUT_MINUTES = 240
+
+
+def sweep_timeout_minutes(stage: str, max_runs: int) -> int:
+  """Sizes the wall-clock budget of a sweep from its trial count.
+
+  A fixed budget silently truncates large sweeps: the agent is killed, the
+  best run *so far* is promoted, and the campaign reports success with fewer
+  trials than requested. Scaling with ``max_runs`` keeps the timeout doing its
+  real job (catching a wedged agent) without capping the search.
+
+  Args:
+    stage: Sweep stage name ('sft', 'rm' or 'perl').
+    max_runs: Number of trials the sweep is asked to run.
+
+  Returns:
+    The timeout in minutes.
+  """
+  per_trial = MINUTES_PER_TRIAL.get(stage, 10.0)
+  estimate = max(0, int(max_runs)) * per_trial * TIMEOUT_SAFETY_FACTOR
+  return int(max(MIN_TIMEOUT_MINUTES, math.ceil(estimate)))
 
 
 @dataclass
@@ -42,10 +76,21 @@ class EvalStageConfig:
   enabled: bool = True
   evaluator_model: str = "gemini-2.5-flash"
   use_gemini: bool = True
+  # Seed used to subsample the test set and to draw few-shot examples.
+  # Defaults to the value hard-coded in ``scripts/evaluator.sh`` (12345) so
+  # that orchestrated runs score the *same* subset as the baselines already
+  # recorded in BASELINES_*.md. The training seed (``CampaignConfig.seed``)
+  # is deliberately independent.
+  seed: int = 12345
   max_eval_samples: int = 1000
   eval_batch_size: int = 32
   max_workers: int = 32
   threshold: float = 0.1025
+  # Per-phase wall-clock budget. Generation of 1000 completions plus Gemini
+  # autorating comfortably fits in three hours; beyond that something is
+  # wedged (a stalled Vertex call, a hung vLLM worker).
+  timeout_minutes: int = 180
+
   evaluator_num_fewshot: int = 2
   writer_num_fewshot: int = 0
   max_tokens: int = 250
@@ -60,6 +105,35 @@ class EvalStageConfig:
   log_to_wandb: bool = True
   overwrite_scores: bool = False
   scores_checkpoint_path: Optional[str] = None
+
+
+@dataclass
+class RobustnessConfig:
+  """Knobs controlling how hard the campaign tries to survive the night.
+
+  The defaults assume an unattended run on a GCP VM: transient W&B/HF errors
+  are retried, a crashed materialization gets one more chance, and a silent
+  subprocess is reported long before the stage timeout would kill it.
+  """
+
+  #: Attempts (not retries) for W&B API and Hugging Face Hub calls.
+  api_attempts: int = 4
+  #: Attempts for the (expensive) retraining of a winning configuration.
+  #: A permanent failure - a bad flag, a missing dataset - is not retried,
+  #: see :func:`src.orchestrator.retry.is_retryable`.
+  materialize_attempts: int = 2
+  #: Attempts for one evaluation phase (generation or scoring).
+  eval_attempts: int = 2
+  #: Initial backoff; doubles per attempt up to ``max_delay_s``.
+  retry_base_delay_s: float = 15.0
+  max_delay_s: float = 300.0
+  #: Warn when a subprocess produces no output for this long. Not fatal -
+  #: some phases are legitimately quiet - but it is the only early sign of a
+  #: wedged trial in an overnight run.
+  stall_warning_minutes: float = 30.0
+  #: Mirror every streamed line into ``logs/campaign/{campaign_id}.log``.
+  log_to_file: bool = True
+  log_dir: str = "logs/campaign"
 
 
 @dataclass
@@ -90,6 +164,7 @@ class CampaignConfig:
   perl: SweepStageConfig = field(default_factory=SweepStageConfig)
   eval: EvalStageConfig = field(default_factory=EvalStageConfig)
   reporting: ReportingConfig = field(default_factory=ReportingConfig)
+  robustness: RobustnessConfig = field(default_factory=RobustnessConfig)
   dry_run: bool = False
   no_tui: bool = False
   state_file: Optional[str] = None
@@ -141,6 +216,7 @@ class CampaignConfig:
     perl_data = data.pop("perl_stage", None) or data.pop("perl", {})
     eval_data = data.pop("eval_stage", None) or data.pop("eval", {})
     rep_data = data.pop("reporting_stage", None) or data.pop("reporting", {})
+    rob_data = data.pop("robustness", {})
 
     return cls(
         sft=SweepStageConfig(**sft_data),
@@ -148,6 +224,7 @@ class CampaignConfig:
         perl=SweepStageConfig(**perl_data),
         eval=EvalStageConfig(**eval_data),
         reporting=ReportingConfig(**rep_data),
+        robustness=RobustnessConfig(**rob_data),
         **data,
     )
 
@@ -185,7 +262,7 @@ class CampaignConfig:
             enabled=True,
             sweep_config_path="scripts/sweep_sft.yaml",
             max_runs=sft_runs,
-            timeout_minutes=240,
+            timeout_minutes=sweep_timeout_minutes("sft", sft_runs),
             metric="eval/loss",
             goal="minimize",
         ),
@@ -193,7 +270,7 @@ class CampaignConfig:
             enabled=True,
             sweep_config_path="scripts/sweep_rm.yaml",
             max_runs=rm_runs,
-            timeout_minutes=240,
+            timeout_minutes=sweep_timeout_minutes("rm", rm_runs),
             metric="eval/roc_auc",
             goal="maximize",
         ),
@@ -201,7 +278,7 @@ class CampaignConfig:
             enabled=True,
             sweep_config_path="scripts/sweep_perl.yaml",
             max_runs=perl_runs,
-            timeout_minutes=360,
+            timeout_minutes=sweep_timeout_minutes("perl", perl_runs),
             metric="train/rewards/reward_fn/mean",
             goal="maximize",
             sft_model_path="auto",

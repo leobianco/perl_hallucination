@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from src.orchestrator import eval_metrics
 from src.orchestrator.cli import theme as theme_mod
 from src.orchestrator.cli.theme import Theme
 
@@ -124,9 +125,8 @@ def build_stage_views(
     metric_value = getattr(result, "best_metric_val", None) if result else None
     if key == "eval" and result is not None:
       metrics = getattr(result, "metrics", {}) or {}
-      metric_value = metrics.get(
-          "hallucination_rate", metrics.get("eval/hallucination_rate")
-      )
+      # Eval scores several policies; the headline number is the PE-RL one.
+      metric_value = eval_metrics.headline_metric(metrics)
 
     view = StageView(
         key=key,

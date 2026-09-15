@@ -10,7 +10,9 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import logging
 import os
+import signal
 import shutil
 import sys
 import time
@@ -21,6 +23,8 @@ from src.orchestrator.cli import theme as theme_mod
 from src.orchestrator.cli.console import UiConsole
 from src.orchestrator.config import CampaignConfig, VALID_TASKS
 from src.orchestrator.state import CampaignState
+
+logger = logging.getLogger(__name__)
 
 PROGRAM = "run_campaign.py"
 CHECKPOINTS_ROOT = "./checkpoints"
@@ -305,6 +309,29 @@ def run_diagnostics(config: CampaignConfig) -> List[Dict[str, str]]:
     add("Hugging Face token", "ok", "token available for pushes")
   else:
     add("Hugging Face token", "warn", "no token: model pushes will fail")
+
+  # Autorater credentials. The eval stage runs last, so a missing credential
+  # here is only discovered after a full day of GPU time - check it upfront.
+  if "eval" in theme_mod.iter_stage_names(config.stages) and config.eval.enabled:
+    vertex = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "true").lower()
+    if os.environ.get("GEMINI_API_KEY"):
+      add("Gemini credentials", "ok", "GEMINI_API_KEY set (AI Studio)")
+    elif vertex == "true" and (
+        os.environ.get("GOOGLE_CLOUD_PROJECT")
+        or os.path.exists(
+            os.path.expanduser(
+                "~/.config/gcloud/application_default_credentials.json"
+            )
+        )
+    ):
+      add("Gemini credentials", "ok", "Vertex AI application default creds")
+    else:
+      add(
+          "Gemini credentials",
+          "fail",
+          "set GEMINI_API_KEY, or GOOGLE_CLOUD_PROJECT + "
+          "'gcloud auth application-default login' for Vertex",
+      )
 
   # Sweep configuration files.
   for stage in theme_mod.iter_stage_names(config.stages):
@@ -679,20 +706,65 @@ def _is_interactive() -> bool:
     return False
 
 
+def _survive_terminal_hangup(console: UiConsole) -> None:
+  """Makes the campaign immune to the terminal going away.
+
+  A dropped SSH connection sends SIGHUP, whose default action is to kill the
+  process - taking a campaign that is eight hours into its GPU budget with
+  it. tmux normally shields us, but nothing forces the user to remember tmux,
+  so ignore the signal outright. Ctrl-C (SIGINT) and ``s`` still work.
+
+  Args:
+    console: Used to hint at the behaviour when it is worth mentioning.
+  """
+  if not hasattr(signal, "SIGHUP"):
+    return  # Not POSIX; nothing to guard against.
+  try:
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+  except (OSError, ValueError) as error:
+    # Only the main thread may install handlers; not fatal.
+    logger.debug("Could not ignore SIGHUP: %s", error)
+    return
+  if not _is_interactive():
+    console.info(
+        "SIGHUP ignored: the campaign will keep running if the terminal "
+        "disconnects."
+    )
+
+
 def _missing_upstream_checkpoints(config: CampaignConfig) -> List[str]:
-  """Returns the upstream models PE-RL needs but cannot obtain."""
+  """Returns the upstream models a selected stage needs but cannot obtain.
+
+  Catching this before launch matters: the alternative is discovering at
+  hour eleven that the final stage has nothing to work with.
+
+  Args:
+    config: The campaign about to be launched.
+
+  Returns:
+    Flags the user must supply, empty when the plan is self-sufficient.
+  """
   stages = theme_mod.iter_stage_names(config.stages)
-  if "perl" not in stages:
-    return []
   missing = []
-  if "sft" not in stages and (
-      not config.perl.sft_model_path or config.perl.sft_model_path == "auto"
-  ):
-    missing.append("--sft-model")
-  if "rm" not in stages and (
-      not config.perl.reward_model_path or config.perl.reward_model_path == "auto"
-  ):
-    missing.append("--reward-model")
+
+  if "perl" in stages:
+    if "sft" not in stages and (
+        not config.perl.sft_model_path or config.perl.sft_model_path == "auto"
+    ):
+      missing.append("--sft-model")
+    if "rm" not in stages and (
+        not config.perl.reward_model_path
+        or config.perl.reward_model_path == "auto"
+    ):
+      missing.append("--reward-model")
+
+  # Evaluation scores the trained policies (SFT and PE-RL). It deliberately
+  # never falls back to the base model, so a run with neither stage selected
+  # and no explicit SFT checkpoint has nothing to evaluate.
+  if "eval" in stages and not {"sft", "perl"} & set(stages):
+    if not config.perl.sft_model_path or config.perl.sft_model_path == "auto":
+      missing.append("--sft-model (evaluation has no policy to score)")
+
   return missing
 
 
@@ -855,6 +927,9 @@ def main(argv: Optional[Sequence[str]] = None, console: Optional[UiConsole] = No
   if handler is None:
     parser.print_help()
     return EXIT_USAGE
+
+  if args.command in ("run", "resume"):
+    _survive_terminal_hangup(console)
 
   try:
     return handler(args, console)

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import time
 from typing import Any, Callable, Dict, Optional
 
 from src.orchestrator.cli.events import ControlSignals, EventBus, EventType
 from src.orchestrator.config import CampaignConfig
+from src.orchestrator import logging_setup
 from src.orchestrator.model_manager import ModelManager
 from src.orchestrator.reporter import CampaignReporter
 from src.orchestrator.stages.base import BaseStage, CampaignContext
@@ -19,6 +21,9 @@ from src.orchestrator.state import CampaignState, StageResult, StageStatus
 from src.orchestrator.sweep_controller import SweepController
 
 logger = logging.getLogger(__name__)
+
+#: Free disk below this (GiB) triggers a warning before each stage.
+LOW_DISK_WARNING_GB = 25.0
 
 
 class CampaignEngine:
@@ -39,6 +44,11 @@ class CampaignEngine:
     state_path = config.state_file or f"./checkpoints/{config.task_name}/{config.name}_state.json"
     self.state_path = state_path
 
+    # Opened before anything else so even constructor failures land on disk.
+    self.log_path = logging_setup.configure_campaign_logging(
+        config.name, log_dir=config.robustness.log_dir
+    )
+
     if state:
       self.state = state
     else:
@@ -52,10 +62,12 @@ class CampaignEngine:
         entity=config.user,
         project=config.project,
         dry_run=config.dry_run,
+        robustness=config.robustness,
     )
     self.model_manager = ModelManager(
         user=config.user,
         dry_run=config.dry_run,
+        robustness=config.robustness,
     )
     self.reporter = CampaignReporter(self.config, self.state)
 
@@ -84,7 +96,41 @@ class CampaignEngine:
         state=self.state,
         sweep_controller=self.sweep_controller,
         model_manager=self.model_manager,
+        state_path=self.state_path,
     )
+
+  def _stage_line_callback(self, stage_name: str) -> Callable[[str], None]:
+    """Line sink for a stage: the event bus plus the durable campaign log."""
+    return logging_setup.tee_line_callback(
+        self.log_path, self.bus.as_line_callback(stage_name)
+    )
+
+  def _warn_on_low_disk(self, stage_name: str) -> None:
+    """Publishes a notice when free disk space is running out.
+
+    Every trial writes a LoRA checkpoint; a 30-trial sweep fills a disk
+    quietly and then a push fails at the worst possible moment. This does not
+    block the stage - only the user can decide what to delete.
+
+    Args:
+      stage_name: Stage about to start, used in the message.
+    """
+    try:
+      free_gb = shutil.disk_usage(".").free / (1024**3)
+    except OSError:
+      return
+    if free_gb >= LOW_DISK_WARNING_GB:
+      return
+    self.bus.publish(
+        EventType.NOTICE,
+        stage=stage_name,
+        message=(
+            f"Only {free_gb:.0f} GB of disk left before stage "
+            f"'{stage_name}'. Checkpoints may fail to write; consider "
+            "clearing ./checkpoints."
+        ),
+    )
+    logger.warning("Low disk space before stage %s: %.0f GB", stage_name, free_gb)
 
   def _should_interrupt_stage(self) -> bool:
     """Predicate handed to sweep agents so hotkeys can cut a sweep short."""
@@ -184,6 +230,7 @@ class CampaignEngine:
           )
           break
 
+        self._warn_on_low_disk(stage_name)
         self.state.mark_stage_running(stage_name)
         self.state.save(self.state_path)
         started = time.time()
@@ -197,7 +244,7 @@ class CampaignEngine:
         stage_instance = self._instantiate_stage(stage_name)
         try:
           result: StageResult = stage_instance.execute(
-              live_line_callback=self.bus.as_line_callback(stage_name),
+              live_line_callback=self._stage_line_callback(stage_name),
               stop_requested_callback=self._should_interrupt_stage,
           )
           self.state.record_stage_result(stage_name, result)
@@ -227,11 +274,9 @@ class CampaignEngine:
 
         except Exception as stage_err:
           logger.error("Error executing stage '%s': %s", stage_name, stage_err)
-          failed_result = StageResult(
-              status=StageStatus.FAILED,
-              error_message=str(stage_err),
-          )
-          self.state.record_stage_result(stage_name, failed_result)
+          # Preserve the sweep id and any partial metrics: a resume must be
+          # able to rejoin the sweep instead of paying for it a second time.
+          self.state.mark_stage_failed(stage_name, str(stage_err))
           self.state.status = "FAILED"
           self.state.save(self.state_path)
           self.bus.publish(
@@ -255,6 +300,7 @@ class CampaignEngine:
             "status": "STOPPED",
             "artifacts": artifacts,
             "state_file": self.state_path,
+          "log_file": self.log_path,
         }
 
       # All stages completed
@@ -275,6 +321,7 @@ class CampaignEngine:
           "status": "COMPLETED",
           "artifacts": artifacts,
           "state_file": self.state_path,
+          "log_file": self.log_path,
       }
 
     except Exception as e:

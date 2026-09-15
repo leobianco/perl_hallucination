@@ -6,13 +6,43 @@ import datetime
 import logging
 import os
 import shutil
-import subprocess
-import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 
+
+from src.orchestrator.config import RobustnessConfig
+from src.orchestrator.process import stream_subprocess
+from src.orchestrator.retry import run_with_retries
 from src.utils import sanitize_hf_repo_id
 
 logger = logging.getLogger(__name__)
+
+
+#: Hyperparameters that may be re-injected into the materialization command.
+#:
+#: ``wandb`` run configs do not only contain the sweep's search space: the
+#: Hugging Face ``WandbCallback`` merges the *entire* ``TrainingArguments``
+#: dump and the model's ``config.json`` into ``run.config``. Forwarding all of
+#: that back as CLI flags (``--vocab_size``, ``--rope_theta``, ...) makes
+#: ``HfArgumentParser`` abort with "some specified arguments are not used",
+#: which would kill the campaign right after a multi-hour sweep. Stages pass
+#: the sweep's own ``parameters:`` keys; this constant is the fallback.
+DEFAULT_TUNABLE_KEYS: Set[str] = {
+    "learning_rate",
+    "num_train_epochs",
+    "weight_decay",
+    "warmup_ratio",
+    "lr_scheduler_type",
+    "lora_r",
+    "lora_alpha",
+    "lora_dropout",
+    "beta",
+    "temperature",
+    "reward_penalty_alpha",
+    "num_generations",
+    "max_completion_length",
+    "sft_data_fraction",
+    "num_fewshot",
+}
 
 
 class ModelManager:
@@ -23,10 +53,15 @@ class ModelManager:
       user: str = "leobianco",
       dry_run: bool = False,
       deepspeed_config: str = "scripts/deepspeed_config.yaml",
+      robustness: Optional[RobustnessConfig] = None,
   ):
     self.user = user
     self.dry_run = dry_run
     self.deepspeed_config = deepspeed_config
+    # Materialization ends with a Hugging Face push, the single most
+    # failure-prone moment of the whole campaign.
+    self.robustness = robustness or RobustnessConfig()
+
 
   def verify_model_exists(self, repo_or_path: str) -> bool:
     """Verifies whether a model checkpoint exists locally or on Hugging Face Hub."""
@@ -62,7 +97,7 @@ class ModelManager:
       )
       return repo_id
 
-    try:
+    def _upload() -> str:
       from huggingface_hub import HfApi  # pylint: disable=g-import-not-at-top
 
       api = HfApi()
@@ -72,6 +107,16 @@ class ModelManager:
           repo_id=repo_id,
           repo_type="model",
           commit_message=commit_message,
+      )
+      return repo_id
+
+    try:
+      run_with_retries(
+          _upload,
+          description=f"Hugging Face upload for {repo_id}",
+          attempts=self.robustness.api_attempts,
+          base_delay_s=self.robustness.retry_base_delay_s,
+          max_delay_s=self.robustness.max_delay_s,
       )
       logger.info("Successfully pushed folder %s to Hugging Face: %s", folder_path, repo_id)
       return repo_id
@@ -105,6 +150,8 @@ class ModelManager:
       sft_model_path: Optional[str] = None,
       reward_model_path: Optional[str] = None,
       live_line_callback: Optional[Callable[[str], None]] = None,
+      tunable_keys: Optional[Iterable[str]] = None,
+      stop_requested_callback: Optional[Callable[[], bool]] = None,
   ) -> str:
     """Executes a single training run with winning hyperparameters and pushes to HF Hub.
 
@@ -117,10 +164,24 @@ class ModelManager:
         sft_model_path: Required for PE-RL stage.
         reward_model_path: Required for PE-RL stage.
         live_line_callback: Callback for streaming logs.
+        tunable_keys: Keys of ``best_params`` that are genuine hyperparameters
+          of the training script (normally the sweep's ``parameters:`` block).
+          Everything else in the W&B run config is ignored, because it also
+          contains the full ``TrainingArguments`` dump and the model config.
+        stop_requested_callback: Predicate polled while training; when it
+          returns True the training subprocess is terminated.
 
     Returns:
         The uploaded Hugging Face model repository ID.
+
+    Raises:
+        ValueError: If the stage is unknown or PE-RL dependencies are missing.
+        RuntimeError: If the training subprocess fails or is interrupted
+          before the checkpoint is pushed.
     """
+
+    allowed_keys = {str(k) for k in (tunable_keys or DEFAULT_TUNABLE_KEYS)}
+
     timestamp = datetime.datetime.now().strftime("%y%m%d%H%M")
     model_short = base_model.split("/")[-1]
 
@@ -328,65 +389,113 @@ class ModelManager:
           "True",
       ])
 
-    # Filter out non-hyperparameter keys from W&B run.config
-    ignored_keys = {
-        "program",
-        "task_name",
-        "model_repo_id",
-        "output_dir",
-        "hub_model_id",
-        "report_to",
-        "run_name",
-        "push_to_hub",
-        "resume_from_checkpoint",
-        "hub_token",
-        "deepspeed",
-        "deepspeed_config",
-        "accelerator_config",
-        "distributed_state",
-        "lr_scheduler_kwargs",
-        "label_names",
-        "wandb_sweep_id",
-    }
-
-    # Inject best parameters (scalars only)
+    # Inject the winning hyperparameters (scalars only, allowlisted).
+    #
+    # The W&B run config of a Hugging Face Trainer run is a merge of the sweep
+    # parameters, the full TrainingArguments dump and the model's config.json.
+    # Only the declared tunables may be replayed on the command line.
+    injected: Dict[str, Any] = {}
+    skipped: List[str] = []
     for k, v in best_params.items():
-      if (
-          k.startswith("_")
-          or "wandb" in k.lower()
-          or k in ignored_keys
-          or v is None
-          or isinstance(v, (dict, list, tuple, set))
-      ):
+      key = str(k)
+      if key.startswith("_") or "wandb" in key.lower() or v is None:
         continue
-      flag = f"--{k}"
-      if flag not in cmd:
-        cmd.extend([flag, str(v)])
+      if isinstance(v, (dict, list, tuple, set, bool)):
+        # Booleans are never part of a search space here, and forwarding them
+        # would silently flip explicitly configured flags above.
+        skipped.append(key)
+        continue
+      if key not in allowed_keys:
+        skipped.append(key)
+        continue
+      flag = f"--{key}"
+      if flag in cmd:
+        continue
+      cmd.extend([flag, str(v)])
+      injected[key] = v
 
+    logger.info(
+        "Materializing %s with hyperparameters %s (%d config keys ignored)",
+        stage_name,
+        injected,
+        len(skipped),
+    )
+    if live_line_callback:
+      live_line_callback(
+          f"Retraining winner with: "
+          + ", ".join(f"{k}={v}" for k, v in sorted(injected.items()))
+      )
     logger.info("Launching materialization: %s", " ".join(cmd))
 
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        universal_newlines=True,
-    )
-
-    while process.poll() is None:
-      line = process.stdout.readline() if process.stdout else ""
-      if line:
-        clean = line.rstrip()
-        if live_line_callback:
-          live_line_callback(clean)
-      else:
-        time.sleep(0.1)
-
-    if process.returncode != 0:
-      raise RuntimeError(
-          f"Materialization failed for {stage_name} with exit code {process.returncode}"
+    def _train_once() -> None:
+      outcome = stream_subprocess(
+          cmd,
+          on_line=live_line_callback,
+          stop_requested=stop_requested_callback,
+          stall_warning_s=self.robustness.stall_warning_minutes * 60,
       )
+      if outcome.interrupted:
+        raise RuntimeError(
+            f"Materialization of the best {stage_name} model was interrupted "
+            "before the checkpoint could be pushed."
+        )
+      if outcome.returncode != 0:
+        # If the training completed and saved weights locally, but the push_to_hub
+        # failed at the very end due to a transient error, salvage the checkpoint
+        # by uploading the local folder directly with retries.
+        candidate_dirs = [output_dir]
+        if os.path.exists(output_dir):
+          try:
+            for entry in os.listdir(output_dir):
+              sub = os.path.join(output_dir, entry)
+              if os.path.isdir(sub) and entry.startswith("checkpoint-"):
+                candidate_dirs.append(sub)
+          except OSError:
+            pass
+
+        for c_dir in candidate_dirs:
+          try:
+            files = os.listdir(c_dir)
+          except OSError:
+            continue
+          if any(f.endswith((".safetensors", ".bin")) for f in files):
+            logger.warning(
+                "Materialization subprocess exited with %d, but valid checkpoint found at %s. "
+                "Attempting direct upload to Hugging Face Hub with backoff...",
+                outcome.returncode,
+                c_dir,
+            )
+            if live_line_callback:
+              live_line_callback(
+                  f"[RETRY] Process exited with {outcome.returncode}; "
+                  f"recovering checkpoint from {c_dir} via direct HF upload..."
+              )
+            try:
+              self.upload_local_checkpoint(c_dir, repo_id)
+              return
+            except Exception as upload_err:
+              logger.error("Direct checkpoint recovery upload failed: %s", upload_err)
+              break
+
+        raise RuntimeError(
+            f"Materialization failed for {stage_name} with exit code "
+            f"{outcome.returncode}"
+        )
+
+    # A transient Hub 5xx at the push step would otherwise discard the entire
+    # sweep. Deterministic failures (bad flags) are not retried: the message
+    # is matched against retry.NON_RETRYABLE_MARKERS, and "interrupted" is
+    # explicitly one of them so a stop request takes effect at once.
+    run_with_retries(
+        _train_once,
+        description=f"{stage_name} materialization",
+        attempts=self.robustness.materialize_attempts,
+        base_delay_s=self.robustness.retry_base_delay_s,
+        max_delay_s=self.robustness.max_delay_s,
+        on_notice=live_line_callback,
+        stop_requested=stop_requested_callback,
+    )
 
     logger.info("Successfully materialized and pushed model: %s", repo_id)
     return repo_id
+

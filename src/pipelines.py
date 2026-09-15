@@ -756,6 +756,28 @@ class Pipeline(abc.ABC):
     raise NotImplementedError()
 
 
+def _push_to_hub_with_retry(
+    push_fn: Any,
+    description: str = "Hugging Face Hub push",
+    attempts: int = 3,
+    base_delay_s: float = 5.0,
+) -> Any:
+  """Retries a push_to_hub operation with exponential backoff on transient errors."""
+  for attempt in range(1, attempts + 1):
+    try:
+      return push_fn()
+    except Exception as e:
+      if attempt == attempts:
+        print(f"[Hub Push] Failed after {attempts} attempts: {e}")
+        raise
+      delay = base_delay_s * (2 ** (attempt - 1))
+      print(
+          f"[Hub Push] Warning: {description} failed (attempt {attempt}/{attempts}): {e}. "
+          f"Retrying in {delay:.0f}s..."
+      )
+      time.sleep(delay)
+
+
 class SFTPipeline(Pipeline):
   """Pipeline for supervised fine-tuning (writer_sft.py)."""
 
@@ -871,7 +893,7 @@ class SFTPipeline(Pipeline):
     resume_ckpt = self._resolve_resume_checkpoint()
     self.trainer.train(resume_from_checkpoint=resume_ckpt)
     if getattr(self.training_args, "push_to_hub", False):
-      self.trainer.push_to_hub()
+      _push_to_hub_with_retry(self.trainer.push_to_hub, description="SFT model push")
 
 
 class RewardModelPipeline(Pipeline):
@@ -1070,7 +1092,10 @@ class RewardModelPipeline(Pipeline):
     if getattr(self.training_args, "push_to_hub", False) and getattr(
         self.training_args, "hub_model_id", None
     ):
-      self.model.push_to_hub(self.training_args.hub_model_id)
+      _push_to_hub_with_retry(
+          lambda: self.model.push_to_hub(self.training_args.hub_model_id),
+          description="Reward model push",
+      )
 
 
 class PERLPipeline(Pipeline):
@@ -1439,7 +1464,7 @@ class PERLPipeline(Pipeline):
       resume_ckpt = self._resolve_resume_checkpoint()
       self.trainer.train(resume_from_checkpoint=resume_ckpt)
       if getattr(self.training_args, "push_to_hub", False):
-        self.trainer.push_to_hub()
+        _push_to_hub_with_retry(self.trainer.push_to_hub, description="PERL model push")
 
 
 class DPOPipeline(Pipeline):
@@ -1558,7 +1583,7 @@ class DPOPipeline(Pipeline):
       resume_ckpt = self._resolve_resume_checkpoint()
       self.trainer.train(resume_from_checkpoint=resume_ckpt)
       if getattr(self.training_args, "push_to_hub", False):
-        self.trainer.push_to_hub()
+        _push_to_hub_with_retry(self.trainer.push_to_hub, description="DPO model push")
 
 
 class ScopeMixtureLogitsProcessor(LogitsProcessor):

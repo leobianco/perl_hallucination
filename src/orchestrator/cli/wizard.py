@@ -22,6 +22,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from src.orchestrator.cli import theme as theme_mod
 from src.orchestrator.cli.console import UiConsole
 from src.orchestrator.cli.renderables import banner
+from src.orchestrator import config as config_mod
 from src.orchestrator.config import CampaignConfig, VALID_TASKS
 
 #: Human friendly task descriptions shown in the picker.
@@ -58,7 +59,9 @@ PRESET_DESCRIPTIONS: Dict[str, str] = {
 }
 
 #: Rough per-trial wall-clock estimates (minutes) used for the ETA preview.
-MINUTES_PER_TRIAL: Dict[str, float] = {"sft": 12.0, "rm": 8.0, "perl": 35.0}
+#: Shared with :func:`src.orchestrator.config.sweep_timeout_minutes` so the
+#: advertised estimate and the sweep timeout budget stay consistent.
+MINUTES_PER_TRIAL: Dict[str, float] = config_mod.MINUTES_PER_TRIAL
 
 _REPO_ID_RE = re.compile(r"^[\w.\-]+/[\w.\-]+$")
 

@@ -5,11 +5,13 @@ from __future__ import annotations
 import abc
 from dataclasses import dataclass
 import logging
-from typing import Callable, Optional
+from typing import Any, Callable, Dict, Optional, Set
+
 from src.orchestrator.config import CampaignConfig
 from src.orchestrator.model_manager import ModelManager
-from src.orchestrator.state import CampaignState, StageResult
+from src.orchestrator.state import CampaignState, StageResult, StageStatus
 from src.orchestrator.sweep_controller import SweepController
+
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +24,9 @@ class CampaignContext:
   state: CampaignState
   sweep_controller: SweepController
   model_manager: ModelManager
+  #: Where the engine persists ``state``; lets stages checkpoint a sweep id
+  #: as soon as it exists, so a crash mid-sweep is resumable.
+  state_path: Optional[str] = None
 
   @property
   def sft_model_repo_id(self) -> Optional[str]:
@@ -68,3 +73,76 @@ class BaseStage(abc.ABC):
       stop_requested_callback: Optional[Callable[[], bool]] = None,
   ) -> StageResult:
     """Executes the stage logic and returns the resulting StageResult."""
+
+  # --- Shared helpers -------------------------------------------------
+  def tunable_keys(self, sweep_dict: Dict[str, Any]) -> Set[str]:
+    """Returns the hyperparameter names this sweep actually searches over.
+
+    Only these may be replayed on the materialization command line: the rest
+    of a W&B run config is the training-argument and model-config dump, which
+    the training scripts' argument parsers reject.
+
+    Args:
+      sweep_dict: The sweep configuration that was registered.
+
+    Returns:
+      The set of parameter names, or an empty set when the sweep declares
+      none (the model manager then falls back to its own allowlist).
+    """
+    params = sweep_dict.get("parameters")
+    if isinstance(params, dict):
+      return {str(key) for key in params}
+    return set()
+
+  def resolve_sweep_id(
+      self,
+      sweep_dict: Dict[str, Any],
+      live_line_callback: Optional[Callable[[str], None]] = None,
+  ) -> str:
+    """Reuses the sweep of an interrupted attempt, or registers a new one.
+
+    Registering a fresh sweep after a crash silently discards every trial the
+    previous attempt paid for. When the persisted state still holds a sweep id
+    for this stage and the stage never completed, the agent is pointed back at
+    that sweep instead.
+
+    Args:
+      sweep_dict: Sweep configuration to register when there is nothing to
+        resume.
+      live_line_callback: Optional log sink.
+
+    Returns:
+      The sweep id to run the agent against.
+    """
+    previous = self.state.stages.get(self.name)
+    if (
+        previous is not None
+        and previous.sweep_id
+        and previous.status != StageStatus.COMPLETED
+    ):
+      message = (
+          f"Resuming existing {self.name.upper()} sweep {previous.sweep_id} "
+          "instead of starting a new one."
+      )
+      logger.info(message)
+      if live_line_callback:
+        live_line_callback(message)
+      return previous.sweep_id
+
+    sweep_id = self.sweep_controller.create_sweep(sweep_dict)
+    self.record_sweep_id(sweep_id)
+    return sweep_id
+
+  def record_sweep_id(self, sweep_id: str) -> None:
+    """Persists ``sweep_id`` immediately so a crash stays resumable."""
+    result = self.state.stages.get(self.name)
+    if result is None:
+      result = StageResult(status=StageStatus.RUNNING)
+      self.state.stages[self.name] = result
+    result.sweep_id = sweep_id
+    if self.context.state_path:
+      try:
+        self.state.save(self.context.state_path)
+      except OSError as exc:
+        logger.warning("Could not persist sweep id to state file: %s", exc)
+

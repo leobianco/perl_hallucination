@@ -111,20 +111,25 @@ class PerlStage(BaseStage):
     yaml_metric = sweep_dict.get("metric", {}).get("name")
     target_metric = yaml_metric or cfg.metric
 
-    # 1. Register Sweep
-    sweep_id = self.sweep_controller.create_sweep(sweep_dict)
+    # 1. Register Sweep (or resume the one an interrupted attempt created)
+    sweep_id = self.resolve_sweep_id(sweep_dict, live_line_callback)
     logger.info("Registered PE-RL Sweep: %s", sweep_id)
     if live_line_callback:
       live_line_callback(f"Registered PE-RL Sweep: {sweep_id}")
 
     # 2. Run Sweep Agent with max_runs bound (default: 10)
-    self.sweep_controller.run_sweep_agent(
+    exit_code = self.sweep_controller.run_sweep_agent(
         sweep_id=sweep_id,
         max_runs=cfg.max_runs,
         timeout_minutes=cfg.timeout_minutes,
         live_line_callback=live_line_callback,
         stop_requested_callback=stop_requested_callback,
     )
+    if exit_code != 0 and live_line_callback:
+      live_line_callback(
+          f"[WARNING] PE-RL sweep agent exited with code {exit_code}; scoring "
+          "the trials that did finish."
+      )
 
     # 3. Query Best Run (maximizing rewards/reward_fn/mean)
     best_run_id, best_val, best_params = self.sweep_controller.fetch_best_run(
@@ -148,7 +153,10 @@ class PerlStage(BaseStage):
         sft_model_path=sft_model,
         reward_model_path=rm_model,
         live_line_callback=live_line_callback,
+        tunable_keys=self.tunable_keys(sweep_dict),
+        stop_requested_callback=stop_requested_callback,
     )
+
     logger.info("PE-RL model pushed to: %s", perl_repo_id)
     if live_line_callback:
       live_line_callback(f"PE-RL model published to Hub: {perl_repo_id}")

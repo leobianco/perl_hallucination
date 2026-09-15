@@ -91,6 +91,45 @@ class CampaignState:
     self.stages[stage_name] = result
     self.updated_at = datetime.datetime.now().isoformat()
 
+  def mark_stage_failed(self, stage_name: str, error_message: str) -> None:
+    """Flags a stage as failed *without* discarding its progress.
+
+    Overwriting the whole ``StageResult`` on failure would drop the sweep id
+    and any partial metrics, so the next ``resume`` would re-register the
+    sweep and pay for every trial a second time.
+
+    Args:
+      stage_name: Stage that raised.
+      error_message: Human readable cause, stored for the report.
+    """
+    result = self.stages.get(stage_name)
+    if result is None:
+      result = StageResult()
+      self.stages[stage_name] = result
+    result.status = StageStatus.FAILED
+    result.error_message = error_message
+    result.end_time = datetime.datetime.now().isoformat()
+    self.updated_at = datetime.datetime.now().isoformat()
+
+  def merge_stage_metrics(
+      self, stage_name: str, metrics: Dict[str, Any]
+  ) -> None:
+    """Merges partial metrics into a stage result as they become available.
+
+    Used by long multi-phase stages (evaluation) so an expensive, already
+    scored model is not re-evaluated after an interruption.
+
+    Args:
+      stage_name: Stage owning the metrics.
+      metrics: Metric keys to merge into the stored result.
+    """
+    result = self.stages.get(stage_name)
+    if result is None:
+      result = StageResult(status=StageStatus.RUNNING)
+      self.stages[stage_name] = result
+    result.metrics.update(metrics)
+    self.updated_at = datetime.datetime.now().isoformat()
+
   def is_stage_completed(self, stage_name: str) -> bool:
     """Checks if a stage was successfully completed previously."""
     if stage_name not in self.stages:

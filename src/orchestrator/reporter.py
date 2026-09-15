@@ -6,6 +6,7 @@ import datetime
 import logging
 import os
 from typing import Any, Dict, Optional
+from src.orchestrator import eval_metrics
 from src.orchestrator.config import CampaignConfig
 from src.orchestrator.state import CampaignState, StageStatus
 
@@ -20,19 +21,39 @@ class CampaignReporter:
     self.state = state
 
   def generate_all(self) -> Dict[str, str]:
-    """Generates all configured reports and returns a dictionary of report paths/URLs."""
+    """Generates all configured reports and returns a dictionary of report paths/URLs.
+
+    Reporting runs after every checkpoint has been trained and pushed, so a
+    failure here (a formatting bug, a W&B outage) must never be allowed to
+    mark a successful campaign as failed. Each artifact is attempted
+    independently and errors are recorded instead of raised.
+
+    Returns:
+      Artifact paths/URLs, plus a ``reporting_error`` entry when something
+      could not be produced.
+    """
     artifacts = {}
     if self.config.reporting.generate_markdown:
-      md_path = self.generate_markdown_report()
-      artifacts["markdown_report"] = md_path
+      try:
+        artifacts["markdown_report"] = self.generate_markdown_report()
+      except Exception as error:  # pylint: disable=broad-except
+        logger.exception("Markdown report generation failed")
+        artifacts["reporting_error"] = f"markdown report: {error}"
 
     if self.config.reporting.render_console_summary:
-      self.render_console_summary()
+      try:
+        self.render_console_summary()
+      except Exception as error:  # pylint: disable=broad-except
+        logger.warning("Console summary rendering failed: %s", error)
 
     if self.config.reporting.publish_wandb_report:
-      report_url = self.publish_wandb_report()
-      if report_url:
-        artifacts["wandb_report_url"] = report_url
+      try:
+        report_url = self.publish_wandb_report()
+        if report_url:
+          artifacts["wandb_report_url"] = report_url
+      except Exception as error:  # pylint: disable=broad-except
+        logger.warning("W&B report publishing failed: %s", error)
+        artifacts.setdefault("reporting_error", f"wandb report: {error}")
 
     return artifacts
 
@@ -88,7 +109,7 @@ class CampaignReporter:
         val_str = f"{stage_res.best_metric_val:.4f}" if stage_res.best_metric_val is not None else "-"
       elif stage_name == "eval":
         metric_str = "autorater_hallucination"
-        h_rate = stage_res.metrics.get("hallucination_rate", stage_res.metrics.get("eval/hallucination_rate"))
+        h_rate = eval_metrics.headline_metric(stage_res.metrics)
         val_str = f"{h_rate:.4f}" if h_rate is not None else "Done"
       else:
         metric_str = "-"
@@ -158,19 +179,48 @@ class CampaignReporter:
     # Eval Details
     eval_res = self.state.stages.get("eval")
     if eval_res and eval_res.status == StageStatus.COMPLETED:
+      targets = eval_metrics.present_targets(eval_res.metrics)
       lines.extend([
           "### 2.4. Final Evaluation & Gemini Autorating",
           f"* **Evaluator Model**: `{self.config.eval.evaluator_model}`",
-          f"* **Tested Policy**: `{eval_res.model_repo_id}`",
-          "* **Comprehensive Metric Results**:",
+          f"* **Headline Policy**: `{eval_res.model_repo_id}`",
+          f"* **Evaluation Seed**: `{self.config.eval.seed}`"
+          f" (subsamples {self.config.eval.max_eval_samples} test examples)",
           "",
-          "| Metric | Measured Value |",
-          "| :--- | :--- |",
       ])
-      for m_name, m_val in eval_res.metrics.items():
-        val_display = f"{m_val:.4f}" if isinstance(m_val, float) else str(m_val)
-        lines.append(f"| `{m_name}` | **{val_display}** |")
-      lines.append("")
+
+      if targets:
+        # Δ is signed so that positive always means PE-RL improved on SFT,
+        # regardless of whether the metric is minimized or maximized.
+        header = "| Metric | " + " | ".join(t for _, t in targets) + " | Δ |"
+        divider = "| :--- | " + " | ".join("---:" for _ in targets) + " | ---: |"
+        lines.extend([
+            "* **Per-policy results** (Δ = PE-RL improvement over SFT):",
+            "",
+            header,
+            divider,
+        ])
+        for name, values, delta in eval_metrics.comparison_rows(
+            eval_res.metrics
+        ):
+          cells = " | ".join(
+              f"**{eval_metrics.format_value(v)}**" for v in values
+          )
+          delta_str = (
+              f"{delta:+.4f}" if isinstance(delta, float) else "-"
+          )
+          lines.append(f"| `{name}` | {cells} | {delta_str} |")
+        lines.append("")
+      else:
+        lines.extend([
+            "| Metric | Measured Value |",
+            "| :--- | :--- |",
+        ])
+        for m_name, m_val in eval_res.metrics.items():
+          lines.append(
+              f"| `{m_name}` | **{eval_metrics.format_value(m_val)}** |"
+          )
+        lines.append("")
 
     lines.extend([
         "---",

@@ -164,10 +164,13 @@ if "torch" not in sys.modules or not hasattr(sys.modules["torch"], "__path__"):
   sys.modules["torch.nn"] = torch_mod.nn
 
 from src.pipelines import (
+    DPOPipeline,
     PERLPipeline,
     Pipeline,
+    RewardModelPipeline,
     SFTPipeline,
     WandbResumptionCallback,
+    _push_to_hub_with_retry,
     parse_hf_repo_reference,
 )
 
@@ -546,6 +549,121 @@ class TestPipelineRunAndSaveResumption(unittest.TestCase):
     pipeline.run_and_save()
     mock_trainer.train.assert_called_once_with(resume_from_checkpoint=None)
     mock_trainer.push_to_hub.assert_called_once()
+
+
+class TestPipelinePushToHubRetries(unittest.TestCase):
+  """Push operations across all pipelines must retry on transient 500s."""
+
+  def test_push_to_hub_with_retry_succeeds_after_transient_500(self):
+    calls = []
+
+    def _flaky():
+      calls.append(1)
+      if len(calls) < 3:
+        raise RuntimeError("500 Internal Server Error: transient hub blip")
+      return "uploaded"
+
+    res = _push_to_hub_with_retry(_flaky, attempts=3, base_delay_s=0.0)
+    self.assertEqual(res, "uploaded")
+    self.assertEqual(len(calls), 3)
+
+  def test_push_to_hub_with_retry_raises_after_exhaustion(self):
+    calls = []
+
+    def _broken():
+      calls.append(1)
+      raise RuntimeError("500 Internal Server Error")
+
+    with self.assertRaises(RuntimeError) as ctx:
+      _push_to_hub_with_retry(_broken, attempts=3, base_delay_s=0.0)
+    self.assertIn("500", str(ctx.exception))
+    self.assertEqual(len(calls), 3)
+
+  def test_sft_pipeline_push_retries_transient_error(self):
+    pipeline = SFTPipeline()
+    pipeline.training_args = MagicMock(push_to_hub=True)
+    pipeline._resolve_resume_checkpoint = MagicMock(return_value=None)
+
+    calls = []
+
+    def _flaky_push():
+      calls.append(1)
+      if len(calls) < 2:
+        raise RuntimeError("500 Hub Blip")
+      return None
+
+    mock_trainer = MagicMock()
+    mock_trainer.push_to_hub.side_effect = _flaky_push
+    pipeline.trainer = mock_trainer
+
+    with patch("time.sleep"):
+      pipeline.run_and_save()
+    self.assertEqual(len(calls), 2)
+
+  def test_reward_model_pipeline_push_retries_transient_error(self):
+    pipeline = RewardModelPipeline()
+    pipeline.training_args = MagicMock(
+        push_to_hub=True, hub_model_id="test/rm", output_dir=None
+    )
+    pipeline._resolve_resume_checkpoint = MagicMock(return_value=None)
+    pipeline.trainer = MagicMock()
+
+    calls = []
+
+    def _flaky_push(*_args, **_kwargs):
+      calls.append(1)
+      if len(calls) < 2:
+        raise RuntimeError("500 Hub Blip")
+      return None
+
+    pipeline.model = MagicMock()
+    pipeline.model.push_to_hub.side_effect = _flaky_push
+
+    with patch("time.sleep"):
+      pipeline.run_and_save()
+    self.assertEqual(len(calls), 2)
+
+  def test_perl_pipeline_push_retries_transient_error(self):
+    pipeline = PERLPipeline()
+    pipeline.training_args = MagicMock(push_to_hub=True, do_train=True)
+    pipeline._resolve_resume_checkpoint = MagicMock(return_value=None)
+
+    calls = []
+
+    def _flaky_push():
+      calls.append(1)
+      if len(calls) < 2:
+        raise RuntimeError("500 Hub Blip")
+      return None
+
+    mock_trainer = MagicMock()
+    mock_trainer.push_to_hub.side_effect = _flaky_push
+    pipeline.trainer = mock_trainer
+
+    with patch("time.sleep"):
+      pipeline.run_and_save()
+    self.assertEqual(len(calls), 2)
+
+  def test_dpo_pipeline_push_retries_transient_error(self):
+    pipeline = DPOPipeline()
+    pipeline.training_args = MagicMock(push_to_hub=True, do_train=True)
+    pipeline._resolve_resume_checkpoint = MagicMock(return_value=None)
+
+    calls = []
+
+    def _flaky_push():
+      calls.append(1)
+      if len(calls) < 2:
+        raise RuntimeError("500 Hub Blip")
+      return None
+
+    mock_trainer = MagicMock()
+    mock_trainer.push_to_hub.side_effect = _flaky_push
+    pipeline.trainer = mock_trainer
+
+    with patch("time.sleep"):
+      pipeline.run_and_save()
+    self.assertEqual(len(calls), 2)
 
 
 class TestPipelineArgumentSetup(unittest.TestCase):
