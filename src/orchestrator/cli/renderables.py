@@ -126,7 +126,11 @@ def build_stage_views(
     if key == "eval" and result is not None:
       metrics = getattr(result, "metrics", {}) or {}
       # Eval scores several policies; the headline number is the PE-RL one.
-      metric_value = eval_metrics.headline_metric(metrics)
+      # It is only a *preference*: an eval that recorded something else must
+      # not end up with an emptier row than one that recorded nothing.
+      headline = eval_metrics.headline_metric(metrics)
+      if headline is not None:
+        metric_value = headline
 
     view = StageView(
         key=key,

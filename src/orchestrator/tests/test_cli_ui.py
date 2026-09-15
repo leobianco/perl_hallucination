@@ -530,6 +530,83 @@ class RealAgentOutputParserTest(unittest.TestCase):
     )
 
 
+class MetricExtractionTest(unittest.TestCase):
+  """Why the leaderboard and the DAG's "Best" cell used to stay empty.
+
+  Three independent defects all surfaced as a ``-``: an alias that matched
+  the wrong number, a metric flushed after the trial was already closed, and
+  an alias expansion that mangled multi-word metric keys.
+  """
+
+  def test_training_loss_is_not_mistaken_for_eval_loss(self):
+    # The HF Trainer interleaves {'loss': ...} (training) with
+    # {'eval_loss': ...}. Degrading `eval/loss` to a bare `loss` alias made
+    # the leaderboard rank trials on the training loss instead.
+    parser = events_mod.SweepProgressParser(metric_name="eval/loss")
+    parser.feed("wandb: Agent Starting Run: t1 with config:")
+    parser.feed("{'loss': 1.9012, 'grad_norm': 3.2, 'epoch': 0.02}")
+    self.assertIsNone(parser.trials[0].metric)
+    parser.feed("{'eval_loss': 0.4231, 'eval_runtime': 11.8, 'epoch': 0.33}")
+    self.assertAlmostEqual(parser.trials[0].metric, 0.4231)
+
+  def test_unqualified_metric_still_matches_bare_key(self):
+    parser = events_mod.SweepProgressParser(metric_name="accuracy")
+    parser.feed("wandb: Agent Starting Run: t1 with config:")
+    parser.feed("{'accuracy': 0.87}")
+    self.assertAlmostEqual(parser.trials[0].metric, 0.87)
+
+  def test_metric_flushed_after_cleanup_still_scores_the_trial(self):
+    # A piped child is block buffered: its run-summary block can drain after
+    # the agent has already logged the cleanup line.
+    parser = events_mod.SweepProgressParser(metric_name="eval/loss")
+    parser.feed("wandb: Agent Starting Run: t1 with config:")
+    parser.feed(
+        "2026-09-15 11:45:10,000 - wandb.wandb_agent - INFO - Cleaning up"
+        " finished run: t1"
+    )
+    self.assertIsNone(parser.active_trial)
+    parser.feed("wandb: Run summary:")
+    parser.feed("wandb:   eval/loss 0.4231")
+    self.assertAlmostEqual(parser.trials[0].metric, 0.4231)
+    self.assertAlmostEqual(parser.best_trial("minimize").metric, 0.4231)
+
+  def test_late_metric_never_overwrites_a_scored_trial(self):
+    parser = events_mod.SweepProgressParser(metric_name="eval/loss")
+    parser.feed("wandb: Agent Starting Run: t1 with config:")
+    parser.feed("{'eval_loss': 0.40}")
+    parser.feed("wandb: Agent Finished Run: t1")
+    parser.feed("wandb:   eval/loss 9.99")
+    self.assertAlmostEqual(parser.trials[0].metric, 0.40)
+
+  def test_late_metric_does_not_leak_into_the_next_trial(self):
+    parser = events_mod.SweepProgressParser(metric_name="eval/loss")
+    parser.feed("wandb: Agent Starting Run: t1 with config:")
+    parser.feed("wandb: Agent Finished Run: t1")
+    parser.feed("wandb: Agent Starting Run: t2 with config:")
+    parser.feed("{'eval_loss': 0.22}")
+    self.assertIsNone(parser.trials[0].metric)
+    self.assertAlmostEqual(parser.trials[1].metric, 0.22)
+
+  def test_multi_word_segments_survive_alias_expansion(self):
+    aliases = events_mod._metric_aliases(  # pylint: disable=protected-access
+        "train/rewards/reward_fn/mean"
+    )
+    self.assertIn("train/rewards/reward_fn/mean", aliases)
+    self.assertIn("rewards/reward_fn/mean", aliases)
+    # `reward_fn` must not be split into `reward/fn`, and no alias may be
+    # short enough to match an unrelated `mean`.
+    self.assertNotIn("train/rewards/reward/fn/mean", aliases)
+    self.assertNotIn("mean", aliases)
+
+  def test_perl_reward_metric_is_extracted(self):
+    parser = events_mod.SweepProgressParser(
+        metric_name="train/rewards/reward_fn/mean"
+    )
+    parser.feed("wandb: Agent Starting Run: p1 with config:")
+    parser.feed("{'rewards/reward_fn/mean': 0.6123, 'epoch': 0.5}")
+    self.assertAlmostEqual(parser.trials[0].metric, 0.6123)
+
+
 class StageViewTest(unittest.TestCase):
   """Derivation of DAG rows from config + state."""
 

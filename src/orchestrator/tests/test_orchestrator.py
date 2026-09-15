@@ -85,6 +85,40 @@ class TestOrchestratorState(unittest.TestCase):
       self.assertEqual(loaded.get_model_repo_id("sft"), "leobianco/npov_SFT_test")
       self.assertEqual(loaded.get_next_pending_stage(["sft", "rm"]), "rm")
 
+  def test_stage_result_inherits_live_best_metric(self):
+    # A stage reports its *outcome*. When the post-sweep W&B query comes back
+    # empty - or the stage failed before reaching it - the best score mirrored
+    # while the sweep ran is the only one there is, and blanking it leaves a
+    # visibly-executed stage showing "-" in the Best column.
+    state = CampaignState(campaign_id="c", task_name="npov")
+    state.mark_stage_running("sft")
+    state.update_stage_progress(
+        "sft", trials_done=7, trials_total=15, best_metric_val=0.31
+    )
+
+    state.record_stage_result(
+        "sft", StageResult(status=StageStatus.FAILED, error_message="boom")
+    )
+    self.assertAlmostEqual(state.stages["sft"].best_metric_val, 0.31)
+    self.assertEqual(state.stages["sft"].trials_done, 7)
+
+  def test_stage_result_keeps_its_own_best_metric(self):
+    state = CampaignState(campaign_id="c", task_name="npov")
+    state.mark_stage_running("sft")
+    state.update_stage_progress("sft", best_metric_val=0.31)
+
+    state.record_stage_result(
+        "sft",
+        StageResult(
+            status=StageStatus.COMPLETED,
+            best_run_id="run_xyz",
+            best_metric_val=0.28,
+        ),
+    )
+    # The authoritative value from the W&B API wins over the parsed one.
+    self.assertAlmostEqual(state.stages["sft"].best_metric_val, 0.28)
+    self.assertEqual(state.stages["sft"].best_run_id, "run_xyz")
+
 
 class TestSweepController(unittest.TestCase):
   """Tests for sweep registration, bounded execution, and best-run query in dry-run mode."""
@@ -536,6 +570,30 @@ class TestProgressIsMirroredToDisk(unittest.TestCase):
     stages = CampaignState.load(self.engine.state_path).stages
     self.assertEqual(stages["sft"].trials_done, 2)
     self.assertEqual(stages["rm"].trials_done, 1)
+
+  def notices(self):
+    """NOTICE messages published on the bus so far."""
+    return [
+        event.message
+        for event in self.engine.bus.history
+        if event.type == events_mod.EventType.NOTICE
+    ]
+
+  def test_unscored_trials_are_announced_once(self):
+    # A metric that never appears is the difference between "still warming
+    # up" and "your metric name is wrong", and the UI cannot tell them apart.
+    scoreless = [
+        line for line in AGENT_TRANSCRIPT if "eval_loss" not in line
+    ]
+    self.engine.bus.subscribe(lambda _event: None)
+    self.feed(scoreless)
+    matching = [n for n in self.notices() if "no 'eval/loss'" in n]
+    self.assertEqual(len(matching), 1)
+    self.assertIn("SFT", matching[0])
+
+  def test_no_warning_when_trials_are_scored(self):
+    self.feed(AGENT_TRANSCRIPT)
+    self.assertEqual([n for n in self.notices() if "no 'eval/loss'" in n], [])
 
 
 class TestSweepNaming(unittest.TestCase):

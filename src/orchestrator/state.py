@@ -157,6 +157,14 @@ class CampaignState:
         result.trials_done = previous.trials_done
       if not result.trials_total:
         result.trials_total = previous.trials_total
+      # Same reasoning for the leader board. A stage that failed part way
+      # through, or whose post-sweep W&B query came back empty, still knows
+      # the best score it saw - dropping it would blank the "Best" column of
+      # a stage that visibly ran trials.
+      if result.best_metric_val is None:
+        result.best_metric_val = previous.best_metric_val
+      if not result.best_run_id:
+        result.best_run_id = previous.best_run_id
     result.end_time = datetime.datetime.now().isoformat()
     self.stages[stage_name] = result
     self.updated_at = datetime.datetime.now().isoformat()

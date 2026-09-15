@@ -33,6 +33,11 @@ LOW_DISK_WARNING_GB = 25.0
 #: noisy intra-trial updates.
 PROGRESS_SAVE_INTERVAL_S = 5.0
 
+#: How many trials may finish without the configured metric ever appearing
+#: before the campaign says so. One is enough to be suspicious, but a first
+#: trial that crashes early legitimately has no metric, so wait for a second.
+UNSCORED_TRIALS_BEFORE_WARNING = 2
+
 
 class CampaignEngine:
   """Coordinates DAG execution, state persistence, error handling, and reporting."""
@@ -157,11 +162,34 @@ class CampaignEngine:
     # watching pane would appear to go backwards on every resume.
     previous = self.state.stages.get(stage_name)
     baseline = int(getattr(previous, "trials_done", 0) or 0)
+    #: A silent "-" in the Best column is indistinguishable from "the sweep
+    #: has not scored anything yet". Say it once, out loud, naming the key
+    #: that was searched for, so a metric renamed in the sweep YAML is a
+    #: two-second diagnosis instead of an evening of squinting at logs.
+    unscored_warned = [False]
 
     def track(line: str) -> None:
       try:
         parser.feed(line)
         best = parser.best_trial(goal)
+        if (
+            best is None
+            and not unscored_warned[0]
+            and parser.completed_count >= UNSCORED_TRIALS_BEFORE_WARNING
+        ):
+          unscored_warned[0] = True
+          self.bus.publish(
+              EventType.NOTICE,
+              message=(
+                  f"{stage_name.upper()}: {parser.completed_count} trials have"
+                  f" finished but no '{parser.metric_name}' value appeared in"
+                  " the agent output, so the leaderboard and the Best column"
+                  " stay empty. The final ranking still uses the W&B API;"
+                  " only the live view is affected. Check that the metric"
+                  " name matches what the training script logs."
+              ),
+              stage=stage_name,
+          )
         self._persist_progress(
             stage_name,
             trials_done=baseline + parser.completed_count,

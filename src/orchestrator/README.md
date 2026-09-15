@@ -212,6 +212,41 @@ Three behaviours worth knowing:
 > rather than restarting at zero, because a new `wandb agent` counts only its
 > own trials while the state file tracks the whole stage.
 
+#### Where the "Best" column comes from
+
+The `Best` column - and the metric column of the live leaderboard - is filled
+from **two different sources at two different times**:
+
+| When | Source | Accuracy |
+|---|---|---|
+| While the sweep runs | The metric key scraped out of the agent's stdout | Best effort |
+| Once the stage ends | The W&B API (`fetch_best_run`) | Authoritative |
+
+The live number therefore depends on the stage's `metric:` **literally
+appearing in the output**. The scraper accepts the spellings a training
+script actually uses - `eval/loss`, `eval_loss`, and for a nested key like
+`train/rewards/reward_fn/mean` also the suffix `rewards/reward_fn/mean`. It
+deliberately does **not** fall back to the last segment alone: matching a
+bare `loss` would pick up the HF `Trainer`'s *training* loss and rank the
+whole leaderboard on the wrong quantity.
+
+`-` in that column means "no value seen yet", which is legitimate early in a
+stage. If trials are finishing and it is still empty, the campaign says so
+once:
+
+```
+NOTICE  SFT: 2 trials have finished but no 'eval/loss' value appeared in the
+        agent output, so the leaderboard and the Best column stay empty. The
+        final ranking still uses the W&B API; only the live view is affected.
+        Check that the metric name matches what the training script logs.
+```
+
+The usual cause is a mismatch between `metric.name` in `scripts/sweep_*.yaml`
+and what the training script logs. **The sweep itself is unaffected** - W&B
+optimises on its own copy of the metric, and the stage's final best run is
+queried from the API - so this is a display problem, not a lost experiment.
+
+
 ### 8. Headless Mode (for `nohup` or logging to file)
 ```bash
 python3 scripts/run_campaign.py run --task npov --no-tui > campaign.log 2>&1 &

@@ -360,11 +360,22 @@ def strip_log_prefix(text: str) -> str:
   return cleaned
 
 
+#: Smallest number of path segments an alias may keep. A qualified metric
+#: must never degrade to its bare last segment: ``eval/loss`` reduced to
+#: ``loss`` matches the HF ``Trainer``'s *training* loss line
+#: (``{'loss': 1.90, 'grad_norm': ..., 'epoch': ...}``), which is a different,
+#: systematically smaller quantity than the ``eval/loss`` the sweep optimizes.
+#: The leaderboard would then rank trials on the wrong number.
+_MIN_ALIAS_SEGMENTS = 2
+
+
 def _metric_aliases(metric_name: str) -> List[str]:
   """Returns the spellings a training script may use for ``metric_name``.
 
-  ``eval/loss`` is logged as ``eval/loss`` by W&B, as ``eval_loss`` by the HF
-  ``Trainer``, and sometimes bare as ``loss`` in a summary block.
+  ``eval/loss`` is logged as ``eval/loss`` by W&B and as ``eval_loss`` by the
+  HF ``Trainer``. Long keys are also matched on a suffix, because TRL logs
+  ``train/rewards/reward_fn/mean`` as ``rewards/reward_fn/mean`` - but never
+  on a suffix short enough to collide with an unrelated metric.
 
   Args:
     metric_name: The configured metric key.
@@ -375,13 +386,23 @@ def _metric_aliases(metric_name: str) -> List[str]:
   target = (metric_name or "").strip()
   if not target:
     return []
-  aliases = {
-      target,
-      target.replace("/", "_"),
-      target.replace("_", "/"),
-      target.split("/")[-1],
-  }
-  return sorted({a for a in aliases if a}, key=len, reverse=True)
+  # ``/`` is the real separator whenever it is present. Treating ``_`` as one
+  # too would shred a segment that legitimately contains it:
+  # ``train/rewards/reward_fn/mean`` would become ``train/rewards/reward/fn/
+  # mean``, which matches nothing at all.
+  separator = "/" if "/" in target else "_"
+  segments = [s for s in target.split(separator) if s]
+  if not segments:
+    return []
+
+  aliases = set()
+  # An unqualified metric (``accuracy``) has nothing to strip; keep it as is.
+  shortest = min(_MIN_ALIAS_SEGMENTS, len(segments))
+  for start in range(0, len(segments) - shortest + 1):
+    suffix = segments[start:]
+    aliases.add("/".join(suffix))
+    aliases.add("_".join(suffix))
+  return sorted(aliases, key=len, reverse=True)
 
 
 class SweepProgressParser:
@@ -399,6 +420,12 @@ class SweepProgressParser:
     self.trials: List[TrialRecord] = []
     self._by_run: Dict[str, TrialRecord] = {}
     self._active: Optional[TrialRecord] = None
+    #: Trial closed most recently. A piped child process is block buffered,
+    #: so its final output (the ``wandb: Run summary:`` block, the last
+    #: ``{'eval_loss': ...}`` line) is often flushed *after* the agent has
+    #: already logged "Cleaning up finished run". Without somewhere to put
+    #: those lines the trial stays unscored forever.
+    self._last_finished: Optional[TrialRecord] = None
     self._reading_params = False
     self._metric_re = self._build_metric_re(self.metric_name)
 
@@ -487,19 +514,30 @@ class SweepProgressParser:
       self._finish_trial(trial.run_id)
       return trial
 
-    if self._active is None:
-      return None
-
     # A metric can be logged by the training script long after the config
     # block ended, so it is checked before the (block-scoped) param parsing.
-    if self._metric_re is not None:
-      metric_match = self._metric_re.search(text)
-      if metric_match:
+    metric_match = (
+        self._metric_re.search(text) if self._metric_re is not None else None
+    )
+    if metric_match:
+      target = self._active
+      if target is None:
+        # Late arrival: the child's buffered tail drained after the agent
+        # announced the cleanup. Score the trial it belongs to, but never
+        # overwrite a value that trial already reported - a number seen after
+        # the boundary is only trustworthy as a first observation.
+        target = self._last_finished
+        if target is not None and target.metric is not None:
+          target = None
+      if target is not None:
         try:
-          self._active.metric = float(metric_match.group(1))
-          return self._active
+          target.metric = float(metric_match.group(1))
+          return target
         except ValueError:
           pass
+
+    if self._active is None:
+      return None
 
     param_match = _PARAM_RE.match(text)
     if param_match:
@@ -592,6 +630,7 @@ class SweepProgressParser:
     trial.state = state
     trial.finished_at = time.time()
     self._reading_params = False
+    self._last_finished = trial
     if self._active is trial:
       self._active = None
     return trial
