@@ -338,6 +338,83 @@ class SweepController:
     except Exception as e:
       logger.warning("Could not stop sweep via CLI: %s", e)
 
+  def resume_sweep(self, sweep_id: str) -> bool:
+    """Reactivates a sweep that was sealed, so agents are accepted again.
+
+    The counterpart of :meth:`stop_sweep`. Aborting a campaign seals its
+    sweep; without this, the next resume hands a stopped sweep to
+    ``wandb agent`` and dies with "Sweep <id> is not running" while the
+    trials it already paid for sit there, reachable but unusable.
+
+    Args:
+      sweep_id: Sweep id in any accepted shape.
+
+    Returns:
+      True when the sweep is believed to be accepting agents afterwards.
+      False when it could not be reactivated - the caller should say so
+      rather than launch an agent that is certain to fail.
+    """
+    if self.dry_run:
+      logger.info("[DRY-RUN] Resumed sweep: %s", sweep_id)
+      return True
+
+    full_sweep_id = self.qualify_sweep_id(sweep_id)
+    try:
+      completed = subprocess.run(
+          ["wandb", "sweep", "--resume", full_sweep_id],
+          check=False,
+          capture_output=True,
+          timeout=30,
+      )
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      logger.warning("Could not resume sweep %s: %s", full_sweep_id, e)
+      return False
+
+    if completed.returncode == 0:
+      logger.info("Resumed sweep %s", full_sweep_id)
+      return True
+
+    logger.warning(
+        "wandb sweep --resume %s exited %d: %s",
+        full_sweep_id,
+        completed.returncode,
+        (completed.stderr or b"").decode("utf-8", "replace").strip(),
+    )
+    return False
+
+  def sweep_is_running(self, sweep_id: str) -> Optional[bool]:
+    """Checks whether a sweep is in a state that accepts new agents.
+
+    Existence is not enough: a stopped or finished sweep is still fetchable
+    through the API but rejects every agent.
+
+    Args:
+      sweep_id: Sweep id in any accepted shape.
+
+    Returns:
+      True when the sweep accepts agents, False when it positively does
+      not, and None when the state could not be determined.
+    """
+    if not sweep_id:
+      return False
+    if self.dry_run:
+      return True
+
+    try:
+      import wandb  # pylint: disable=g-import-not-at-top
+
+      api = wandb.Api()
+      sweep = api.sweep(self.qualify_sweep_id(sweep_id))
+      state = str(getattr(sweep, "state", "") or "").lower()
+      if not state:
+        return None
+      # W&B reports PENDING/RUNNING for live sweeps and
+      # STOPPED/FINISHED/CANCELED/CRASHED for sealed ones.
+      return state in ("running", "pending")
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      logger.warning("Could not read state of sweep %s: %s", sweep_id, e)
+      return None
+
   def fetch_best_run(
       self,
       sweep_id: str,

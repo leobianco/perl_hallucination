@@ -319,6 +319,28 @@ class BaseStage(abc.ABC):
               "risking the loss of completed trials.",
               previous.sweep_id,
           )
+        # Existing is not the same as usable. Aborting a campaign seals its
+        # sweep (stop_sweep), and a sealed sweep still resolves through the
+        # API but rejects every agent with "Sweep <id> is not running".
+        # Reactivate it, because its finished trials are exactly what this
+        # resume is trying to keep.
+        if self.sweep_controller.sweep_is_running(previous.sweep_id) is False:
+          reactivated = self.sweep_controller.resume_sweep(previous.sweep_id)
+          notice = (
+              f"{self.name.upper()} sweep {previous.sweep_id} was stopped; "
+              + (
+                  "reactivated it."
+                  if reactivated
+                  else "it could NOT be reactivated automatically. Resume it "
+                  "in the W&B UI (or `wandb sweep --resume "
+                  f"{previous.sweep_id}`) and run this command again."
+              )
+          )
+          logger.warning(notice)
+          if live_line_callback:
+            live_line_callback(
+                notice if reactivated else f"[WARNING] {notice}"
+            )
         message = (
             f"Resuming existing {self.name.upper()} sweep "
             f"{previous.sweep_id}{name_hint} instead of starting a new one."

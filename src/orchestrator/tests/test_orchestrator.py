@@ -171,6 +171,64 @@ class TestResumeBudget(unittest.TestCase):
     self.assertTrue(any("6/10" in line and "4" in line for line in lines))
 
 
+class TestSealedSweepIsReactivated(unittest.TestCase):
+  """Aborting a campaign seals its sweep; resuming has to unseal it.
+
+  A sealed sweep still resolves through the W&B API, so an existence check
+  alone says "reuse it" and the agent then dies with "Sweep <id> is not
+  running" - while the trials already paid for sit there, unusable.
+  """
+
+  def make_stage(self, running, resume_ok=True):
+    config = CampaignConfig.create_default(
+        task_name="npov", sft_runs=10, dry_run=True
+    )
+    controller = mock.MagicMock()
+    controller.sweep_exists.return_value = True
+    controller.sweep_is_running.return_value = running
+    controller.resume_sweep.return_value = resume_ok
+    state = CampaignState(campaign_id="c", task_name="npov")
+    state.mark_stage_running("sft")
+    state.stages["sft"].sweep_id = "sweep-abc"
+    context = CampaignContext(
+        config=config,
+        state=state,
+        sweep_controller=controller,
+        model_manager=mock.MagicMock(),
+    )
+    return SftStage(context), controller
+
+  def test_a_stopped_sweep_is_reactivated_before_reuse(self):
+    stage, controller = self.make_stage(running=False)
+    lines = []
+    sweep_id = stage.resolve_sweep_id({"program": "x"}, lines.append)
+    self.assertEqual(sweep_id, "sweep-abc")
+    controller.resume_sweep.assert_called_once_with("sweep-abc")
+    controller.create_sweep.assert_not_called()
+    self.assertTrue(any("reactivated" in line for line in lines))
+
+  def test_a_live_sweep_is_left_alone(self):
+    stage, controller = self.make_stage(running=True)
+    stage.resolve_sweep_id({"program": "x"})
+    controller.resume_sweep.assert_not_called()
+
+  def test_an_unknown_state_is_left_alone(self):
+    # Never poke a sweep whose state could not be read; the agent launch is
+    # a cheaper way to find out than a wrong guess.
+    stage, controller = self.make_stage(running=None)
+    stage.resolve_sweep_id({"program": "x"})
+    controller.resume_sweep.assert_not_called()
+
+  def test_a_failed_reactivation_tells_the_user_what_to_do(self):
+    stage, _ = self.make_stage(running=False, resume_ok=False)
+    lines = []
+    stage.resolve_sweep_id({"program": "x"}, lines.append)
+    self.assertTrue(
+        any("wandb sweep --resume" in line for line in lines),
+        f"no actionable remedy in {lines}",
+    )
+
+
 class TestSweepController(unittest.TestCase):
   """Tests for sweep registration, bounded execution, and best-run query in dry-run mode."""
 
