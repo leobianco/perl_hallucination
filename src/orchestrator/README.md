@@ -207,6 +207,11 @@ quietly cost you one point of your hyperparameter search.
 Progress, sweep id and best-so-far survive a resume; only the *verdict* of the
 failed attempt is discarded.
 
+Both panes derive the counter from the same baseline, which the engine
+establishes once per stage attempt and ships with the `STAGE_STARTED` event.
+If the launching pane and `status --watch` ever disagree about the trial
+count, that is a bug worth reporting - they are no longer allowed to.
+
 
 ### 7. Monitoring from a second tmux pane
 ```bash

@@ -90,6 +90,10 @@ class DashboardModel:
     self._pending: Deque[Tuple[float, Optional[str], str]] = collections.deque()
     self._parsers: Dict[str, SweepProgressParser] = {}
     self._live: Dict[str, Dict[str, Any]] = {}
+    #: Trials each stage had already completed before this process started,
+    #: as reported by the engine. The parsers above count only the current
+    #: agent, so every number they produce has to be offset by this.
+    self._baselines: Dict[str, int] = {}
 
   # --- Event ingestion ------------------------------------------------
   def on_event(self, event: CampaignEvent) -> None:
@@ -105,13 +109,18 @@ class DashboardModel:
             max_trials=int(event.payload.get("max_runs") or 0),
         )
         self._parsers[stage] = parser
+        # This parser sees only the agent *this* process launches. On a
+        # resume the sweep already has trials, and the engine says how many.
+        self._baselines[stage] = int(event.payload.get("trials_baseline") or 0)
         self._live.setdefault(stage, {})["status"] = "RUNNING"
       elif event.type == EventType.TRIAL_FINISHED:
         stage = event.stage or self.current_stage or ""
         live = self._live.setdefault(stage, {})
-        live["trials_done"] = int(
-            event.payload.get("index", live.get("trials_done", 0) + 1)
-        )
+        index = event.payload.get("index")
+        if index is None:
+          live["trials_done"] = live.get("trials_done", 0) + 1
+        else:
+          live["trials_done"] = self._baselines.get(stage, 0) + int(index)
         metric = event.payload.get("metric")
         if metric is not None:
           self._record_metric(stage, float(metric))
@@ -151,7 +160,10 @@ class DashboardModel:
     if parser is not None and event.type == EventType.LOG:
       parser.feed(event.message)
       live = self._live.setdefault(stage or "", {})
-      done = parser.completed_count
+      # `live` overrides the persisted counter in build_stage_views, so a
+      # bare in-process count here would *hide* the recovered trials rather
+      # than add to them.
+      done = self._baselines.get(stage or "", 0) + parser.completed_count
       if done:
         live["trials_done"] = done
       if parser.max_trials:

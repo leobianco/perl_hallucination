@@ -113,6 +113,10 @@ class CampaignEngine:
     self._progress_parsers: Dict[str, Any] = {}
     self._progress_lock = threading.Lock()
     self._progress_saved_at = 0.0
+    #: Trials each stage had already completed when this process took over.
+    #: Cached because every consumer of the counter has to agree on it, and
+    #: establishing it costs a W&B round trip.
+    self._resume_baselines: Dict[str, int] = {}
 
     # Context shared across all stages
     self.context = CampaignContext(
@@ -155,6 +159,21 @@ class CampaignEngine:
 
     Returns:
       Number of trials to add to the new agent's own count. Never negative.
+    """
+    if stage_name in self._resume_baselines:
+      return self._resume_baselines[stage_name]
+    baseline = self._compute_resume_baseline(stage_name)
+    self._resume_baselines[stage_name] = baseline
+    return baseline
+
+  def _compute_resume_baseline(self, stage_name: str) -> int:
+    """Establishes the resume baseline; see :meth:`_resume_baseline`.
+
+    Args:
+      stage_name: Stage about to run.
+
+    Returns:
+      Trials already completed, from the state file or W&B.
     """
     previous = self.state.stages.get(stage_name)
     baseline = int(getattr(previous, "trials_done", 0) or 0)
@@ -339,12 +358,26 @@ class CampaignEngine:
       raise ValueError(f"Unknown stage name: {stage_name}")
 
   def _stage_payload(self, stage_name: str) -> Dict[str, Any]:
-    """Metadata describing a stage, published with ``STAGE_STARTED``."""
+    """Metadata describing a stage, published with ``STAGE_STARTED``.
+
+    ``trials_baseline`` travels with the event because the dashboard builds
+    its *own* parser from this payload, and that parser counts only what the
+    current agent process does. Without the offset the pane would show the
+    recovered ``06/10`` until the first new trial landed and then drop to
+    ``01/10`` - the resumed sweep looking like it had thrown the work away.
+
+    Args:
+      stage_name: Stage being described.
+
+    Returns:
+      Payload dictionary for the event bus.
+    """
     stage_cfg = getattr(self.config, stage_name, None)
     return {
         "metric": getattr(stage_cfg, "metric", None),
         "goal": getattr(stage_cfg, "goal", None),
         "max_runs": getattr(stage_cfg, "max_runs", 0),
+        "trials_baseline": self._resume_baseline(stage_name),
     }
 
   def run(self) -> Dict[str, Any]:
@@ -418,6 +451,10 @@ class CampaignEngine:
           break
 
         self._warn_on_low_disk(stage_name)
+        # The baseline belongs to a stage *attempt*. Dropping it here means a
+        # stage re-entered within one process re-establishes it instead of
+        # reusing an offset that is now too low.
+        self._resume_baselines.pop(stage_name, None)
         self.state.mark_stage_running(stage_name)
         self.state.save(self.state_path)
         started = time.time()

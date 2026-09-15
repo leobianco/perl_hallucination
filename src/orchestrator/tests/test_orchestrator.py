@@ -300,6 +300,35 @@ class TestResumeBaseline(unittest.TestCase):
     self.assertEqual(engine._resume_baseline("sft"), 0)
     engine.sweep_controller.count_finished_runs.assert_not_called()
 
+  def test_every_sweep_stage_publishes_its_baseline(self):
+    # The dashboard builds its own parser from this payload, so the offset
+    # has to reach it for RM and PE-RL exactly as it does for SFT.
+    for stage in ("sft", "rm", "perl"):
+      with self.subTest(stage=stage):
+        config = CampaignConfig.create_default(task_name="npov", dry_run=True)
+        state = CampaignState(campaign_id="c", task_name="npov")
+        state.mark_stage_running(stage)
+        state.stages[stage].sweep_id = f"sweep-{stage}"
+        state.stages[stage].trials_done = 6
+        engine = CampaignEngine(config=config, state=state)
+        engine.sweep_controller = mock.MagicMock()
+        engine.sweep_controller.count_finished_runs.return_value = 6
+
+        payload = engine._stage_payload(stage)
+
+        self.assertEqual(payload["trials_baseline"], 6)
+
+  def test_the_baseline_is_established_once_per_stage(self):
+    # Every consumer must see the same number, and each lookup is a W&B
+    # round trip.
+    engine = self.make_engine(persisted=0, counted=6)
+    for _ in range(4):
+      engine._resume_baseline("sft")
+    engine._stage_payload("sft")
+    self.assertEqual(
+        engine.sweep_controller.count_finished_runs.call_count, 1
+    )
+
 
 class TestStaleErrorIsCleared(unittest.TestCase):
   """A resumed stage must not wear the previous attempt's failure."""
@@ -741,12 +770,18 @@ class TestProgressIsMirroredToDisk(unittest.TestCase):
   def test_a_resumed_stage_does_not_restart_the_counter(self):
     # A resumed stage spawns a fresh agent counting from zero. The pane must
     # not appear to lose the trials a previous attempt already paid for.
+    # A resume is a new *process*, so this builds a second engine over the
+    # same state file rather than a second sink on the same engine.
     self.feed(AGENT_TRANSCRIPT)
     self.assertEqual(self.reload().trials_done, 2)
-    resumed = self.engine._stage_line_callback("sft")  # pylint: disable=protected-access
+
+    resumed_engine = CampaignEngine(config=self.config)
+    resumed = resumed_engine._stage_line_callback("sft")  # pylint: disable=protected-access
     for line in AGENT_TRANSCRIPT[:7]:
       resumed(line)
-    self.assertEqual(self.reload().trials_done, 3)
+
+    reloaded = CampaignState.load(resumed_engine.state_path).stages["sft"]
+    self.assertEqual(reloaded.trials_done, 3)
 
   def test_tracking_never_breaks_the_log_stream(self):
     # The progress mirror is cosmetic; if it explodes, the campaign and its

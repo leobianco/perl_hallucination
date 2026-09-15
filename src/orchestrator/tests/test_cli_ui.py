@@ -1110,6 +1110,88 @@ class DashboardModelTest(unittest.TestCase):
     self.assertEqual(len(self.model.drain_pending_logs(limit=1000)), 400)
 
 
+class ResumedCounterTest(unittest.TestCase):
+  """The launching pane must not undo the resume baseline.
+
+  Reported symptom: a resumed sweep showed the recovered `06/10`, then as
+  soon as the new agent finished a trial the counter "reset" and climbed
+  from `01/10`, making it look like the sweep had restarted from scratch and
+  was running extra trials. The dashboard's parser only sees the agent this
+  process launched, and `live` overrides the persisted counter.
+  """
+
+  def setUp(self):
+    self.config = CampaignConfig.create_default(task_name="npov", sft_runs=10)
+    self.state = make_state()
+    self.model = dashboard_mod.DashboardModel(self.config, self.state)
+
+  def start(self, stage="sft", baseline=6, max_runs=10):
+    self.model.on_event(
+        event(
+            events_mod.EventType.STAGE_STARTED,
+            stage=stage,
+            metric="eval/loss",
+            max_runs=max_runs,
+            trials_baseline=baseline,
+        )
+    )
+
+  def feed(self, line, stage="sft"):
+    self.model.on_event(events_mod.CampaignEvent(
+        type=events_mod.EventType.LOG, stage=stage, message=line, payload={}
+    ))
+
+  def trials_done(self, stage="sft"):
+    return {v.key: v for v in self.model.stage_views()}[stage].trials_done
+
+  def test_a_new_trial_adds_to_the_recovered_count(self):
+    self.start(baseline=6)
+    self.feed("wandb: Agent Starting Run: newrun01 with config:")
+    self.feed(
+        "2026-09-15 11:45:10,000 - wandb.wandb_agent - INFO - Cleaning up"
+        " finished run: newrun01"
+    )
+    self.assertEqual(self.trials_done(), 7)
+
+  def test_the_counter_never_goes_below_the_baseline(self):
+    self.start(baseline=6)
+    seen = []
+    for index in range(1, 5):
+      self.feed(f"wandb: Agent Starting Run: run{index} with config:")
+      seen.append(self.trials_done())
+      self.feed(
+          "2026-09-15 11:45:10,000 - wandb.wandb_agent - INFO - Cleaning up"
+          f" finished run: run{index}"
+      )
+      seen.append(self.trials_done())
+    self.assertTrue(
+        all(value >= 6 for value in seen), f"counter dipped below 6: {seen}"
+    )
+    # Six recovered plus the four this agent ran.
+    self.assertEqual(self.trials_done(), 10)
+
+  def test_a_fresh_stage_is_unaffected(self):
+    self.start(baseline=0)
+    self.feed("wandb: Agent Starting Run: run1 with config:")
+    self.feed(
+        "2026-09-15 11:45:10,000 - wandb.wandb_agent - INFO - Cleaning up"
+        " finished run: run1"
+    )
+    self.assertEqual(self.trials_done(), 1)
+
+  def test_a_payload_without_a_baseline_still_works(self):
+    # Older engines, and the plain renderer's synthetic events.
+    self.model.on_event(
+        event(events_mod.EventType.STAGE_STARTED, stage="sft", max_runs=10)
+    )
+    self.feed("wandb: Agent Starting Run: run1 with config:")
+    self.feed(
+        "2026-09-15 11:45:10,000 - wandb.wandb_agent - INFO - Cleaning up"
+        " finished run: run1"
+    )
+    self.assertEqual(self.trials_done(), 1)
+
+
 class HotkeyTest(unittest.TestCase):
   """Keyboard semantics, decoupled from any terminal."""
 
