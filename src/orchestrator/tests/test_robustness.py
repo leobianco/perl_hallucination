@@ -11,6 +11,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 from src.orchestrator import model_manager as model_manager_mod
 from src.orchestrator.cli import events as events_mod
@@ -229,6 +230,159 @@ class TestSweepResumption(unittest.TestCase):
       )
       self.assertEqual(keys, {"learning_rate", "lora_r"})
       self.assertEqual(stage.tunable_keys({}), set())
+
+
+class _VanishingSweepController(_FakeSweepController):
+  """Controller whose recorded sweep is reported missing or unverifiable."""
+
+  def __init__(self, exists):
+    super().__init__()
+    self._exists = exists
+    self.existence_checks = []
+
+  def sweep_exists(self, sweep_id):
+    self.existence_checks.append(sweep_id)
+    return self._exists
+
+
+class TestDeletedSweepRecovery(unittest.TestCase):
+  """A sweep deleted from the W&B UI must not wedge the next run.
+
+  The state file keeps pointing at the old sweep id, so resuming used to
+  hand a dead id to ``wandb agent`` and fail the campaign. There is nothing
+  to salvage in that situation: registering a new sweep is the only useful
+  behaviour.
+  """
+
+  def _stage(self, temp_dir, state, exists):
+    config = CampaignConfig.create_default(task_name="bosch", dry_run=True)
+    controller = _VanishingSweepController(exists)
+    context = CampaignContext(
+        config=config,
+        state=state,
+        sweep_controller=controller,
+        model_manager=ModelManager(user="leobianco", dry_run=True),
+        state_path=os.path.join(temp_dir, "state.json"),
+    )
+    return _ProbeStage(context), controller, context
+
+  def _running_state(self):
+    state = CampaignState(campaign_id="c", task_name="bosch")
+    state.stages["sft"] = StageResult(
+        status=StageStatus.RUNNING,
+        sweep_id="deleted_sweep_42",
+        sweep_name="BOSCH gemma-4-E2B-it SFT Sweep #1",
+    )
+    return state
+
+  def test_deleted_sweep_triggers_a_fresh_registration(self):
+    with tempfile.TemporaryDirectory() as temp_dir:
+      state = self._running_state()
+      stage, controller, _ = self._stage(temp_dir, state, exists=False)
+
+      sweep_id = stage.resolve_sweep_id({"parameters": {}})
+
+      self.assertEqual(controller.existence_checks, ["deleted_sweep_42"])
+      self.assertEqual(sweep_id, "new_sweep_1")
+      self.assertEqual(controller.created, 1)
+
+  def test_deleted_sweep_warns_the_operator(self):
+    with tempfile.TemporaryDirectory() as temp_dir:
+      state = self._running_state()
+      stage, _, _ = self._stage(temp_dir, state, exists=False)
+      lines = []
+
+      stage.resolve_sweep_id({"parameters": {}}, live_line_callback=lines.append)
+
+      self.assertTrue(
+          any("no longer exists" in line for line in lines),
+          f"expected a warning about the missing sweep, got {lines}",
+      )
+
+  def test_stale_pointer_is_cleared_from_disk(self):
+    with tempfile.TemporaryDirectory() as temp_dir:
+      state = self._running_state()
+      stage, _, context = self._stage(temp_dir, state, exists=False)
+
+      sweep_id = stage.resolve_sweep_id({"parameters": {}})
+
+      with open(context.state_path, "r", encoding="utf-8") as f:
+        persisted = json.load(f)
+      self.assertEqual(persisted["stages"]["sft"]["sweep_id"], sweep_id)
+      self.assertNotEqual(
+          persisted["stages"]["sft"]["sweep_id"], "deleted_sweep_42"
+      )
+
+  def test_unverifiable_sweep_is_kept(self):
+    # W&B unreachable: discarding the sweep would throw away paid-for
+    # trials, so the recorded id must survive.
+    with tempfile.TemporaryDirectory() as temp_dir:
+      state = self._running_state()
+      stage, controller, _ = self._stage(temp_dir, state, exists=None)
+
+      sweep_id = stage.resolve_sweep_id({"parameters": {}})
+
+      self.assertEqual(sweep_id, "deleted_sweep_42")
+      self.assertEqual(controller.created, 0)
+
+  def test_live_sweep_is_still_reused(self):
+    with tempfile.TemporaryDirectory() as temp_dir:
+      state = self._running_state()
+      stage, controller, _ = self._stage(temp_dir, state, exists=True)
+
+      sweep_id = stage.resolve_sweep_id({"parameters": {}})
+
+      self.assertEqual(sweep_id, "deleted_sweep_42")
+      self.assertEqual(controller.created, 0)
+
+
+class TestSweepExistenceProbe(unittest.TestCase):
+  """``sweep_exists`` must tell 'deleted' apart from 'cannot reach W&B'."""
+
+  def _controller_raising(self, exc):
+    controller = SweepController(entity="e", project="p", dry_run=False)
+    fake_wandb = types.ModuleType("wandb")
+
+    class _Api:
+
+      def sweep(self, _sweep_id):
+        raise exc
+
+    fake_wandb.Api = _Api
+    self.enterContext(mock.patch.dict(sys.modules, {"wandb": fake_wandb}))
+    return controller
+
+  def test_missing_sweep_reports_false(self):
+    controller = self._controller_raising(
+        ValueError("Could not find sweep e/p/gone123")
+    )
+    self.assertIs(controller.sweep_exists("gone123"), False)
+
+  def test_http_404_reports_false(self):
+    controller = self._controller_raising(RuntimeError("404 Client Error"))
+    self.assertIs(controller.sweep_exists("gone123"), False)
+
+  def test_transient_error_reports_unknown(self):
+    controller = self._controller_raising(
+        ConnectionError("503 Service Unavailable")
+    )
+    self.assertIsNone(controller.sweep_exists("maybe123"))
+
+  def test_dry_run_short_circuits(self):
+    controller = SweepController(entity="e", project="p", dry_run=True)
+    self.assertIs(controller.sweep_exists("anything"), True)
+
+  def test_empty_id_is_missing(self):
+    controller = SweepController(entity="e", project="p", dry_run=True)
+    self.assertIs(controller.sweep_exists(""), False)
+
+  def test_qualify_sweep_id_expands_short_forms(self):
+    controller = SweepController(entity="e", project="p", dry_run=True)
+    self.assertEqual(controller.qualify_sweep_id("abc"), "e/p/abc")
+    self.assertEqual(controller.qualify_sweep_id("proj/abc"), "e/proj/abc")
+    self.assertEqual(
+        controller.qualify_sweep_id("ent/proj/abc"), "ent/proj/abc"
+    )
 
 
 class _FakeRun:

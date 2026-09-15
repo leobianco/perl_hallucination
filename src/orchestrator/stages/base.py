@@ -226,6 +226,14 @@ class BaseStage(abc.ABC):
     for this stage and the stage never completed, the agent is pointed back at
     that sweep instead.
 
+    The recorded sweep is verified first. A sweep deleted from the W&B UI
+    between two runs would otherwise be handed to ``wandb agent``, which
+    fails the whole campaign with a confusing "sweep not found" - even
+    though there is nothing to salvage and a new sweep is exactly what the
+    user wants. Verification is tri-state on purpose: when W&B cannot be
+    reached the sweep is *kept*, because abandoning a live sweep on a
+    transient error is far more expensive than a failed agent launch.
+
     Args:
       sweep_dict: Sweep configuration to register when there is nothing to
         resume.
@@ -241,14 +249,39 @@ class BaseStage(abc.ABC):
         and previous.status != StageStatus.COMPLETED
     ):
       name_hint = f" ({previous.sweep_name})" if previous.sweep_name else ""
-      message = (
-          f"Resuming existing {self.name.upper()} sweep "
-          f"{previous.sweep_id}{name_hint} instead of starting a new one."
-      )
-      logger.info(message)
-      if live_line_callback:
-        live_line_callback(message)
-      return previous.sweep_id
+      still_exists = self.sweep_controller.sweep_exists(previous.sweep_id)
+      if still_exists is False:
+        message = (
+            f"Recorded {self.name.upper()} sweep {previous.sweep_id}"
+            f"{name_hint} no longer exists on W&B (deleted?). "
+            "Registering a new sweep."
+        )
+        logger.warning(message)
+        if live_line_callback:
+          live_line_callback(f"[WARNING] {message}")
+        # Drop the stale pointer so a later crash does not resurrect it.
+        previous.sweep_id = None
+        previous.sweep_name = None
+        if self.context.state_path:
+          try:
+            self.state.save(self.context.state_path)
+          except OSError as exc:
+            logger.warning("Could not persist cleared sweep id: %s", exc)
+      else:
+        if still_exists is None:
+          logger.warning(
+              "Could not confirm sweep %s exists; reusing it rather than "
+              "risking the loss of completed trials.",
+              previous.sweep_id,
+          )
+        message = (
+            f"Resuming existing {self.name.upper()} sweep "
+            f"{previous.sweep_id}{name_hint} instead of starting a new one."
+        )
+        logger.info(message)
+        if live_line_callback:
+          live_line_callback(message)
+        return previous.sweep_id
 
     # If sweep_dict doesn't already have a descriptive name, generate one
     if not sweep_dict.get("name"):

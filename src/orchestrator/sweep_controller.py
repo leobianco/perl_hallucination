@@ -200,6 +200,70 @@ class SweepController:
     return 0 if outcome.cut_short else outcome.returncode
 
 
+  def qualify_sweep_id(self, sweep_id: str) -> str:
+    """Expands a bare or half-qualified sweep id into ``entity/project/id``.
+
+    Args:
+      sweep_id: Sweep id in any of the accepted shapes.
+
+    Returns:
+      The fully qualified sweep path.
+    """
+    entity = self.resolve_entity()
+    full_sweep_id = str(sweep_id).strip()
+    parts = full_sweep_id.split("/")
+    if len(parts) == 1:
+      return f"{entity}/{self.project}/{parts[0]}"
+    if len(parts) == 2:
+      return f"{entity}/{parts[0]}/{parts[1]}"
+    return full_sweep_id
+
+  def sweep_exists(self, sweep_id: str) -> Optional[bool]:
+    """Checks whether ``sweep_id`` is still present on the W&B backend.
+
+    Deliberately tri-state. A resume must distinguish "the sweep was
+    deleted" (safe to register a fresh one) from "W&B is unreachable right
+    now" - discarding a live sweep on a transient network blip would throw
+    away every trial it has already paid for.
+
+    Args:
+      sweep_id: Sweep id in any accepted shape.
+
+    Returns:
+      True when the sweep is present, False when the backend positively
+      reports it missing, and None when existence could not be determined.
+    """
+    if not sweep_id:
+      return False
+    if self.dry_run:
+      return True
+
+    full_sweep_id = self.qualify_sweep_id(sweep_id)
+    try:
+      import wandb  # pylint: disable=g-import-not-at-top
+
+      api = wandb.Api()
+      sweep = api.sweep(full_sweep_id)
+      return sweep is not None
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      text = f"{type(e).__name__}: {e}".lower()
+      missing_hints = (
+          "could not find sweep",
+          "not found",
+          "does not exist",
+          "no sweep",
+          "404",
+      )
+      if any(hint in text for hint in missing_hints):
+        logger.info("Sweep %s no longer exists on W&B: %s", full_sweep_id, e)
+        return False
+      logger.warning(
+          "Could not verify whether sweep %s still exists: %s",
+          full_sweep_id,
+          e,
+      )
+      return None
+
   def stop_sweep(self, sweep_id: str) -> None:
     """Closes and seals a sweep on the W&B backend, transitioning state to STOPPED."""
     if self.dry_run:
