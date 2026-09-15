@@ -166,6 +166,16 @@ class PerlStage(BaseStage):
     if live_line_callback:
       live_line_callback(f"Best PE-RL Run: {best_run_id} ({target_metric}={best_val:.5f})")
 
+    # Make the winner findable in the W&B web UI. Best-effort by design.
+    self.sweep_controller.mark_best_run(
+        sweep_id=sweep_id,
+        run_id=best_run_id,
+        stage_name="perl",
+        metric_name=target_metric,
+        metric_value=best_val,
+        live_line_callback=live_line_callback,
+    )
+
     # 4. Materialize and Push to Hugging Face Hub
     # NOTE: the sweep-agent predicate is deliberately *not* reused here; see
     # BaseStage.materialization_stop_callback.

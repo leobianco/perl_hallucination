@@ -13,6 +13,8 @@ from src.orchestrator.engine import CampaignEngine
 from src.orchestrator.model_manager import ModelManager
 from src.orchestrator.reporter import CampaignReporter
 from src.orchestrator.stages.base import CampaignContext
+from src.orchestrator.stages.perl_stage import PerlStage
+from src.orchestrator.stages.rm_stage import RmStage
 from src.orchestrator.stages.sft_stage import SftStage
 from src.orchestrator.state import CampaignState
 from src.orchestrator.state import StageResult
@@ -328,6 +330,134 @@ class TestResumeBaseline(unittest.TestCase):
     self.assertEqual(
         engine.sweep_controller.count_finished_runs.call_count, 1
     )
+
+
+class TestBestRunIsTagged(unittest.TestCase):
+  """The winner is tagged in W&B so it is findable in the web UI."""
+
+  def _sweep_with(self, runs):
+    fake_wandb = mock.MagicMock()
+    fake_sweep = mock.MagicMock()
+    fake_sweep.runs = runs
+    fake_wandb.Api.return_value.sweep.return_value = fake_sweep
+    return fake_wandb
+
+  def _run(self, run_id, tags=()):
+    run = mock.MagicMock()
+    run.id = run_id
+    run.tags = list(tags)
+    return run
+
+  def test_the_winner_gets_both_tags_and_a_note(self):
+    winner = self._run("win1")
+    fake_wandb = self._sweep_with([winner, self._run("other")])
+    with mock.patch.dict("sys.modules", {"wandb": fake_wandb}):
+      ctrl = SweepController(entity="e", project="p", dry_run=False)
+      ok = ctrl.mark_best_run(
+          sweep_id="s", run_id="win1", stage_name="rm",
+          metric_name="eval/roc_auc", metric_value=0.8812,
+      )
+    self.assertTrue(ok)
+    self.assertEqual(winner.tags, ["best", "best-rm"])
+    self.assertIn("eval/roc_auc=0.88120", winner.notes)
+    winner.update.assert_called_once()
+
+  def test_the_previous_winner_is_demoted(self):
+    # Otherwise a re-run leaves a pile of runs all claiming to be best.
+    old = self._run("old1", tags=["best", "best-sft", "keep-me"])
+    winner = self._run("new1")
+    fake_wandb = self._sweep_with([old, winner])
+    with mock.patch.dict("sys.modules", {"wandb": fake_wandb}):
+      ctrl = SweepController(entity="e", project="p", dry_run=False)
+      ctrl.mark_best_run(
+          sweep_id="s", run_id="new1", stage_name="sft",
+          metric_name="eval/loss", metric_value=0.3,
+      )
+    # Unrelated tags on the demoted run are left alone.
+    self.assertEqual(old.tags, ["keep-me"])
+    old.update.assert_called_once()
+    self.assertEqual(winner.tags, ["best", "best-sft"])
+
+  def test_an_untouched_run_is_not_rewritten(self):
+    # One API write per changed run; a 30-trial sweep must not issue 30.
+    bystander = self._run("other", tags=["something"])
+    winner = self._run("win1")
+    fake_wandb = self._sweep_with([bystander, winner])
+    with mock.patch.dict("sys.modules", {"wandb": fake_wandb}):
+      ctrl = SweepController(entity="e", project="p", dry_run=False)
+      ctrl.mark_best_run(
+          sweep_id="s", run_id="win1", stage_name="perl",
+          metric_name="train/rewards/reward_fn/mean", metric_value=0.7,
+      )
+    bystander.update.assert_not_called()
+
+  def test_tagging_is_idempotent(self):
+    winner = self._run("win1", tags=["best", "best-sft"])
+    fake_wandb = self._sweep_with([winner])
+    with mock.patch.dict("sys.modules", {"wandb": fake_wandb}):
+      ctrl = SweepController(entity="e", project="p", dry_run=False)
+      ctrl.mark_best_run(
+          sweep_id="s", run_id="win1", stage_name="sft",
+          metric_name="eval/loss", metric_value=0.3,
+      )
+    self.assertEqual(winner.tags, ["best", "best-sft"])
+
+  def test_a_failure_is_reported_but_never_raises(self):
+    # This runs between the sweep and materialization. A cosmetic tag must
+    # not be able to throw away hours of GPU time.
+    fake_wandb = mock.MagicMock()
+    fake_wandb.Api.side_effect = RuntimeError("network is down")
+    lines = []
+    with mock.patch.dict("sys.modules", {"wandb": fake_wandb}):
+      ctrl = SweepController(entity="e", project="p", dry_run=False)
+      ok = ctrl.mark_best_run(
+          sweep_id="s", run_id="win1", stage_name="sft",
+          metric_name="eval/loss", metric_value=0.3,
+          live_line_callback=lines.append,
+      )
+    self.assertFalse(ok)
+    self.assertTrue(any("could not tag" in l.lower() for l in lines), lines)
+
+  def test_a_missing_run_id_is_a_no_op(self):
+    ctrl = SweepController(entity="e", project="p", dry_run=True)
+    self.assertFalse(ctrl.mark_best_run(
+        sweep_id="s", run_id="", stage_name="sft", metric_name="eval/loss"
+    ))
+
+  def test_every_sweep_stage_tags_its_winner(self):
+    for stage_name, stage_cls in (
+        ("sft", SftStage), ("rm", RmStage), ("perl", PerlStage)
+    ):
+      with self.subTest(stage=stage_name):
+        config = CampaignConfig.create_default(task_name="npov", dry_run=True)
+        state = CampaignState(campaign_id="c", task_name="npov")
+        # PE-RL needs its predecessors' artefacts before it will run.
+        for done, repo in (("sft", "u/npov_SFT"), ("rm", "u/npov_RM")):
+          state.record_stage_result(done, StageResult(
+              status=StageStatus.COMPLETED, model_repo_id=repo
+          ))
+        controller = mock.MagicMock()
+        controller.create_sweep.return_value = "sweep-x"
+        controller.sweep_exists.return_value = False
+        # `remaining_runs` lives on the stage; this is what it really calls.
+        controller.count_finished_runs.return_value = 0
+        controller.run_sweep_agent.return_value = 0
+        controller.fetch_best_run.return_value = ("win1", 0.3, {"lora_r": 8})
+        model_manager = mock.MagicMock()
+        model_manager.materialize_and_push.return_value = "u/out"
+        context = CampaignContext(
+            config=config,
+            state=state,
+            sweep_controller=controller,
+            model_manager=model_manager,
+        )
+
+        stage_cls(context).execute()
+
+        controller.mark_best_run.assert_called_once()
+        kwargs = controller.mark_best_run.call_args.kwargs
+        self.assertEqual(kwargs["stage_name"], stage_name)
+        self.assertEqual(kwargs["run_id"], "win1")
 
 
 class TestStaleErrorIsCleared(unittest.TestCase):

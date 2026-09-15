@@ -251,6 +251,32 @@ Three behaviours worth knowing:
 > rather than restarting at zero, because a new `wandb agent` counts only its
 > own trials while the state file tracks the whole stage.
 
+#### Finding the winner in the W&B web UI
+
+When a stage picks its winner, that run is tagged in W&B:
+
+| Tag | Meaning |
+|---|---|
+| `best` | This run won its stage. Filter on it to see every winner in the project. |
+| `best-sft` / `best-rm` / `best-perl` | Which stage it won, since one project holds the sweeps of every stage and task. |
+
+The run's **notes** field is also set to the metric that won it, e.g.
+*"Selected by Auto-PERL as the best SFT trial (eval/loss=0.31042)."*
+
+In the W&B runs table, filter with `tags contains best-sft` to jump straight
+to it. W&B has no literal "pin", so tags are the closest equivalent - and
+unlike renaming the run, they are reversible and lose no information.
+
+If a stage is re-run and a *different* trial wins, the tags are stripped from
+the previous winner first, so exactly one run per sweep is ever tagged. Any
+other tags you added yourself are left untouched.
+
+> [!NOTE]
+> Tagging is cosmetic and deliberately best-effort. It happens between the
+> sweep and the retraining of the winner, so a W&B hiccup there prints a
+> warning and carries on rather than discarding hours of GPU time. Model
+> selection never depends on the tag.
+
 #### Where the "Best" column comes from
 
 The `Best` column - and the metric column of the live leaderboard - is filled

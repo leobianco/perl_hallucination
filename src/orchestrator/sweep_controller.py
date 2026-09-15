@@ -418,6 +418,107 @@ class SweepController:
       logger.warning("Could not read state of sweep %s: %s", sweep_id, e)
       return None
 
+  def mark_best_run(
+      self,
+      sweep_id: str,
+      run_id: str,
+      stage_name: str,
+      metric_name: str,
+      metric_value: Optional[float] = None,
+      live_line_callback: Optional[Callable[[str], None]] = None,
+  ) -> bool:
+    """Tags the winning run so it stands out in the W&B web UI.
+
+    W&B has no "pin" concept, but tags are rendered as chips in the runs
+    table and are filterable, which is the closest thing. Two tags are
+    applied: a generic ``best`` and a stage-qualified ``best-sft`` /
+    ``best-rm`` / ``best-perl``, because one project holds the sweeps of
+    every stage and every task.
+
+    Tags are stripped from any *other* run in the same sweep that still
+    carries them, so a re-run that picks a different winner leaves exactly
+    one tagged run rather than a growing pile of former champions.
+
+    This is cosmetic. It runs after hours of sweeping and immediately before
+    materialization, so it is written to be incapable of failing the stage:
+    every error is swallowed and reported.
+
+    Args:
+      sweep_id: Sweep the run belongs to.
+      run_id: The winning run.
+      stage_name: Stage that produced it, used for the qualified tag.
+      metric_name: Metric the winner was chosen on, recorded in the note.
+      metric_value: Its value, recorded in the note.
+      live_line_callback: Optional sink for a confirmation line.
+
+    Returns:
+      True when the winner was tagged, False when nothing was changed.
+    """
+    if not sweep_id or not run_id:
+      return False
+
+    stage_tag = f"best-{stage_name.lower()}"
+    tags = ("best", stage_tag)
+
+    if self.dry_run:
+      logger.info("[DRY-RUN] Tagged run %s with %s", run_id, list(tags))
+      if live_line_callback:
+        live_line_callback(f"[DRY-RUN] Tagged best run {run_id}: {', '.join(tags)}")
+      return True
+
+    try:
+      import wandb  # pylint: disable=g-import-not-at-top
+
+      api = wandb.Api()
+      sweep = api.sweep(self.qualify_sweep_id(sweep_id))
+
+      demoted = 0
+      winner = None
+      for run in sweep.runs:
+        if run.id == run_id:
+          winner = run
+          continue
+        existing = list(run.tags or [])
+        remaining = [tag for tag in existing if tag not in tags]
+        if len(remaining) != len(existing):
+          run.tags = remaining
+          run.update()
+          demoted += 1
+
+      if winner is None:
+        # The winner came from this very sweep, so this means the listing is
+        # stale rather than that the run is gone. Fetch it directly.
+        winner = api.run(f"{self.resolve_entity()}/{self.project}/{run_id}")
+
+      winner.tags = sorted(set(list(winner.tags or [])) | set(tags))
+      value = "unknown" if metric_value is None else f"{metric_value:.5f}"
+      winner.notes = (
+          f"Selected by Auto-PERL as the best {stage_name.upper()} trial "
+          f"({metric_name}={value})."
+      )
+      winner.update()
+
+      logger.info(
+          "Tagged run %s as %s (%d previous winner(s) untagged)",
+          run_id,
+          stage_tag,
+          demoted,
+      )
+      if live_line_callback:
+        live_line_callback(
+            f"Tagged best run {run_id} in W&B as '{stage_tag}'"
+            + (f"; untagged {demoted} previous winner(s)." if demoted else ".")
+        )
+      return True
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      logger.warning("Could not tag best run %s: %s", run_id, e)
+      if live_line_callback:
+        live_line_callback(
+            f"[WARNING] Could not tag the best run in W&B ({e}). The campaign"
+            " is unaffected; this only changes how the sweep looks in the UI."
+        )
+      return False
+
   def fetch_best_run(
       self,
       sweep_id: str,
