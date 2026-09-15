@@ -118,6 +118,51 @@ class BaseStage(abc.ABC):
     """
     return self.context.abort_requested_callback
 
+  def remaining_runs(
+      self,
+      sweep_id: str,
+      max_runs: int,
+      live_line_callback: Optional[Callable[[str], None]] = None,
+  ) -> int:
+    """Returns how many trials still need to run to reach ``max_runs``.
+
+    ``wandb agent --count N`` bounds a single agent process, not the sweep.
+    Passing the full budget to a resumed stage runs a second full budget on
+    top of the trials already paid for: stopping at 6 of 10 and resuming
+    would produce 16 trials, not 10.
+
+    The count comes from W&B, which is the only party that knows the real
+    total. When it cannot be established the budget is left untouched -
+    overshooting costs GPU hours, but undershooting would silently shrink
+    the search the user asked for.
+
+    Args:
+      sweep_id: The sweep being executed.
+      max_runs: The configured trial budget for the whole stage.
+      live_line_callback: Optional sink for an explanatory line.
+
+    Returns:
+      Trials left to run; 0 when the budget is already spent.
+    """
+    budget = max(0, int(max_runs or 0))
+    done = self.sweep_controller.count_finished_runs(sweep_id)
+    if done is None or done <= 0:
+      return budget
+
+    remaining = max(0, budget - int(done))
+    if live_line_callback:
+      if remaining:
+        live_line_callback(
+            f"Sweep already has {done}/{budget} finished trials; running the"
+            f" remaining {remaining}."
+        )
+      else:
+        live_line_callback(
+            f"Sweep already has {done}/{budget} finished trials; skipping the"
+            " agent and scoring the trials that exist."
+        )
+    return remaining
+
   def get_sweep_descriptor(self, sweep_dict: Dict[str, Any]) -> Tuple[str, str]:
     """Returns (model_short_name, stage_type_string) for this stage.
 

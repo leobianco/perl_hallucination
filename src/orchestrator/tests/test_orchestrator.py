@@ -13,6 +13,7 @@ from src.orchestrator.engine import CampaignEngine
 from src.orchestrator.model_manager import ModelManager
 from src.orchestrator.reporter import CampaignReporter
 from src.orchestrator.stages.base import CampaignContext
+from src.orchestrator.stages.sft_stage import SftStage
 from src.orchestrator.state import CampaignState
 from src.orchestrator.state import StageResult
 from src.orchestrator.state import StageStatus
@@ -118,6 +119,56 @@ class TestOrchestratorState(unittest.TestCase):
     # The authoritative value from the W&B API wins over the parsed one.
     self.assertAlmostEqual(state.stages["sft"].best_metric_val, 0.28)
     self.assertEqual(state.stages["sft"].best_run_id, "run_xyz")
+
+
+class TestResumeBudget(unittest.TestCase):
+  """`wandb agent --count N` bounds an agent, not a sweep.
+
+  Asking a resumed stage for the full `max_runs` runs a second full budget
+  on top of the trials already paid for: stop at 6 of 10, resume, get 16.
+  """
+
+  def make_stage(self, finished):
+    config = CampaignConfig.create_default(
+        task_name="npov", sft_runs=10, dry_run=True
+    )
+    controller = mock.MagicMock()
+    controller.count_finished_runs.return_value = finished
+    context = CampaignContext(
+        config=config,
+        state=CampaignState(campaign_id="c", task_name="npov"),
+        sweep_controller=controller,
+        model_manager=mock.MagicMock(),
+    )
+    return SftStage(context)
+
+  def test_only_the_missing_trials_are_requested(self):
+    stage = self.make_stage(finished=6)
+    self.assertEqual(stage.remaining_runs("sweep1", 10), 4)
+
+  def test_a_spent_budget_requests_nothing(self):
+    stage = self.make_stage(finished=10)
+    self.assertEqual(stage.remaining_runs("sweep1", 10), 0)
+
+  def test_an_overshot_budget_does_not_go_negative(self):
+    stage = self.make_stage(finished=14)
+    self.assertEqual(stage.remaining_runs("sweep1", 10), 0)
+
+  def test_a_fresh_sweep_gets_the_whole_budget(self):
+    stage = self.make_stage(finished=0)
+    self.assertEqual(stage.remaining_runs("sweep1", 10), 10)
+
+  def test_an_unknown_count_never_shrinks_the_search(self):
+    # Overshooting costs GPU hours; undershooting silently gives the user a
+    # smaller hyperparameter search than they asked for. Prefer the former.
+    stage = self.make_stage(finished=None)
+    self.assertEqual(stage.remaining_runs("sweep1", 10), 10)
+
+  def test_the_user_is_told_what_is_being_skipped(self):
+    stage = self.make_stage(finished=6)
+    lines = []
+    stage.remaining_runs("sweep1", 10, lines.append)
+    self.assertTrue(any("6/10" in line and "4" in line for line in lines))
 
 
 class TestSweepController(unittest.TestCase):

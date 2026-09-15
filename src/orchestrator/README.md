@@ -174,6 +174,21 @@ recorded sweep id before reusing it:
 Use `--fresh` when you want to discard the campaign's *results*, not merely
 its sweeps.
 
+#### A resumed sweep only runs the trials it still owes
+
+`max_runs` is a budget for the **whole stage**, not per attempt. Before
+launching an agent, the stage asks W&B how many trials the sweep has already
+finished and requests only the difference:
+
+```
+Sweep already has 6/10 finished trials; running the remaining 4.
+```
+
+If the budget is already spent the agent is skipped entirely and the stage
+goes straight to picking its winner. If W&B cannot be reached the full budget
+is used unchanged - overshooting costs GPU hours, but undershooting would
+silently give you a smaller search than you asked for.
+
 ### 7. Monitoring from a second tmux pane
 ```bash
 python3 scripts/run_campaign.py status --task npov --watch

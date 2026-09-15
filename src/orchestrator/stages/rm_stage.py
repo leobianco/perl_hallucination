@@ -100,19 +100,22 @@ class RmStage(BaseStage):
     if live_line_callback:
       live_line_callback(f"Registered RM Sweep: {sweep_id}{name_str}")
 
-    # 2. Run Sweep Agent with max_runs bound (default: 30)
-    exit_code = self.sweep_controller.run_sweep_agent(
-        sweep_id=sweep_id,
-        max_runs=cfg.max_runs,
-        timeout_minutes=cfg.timeout_minutes,
-        live_line_callback=live_line_callback,
-        stop_requested_callback=stop_requested_callback,
-    )
-    if exit_code != 0 and live_line_callback:
-      live_line_callback(
-          f"[WARNING] RM sweep agent exited with code {exit_code}; scoring "
-          "the trials that did finish."
+    # 2. Run Sweep Agent for the trials still missing from the budget. On a
+    # resume this is fewer than max_runs; see BaseStage.remaining_runs.
+    remaining = self.remaining_runs(sweep_id, cfg.max_runs, live_line_callback)
+    if remaining:
+      exit_code = self.sweep_controller.run_sweep_agent(
+          sweep_id=sweep_id,
+          max_runs=remaining,
+          timeout_minutes=cfg.timeout_minutes,
+          live_line_callback=live_line_callback,
+          stop_requested_callback=stop_requested_callback,
       )
+      if exit_code != 0 and live_line_callback:
+        live_line_callback(
+            f"[WARNING] RM sweep agent exited with code {exit_code}; scoring "
+            "the trials that did finish."
+        )
 
     # 3. Query Best Run (maximizing eval/roc_auc)
     best_run_id, best_val, best_params = self.sweep_controller.fetch_best_run(

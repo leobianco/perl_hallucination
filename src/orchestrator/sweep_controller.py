@@ -264,6 +264,47 @@ class SweepController:
       )
       return None
 
+  def count_finished_runs(self, sweep_id: str) -> Optional[int]:
+    """Counts the trials a sweep has already completed.
+
+    ``wandb agent --count N`` is a budget for *that agent process*, not for
+    the sweep. A resumed stage that asked for the full ``max_runs`` again
+    would happily run a second full budget on top of what it already paid
+    for. W&B is the only place that knows the real total, since trials may
+    also have been run by an agent this campaign never saw.
+
+    Args:
+      sweep_id: Sweep id in any accepted shape.
+
+    Returns:
+      The number of runs in a terminal state, or None when the count could
+      not be established (the caller must then not reduce its budget).
+    """
+    if not sweep_id:
+      return None
+    if self.dry_run:
+      return 0
+
+    try:
+      import wandb  # pylint: disable=g-import-not-at-top
+
+      api = wandb.Api()
+      sweep = api.sweep(self.qualify_sweep_id(sweep_id))
+      # "crashed"/"failed" trials consumed their slot as far as the agent's
+      # --count is concerned, so they count here too. Only "running" and
+      # "pending" do not.
+      return sum(
+          1
+          for run in sweep.runs
+          if str(getattr(run, "state", "")).lower()
+          in ("finished", "failed", "crashed", "killed")
+      )
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      logger.warning(
+          "Could not count finished runs for sweep %s: %s", sweep_id, e
+      )
+      return None
+
   def stop_sweep(self, sweep_id: str) -> None:
     """Closes and seals a sweep on the W&B backend, transitioning state to STOPPED."""
     if self.dry_run:
