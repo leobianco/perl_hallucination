@@ -12,6 +12,7 @@ from src.orchestrator.config import CampaignConfig
 from src.orchestrator.engine import CampaignEngine
 from src.orchestrator.model_manager import ModelManager
 from src.orchestrator.reporter import CampaignReporter
+from src.orchestrator.stages.base import CampaignContext
 from src.orchestrator.state import CampaignState
 from src.orchestrator.state import StageResult
 from src.orchestrator.state import StageStatus
@@ -403,6 +404,113 @@ class TestEngineControls(unittest.TestCase):
         config=self.config, stop_requested_callback=lambda: True
     ).run()
     self.assertEqual(result["status"], "STOPPED")
+
+
+class TestSweepNaming(unittest.TestCase):
+  """Tests for descriptive sweep name generation across SFT, RM, and PE-RL."""
+
+  def test_sft_sweep_name_generation(self):
+    with tempfile.TemporaryDirectory() as temp_dir:
+      config = CampaignConfig.create_default(task_name="bosch", dry_run=True)
+      config.state_file = os.path.join(temp_dir, "bosch_state.json")
+      state = CampaignState(campaign_id="test_camp", task_name="bosch")
+      context = CampaignContext(
+          config=config,
+          state=state,
+          sweep_controller=SweepController(dry_run=True),
+          model_manager=ModelManager(dry_run=True),
+      )
+      from src.orchestrator.stages.sft_stage import SftStage  # pylint: disable=g-import-not-at-top
+
+      stage = SftStage(context)
+      name = stage.generate_sweep_name({"command": []})
+      self.assertEqual(name, "BOSCH gemma-4-E2B-it SFT Sweep #1")
+
+  def test_rm_sweep_name_organic_and_synthetic(self):
+    with tempfile.TemporaryDirectory() as temp_dir:
+      config = CampaignConfig.create_default(task_name="bosch", dry_run=True)
+      config.state_file = os.path.join(temp_dir, "bosch_state.json")
+      state = CampaignState(campaign_id="test_camp", task_name="bosch")
+      context = CampaignContext(
+          config=config,
+          state=state,
+          sweep_controller=SweepController(dry_run=True),
+          model_manager=ModelManager(dry_run=True),
+      )
+      from src.orchestrator.stages.rm_stage import RmStage  # pylint: disable=g-import-not-at-top
+
+      stage = RmStage(context)
+      # Default organic
+      name_org = stage.generate_sweep_name({"command": []})
+      self.assertEqual(name_org, "BOSCH gemma-3-1b-it RM Organic Sweep #1")
+
+      # Synthetic dataset
+      name_synth = stage.generate_sweep_name({
+          "command": ["--dataset_repo_id=leobianco/bosch_rm_synthetic"]
+      })
+      self.assertEqual(name_synth, "BOSCH gemma-3-1b-it RM Synthetic Sweep #1")
+
+  def test_perl_sweep_name_organic_and_synthetic(self):
+    with tempfile.TemporaryDirectory() as temp_dir:
+      config = CampaignConfig.create_default(task_name="npov", dry_run=True)
+      config.state_file = os.path.join(temp_dir, "npov_state.json")
+      state = CampaignState(campaign_id="test_camp", task_name="npov")
+      context = CampaignContext(
+          config=config,
+          state=state,
+          sweep_controller=SweepController(dry_run=True),
+          model_manager=ModelManager(dry_run=True),
+      )
+      from src.orchestrator.stages.perl_stage import PerlStage  # pylint: disable=g-import-not-at-top
+
+      stage = PerlStage(context)
+      name_org = stage.generate_sweep_name({"command": []})
+      self.assertEqual(name_org, "NPOV gemma-4-E2B-it PERL Organic Sweep #1")
+
+      name_synth = stage.generate_sweep_name({
+          "command": ["--reward_model_path=leobianco/npov_RM_synthetic"]
+      })
+      self.assertEqual(name_synth, "NPOV gemma-4-E2B-it PERL Synthetic Sweep #1")
+
+  def test_sweep_number_increments_with_existing_sweeps(self):
+    with tempfile.TemporaryDirectory() as temp_dir:
+      config = CampaignConfig.create_default(task_name="bosch", dry_run=True)
+      config.state_file = os.path.join(temp_dir, "bosch", "camp2_state.json")
+      os.makedirs(os.path.join(temp_dir, "bosch"), exist_ok=True)
+
+      # Create prior state file with an existing SFT sweep
+      prior_state = CampaignState(campaign_id="camp1", task_name="bosch")
+      prior_state.stages["sft"] = StageResult(
+          status=StageStatus.COMPLETED,
+          sweep_id="sweep_sft_prior_1",
+          sweep_name="BOSCH gemma-4-E2B-it SFT Sweep #1",
+      )
+      prior_state.save(os.path.join(temp_dir, "bosch", "camp1_state.json"))
+
+      current_state = CampaignState(campaign_id="camp2", task_name="bosch")
+      context = CampaignContext(
+          config=config,
+          state=current_state,
+          sweep_controller=SweepController(dry_run=True),
+          model_manager=ModelManager(dry_run=True),
+      )
+      from src.orchestrator.stages.sft_stage import SftStage  # pylint: disable=g-import-not-at-top
+
+      stage = SftStage(context)
+      name = stage.generate_sweep_name({"command": []})
+      self.assertEqual(name, "BOSCH gemma-4-E2B-it SFT Sweep #2")
+
+      # Add another state file with Sweep #2 and verify it increments to #3
+      prior_state_2 = CampaignState(campaign_id="camp2_done", task_name="bosch")
+      prior_state_2.stages["sft"] = StageResult(
+          status=StageStatus.COMPLETED,
+          sweep_id="sweep_sft_prior_2",
+          sweep_name="BOSCH gemma-4-E2B-it SFT Sweep #2",
+      )
+      prior_state_2.save(os.path.join(temp_dir, "bosch", "camp2_done_state.json"))
+
+      name_3 = stage.generate_sweep_name({"command": []})
+      self.assertEqual(name_3, "BOSCH gemma-4-E2B-it SFT Sweep #3")
 
 
 if __name__ == "__main__":

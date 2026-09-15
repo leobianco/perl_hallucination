@@ -28,6 +28,7 @@ class StageResult:
 
   status: StageStatus = StageStatus.PENDING
   sweep_id: Optional[str] = None
+  sweep_name: Optional[str] = None
   best_run_id: Optional[str] = None
   best_metric_val: Optional[float] = None
   best_params: Dict[str, Any] = field(default_factory=dict)

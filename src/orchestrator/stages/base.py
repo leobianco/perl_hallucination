@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass
+import glob
+import json
 import logging
-from typing import Any, Callable, Dict, Optional, Set
+import os
+import re
+from typing import Any, Callable, Dict, Optional, Set, Tuple
 
 from src.orchestrator.config import CampaignConfig
 from src.orchestrator.model_manager import ModelManager
@@ -114,6 +118,102 @@ class BaseStage(abc.ABC):
     """
     return self.context.abort_requested_callback
 
+  def get_sweep_descriptor(self, sweep_dict: Dict[str, Any]) -> Tuple[str, str]:
+    """Returns (model_short_name, stage_type_string) for this stage.
+
+    Args:
+      sweep_dict: Sweep configuration dictionary.
+
+    Returns:
+      Tuple of (short model name, stage type string).
+    """
+    del sweep_dict  # Default implementation does not inspect command args.
+    model_short = self.config.base_model.rstrip("/").split("/")[-1]
+    return model_short, self.name.upper()
+
+  def determine_sweep_number(self, prefix: str) -> int:
+    """Calculates the 1-based sweep number for this stage.
+
+    Counts prior sweeps matching this prefix from local checkpoint
+    state files and the Weights & Biases API.
+
+    Args:
+      prefix: Prefix string identifying the task, model, and stage.
+
+    Returns:
+      Next 1-based sweep number.
+    """
+    seen_numbers: Set[int] = set()
+    state_file_path = (
+        self.config.state_file
+        or f"./checkpoints/{self.config.task_name}/state.json"
+    )
+    checkpoints_dir = os.path.dirname(os.path.abspath(state_file_path))
+
+    if os.path.isdir(checkpoints_dir):
+      for fpath in glob.glob(os.path.join(checkpoints_dir, "*_state.json")):
+        fpath = os.path.abspath(fpath)
+        if fpath == os.path.abspath(state_file_path):
+          continue
+        try:
+          with open(fpath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+          if data.get("campaign_id") == self.state.campaign_id:
+            continue
+          if data.get("task_name") != self.config.task_name:
+            continue
+          stage_data = data.get("stages", {}).get(self.name, {})
+          sw_name = stage_data.get("sweep_name")
+          if sw_name and sw_name.startswith(prefix):
+            m = re.search(r"Sweep #(\d+)", sw_name)
+            if m:
+              seen_numbers.add(int(m.group(1)))
+            else:
+              seen_numbers.add(len(seen_numbers) + 1)
+        except (OSError, json.JSONDecodeError):
+          continue
+
+    if not self.config.dry_run:
+      try:
+        import wandb  # pylint: disable=g-import-not-at-top
+
+        api = wandb.Api()
+        entity = self.sweep_controller.resolve_entity()
+        proj = self.config.project
+        sweeps = api.sweeps(f"{entity}/{proj}")
+        for s in sweeps:
+          s_name = getattr(s, "name", "") or ""
+          if s_name.startswith(prefix):
+            m = re.search(r"Sweep #(\d+)", s_name)
+            if m:
+              seen_numbers.add(int(m.group(1)))
+            else:
+              seen_numbers.add(len(seen_numbers) + 1)
+      except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.debug("Could not query existing sweeps from W&B: %s", e)
+
+    return max(seen_numbers, default=0) + 1
+
+  def generate_sweep_name(self, sweep_dict: Dict[str, Any]) -> str:
+    """Constructs a descriptive human-readable W&B sweep name.
+
+    Format: [TASK NAME] [MODEL NAME & SIZE] [STAGE / DATA TYPE] [Sweep #X]
+    Example: BOSCH gemma-4-E2B-it SFT Sweep #1
+             BOSCH gemma-3-1b-it RM Organic Sweep #1
+             BOSCH gemma-4-E2B-it PERL Organic Sweep #1
+
+    Args:
+      sweep_dict: Sweep configuration dictionary.
+
+    Returns:
+      Descriptive sweep name formatted string.
+    """
+    task_str = self.config.task_name.upper()
+    model_short, stage_type_str = self.get_sweep_descriptor(sweep_dict)
+    prefix = f"{task_str} {model_short} {stage_type_str}"
+    sweep_num = self.determine_sweep_number(prefix)
+    return f"{prefix} Sweep #{sweep_num}"
+
   def resolve_sweep_id(
       self,
       sweep_dict: Dict[str, Any],
@@ -140,26 +240,43 @@ class BaseStage(abc.ABC):
         and previous.sweep_id
         and previous.status != StageStatus.COMPLETED
     ):
+      name_hint = f" ({previous.sweep_name})" if previous.sweep_name else ""
       message = (
-          f"Resuming existing {self.name.upper()} sweep {previous.sweep_id} "
-          "instead of starting a new one."
+          f"Resuming existing {self.name.upper()} sweep "
+          f"{previous.sweep_id}{name_hint} instead of starting a new one."
       )
       logger.info(message)
       if live_line_callback:
         live_line_callback(message)
       return previous.sweep_id
 
+    # If sweep_dict doesn't already have a descriptive name, generate one
+    if not sweep_dict.get("name"):
+      sweep_name = self.generate_sweep_name(sweep_dict)
+      sweep_dict["name"] = sweep_name
+    else:
+      sweep_name = sweep_dict["name"]
+
+    message = f"Registering sweep '{sweep_name}' on W&B..."
+    logger.info(message)
+    if live_line_callback:
+      live_line_callback(message)
+
     sweep_id = self.sweep_controller.create_sweep(sweep_dict)
-    self.record_sweep_id(sweep_id)
+    self.record_sweep_id(sweep_id, sweep_name=sweep_name)
     return sweep_id
 
-  def record_sweep_id(self, sweep_id: str) -> None:
-    """Persists ``sweep_id`` immediately so a crash stays resumable."""
+  def record_sweep_id(
+      self, sweep_id: str, sweep_name: Optional[str] = None
+  ) -> None:
+    """Persists ``sweep_id`` and optional ``sweep_name`` immediately so a crash stays resumable."""
     result = self.state.stages.get(self.name)
     if result is None:
       result = StageResult(status=StageStatus.RUNNING)
       self.state.stages[self.name] = result
     result.sweep_id = sweep_id
+    if sweep_name:
+      result.sweep_name = sweep_name
     if self.context.state_path:
       try:
         self.state.save(self.context.state_path)

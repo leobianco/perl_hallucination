@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Callable, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 import yaml
 from src.orchestrator.stages.base import BaseStage
 from src.orchestrator.state import StageResult, StageStatus
@@ -18,6 +18,22 @@ class RmStage(BaseStage):
   @property
   def name(self) -> str:
     return "rm"
+
+  def get_sweep_descriptor(self, sweep_dict: Dict[str, Any]) -> Tuple[str, str]:
+    rm_model = "google/gemma-3-1b-it"
+    dataset = f"{self.config.user}/{self.config.task_name}_rm_organic"
+    cmd = sweep_dict.get("command", [])
+    if isinstance(cmd, list):
+      for arg in cmd:
+        if isinstance(arg, str):
+          if arg.startswith("--model_repo_id="):
+            rm_model = arg.split("=", 1)[1]
+          elif arg.startswith("--dataset_repo_id="):
+            dataset = arg.split("=", 1)[1]
+    model_short = rm_model.rstrip("/").split("/")[-1]
+    is_synth = any(k in dataset.lower() for k in ("synthetic", "llm", "erased"))
+    data_type = "Synthetic" if is_synth else "Organic"
+    return model_short, f"RM {data_type}"
 
   def execute(
       self,
@@ -78,9 +94,11 @@ class RmStage(BaseStage):
 
     # 1. Register Sweep (or resume the one an interrupted attempt created)
     sweep_id = self.resolve_sweep_id(sweep_dict, live_line_callback)
-    logger.info("Registered RM Sweep: %s", sweep_id)
+    sweep_name = sweep_dict.get("name")
+    name_str = f" ({sweep_name})" if sweep_name else ""
+    logger.info("Registered RM Sweep: %s%s", sweep_id, name_str)
     if live_line_callback:
-      live_line_callback(f"Registered RM Sweep: {sweep_id}")
+      live_line_callback(f"Registered RM Sweep: {sweep_id}{name_str}")
 
     # 2. Run Sweep Agent with max_runs bound (default: 30)
     exit_code = self.sweep_controller.run_sweep_agent(

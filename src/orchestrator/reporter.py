@@ -128,9 +128,14 @@ class CampaignReporter:
     # SFT Details
     sft_res = self.state.stages.get("sft")
     if sft_res and sft_res.status == StageStatus.COMPLETED:
+      sft_sw = (
+          f"`{sft_res.sweep_name}` (`{sft_res.sweep_id}`)"
+          if sft_res.sweep_name
+          else f"`{sft_res.sweep_id}`"
+      )
       lines.extend([
           "### 2.1. Supervised Fine-Tuning (SFT)",
-          f"* **Sweep ID**: `{sft_res.sweep_id}`",
+          f"* **Sweep**: {sft_sw}",
           f"* **Winning Run ID**: `{sft_res.best_run_id}`",
           f"* **Best Eval Loss**: `{sft_res.best_metric_val:.5f}`",
           f"* **Hugging Face Model**: [{sft_res.model_repo_id}](https://huggingface.co/{sft_res.model_repo_id})",
@@ -145,9 +150,14 @@ class CampaignReporter:
     # RM Details
     rm_res = self.state.stages.get("rm")
     if rm_res and rm_res.status == StageStatus.COMPLETED:
+      rm_sw = (
+          f"`{rm_res.sweep_name}` (`{rm_res.sweep_id}`)"
+          if rm_res.sweep_name
+          else f"`{rm_res.sweep_id}`"
+      )
       lines.extend([
           "### 2.2. Reward Model (RM)",
-          f"* **Sweep ID**: `{rm_res.sweep_id}`",
+          f"* **Sweep**: {rm_sw}",
           f"* **Winning Run ID**: `{rm_res.best_run_id}`",
           f"* **Best ROC-AUC**: `{rm_res.best_metric_val:.5f}`",
           f"* **Hugging Face Model**: [{rm_res.model_repo_id}](https://huggingface.co/{rm_res.model_repo_id})",
@@ -162,9 +172,14 @@ class CampaignReporter:
     # PE-RL Details
     perl_res = self.state.stages.get("perl")
     if perl_res and perl_res.status == StageStatus.COMPLETED:
+      perl_sw = (
+          f"`{perl_res.sweep_name}` (`{perl_res.sweep_id}`)"
+          if perl_res.sweep_name
+          else f"`{perl_res.sweep_id}`"
+      )
       lines.extend([
           "### 2.3. Parameter-Efficient Reinforcement Learning (PE-RL)",
-          f"* **Sweep ID**: `{perl_res.sweep_id}`",
+          f"* **Sweep**: {perl_sw}",
           f"* **Winning Run ID**: `{perl_res.best_run_id}`",
           f"* **Best Mean Reward**: `{perl_res.best_metric_val:.5f}`",
           f"* **Hugging Face Model**: [{perl_res.model_repo_id}](https://huggingface.co/{perl_res.model_repo_id})",

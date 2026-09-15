@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Callable, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 import yaml
 from src.orchestrator.stages.base import BaseStage
 from src.orchestrator.state import StageResult, StageStatus
@@ -18,6 +18,16 @@ class SftStage(BaseStage):
   @property
   def name(self) -> str:
     return "sft"
+
+  def get_sweep_descriptor(self, sweep_dict: Dict[str, Any]) -> Tuple[str, str]:
+    model = self.config.base_model
+    cmd = sweep_dict.get("command", [])
+    if isinstance(cmd, list):
+      for arg in cmd:
+        if isinstance(arg, str) and arg.startswith("--model_repo_id="):
+          model = arg.split("=", 1)[1]
+    model_short = model.rstrip("/").split("/")[-1]
+    return model_short, "SFT"
 
   def execute(
       self,
@@ -81,9 +91,11 @@ class SftStage(BaseStage):
 
     # 1. Register Sweep (or resume the one an interrupted attempt created)
     sweep_id = self.resolve_sweep_id(sweep_dict, live_line_callback)
-    logger.info("Registered SFT Sweep: %s", sweep_id)
+    sweep_name = sweep_dict.get("name")
+    name_str = f" ({sweep_name})" if sweep_name else ""
+    logger.info("Registered SFT Sweep: %s%s", sweep_id, name_str)
     if live_line_callback:
-      live_line_callback(f"Registered SFT Sweep: {sweep_id}")
+      live_line_callback(f"Registered SFT Sweep: {sweep_id}{name_str}")
 
     # 2. Run Sweep Agent with max_runs bound (default: 30)
     exit_code = self.sweep_controller.run_sweep_agent(
