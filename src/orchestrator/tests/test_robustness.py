@@ -679,20 +679,34 @@ class TestStageSelectionDefaults(unittest.TestCase):
     # generations: its maximum is a lucky batch, not a better policy.
     self.assertEqual(self.config.perl.selection_strategy, "final")
 
-  def test_the_published_checkpoint_matches_the_ranking(self):
-    # Ranking on the peak only means something if the peak is what gets
-    # pushed, so every stage that selects on "best" must publish "best".
+  def test_the_default_repo_checkpoint_matches_the_ranking(self):
+    # Both checkpoints are published either way, but the one the repo serves
+    # by default must be the one the trials were ranked on, otherwise the
+    # metric quoted in the report describes a model nobody loads.
     for stage in ("sft", "rm", "perl"):
       with self.subTest(stage=stage):
         stage_cfg = getattr(self.config, stage)
-        if stage_cfg.selection_strategy == "best":
-          self.assertEqual(stage_cfg.checkpoint_policy, "best")
+        self.assertEqual(
+            stage_cfg.checkpoint_policy, stage_cfg.selection_strategy
+        )
+
+  def test_perl_serves_the_final_checkpoint_by_default(self):
+    self.assertEqual(self.config.perl.checkpoint_policy, "final")
+
+  def test_sft_and_rm_serve_the_best_checkpoint_by_default(self):
+    self.assertEqual(self.config.sft.checkpoint_policy, "best")
+    self.assertEqual(self.config.rm.checkpoint_policy, "best")
 
   def test_sft_materialization_evaluates_as_often_as_its_sweep(self):
     # scripts/sweep_sft.yaml uses --eval_steps=10. Retraining once per
     # epoch would make the selected peak unreachable.
     self.assertEqual(self.config.sft.materialization_eval_steps, 10)
     self.assertEqual(self.config.rm.materialization_eval_steps, 50)
+
+  def test_perl_materialization_can_locate_its_best_checkpoint(self):
+    # PE-RL serves the final checkpoint, but the best one is still published
+    # as a companion, so the cadence still has to mirror the sweep.
+    self.assertEqual(self.config.perl.materialization_eval_steps, 50)
 
   def test_validate_rejects_an_unknown_strategy(self):
     self.config.rm.selection_strategy = "peak"
@@ -706,12 +720,12 @@ class TestStageSelectionDefaults(unittest.TestCase):
       self.config.validate()
     self.assertIn("checkpoint_policy", str(ctx.exception))
 
-  def test_validate_rejects_ranking_on_peak_while_shipping_the_last(self):
-    # The reported metric would then belong to a checkpoint nobody can load.
+  def test_ranking_on_peak_while_serving_the_last_is_allowed(self):
+    # It used to be rejected because the best checkpoint was then never
+    # pushed. It is published under "best/" now, so the combination only
+    # changes which one is the default and is a legitimate choice.
     self.config.rm.checkpoint_policy = "final"  # selection is "best"
-    with self.assertRaises(ValueError) as ctx:
-      self.config.validate()
-    self.assertIn("never pushed", str(ctx.exception))
+    self.config.validate()
 
   def test_the_default_campaign_validates(self):
     self.config.validate()
@@ -738,7 +752,22 @@ class TestMaterializationCheckpointFlags(unittest.TestCase):
   def test_final_policy_disables_early_stopping(self):
     flags = self._flags("perl", policy="final")
     self.assertEqual(self._value_of(flags, "--load_best_model_at_end"), "False")
-    self.assertNotIn("--metric_for_best_model", flags)
+
+  def test_final_policy_still_declares_the_best_metric(self):
+    # Without metric_for_best_model the trainer never populates
+    # TrainerState.best_model_checkpoint, so the best checkpoint would be
+    # neither protected from rotation nor publishable under "best/".
+    for stage, metric, greater in (
+        ("sft", "loss", "False"),
+        ("rm", "roc_auc", "True"),
+        ("perl", "rewards/reward_fn/mean", "True"),
+    ):
+      with self.subTest(stage=stage):
+        flags = self._flags(stage, policy="final", eval_steps=50)
+        self.assertEqual(
+            self._value_of(flags, "--metric_for_best_model"), metric
+        )
+        self.assertEqual(self._value_of(flags, "--greater_is_better"), greater)
 
   def test_eval_and_save_cadence_are_kept_identical(self):
     # load_best_model_at_end requires the strategies to match and save_steps

@@ -65,10 +65,17 @@ def sweep_timeout_minutes(stage: str, max_runs: int) -> int:
 #:   is what ``--load_best_model_at_end`` gives us for SFT and RM.
 SELECTION_STRATEGIES = ("final", "best")
 
-#: Which checkpoint of the materialization run is published.
+#: Which checkpoint of the materialization run becomes the *default* of the
+#: published Hub repository, i.e. the one a bare ``from_pretrained(repo_id)``
+#: returns.
 #:
-#: ``best``  - ``--load_best_model_at_end True`` (early stopping in-run).
-#: ``final`` - the last checkpoint, i.e. no in-run early stopping.
+#: Both checkpoints are always published: the default one at the repository
+#: root and the other under the ``best/`` or ``last/`` subfolder, reachable
+#: as ``from_pretrained(repo_id, subfolder=...)`` or ``repo_id:subfolder``.
+#: This knob therefore only chooses the default, never what is kept.
+#:
+#: ``best``  - ``--load_best_model_at_end True``; root holds the best step.
+#: ``final`` - no in-run early stopping; root holds the last step.
 CHECKPOINT_POLICIES = ("best", "final")
 
 
@@ -88,14 +95,16 @@ class SweepStageConfig:
   #: keeps the historical behaviour; :meth:`CampaignConfig.create_default`
   #: opts SFT and RM into ``best``.
   selection_strategy: str = "final"
-  #: Which checkpoint of the materialization run reaches the Hub; see
-  #: CHECKPOINT_POLICIES. Keep this consistent with ``selection_strategy``:
-  #: ranking trials on their peak and then publishing their last checkpoint
-  #: (or the reverse) selects on one criterion and ships another.
+  #: Which checkpoint the published Hub repo serves by default; see
+  #: CHECKPOINT_POLICIES. The other one is always published alongside it
+  #: under a subfolder, so this is purely a choice of default - but it should
+  #: still agree with ``selection_strategy``, otherwise the metric quoted in
+  #: the report belongs to a checkpoint that is not the repo's default.
   checkpoint_policy: str = "best"
-  #: Eval/save cadence (in optimizer steps) of the materialization run. Only
-  #: meaningful under ``checkpoint_policy="best"``: it decides how finely the
-  #: peak can be recovered. None keeps the stage's historical cadence.
+  #: Eval/save cadence (in optimizer steps) of the materialization run. It
+  #: decides how finely the best checkpoint can be located, whether that
+  #: checkpoint ends up at the root or in the ``best/`` subfolder. None keeps
+  #: the stage's historical cadence.
   #: It should mirror the sweep YAML's ``--eval_steps``, otherwise trials are
   #: ranked at a resolution the winner's retraining cannot reproduce.
   materialization_eval_steps: Optional[int] = None
@@ -217,8 +226,7 @@ class CampaignConfig:
 
     Raises:
       ValueError: On an unknown task, stage, selection strategy or checkpoint
-        policy, or on a selection/checkpoint combination that would rank
-        trials on one criterion and publish a model chosen by another.
+        policy.
     """
     if self.task_name not in VALID_TASKS:
       raise ValueError(
@@ -244,20 +252,10 @@ class CampaignConfig:
             f"the {stage_name.upper()} stage. Must be one of "
             f"{list(CHECKPOINT_POLICIES)}."
         )
-      # Ranking trials by their peak and then shipping the winner's last
-      # checkpoint means the number in the report was never measured on the
-      # model that was published. Catch it here rather than in the report.
-      if (
-          stage_cfg.selection_strategy == "best"
-          and stage_cfg.checkpoint_policy == "final"
-      ):
-        raise ValueError(
-            f"The {stage_name.upper()} stage ranks trials on their best step "
-            "(selection_strategy='best') but publishes the last checkpoint "
-            "(checkpoint_policy='final'). The reported metric would then "
-            "belong to a checkpoint that was never pushed. Use "
-            "checkpoint_policy='best', or rank on 'final' too."
-        )
+      # No combination of the two is rejected any more: the materialization
+      # run publishes both the best and the final checkpoint (one at the
+      # repository root, the other under a named subfolder), so ranking on
+      # one criterion can no longer leave the corresponding model unpushed.
 
   def to_dict(self) -> Dict[str, Any]:
     """Converts the config dataclass to a nested dictionary."""
@@ -376,7 +374,16 @@ class CampaignConfig:
             # it would select the luckiest batch rather than the best
             # configuration. The converged level is the honest signal.
             selection_strategy="final",
-            checkpoint_policy="best",
+            # The last checkpoint is the one a bare
+            # ``from_pretrained(repo_id)`` returns, for the same reason: a
+            # peak-reward adapter is one lucky batch away from being a
+            # collapsed policy, and the evaluation stage should default to
+            # the stable model. The best-reward checkpoint is still published
+            # under the "best/" subfolder if you want to compare them.
+            checkpoint_policy="final",
+            # Mirrors --eval_steps in scripts/sweep_perl.yaml, so the "best/"
+            # companion is located at the same resolution the sweep used.
+            materialization_eval_steps=50,
             sft_model_path="auto",
             reward_model_path="auto",
         ),

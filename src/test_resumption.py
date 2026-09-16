@@ -1220,6 +1220,264 @@ class TestBestAndLastCheckpointSaving(unittest.TestCase):
         self.assertEqual(resolved, ckpt_dir)
 
 
+class TestBestCheckpointArchiver(unittest.TestCase):
+  """The best checkpoint must survive save_total_limit rotation."""
+
+  def _args_and_state(self, output_dir, best_dir, step):
+    args = MagicMock()
+    args.output_dir = output_dir
+    state = MagicMock()
+    state.is_world_process_zero = True
+    state.best_model_checkpoint = best_dir
+    state.best_global_step = step
+    state.best_metric = 0.42
+    return args, state
+
+  def _make_checkpoint(self, path):
+    os.makedirs(path, exist_ok=True)
+    with open(os.path.join(path, "adapter_config.json"), "w") as f:
+      f.write("{}")
+    with open(os.path.join(path, "adapter_model.safetensors"), "w") as f:
+      f.write("weights")
+    # Optimizer state is what we must NOT carry around.
+    with open(os.path.join(path, "optimizer.pt"), "w") as f:
+      f.write("x" * 1024)
+
+  def test_archive_survives_deletion_of_the_original(self):
+    from src.pipelines import BestCheckpointArchiver
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+      best_dir = os.path.join(tmpdir, "checkpoint-150")
+      self._make_checkpoint(best_dir)
+      args, state = self._args_and_state(tmpdir, best_dir, 150)
+
+      archiver = BestCheckpointArchiver()
+      archiver.on_save(args, state, MagicMock())
+
+      # Rotation removes the original checkpoint.
+      shutil.rmtree(best_dir)
+
+      self.assertIsNotNone(archiver.archive_dir)
+      self.assertTrue(os.path.isdir(archiver.archive_dir))
+      self.assertEqual(archiver.archived_step, 150)
+      self.assertTrue(
+          os.path.isfile(
+              os.path.join(archiver.archive_dir, "adapter_model.safetensors")
+          )
+      )
+
+  def test_optimizer_state_is_not_archived(self):
+    from src.pipelines import BestCheckpointArchiver
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+      best_dir = os.path.join(tmpdir, "checkpoint-150")
+      self._make_checkpoint(best_dir)
+      args, state = self._args_and_state(tmpdir, best_dir, 150)
+
+      archiver = BestCheckpointArchiver()
+      archiver.on_save(args, state, MagicMock())
+
+      self.assertFalse(
+          os.path.exists(os.path.join(archiver.archive_dir, "optimizer.pt"))
+      )
+
+  def test_a_new_best_replaces_the_previous_archive(self):
+    from src.pipelines import BestCheckpointArchiver
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+      first = os.path.join(tmpdir, "checkpoint-100")
+      second = os.path.join(tmpdir, "checkpoint-200")
+      self._make_checkpoint(first)
+      self._make_checkpoint(second)
+      with open(os.path.join(second, "marker.json"), "w") as f:
+        f.write("{}")
+
+      archiver = BestCheckpointArchiver()
+      args, state = self._args_and_state(tmpdir, first, 100)
+      archiver.on_save(args, state, MagicMock())
+
+      args, state = self._args_and_state(tmpdir, second, 200)
+      archiver.on_save(args, state, MagicMock())
+
+      self.assertEqual(archiver.archived_step, 200)
+      self.assertTrue(
+          os.path.isfile(os.path.join(archiver.archive_dir, "marker.json"))
+      )
+
+  def test_a_missing_best_checkpoint_is_not_an_error(self):
+    from src.pipelines import BestCheckpointArchiver
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+      args, state = self._args_and_state(tmpdir, None, None)
+      archiver = BestCheckpointArchiver()
+      archiver.on_save(args, state, MagicMock())  # must not raise
+      self.assertIsNone(archiver.archive_dir)
+
+
+class TestPublishBestAndLast(unittest.TestCase):
+  """Both checkpoints reach the Hub; only the default sits at the root."""
+
+  def _pipeline(self, tmpdir, load_best_model_at_end, global_step=200):
+    pipeline = PERLPipeline()
+    args = MagicMock()
+    args.output_dir = tmpdir
+    args.push_to_hub = True
+    args.hub_model_id = "leobianco/npov_PERL"
+    args.load_best_model_at_end = load_best_model_at_end
+    args.metric_for_best_model = "rewards/reward_fn/mean"
+    args.greater_is_better = True
+    pipeline.training_args = args
+
+    state = MagicMock()
+    state.is_world_process_zero = True
+    state.global_step = global_step
+    state.best_metric = 1.75
+    state.best_model_checkpoint = None
+    trainer = MagicMock()
+    trainer.state = state
+    pipeline.trainer = trainer
+    return pipeline
+
+  def _make_checkpoint(self, path):
+    os.makedirs(path, exist_ok=True)
+    with open(os.path.join(path, "adapter_config.json"), "w") as f:
+      f.write("{}")
+
+  def test_perl_publishes_the_best_checkpoint_under_a_subfolder(self):
+    from src.pipelines import BestCheckpointArchiver
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+      self._make_checkpoint(os.path.join(tmpdir, "checkpoint-200"))
+      archive = os.path.join(tmpdir, BestCheckpointArchiver.ARCHIVE_DIRNAME)
+      self._make_checkpoint(archive)
+
+      pipeline = self._pipeline(tmpdir, load_best_model_at_end=False)
+      archiver = BestCheckpointArchiver()
+      archiver.archive_dir = archive
+      archiver.archived_step = 120
+      pipeline._best_archiver = archiver
+
+      with patch("src.pipelines.HfApi") as mock_api:
+        pipeline._publish_best_and_last(description="PERL")
+
+      api = mock_api.return_value
+      api.upload_folder.assert_called_once()
+      kwargs = api.upload_folder.call_args.kwargs
+      self.assertEqual(kwargs["path_in_repo"], "best")
+      self.assertEqual(kwargs["folder_path"], archive)
+      self.assertIn("optimizer.pt", kwargs["ignore_patterns"])
+
+      manifest_path = os.path.join(tmpdir, "checkpoints.json")
+      self.assertTrue(os.path.isfile(manifest_path))
+      with open(manifest_path) as f:
+        manifest = json.load(f)
+      self.assertEqual(manifest["default"], "last")
+      self.assertEqual(manifest["default_step"], 200)
+      self.assertEqual(manifest["checkpoints"]["best"]["subfolder"], "best")
+      self.assertIsNone(manifest["checkpoints"]["last"]["subfolder"])
+
+  def test_sft_style_run_publishes_the_last_checkpoint_under_a_subfolder(self):
+    from src.pipelines import BestCheckpointArchiver
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+      last_dir = os.path.join(tmpdir, "checkpoint-200")
+      self._make_checkpoint(last_dir)
+      archive = os.path.join(tmpdir, BestCheckpointArchiver.ARCHIVE_DIRNAME)
+      self._make_checkpoint(archive)
+
+      pipeline = self._pipeline(tmpdir, load_best_model_at_end=True)
+      archiver = BestCheckpointArchiver()
+      archiver.archive_dir = archive
+      archiver.archived_step = 120
+      pipeline._best_archiver = archiver
+
+      with patch("src.pipelines.HfApi") as mock_api:
+        pipeline._publish_best_and_last(description="SFT")
+
+      kwargs = mock_api.return_value.upload_folder.call_args.kwargs
+      self.assertEqual(kwargs["path_in_repo"], "last")
+      self.assertEqual(kwargs["folder_path"], last_dir)
+
+      with open(os.path.join(tmpdir, "checkpoints.json")) as f:
+        manifest = json.load(f)
+      self.assertEqual(manifest["default"], "best")
+      self.assertEqual(manifest["default_step"], 120)
+
+  def test_nothing_is_uploaded_twice_when_the_best_is_the_last(self):
+    from src.pipelines import BestCheckpointArchiver
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+      last_dir = os.path.join(tmpdir, "checkpoint-200")
+      self._make_checkpoint(last_dir)
+      archive = os.path.join(tmpdir, BestCheckpointArchiver.ARCHIVE_DIRNAME)
+      self._make_checkpoint(archive)
+
+      pipeline = self._pipeline(tmpdir, load_best_model_at_end=True)
+      archiver = BestCheckpointArchiver()
+      archiver.archive_dir = archive
+      archiver.archived_step = 200  # the peak *is* the final step
+      pipeline._best_archiver = archiver
+
+      with patch("src.pipelines.HfApi") as mock_api:
+        pipeline._publish_best_and_last(description="SFT")
+
+      mock_api.return_value.upload_folder.assert_not_called()
+      with open(os.path.join(tmpdir, "checkpoints.json")) as f:
+        manifest = json.load(f)
+      for name in ("best", "last"):
+        self.assertIsNone(manifest["checkpoints"][name]["subfolder"])
+        self.assertTrue(manifest["checkpoints"][name]["available"])
+
+  def test_a_failed_companion_upload_does_not_raise(self):
+    from src.pipelines import BestCheckpointArchiver
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+      self._make_checkpoint(os.path.join(tmpdir, "checkpoint-200"))
+      archive = os.path.join(tmpdir, BestCheckpointArchiver.ARCHIVE_DIRNAME)
+      self._make_checkpoint(archive)
+
+      pipeline = self._pipeline(tmpdir, load_best_model_at_end=False)
+      archiver = BestCheckpointArchiver()
+      archiver.archive_dir = archive
+      archiver.archived_step = 120
+      pipeline._best_archiver = archiver
+
+      with patch("src.pipelines.HfApi") as mock_api:
+        mock_api.return_value.upload_folder.side_effect = RuntimeError("500")
+        with patch("src.pipelines.time.sleep"):
+          # The root checkpoint was already pushed; the run must not fail.
+          pipeline._publish_best_and_last(description="PERL")
+
+      with open(os.path.join(tmpdir, "checkpoints.json")) as f:
+        manifest = json.load(f)
+      # The manifest must not advertise a subfolder that does not exist.
+      self.assertIsNone(manifest["checkpoints"]["best"]["subfolder"])
+      self.assertFalse(manifest["checkpoints"]["best"]["available"])
+
+  def test_nothing_is_published_when_push_to_hub_is_off(self):
+    with tempfile.TemporaryDirectory() as tmpdir:
+      self._make_checkpoint(os.path.join(tmpdir, "checkpoint-200"))
+      pipeline = self._pipeline(tmpdir, load_best_model_at_end=False)
+      pipeline.training_args.push_to_hub = False
+
+      with patch("src.pipelines.HfApi") as mock_api:
+        pipeline._publish_best_and_last(description="PERL")
+
+      mock_api.return_value.upload_folder.assert_not_called()
+      mock_api.return_value.upload_file.assert_not_called()
+
+  def test_only_the_main_process_publishes(self):
+    with tempfile.TemporaryDirectory() as tmpdir:
+      self._make_checkpoint(os.path.join(tmpdir, "checkpoint-200"))
+      pipeline = self._pipeline(tmpdir, load_best_model_at_end=False)
+      pipeline.trainer.state.is_world_process_zero = False
+
+      with patch("src.pipelines.HfApi") as mock_api:
+        pipeline._publish_best_and_last(description="PERL")
+
+      mock_api.return_value.upload_folder.assert_not_called()
+
+
 if __name__ == "__main__":
   unittest.main()
 

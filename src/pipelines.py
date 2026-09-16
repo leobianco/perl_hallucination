@@ -64,6 +64,7 @@ from sklearn.metrics import (
     precision_score,
     roc_auc_score,
 )
+from src import checkpoint_publication
 from src.metrics import GenerationMetricsEvaluator
 from src.models import (
     Gemma4ForSequenceClassification,
@@ -345,6 +346,96 @@ class WandbResumptionCallback(TrainerCallback):
             pass
 
 
+#: The best/last publication rules live in their own module so they can be
+#: unit tested without importing the training stack.
+BEST_CHECKPOINT_SUBFOLDER = checkpoint_publication.BEST_CHECKPOINT_SUBFOLDER
+LAST_CHECKPOINT_SUBFOLDER = checkpoint_publication.LAST_CHECKPOINT_SUBFOLDER
+CHECKPOINT_MANIFEST_FILENAME = (
+    checkpoint_publication.CHECKPOINT_MANIFEST_FILENAME
+)
+CHECKPOINT_UPLOAD_IGNORE_PATTERNS = (
+    checkpoint_publication.CHECKPOINT_UPLOAD_IGNORE_PATTERNS
+)
+_step_from_checkpoint_dir = checkpoint_publication.step_from_checkpoint_dir
+
+
+class BestCheckpointArchiver(TrainerCallback):
+  """Keeps a rotation-proof copy of the best checkpoint's publishable files.
+
+  ``save_total_limit`` rotation and ``load_best_model_at_end=False`` can both
+  leave the best checkpoint deleted by the time training ends, which would
+  make it impossible to publish. This callback mirrors the best checkpoint
+  into a stable directory (``_best_checkpoint/`` inside ``output_dir``) every
+  time the best changes, copying only the files worth keeping.
+  """
+
+  ARCHIVE_DIRNAME = "_best_checkpoint"
+
+  def __init__(self):
+    self.archived_step: Optional[int] = None
+    self.archived_metric: Optional[float] = None
+    self.archive_dir: Optional[str] = None
+
+  def _archive(self, args: TrainingArguments, state: TrainerState) -> None:
+    """Mirrors ``state.best_model_checkpoint`` into the archive directory."""
+    best_ckpt = getattr(state, "best_model_checkpoint", None)
+    if not isinstance(best_ckpt, str) or not os.path.isdir(best_ckpt):
+      return
+
+    step = checkpoint_publication.coerce_step(
+        getattr(state, "best_global_step", None)
+    )
+    if step is None:
+      step = _step_from_checkpoint_dir(best_ckpt)
+    if step is not None and step == self.archived_step:
+      return
+
+    output_dir = getattr(args, "output_dir", None)
+    if not isinstance(output_dir, str) or not output_dir:
+      return
+
+    destination = os.path.join(output_dir, self.ARCHIVE_DIRNAME)
+    try:
+      if os.path.isdir(destination):
+        shutil.rmtree(destination)
+      shutil.copytree(
+          best_ckpt,
+          destination,
+          ignore=shutil.ignore_patterns(*CHECKPOINT_UPLOAD_IGNORE_PATTERNS),
+      )
+    except Exception as e:
+      print(f"[Checkpoint] Notice: could not archive best checkpoint: {e}")
+      return
+
+    self.archived_step = step
+    self.archived_metric = getattr(state, "best_metric", None)
+    self.archive_dir = destination
+    print(
+        f"[Checkpoint] Archived best checkpoint (step {step}) from "
+        f"{best_ckpt} so rotation cannot discard it."
+    )
+
+  def on_save(
+      self,
+      args: TrainingArguments,
+      state: TrainerState,
+      control: TrainerControl,
+      **kwargs,
+  ):
+    if getattr(state, "is_world_process_zero", True):
+      self._archive(args, state)
+
+  def on_train_end(
+      self,
+      args: TrainingArguments,
+      state: TrainerState,
+      control: TrainerControl,
+      **kwargs,
+  ):
+    if getattr(state, "is_world_process_zero", True):
+      self._archive(args, state)
+
+
 class Pipeline(abc.ABC):
   """Abstract pipeline describing the training workflow.
 
@@ -363,6 +454,20 @@ class Pipeline(abc.ABC):
     self.lora_path: Optional[str] = None
     self.vllm_model: Optional[str] = None
     self.use_vllm: bool = False
+    self._best_archiver: Optional[BestCheckpointArchiver] = None
+
+  def _training_callbacks(self) -> list[Any]:
+    """Builds the callback list shared by every training pipeline.
+
+    ``BestCheckpointArchiver`` is kept on the pipeline so that
+    ``_publish_best_and_last`` can find the archived best checkpoint even
+    after ``save_total_limit`` rotation has removed the original.
+
+    Returns:
+      The callbacks to hand to the trainer.
+    """
+    self._best_archiver = BestCheckpointArchiver()
+    return [WandbResumptionCallback(), self._best_archiver]
 
   def run(self, *cli_args, **cli_kwargs) -> None:
     self.setup_arguments(*cli_args, **cli_kwargs)
@@ -456,6 +561,160 @@ class Pipeline(abc.ABC):
         return result
 
       setattr(self.trainer, "_load_best_model", _wrapped_load_best_model)
+
+  def _locate_best_checkpoint(self) -> tuple[Optional[str], Optional[int]]:
+    """Returns (directory, step) of the best checkpoint, or (None, None)."""
+    archiver = getattr(self, "_best_archiver", None)
+    archive_dir = getattr(archiver, "archive_dir", None)
+    if archive_dir and os.path.isdir(archive_dir):
+      return archive_dir, getattr(archiver, "archived_step", None)
+
+    state = getattr(self.trainer, "state", None) if self.trainer else None
+    best_ckpt = getattr(state, "best_model_checkpoint", None)
+    if isinstance(best_ckpt, str) and os.path.isdir(best_ckpt):
+      step = checkpoint_publication.coerce_step(
+          getattr(state, "best_global_step", None)
+      )
+      if step is None:
+        step = _step_from_checkpoint_dir(best_ckpt)
+      return best_ckpt, step
+    return None, None
+
+  def _locate_last_checkpoint(self) -> tuple[Optional[str], Optional[int]]:
+    """Returns (directory, step) of the final-step checkpoint."""
+    output_dir = getattr(self.training_args, "output_dir", None)
+    if not isinstance(output_dir, str) or not os.path.isdir(output_dir):
+      return None, None
+
+    state = getattr(self.trainer, "state", None) if self.trainer else None
+    global_step = checkpoint_publication.coerce_step(
+        getattr(state, "global_step", None)
+    )
+    if global_step is not None:
+      candidate = os.path.join(output_dir, f"checkpoint-{global_step}")
+      if os.path.isdir(candidate):
+        return candidate, global_step
+
+    # The expected directory is missing (training stopped on a step that was
+    # not a save step and nothing forced a final save); fall back to the
+    # highest-numbered checkpoint that does exist.
+    best_step = None
+    best_dir = None
+    for item in os.listdir(output_dir):
+      step = _step_from_checkpoint_dir(item)
+      if step is None:
+        continue
+      candidate = os.path.join(output_dir, item)
+      if os.path.isdir(candidate) and (best_step is None or step > best_step):
+        best_step, best_dir = step, candidate
+    return best_dir, best_step
+
+  def _publish_best_and_last(self, description: str = "model") -> None:
+    """Publishes the companion checkpoint and a manifest to the Hub.
+
+    The canonical checkpoint of a stage is already at the repository root
+    (``trainer.save_model(output_dir)`` followed by ``push_to_hub``): the best
+    one when ``load_best_model_at_end`` is set, the final-step one otherwise.
+    This method uploads *the other* one to a named subfolder so no information
+    is discarded, and writes ``checkpoints.json`` recording which is which.
+
+    Failures are reported but never raised: the root checkpoint - the artifact
+    the campaign actually depends on - has already been pushed at this point,
+    and losing an expensive training run over a flaky companion upload would
+    be far worse than losing the companion.
+
+    Args:
+      description: Human-readable stage name used in log lines.
+    """
+    if self.training_args is None:
+      return
+    if not getattr(self.training_args, "push_to_hub", False):
+      return
+    hub_model_id = getattr(self.training_args, "hub_model_id", None)
+    if not hub_model_id:
+      return
+    state = getattr(self.trainer, "state", None) if self.trainer else None
+    if state is not None and not getattr(state, "is_world_process_zero", True):
+      return
+    output_dir = getattr(self.training_args, "output_dir", None)
+    if not isinstance(output_dir, str) or not os.path.isdir(output_dir):
+      return
+
+    root_is_best = bool(
+        getattr(self.training_args, "load_best_model_at_end", False)
+    )
+    best_dir, best_step = self._locate_best_checkpoint()
+    last_dir, last_step = self._locate_last_checkpoint()
+    plan = checkpoint_publication.plan_publication(
+        root_is_best=root_is_best,
+        best_dir=best_dir,
+        best_step=best_step,
+        last_dir=last_dir,
+        last_step=last_step,
+    )
+
+    api = HfApi()
+    published_companion = False
+    if plan.companion_name:
+      companion_name = plan.companion_name
+      companion_dir = plan.companion_dir
+      companion_step = plan.companion_step
+      try:
+        _push_to_hub_with_retry(
+            lambda: api.upload_folder(
+                folder_path=companion_dir,
+                path_in_repo=companion_name,
+                repo_id=hub_model_id,
+                ignore_patterns=list(CHECKPOINT_UPLOAD_IGNORE_PATTERNS),
+                commit_message=(
+                    f"Add {companion_name} checkpoint"
+                    f"{f' (step {companion_step})' if companion_step else ''}"
+                ),
+            ),
+            description=f"{description} {companion_name} checkpoint push",
+        )
+        published_companion = True
+        print(
+            f"[Checkpoint] Published {companion_name} checkpoint"
+            f"{f' (step {companion_step})' if companion_step else ''} to "
+            f"{hub_model_id}:{companion_name}"
+        )
+      except Exception as e:
+        print(
+            f"[Checkpoint] Warning: could not publish the {companion_name} "
+            f"checkpoint to {hub_model_id}: {e}. The root checkpoint is "
+            "unaffected."
+        )
+
+    manifest = checkpoint_publication.build_manifest(
+        plan,
+        best_step=best_step,
+        last_step=last_step,
+        companion_published=published_companion,
+        metric_for_best_model=getattr(
+            self.training_args, "metric_for_best_model", None
+        ),
+        greater_is_better=getattr(
+            self.training_args, "greater_is_better", None
+        ),
+        best_metric=getattr(state, "best_metric", None) if state else None,
+    )
+
+    manifest_path = os.path.join(output_dir, CHECKPOINT_MANIFEST_FILENAME)
+    try:
+      with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+      _push_to_hub_with_retry(
+          lambda: api.upload_file(
+              path_or_fileobj=manifest_path,
+              path_in_repo=CHECKPOINT_MANIFEST_FILENAME,
+              repo_id=hub_model_id,
+              commit_message="Update checkpoint manifest",
+          ),
+          description=f"{description} checkpoint manifest push",
+      )
+    except Exception as e:
+      print(f"[Checkpoint] Warning: could not publish the manifest: {e}")
 
   def _setup_wandb_resumption(self) -> None:
     """Inspects resume_from_checkpoint (local or HF Hub) and output_dir to restore WandB run ID."""
@@ -1029,7 +1288,7 @@ class SFTPipeline(Pipeline):
         train_dataset=self.data["train"],
         eval_dataset=self.data["test"],
         processing_class=self.tokenizer,
-        callbacks=[WandbResumptionCallback()],
+        callbacks=self._training_callbacks(),
     )
 
   def run_and_save(self) -> None:
@@ -1038,7 +1297,10 @@ class SFTPipeline(Pipeline):
     if getattr(self.training_args, "output_dir", None):
       self.trainer.save_model(self.training_args.output_dir)
     if getattr(self.training_args, "push_to_hub", False):
-      _push_to_hub_with_retry(self.trainer.push_to_hub, description="SFT model push")
+      _push_to_hub_with_retry(
+          self.trainer.push_to_hub, description="SFT model push"
+      )
+      self._publish_best_and_last(description="SFT")
 
 
 class RewardModelPipeline(Pipeline):
@@ -1226,7 +1488,7 @@ class RewardModelPipeline(Pipeline):
         processing_class=self.tokenizer,
         data_collator=self.data_collator,
         compute_metrics=compute_metrics,
-        callbacks=[WandbResumptionCallback()],
+        callbacks=self._training_callbacks(),
     )
 
   def run_and_save(self) -> None:
@@ -1241,6 +1503,7 @@ class RewardModelPipeline(Pipeline):
           lambda: self.model.push_to_hub(self.training_args.hub_model_id),
           description="Reward model push",
       )
+      self._publish_best_and_last(description="Reward model")
 
 
 class PERLPipeline(Pipeline):
@@ -1601,7 +1864,7 @@ class PERLPipeline(Pipeline):
         train_dataset=self.data["train"],
         eval_dataset=self.data.get("test", None),
         processing_class=self.tokenizer,
-        callbacks=[WandbResumptionCallback()],
+        callbacks=self._training_callbacks(),
     )
 
   def run_and_save(self) -> None:
@@ -1614,6 +1877,7 @@ class PERLPipeline(Pipeline):
         _push_to_hub_with_retry(
             self.trainer.push_to_hub, description="PERL model push"
         )
+        self._publish_best_and_last(description="PERL")
 
 
 class DPOPipeline(Pipeline):
@@ -1724,7 +1988,7 @@ class DPOPipeline(Pipeline):
         train_dataset=self.data["train"],
         eval_dataset=self.data.get("test", None),
         processing_class=self.tokenizer,
-        callbacks=[WandbResumptionCallback()],
+        callbacks=self._training_callbacks(),
     )
 
   def run_and_save(self) -> None:
@@ -1737,6 +2001,7 @@ class DPOPipeline(Pipeline):
         _push_to_hub_with_retry(
             self.trainer.push_to_hub, description="DPO model push"
         )
+        self._publish_best_and_last(description="DPO")
 
 
 class ScopeMixtureLogitsProcessor(LogitsProcessor):

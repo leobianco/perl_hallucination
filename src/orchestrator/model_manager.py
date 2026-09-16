@@ -206,18 +206,24 @@ class ModelManager:
           "--save_strategy", "epoch",
       ])
 
-    if checkpoint_policy == "final":
-      # The last checkpoint is what gets pushed. Evaluation still runs, so
-      # the curve remains visible in W&B - it just does not decide anything.
-      flags.extend(["--load_best_model_at_end", "False"])
-      return flags
-
+    # The best-model metric is declared in *both* policies, not just "best".
+    # Without it TrainerState.best_model_checkpoint is never populated, and
+    # the best checkpoint would be neither protected from save_total_limit
+    # rotation nor publishable as the companion of the final one.
     metric, greater = self.BEST_MODEL_METRICS.get(stage_name, ("loss", "False"))
     flags.extend([
-        "--load_best_model_at_end", "True",
         "--metric_for_best_model", metric,
         "--greater_is_better", greater,
     ])
+
+    if checkpoint_policy == "final":
+      # The last checkpoint is what lands at the repository root. Evaluation
+      # still runs and the best checkpoint is still tracked, archived and
+      # published under the "best/" subfolder - it just does not become the
+      # default the Hub hands out.
+      flags.extend(["--load_best_model_at_end", "False"])
+    else:
+      flags.extend(["--load_best_model_at_end", "True"])
     return flags
 
   def materialize_and_push(

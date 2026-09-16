@@ -326,9 +326,7 @@ rule. Each stage picks one:
 checkpoint (`--load_best_model_at_end`), so a trial that bottoms out at step 60
 and then overfits is shipped as its step-60 checkpoint regardless. Ranking such
 a trial on its *last* eval would judge it by the tail we throw away. Before this
-was fixed, selection and deployment used two different criteria. The two now
-have to agree: `CampaignConfig.validate()` rejects `selection_strategy="best"`
-combined with `checkpoint_policy="final"`.
+was fixed, selection and deployment used two different criteria.
 
 **Why `final` for PE-RL.** `rewards/reward_fn/mean` is a *training* signal
 logged every optimizer step over 8 sampled generations. Its maximum reliably
@@ -353,18 +351,78 @@ noisier signal for the policy to exploit. Two things keep this visible:
 The trustworthy number remains the **eval stage's autorater score**, which is
 computed on a held-out test set that took no part in any of this selection.
 
+#### What ends up on the Hub: `checkpoint_policy`
+
+Nothing is discarded. Every materialization run publishes **both** the best and
+the final checkpoint; `checkpoint_policy` only decides which of the two is the
+repository's *default*:
+
+| Stage | Repo root (`from_pretrained(repo_id)`) | Subfolder |
+|---|---|---|
+| SFT | best `eval/loss` checkpoint | `last/` |
+| RM | best `eval/roc_auc` checkpoint | `last/` |
+| PE-RL | **final-step** policy | `best/` |
+
+PE-RL defaults to the final checkpoint on purpose: a peak-reward adapter is one
+lucky batch away from being a collapsed policy, so the stable model is what you
+get unless you ask for the other one.
+
+```python
+# The default: the checkpoint the campaign chose for this stage.
+model = AutoPeftModelForCausalLM.from_pretrained("leobianco/npov_PERL")
+
+# The companion, for comparison.
+peak = AutoPeftModelForCausalLM.from_pretrained(
+    "leobianco/npov_PERL", subfolder="best"
+)
+```
+
+Anywhere this codebase accepts a model reference you can also write
+`leobianco/npov_PERL:best` - `parse_hf_repo_reference` understands the
+`repo:subfolder` and `repo/tree/<rev>/<subfolder>` forms.
+
+A `checkpoints.json` manifest at the repository root records which checkpoint
+is which, at what step, and under which metric:
+
+```json
+{
+  "default": "last",
+  "default_step": 200,
+  "metric_for_best_model": "rewards/reward_fn/mean",
+  "greater_is_better": true,
+  "best_metric": 1.75,
+  "checkpoints": {
+    "best": {"step": 120, "subfolder": "best", "available": true},
+    "last": {"step": 200, "subfolder": null,   "available": true}
+  }
+}
+```
+
+`subfolder: null` means "at the root". When the best checkpoint *is* the final
+one, both entries point at the root and nothing is uploaded twice. If a
+companion upload fails the manifest says `available: false` rather than
+advertising a subfolder that 404s - the root checkpoint is pushed first and is
+never put at risk by the companion.
+
+Uploads exclude `optimizer.pt`, `scheduler.pt` and the RNG dumps: they are
+useless for evaluation and would dwarf the adapter itself.
+
 **Overriding it.** Per stage, in the campaign YAML:
 
 ```yaml
 rm_stage:
   selection_strategy: final   # rank trials on their last eval instead
-  checkpoint_policy: final    # ... and publish the last checkpoint
+  checkpoint_policy: final    # ... and make the last checkpoint the default
 ```
 
 `materialization_eval_steps` controls how finely the winner's retraining can
 locate that best checkpoint; it defaults to each sweep YAML's `--eval_steps`
-(SFT 10, RM 50). Setting it coarser than the sweep means the peak the trial was
-ranked on may not be reachable in the run that produces the artifact.
+(SFT 10, RM 50, PE-RL 50). Setting it coarser than the sweep means the peak
+the trial was ranked on may not be reachable in the run that produces the
+artifact.
+
+
+
 
 ### 8. Headless Mode (for `nohup` or logging to file)
 ```bash
@@ -490,7 +548,8 @@ perl_stage:
   # Deliberately "final": the training reward is too noisy per step for its
   # peak to mean anything.
   selection_strategy: "final"
-  checkpoint_policy: "best"
+  checkpoint_policy: "final"   # repo root = last policy; best/ holds the peak
+  materialization_eval_steps: 50
   sft_model_path: "auto"
   reward_model_path: "auto"
 
