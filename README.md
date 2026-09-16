@@ -72,7 +72,33 @@ From the project folder, run
     * When `(MODE)` is set to `score`, the `EVALUATOR_MODEL` scores the generations of the previous step, and a rate of hallucination is calculated using `THRESHOLD`. The evaluator uses `EVALUATOR_NUM_FEWSHOT` examples taken from `DATASET_LABELS` to help it classify the samples.
     * When `(MODE)` is set to `autoratereval`, the quality of the evaluator itself is evaluated. We ask for it to score the samples in `DATASET_LABELS`, and we return the best threshold along with the associated metrics.
 
-Notice that you can chain commands, *e.g.* `.scripts/evaluator.sh npov generate ; .scripts/evaluator.sh npov score`.
+Notice that you can chain commands, *e.g.* `./scripts/evaluator.sh npov generate ; ./scripts/evaluator.sh npov score`.
+
+### Evaluating the Last Checkpoint vs. Best Checkpoint
+
+By default, training scripts (`perl.sh`, `writer_sft.sh`, `reward_model.sh`, `scope_dpo.sh`, `ssfo_dpo.sh`) save checkpoints as follows:
+1. **Hugging Face Hub (`<user>/<run_name>`)**: Stores only the **best model** (the checkpoint that achieved the highest validation reward / metric during training).
+2. **Local Disk (`./checkpoints/<task>/<method>/<user>/<run_name>/`)**: Stores:
+   - The **best model** at the root of the directory and in `checkpoint-<BEST_STEP>/`.
+   - The **final step checkpoint** (adapters from the very last training step) in `checkpoint-<LAST_STEP>/`.
+   - *(Note for PE-RL runs)*: Each checkpoint directory also contains a `ref/` subfolder holding TRL's frozen reference policy LoRA adapter used for KL computation; `src.evaluator` automatically ignores `ref/` and loads the trained policy adapter.
+
+To evaluate the **best model** (default):
+- Set `RUN_IDENTIFIER="<user>/<run_name>"` (loads from Hugging Face Hub) or `RUN_IDENTIFIER="./checkpoints/<task>/perl/<user>/<run_name>"` (loads from local root).
+
+To evaluate the **last checkpoint** (`checkpoint-<LAST_STEP>`) instead of the best:
+- Point `RUN_IDENTIFIER` to the specific local `checkpoint-<LAST_STEP>` directory.
+- Explicitly set `DATASET_WITH_COMPLETIONS` to a distinct short Hugging Face dataset name (since auto-generated dataset names from long local filesystem paths are truncated at 96 characters on Hugging Face Hub and could collide with evaluations of other checkpoints from the same run):
+
+```bash
+RUN_IDENTIFIER="./checkpoints/npov/perl/leobianco/<run_name>/checkpoint-220" \
+DATASET_WITH_COMPLETIONS="leobianco/npov_eval_last_ckpt_220" \
+./scripts/evaluator.sh npov generate
+
+RUN_IDENTIFIER="./checkpoints/npov/perl/leobianco/<run_name>/checkpoint-220" \
+DATASET_WITH_COMPLETIONS="leobianco/npov_eval_last_ckpt_220" \
+./scripts/evaluator.sh npov score
+```
 
 We perform our experiments in a multi-GPU setting. More precisely, we use 8 x L4 GPUs. For an efficient use of GPU memory, we employ pipeline parallelism, specifically ZeRO Phase-3 [(link to paper)](https://arxiv.org/abs/1910.02054). To do so, we use Hugging Face's Accelerate library integration of Microsoft's DeepSpeed. The configuration used for our experiments is stored in `scripts/deepspeed_config.yaml` (you should run `accelerate config` to set up your own environment, see [Accelerate's documentation](https://huggingface.co/docs/transformers/en/deepspeed) for more details).
 

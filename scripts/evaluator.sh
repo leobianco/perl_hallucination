@@ -3,8 +3,8 @@
 # Core Parameters
 USER="leobianco"
 SEED=12345
-RUN_IDENTIFIER="google/gemma-4-E2B-it"
-BASE_MODEL="google/gemma-4-E4B-it"
+RUN_IDENTIFIER="${RUN_IDENTIFIER:-google/gemma-4-E2B-it}"
+BASE_MODEL="${BASE_MODEL:-google/gemma-4-E4B-it}"
 EVALUATOR_MODEL="gemini-2.5-flash"
 USE_GEMINI="True"
 RUN_AUTORATER="True"
