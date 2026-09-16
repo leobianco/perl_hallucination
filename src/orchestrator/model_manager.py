@@ -6,7 +6,7 @@ import datetime
 import logging
 import os
 import shutil
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
 from src.orchestrator.config import RobustnessConfig
@@ -140,6 +140,86 @@ class ModelManager:
     except Exception as e:
       logger.warning("Error while pruning checkpoints in %s: %s", base_dir, e)
 
+  #: Metric ``--load_best_model_at_end`` ranks checkpoints on, per stage,
+  #: as ``(metric_for_best_model, greater_is_better)``. These mirror the
+  #: ``metric:`` block of the corresponding sweep YAML - the trial and the
+  #: checkpoint inside it must be judged by the same quantity.
+  BEST_MODEL_METRICS: Dict[str, Tuple[str, str]] = {
+      "sft": ("loss", "False"),
+      "rm": ("roc_auc", "True"),
+      "perl": ("rewards/reward_fn/mean", "True"),
+  }
+
+  #: Eval/save cadence used when the caller does not supply one. None means
+  #: "once per epoch", which is all the SFT retraining ever did.
+  DEFAULT_EVAL_STEPS: Dict[str, Optional[int]] = {
+      "sft": None,
+      "rm": 50,
+      "perl": 50,
+  }
+
+  def _checkpointing_flags(
+      self,
+      stage_name: str,
+      checkpoint_policy: str,
+      eval_steps: Optional[int],
+  ) -> List[str]:
+    """Builds the eval/save/best-model flags of a materialization run.
+
+    Args:
+      stage_name: 'sft', 'rm' or 'perl'.
+      checkpoint_policy: 'best' or 'final'; see ``materialize_and_push``.
+      eval_steps: Requested eval/save cadence in optimizer steps, or None
+        for the stage default.
+
+    Returns:
+      The command-line flags, ready to extend the training command.
+
+    Raises:
+      ValueError: On an unknown ``checkpoint_policy``.
+    """
+    if checkpoint_policy not in ("best", "final"):
+      raise ValueError(
+          f"Unknown checkpoint_policy '{checkpoint_policy}'; expected 'best' "
+          "or 'final'."
+      )
+
+    cadence = eval_steps
+    if cadence is None:
+      cadence = self.DEFAULT_EVAL_STEPS.get(stage_name)
+    cadence = int(cadence) if cadence else None
+
+    flags: List[str] = []
+    if cadence:
+      # ``load_best_model_at_end`` requires the two strategies to match and
+      # save_steps to be a multiple of eval_steps; keeping them literally
+      # equal is the only way that cannot silently drift.
+      flags.extend([
+          "--eval_strategy", "steps",
+          "--eval_steps", str(cadence),
+          "--save_strategy", "steps",
+          "--save_steps", str(cadence),
+      ])
+    else:
+      flags.extend([
+          "--eval_strategy", "epoch",
+          "--save_strategy", "epoch",
+      ])
+
+    if checkpoint_policy == "final":
+      # The last checkpoint is what gets pushed. Evaluation still runs, so
+      # the curve remains visible in W&B - it just does not decide anything.
+      flags.extend(["--load_best_model_at_end", "False"])
+      return flags
+
+    metric, greater = self.BEST_MODEL_METRICS.get(stage_name, ("loss", "False"))
+    flags.extend([
+        "--load_best_model_at_end", "True",
+        "--metric_for_best_model", metric,
+        "--greater_is_better", greater,
+    ])
+    return flags
+
   def materialize_and_push(
       self,
       stage_name: str,
@@ -152,6 +232,8 @@ class ModelManager:
       live_line_callback: Optional[Callable[[str], None]] = None,
       tunable_keys: Optional[Iterable[str]] = None,
       stop_requested_callback: Optional[Callable[[], bool]] = None,
+      checkpoint_policy: str = "best",
+      eval_steps: Optional[int] = None,
   ) -> str:
     """Executes a single training run with winning hyperparameters and pushes to HF Hub.
 
@@ -170,6 +252,14 @@ class ModelManager:
           contains the full ``TrainingArguments`` dump and the model config.
         stop_requested_callback: Predicate polled while training; when it
           returns True the training subprocess is terminated.
+        checkpoint_policy: ``"best"`` publishes the best-scoring checkpoint
+          (``--load_best_model_at_end``); ``"final"`` publishes the last one.
+          This must agree with how the sweep ranked its trials - see
+          ``SweepStageConfig.checkpoint_policy``.
+        eval_steps: Eval/save cadence in optimizer steps. Only used under
+          ``checkpoint_policy="best"``, where it bounds how finely the best
+          checkpoint can be located; it should mirror the sweep YAML's
+          ``--eval_steps``. None keeps the stage's historical cadence.
 
     Returns:
         The uploaded Hugging Face model repository ID.
@@ -260,25 +350,24 @@ class ModelManager:
         "True",
         "--bf16",
         "True",
-        "--save_strategy",
-        "steps" if stage_name in ("rm", "perl") else "epoch",
         "--save_total_limit",
         "2",
     ]
+
+    # Checkpointing is decided in one place for all three stages: which
+    # checkpoint is published, and how finely it can be located. Leaving it
+    # scattered across the per-stage blocks is what let the SFT retraining
+    # evaluate once per epoch while its sweep ranked trials on every-10-step
+    # evals - the selected peak was then unreachable.
+    cmd.extend(
+        self._checkpointing_flags(stage_name, checkpoint_policy, eval_steps)
+    )
 
     # Inject stage-specific flags and defaults matching scripts/*.sh and sweep configs
     if stage_name == "sft":
       cmd.extend([
           "--dataset_repo_id",
           f"{self.user}/{task_name}_sft",
-          "--eval_strategy",
-          "epoch",
-          "--load_best_model_at_end",
-          "True",
-          "--metric_for_best_model",
-          "loss",
-          "--greater_is_better",
-          "False",
           "--task_type",
           "CAUSAL_LM",
           "--peft_type",
@@ -302,18 +391,6 @@ class ModelManager:
       cmd.extend([
           "--dataset_repo_id",
           f"{self.user}/{task_name}_rm_organic",
-          "--eval_strategy",
-          "steps",
-          "--eval_steps",
-          "50",
-          "--save_steps",
-          "50",
-          "--load_best_model_at_end",
-          "True",
-          "--metric_for_best_model",
-          "roc_auc",
-          "--greater_is_better",
-          "True",
           "--task_type",
           "SEQ_CLS",
           "--peft_type",
@@ -349,18 +426,6 @@ class ModelManager:
           sft_model_path,
           "--reward_model_path",
           reward_model_path,
-          "--eval_strategy",
-          "steps",
-          "--eval_steps",
-          "50",
-          "--save_steps",
-          "50",
-          "--load_best_model_at_end",
-          "True",
-          "--metric_for_best_model",
-          "rewards/reward_fn/mean",
-          "--greater_is_better",
-          "True",
           "--task_type",
           "CAUSAL_LM",
           "--peft_type",

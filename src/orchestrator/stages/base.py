@@ -11,10 +11,10 @@ import os
 import re
 from typing import Any, Callable, Dict, Optional, Set, Tuple
 
-from src.orchestrator.config import CampaignConfig
+from src.orchestrator.config import CampaignConfig, SweepStageConfig
 from src.orchestrator.model_manager import ModelManager
 from src.orchestrator.state import CampaignState, StageResult, StageStatus
-from src.orchestrator.sweep_controller import SweepController
+from src.orchestrator.sweep_controller import RunScore, SweepController
 
 
 logger = logging.getLogger(__name__)
@@ -117,6 +117,92 @@ class BaseStage(abc.ABC):
     simply runs to completion.
     """
     return self.context.abort_requested_callback
+
+  def select_winner(
+      self,
+      sweep_id: str,
+      stage_config: SweepStageConfig,
+      metric_name: str,
+      live_line_callback: Optional[Callable[[str], None]] = None,
+  ) -> RunScore:
+    """Picks the sweep's winning trial and explains how it was picked.
+
+    Under ``selection_strategy="best"`` a trial is scored on the peak of its
+    logged history rather than on wherever it happened to stop. That matches
+    what is actually shipped: the materialization publishes the best-scoring
+    checkpoint, so ranking configurations by their last eval would penalise
+    exactly the overfitting tail that ``--load_best_model_at_end`` discards.
+
+    Args:
+      sweep_id: Sweep to score.
+      stage_config: This stage's configuration.
+      metric_name: Metric to rank on.
+      live_line_callback: Optional sink for the explanation lines.
+
+    Returns:
+      The winning trial's score.
+    """
+    winner = self.sweep_controller.fetch_best_run_details(
+        sweep_id=sweep_id,
+        metric_name=metric_name,
+        goal=stage_config.goal,
+        live_line_callback=live_line_callback,
+        selection=stage_config.selection_strategy,
+    )
+    label = self.name.upper()
+    logger.info(
+        "Best %s Run: %s (%s=%.5f, %s)",
+        label,
+        winner.run_id,
+        metric_name,
+        winner.value,
+        winner.describe_selection(),
+    )
+    if live_line_callback:
+      live_line_callback(
+          f"Best {label} Run: {winner.run_id} "
+          f"({metric_name}={winner.value:.5f}; {winner.describe_selection()})"
+      )
+      # The gap between the peak and the end of the run is the part of the
+      # score that comes from early stopping. Surfacing it is what stops a
+      # lucky spike on a noisy metric from passing as a result.
+      if winner.step is not None and winner.final_value is not None:
+        drift = abs(winner.value - winner.final_value)
+        live_line_callback(
+            f"  Early stopping recovered {drift:.5f} of {metric_name} versus "
+            f"the end of the run; the published checkpoint is the step-"
+            f"{winner.step} one."
+        )
+
+    self.sweep_controller.mark_best_run(
+        sweep_id=sweep_id,
+        run_id=winner.run_id,
+        stage_name=self.name,
+        metric_name=metric_name,
+        metric_value=winner.value,
+        live_line_callback=live_line_callback,
+    )
+    return winner
+
+  def materialization_checkpoint_kwargs(
+      self, stage_config: SweepStageConfig
+  ) -> Dict[str, Any]:
+    """Returns the checkpoint-selection kwargs for ``materialize_and_push``."""
+    return {
+        "checkpoint_policy": stage_config.checkpoint_policy,
+        "eval_steps": stage_config.materialization_eval_steps,
+    }
+
+  def stage_result_selection_fields(self, winner: RunScore) -> Dict[str, Any]:
+    """Returns the ``StageResult`` fields that record how ``winner`` was chosen."""
+    return {
+        "best_run_id": winner.run_id,
+        "best_metric_val": winner.value,
+        "best_params": winner.params,
+        "selection_strategy": winner.selection,
+        "selection_step": winner.step,
+        "final_metric_val": winner.final_value,
+    }
 
   def remaining_runs(
       self,

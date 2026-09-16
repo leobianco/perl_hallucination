@@ -2,17 +2,243 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
+import math
 import os
 import subprocess
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from src.orchestrator.config import RobustnessConfig
 from src.orchestrator.process import stream_subprocess
 from src.orchestrator.retry import run_with_retries
 
 logger = logging.getLogger(__name__)
+
+#: Upper bound on the number of history rows read per trial.
+#:
+#: PE-RL logs every optimizer step (``--logging_steps=1``), so a long trial
+#: can hold thousands of rows. The eval metrics we actually rank on are
+#: logged every 10-50 steps, which stays far below this; the cap only exists
+#: so that a misconfigured sweep cannot turn the post-sweep query into a
+#: multi-minute download.
+MAX_HISTORY_ROWS = 20000
+
+
+@dataclasses.dataclass(frozen=True)
+class RunScore:
+  """How one sweep trial scored, and how that score was arrived at.
+
+  Attributes:
+    run_id: The W&B run id.
+    value: The score the trial is ranked on.
+    params: The run's config, i.e. its hyperparameters.
+    final_value: The last value the trial logged for the metric. Equal to
+      ``value`` under ``selection="final"``.
+    step: The step at which ``value`` was observed, when that is a peak
+      strictly better than ``final_value``. None otherwise, including when
+      the trial simply ended at its best point.
+    selection: The strategy that produced ``value`` ('final' or 'best').
+    from_history: True when ``value`` came from the logged history rather
+      than from ``run.summary``. False under ``selection="best"`` means the
+      history was unreadable and the summary was used as a fallback.
+  """
+
+  run_id: str
+  value: float
+  params: Dict[str, Any] = dataclasses.field(default_factory=dict)
+  final_value: Optional[float] = None
+  step: Optional[int] = None
+  selection: str = "final"
+  from_history: bool = False
+
+  def describe_selection(self) -> str:
+    """Returns a short human-readable account of how ``value`` was chosen."""
+    if self.selection != "best":
+      return "final logged value"
+    if not self.from_history:
+      return "final logged value; history unavailable"
+    if self.step is None:
+      return "best logged value, which is also the final one"
+    tail = ""
+    if self.final_value is not None:
+      tail = f" (final was {self.final_value:.5f})"
+    return f"best logged value, at step {self.step}{tail}"
+
+
+def _metric_key_candidates(target: str) -> List[str]:
+  """Returns the key spellings a training script may have used for ``target``.
+
+  The sweep YAML names a metric the way W&B displays it (``eval/loss``), but
+  the Hugging Face Trainer logs ``eval_loss`` and TRL prefixes some keys with
+  ``train/``. Ranking must not depend on which of those a script happens to
+  emit.
+
+  Args:
+    target: Metric name as configured.
+
+  Returns:
+    Candidate keys, most specific first, without duplicates.
+  """
+  candidates = [
+      target,
+      target.replace("/", "_"),
+      target.replace("_", "/"),
+  ]
+  if "train/" in target:
+    without_train = target.replace("train/", "")
+    candidates.extend([without_train, without_train.replace("/", "_")])
+  if "eval/" in target:
+    without_eval = target.replace("eval/", "")
+    candidates.extend([without_eval, without_eval.replace("/", "_")])
+  candidates.append(target.split("/")[-1])
+
+  seen = set()
+  unique = []
+  for cand in candidates:
+    if cand not in seen:
+      seen.add(cand)
+      unique.append(cand)
+  return unique
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+  """Returns ``value`` as a finite float, or None when it is not usable.
+
+  NaN and infinity are rejected: a diverged trial logging ``inf`` would
+  otherwise win a ``maximize`` sweep outright. Booleans are rejected too,
+  since ``True`` would silently score as 1.0.
+
+  Args:
+    value: A raw value from a run summary or history row.
+
+  Returns:
+    The finite float, or None.
+  """
+  if value is None or isinstance(value, bool):
+    return None
+  if not isinstance(value, (int, float)):
+    return None
+  try:
+    as_float = float(value)
+  except (ValueError, TypeError):
+    return None
+  if not math.isfinite(as_float):
+    return None
+  return as_float
+
+
+def _resolve_metric_key(
+    source: Mapping[str, Any], target: str
+) -> Optional[str]:
+  """Returns the key under which ``source`` actually holds ``target``.
+
+  Args:
+    source: A run summary (or any mapping of logged keys).
+    target: Metric name as configured.
+
+  Returns:
+    The matching key, or None when the metric is absent or unusable.
+  """
+  for candidate in _metric_key_candidates(target):
+    try:
+      present = candidate in source
+    except TypeError:
+      return None
+    if present and _coerce_float(source[candidate]) is not None:
+      return candidate
+  return None
+
+
+def _iter_history_rows(run: Any, key: str) -> Optional[Sequence[Any]]:
+  """Reads the run's logged rows for ``key``.
+
+  ``scan_history`` is exact, unlike ``history()`` which subsamples to ~500
+  points and could therefore miss the very peak we are looking for. The
+  ``_step`` column is requested alongside so the peak can be reported, but
+  a backend that rejects the pair - or that keeps ``_step`` out of these
+  rows, which makes the qualified query return *nothing* - must not cost us
+  the scan. An empty result is therefore treated as a miss and retried on
+  the bare key; silently accepting it would downgrade the trial to
+  final-step scoring without anybody noticing.
+
+  Args:
+    run: A ``wandb`` run object.
+    key: The exact logged key to read.
+
+  Returns:
+    The non-empty list of rows, or None when no history could be read.
+  """
+  scan = getattr(run, "scan_history", None)
+  if not callable(scan):
+    return None
+  for keys in ([key, "_step"], [key]):
+    try:
+      rows = list(scan(keys=keys))
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      logger.debug("scan_history(%s) failed for run %s: %s", keys, run, e)
+      continue
+    if rows:
+      return rows
+  return None
+
+
+def _scan_metric_history(
+    run: Any, key: str, goal: str
+) -> Optional[Tuple[float, Optional[int]]]:
+  """Finds a trial's best logged value of ``key`` over all of its steps.
+
+  This is the early-stopping view of a trial: the score of the checkpoint
+  that ``--load_best_model_at_end`` would keep, rather than the score at
+  whichever step the run happened to end on.
+
+  Args:
+    run: A ``wandb`` run object.
+    key: The exact key to read, as resolved by :func:`_resolve_metric_key`.
+    goal: 'minimize' or 'maximize'.
+
+  Returns:
+    ``(best_value, step)`` - ``step`` is None when the row carried no
+    ``_step``. None when the history could not be read or held no usable
+    value, which the caller must treat as "fall back to the summary".
+  """
+  rows = _iter_history_rows(run, key)
+  if not rows:
+    return None
+
+  maximize = goal == "maximize"
+  best_value: Optional[float] = None
+  best_step: Optional[int] = None
+  for index, row in enumerate(rows):
+    if index >= MAX_HISTORY_ROWS:
+      logger.warning(
+          "Stopped scanning the history of run %s after %d rows; the peak "
+          "of '%s' is taken over that prefix only.",
+          getattr(run, "id", "?"),
+          MAX_HISTORY_ROWS,
+          key,
+      )
+      break
+    if not isinstance(row, Mapping):
+      continue
+    value = _coerce_float(row.get(key))
+    if value is None:
+      continue
+    if best_value is None:
+      is_better = True
+    elif maximize:
+      is_better = value > best_value
+    else:
+      is_better = value < best_value
+    if is_better:
+      best_value = value
+      step = row.get("_step")
+      best_step = int(step) if isinstance(step, (int, float)) else None
+
+  if best_value is None:
+    return None
+  return best_value, best_step
 
 
 
@@ -525,8 +751,12 @@ class SweepController:
       metric_name: str,
       goal: str = "minimize",
       live_line_callback: Optional[Callable[[str], None]] = None,
+      selection: str = "final",
   ) -> Tuple[str, float, Dict[str, Any]]:
     """Retrieves the best run, its metric value, and configuration from the sweep.
+
+    Thin wrapper over :meth:`fetch_best_run_details` kept for callers that
+    only need the triple.
 
     Args:
         sweep_id: Full path to sweep.
@@ -534,9 +764,43 @@ class SweepController:
           'rewards/reward_fn/mean').
         goal: 'minimize' or 'maximize'.
         live_line_callback: Optional sink notified about retries.
+        selection: 'final' to score each trial on its last logged value,
+          'best' to score it on the extremum over its whole history.
 
     Returns:
         Tuple of (best_run_id, best_metric_val, best_hyperparameters_dict).
+    """
+    score = self.fetch_best_run_details(
+        sweep_id=sweep_id,
+        metric_name=metric_name,
+        goal=goal,
+        live_line_callback=live_line_callback,
+        selection=selection,
+    )
+    return score.run_id, score.value, score.params
+
+  def fetch_best_run_details(
+      self,
+      sweep_id: str,
+      metric_name: str,
+      goal: str = "minimize",
+      live_line_callback: Optional[Callable[[str], None]] = None,
+      selection: str = "final",
+  ) -> RunScore:
+    """Retrieves the winning run of a sweep together with how it was scored.
+
+    Args:
+        sweep_id: Full path to sweep.
+        metric_name: Target metric key.
+        goal: 'minimize' or 'maximize'.
+        live_line_callback: Optional sink notified about retries.
+        selection: See :meth:`fetch_best_run`.
+
+    Returns:
+        The winning :class:`RunScore`.
+
+    Raises:
+        ValueError: When the sweep is empty or no run logged ``metric_name``.
     """
     if self.dry_run:
       mock_run_id = f"run_{int(time.time())}"
@@ -550,18 +814,33 @@ class SweepController:
           "temperature": 0.7,
       }
       logger.info(
-          "[DRY-RUN] Fetched mock best run %s with %s=%f",
+          "[DRY-RUN] Fetched mock best run %s with %s=%f (selection=%s)",
           mock_run_id,
           metric_name,
           mock_metric,
+          selection,
       )
-      return mock_run_id, mock_metric, mock_params
+      # The simulated trial "peaks" slightly above where it ends, so a
+      # dry run exercises the same reporting path as a real ``best`` pick.
+      final_metric = 0.300 if goal == "minimize" else 0.950
+      chose_peak = selection == "best"
+      return RunScore(
+          run_id=mock_run_id,
+          value=mock_metric if chose_peak else final_metric,
+          params=mock_params,
+          final_value=final_metric,
+          step=120 if chose_peak else None,
+          selection=selection,
+          from_history=chose_peak,
+      )
 
     # This query happens right after hours of sweeping: a transient API error
     # here would throw away the whole stage, so it is worth retrying. A
     # genuinely missing metric raises a message flagged non-retryable.
     return run_with_retries(
-        lambda: self._fetch_best_run_once(sweep_id, metric_name, goal),
+        lambda: self._fetch_best_run_once(
+            sweep_id, metric_name, goal, selection, live_line_callback
+        ),
         description="W&B best-run query",
         attempts=self.robustness.api_attempts,
         base_delay_s=self.robustness.retry_base_delay_s,
@@ -569,13 +848,78 @@ class SweepController:
         on_notice=live_line_callback,
     )
 
+  def _score_run(
+      self,
+      run: Any,
+      metric_name: str,
+      goal: str,
+      selection: str,
+  ) -> Optional[RunScore]:
+    """Scores a single trial according to ``selection``.
+
+    Args:
+      run: A ``wandb`` run object.
+      metric_name: Metric the sweep optimises.
+      goal: 'minimize' or 'maximize'.
+      selection: 'final' or 'best'.
+
+    Returns:
+      The run's :class:`RunScore`, or None when it never logged the metric.
+    """
+    summary = getattr(run, "summary", {}) or {}
+    key = _resolve_metric_key(summary, metric_name)
+    if key is None:
+      return None
+    final_value = _coerce_float(summary.get(key))
+    if final_value is None:
+      return None
+
+    base = RunScore(
+        run_id=run.id,
+        value=final_value,
+        params=dict(getattr(run, "config", {}) or {}),
+        final_value=final_value,
+        selection=selection,
+    )
+    if selection != "best":
+      return base
+
+    peak = _scan_metric_history(run, key, goal)
+    if peak is None:
+      # The summary value is a real observation from this trial, just not
+      # necessarily its best one. Falling back to it keeps the sweep
+      # scoreable; failing here would discard hours of GPU time because an
+      # API for a *refinement* was unavailable.
+      logger.warning(
+          "Could not read the logged history of run %s for '%s'; scoring it "
+          "on its final value instead.",
+          run.id,
+          key,
+      )
+      return base
+
+    peak_value, peak_step = peak
+    # A trial whose peak is its last point is not a "best" pick in any
+    # meaningful sense; reporting no step keeps that honest.
+    improved = (
+        peak_value < final_value if goal == "minimize" else peak_value > final_value
+    )
+    return dataclasses.replace(
+        base,
+        value=peak_value,
+        step=peak_step if improved else None,
+        from_history=True,
+    )
+
   def _fetch_best_run_once(
       self,
       sweep_id: str,
       metric_name: str,
       goal: str,
-  ) -> Tuple[str, float, Dict[str, Any]]:
-    """Single attempt of :meth:`fetch_best_run` (see it for the contract)."""
+      selection: str = "final",
+      live_line_callback: Optional[Callable[[str], None]] = None,
+  ) -> RunScore:
+    """Single attempt of :meth:`fetch_best_run_details` (see it for the contract)."""
     try:
       import wandb  # pylint: disable=g-import-not-at-top
 
@@ -588,42 +932,17 @@ class SweepController:
       if not runs:
         raise ValueError(f"No runs found in sweep {full_sweep_id}")
 
-      def _extract_metric(run_summary: Dict[str, Any], target: str) -> Optional[float]:
-        candidates = [
-            target,
-            target.replace("/", "_"),
-            target.replace("_", "/"),
-        ]
-        if "train/" in target:
-          without_train = target.replace("train/", "")
-          candidates.extend([without_train, without_train.replace("/", "_")])
-        if "eval/" in target:
-          without_eval = target.replace("eval/", "")
-          candidates.extend([without_eval, without_eval.replace("/", "_")])
-        candidates.append(target.split("/")[-1])
-
-        for cand in candidates:
-          if cand in run_summary:
-            v = run_summary[cand]
-            if v is not None and isinstance(v, (int, float)):
-              try:
-                val_float = float(v)
-                if val_float == val_float and abs(val_float) != float("inf"):
-                  return val_float
-              except (ValueError, TypeError):
-                continue
-        return None
-
-      finished_runs: List[Tuple[Any, float]] = []
-      other_runs: List[Tuple[Any, float]] = []
+      finished_runs: List[RunScore] = []
+      other_runs: List[RunScore] = []
 
       for run in runs:
-        val = _extract_metric(run.summary, metric_name)
-        if val is not None:
-          if run.state == "finished":
-            finished_runs.append((run, val))
-          elif run.state in ("running", "failed"):
-            other_runs.append((run, val))
+        score = self._score_run(run, metric_name, goal, selection)
+        if score is None:
+          continue
+        if run.state == "finished":
+          finished_runs.append(score)
+        elif run.state in ("running", "failed"):
+          other_runs.append(score)
 
       # Strictly prioritize finished runs over failed or running ones
       valid_runs = finished_runs if finished_runs else other_runs
@@ -648,20 +967,27 @@ class SweepController:
             f"{observed_keys[:40]}"
         )
 
-
       # Sort by metric
       reverse = goal == "maximize"
-      valid_runs.sort(key=lambda x: x[1], reverse=reverse)
-      best_run, best_val = valid_runs[0]
+      valid_runs.sort(key=lambda score: score.value, reverse=reverse)
+      best = valid_runs[0]
 
       logger.info(
-          "Best run for %s is %s with %s=%.5f",
+          "Best run for %s is %s with %s=%.5f (%s)",
           sweep_id,
-          best_run.id,
+          best.run_id,
           metric_name,
-          best_val,
+          best.value,
+          best.describe_selection(),
       )
-      return best_run.id, best_val, best_run.config
+      if live_line_callback and selection == "best":
+        if not any(score.from_history for score in valid_runs):
+          live_line_callback(
+              "[WARNING] Trials were meant to be ranked on their best "
+              "evaluation step, but no logged history could be read; they "
+              "were ranked on their final value instead."
+          )
+      return best
 
     except Exception as e:
       logger.error("Failed to query best run from W&B API: %s", e)

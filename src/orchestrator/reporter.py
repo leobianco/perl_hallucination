@@ -5,12 +5,48 @@ from __future__ import annotations
 import datetime
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from src.orchestrator import eval_metrics
 from src.orchestrator.config import CampaignConfig
-from src.orchestrator.state import CampaignState, StageStatus
+from src.orchestrator.state import CampaignState, StageResult, StageStatus
 
 logger = logging.getLogger(__name__)
+
+
+def _selection_lines(result: StageResult, metric_label: str) -> List[str]:
+  """Explains how a stage's headline number was picked, when that matters.
+
+  A score obtained by early stopping is not the same claim as a score the
+  run actually ended on, and the difference decides whether the number is a
+  result or a lucky spike. Silent for ``final`` selection so that reports
+  from stages which do not early stop read exactly as before.
+
+  Args:
+    result: The stage's outcome.
+    metric_label: Human-readable metric name for the prose.
+
+  Returns:
+    Zero, one or two markdown bullet lines.
+  """
+  if result.selection_strategy != "best":
+    return []
+  if result.selection_step is None:
+    return [
+        "* **Selection**: best "
+        f"{metric_label} over all evaluation steps (the winning trial ended "
+        "at its best point)."
+    ]
+  lines = [
+      f"* **Selection**: best {metric_label} over all evaluation steps, "
+      f"reached at step `{result.selection_step}` (early stopping)."
+  ]
+  if result.final_metric_val is not None:
+    lines.append(
+        f"* **Final-step {metric_label}**: `{result.final_metric_val:.5f}` - "
+        "the gap to the value above is what early stopping recovered, and "
+        "is optimistically biased by the selection itself."
+    )
+  return lines
 
 
 class CampaignReporter:
@@ -138,6 +174,7 @@ class CampaignReporter:
           f"* **Sweep**: {sft_sw}",
           f"* **Winning Run ID**: `{sft_res.best_run_id}`",
           f"* **Best Eval Loss**: `{sft_res.best_metric_val:.5f}`",
+          *_selection_lines(sft_res, "eval loss"),
           f"* **Hugging Face Model**: [{sft_res.model_repo_id}](https://huggingface.co/{sft_res.model_repo_id})",
           "* **Optimal Hyperparameters**:",
           "```yaml",
@@ -160,6 +197,7 @@ class CampaignReporter:
           f"* **Sweep**: {rm_sw}",
           f"* **Winning Run ID**: `{rm_res.best_run_id}`",
           f"* **Best ROC-AUC**: `{rm_res.best_metric_val:.5f}`",
+          *_selection_lines(rm_res, "ROC-AUC"),
           f"* **Hugging Face Model**: [{rm_res.model_repo_id}](https://huggingface.co/{rm_res.model_repo_id})",
           "* **Optimal Hyperparameters**:",
           "```yaml",
@@ -182,6 +220,7 @@ class CampaignReporter:
           f"* **Sweep**: {perl_sw}",
           f"* **Winning Run ID**: `{perl_res.best_run_id}`",
           f"* **Best Mean Reward**: `{perl_res.best_metric_val:.5f}`",
+          *_selection_lines(perl_res, "mean reward"),
           f"* **Hugging Face Model**: [{perl_res.model_repo_id}](https://huggingface.co/{perl_res.model_repo_id})",
           "* **Optimal Hyperparameters**:",
           "```yaml",

@@ -114,23 +114,13 @@ class SftStage(BaseStage):
             "the trials that did finish."
         )
 
-    # 3. Query Best Run
-    best_run_id, best_val, best_params = self.sweep_controller.fetch_best_run(
+    # 3. Query Best Run. Under selection_strategy="best" this is the trial
+    # with the lowest eval loss at *any* eval step, which is the checkpoint
+    # the materialization below will publish.
+    winner = self.select_winner(
         sweep_id=sweep_id,
+        stage_config=cfg,
         metric_name=target_metric,
-        goal=cfg.goal,
-    )
-    logger.info("Best SFT Run: %s (%s=%.5f)", best_run_id, target_metric, best_val)
-    if live_line_callback:
-      live_line_callback(f"Best SFT Run: {best_run_id} ({target_metric}={best_val:.5f})")
-
-    # Make the winner findable in the W&B web UI. Best-effort by design.
-    self.sweep_controller.mark_best_run(
-        sweep_id=sweep_id,
-        run_id=best_run_id,
-        stage_name="sft",
-        metric_name=target_metric,
-        metric_value=best_val,
         live_line_callback=live_line_callback,
     )
 
@@ -143,11 +133,12 @@ class SftStage(BaseStage):
         stage_name="sft",
         task_name=self.config.task_name,
         base_model=self.config.base_model,
-        best_params=best_params,
+        best_params=winner.params,
         seed=self.config.seed,
         live_line_callback=live_line_callback,
         tunable_keys=self.tunable_keys(sweep_dict),
         stop_requested_callback=self.materialization_stop_callback(),
+        **self.materialization_checkpoint_kwargs(cfg),
     )
 
     logger.info("SFT model pushed to: %s", sft_repo_id)
@@ -157,9 +148,7 @@ class SftStage(BaseStage):
     return StageResult(
         status=StageStatus.COMPLETED,
         sweep_id=sweep_id,
-        best_run_id=best_run_id,
-        best_metric_val=best_val,
-        best_params=best_params,
         model_repo_id=sft_repo_id,
-        metrics={"eval_loss": best_val},
+        metrics={"eval_loss": winner.value},
+        **self.stage_result_selection_fields(winner),
     )

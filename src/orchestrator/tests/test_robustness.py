@@ -387,11 +387,28 @@ class TestSweepExistenceProbe(unittest.TestCase):
 
 class _FakeRun:
 
-  def __init__(self, run_id, summary, state="finished", config=None):
+  def __init__(
+      self, run_id, summary, state="finished", config=None, history=None
+  ):
     self.id = run_id
     self.summary = summary
     self.state = state
     self.config = config or {}
+    #: Rows as ``scan_history`` would return them. None means the run
+    #: exposes no readable history at all.
+    self._history = history
+
+  def scan_history(self, keys=None):
+    if self._history is None:
+      raise RuntimeError("history unavailable")
+    if not keys:
+      return list(self._history)
+    # Mirrors the real API: only rows carrying every requested key.
+    matching = []
+    for row in self._history:
+      if all(key in row for key in keys):
+        matching.append(row)
+    return matching
 
 
 class _FakeSweep:
@@ -449,6 +466,300 @@ class TestFetchBestRunIsStrict(unittest.TestCase):
     controller = SweepController(entity="e", project="p", dry_run=False)
     with self.assertRaises(ValueError):
       controller.fetch_best_run("sweep123", "eval/loss")
+
+
+class TestSelectionStrategy(unittest.TestCase):
+  """Trials must be ranked by the score of the checkpoint we actually ship.
+
+  The materialization publishes the best-scoring checkpoint, so a trial that
+  bottoms out early and then overfits must be judged on its peak, not on the
+  overfitting tail that ``--load_best_model_at_end`` throws away.
+  """
+
+  def _install_wandb(self, runs):
+    module = types.ModuleType("wandb")
+    module.Api = lambda: _FakeApi(_FakeSweep(runs))
+    sys.modules["wandb"] = module
+    self.addCleanup(sys.modules.pop, "wandb", None)
+
+  def _controller(self):
+    return SweepController(entity="e", project="p", dry_run=False)
+
+  def test_final_selection_ignores_the_peak(self):
+    # "overfitter" touches 0.10 at step 20 and ends at 0.90; "steady" ends
+    # at 0.40. Ranked on the last value, "steady" wins.
+    self._install_wandb([
+        _FakeRun(
+            "overfitter",
+            {"eval/loss": 0.90},
+            history=[
+                {"eval/loss": 0.80, "_step": 10},
+                {"eval/loss": 0.10, "_step": 20},
+                {"eval/loss": 0.90, "_step": 30},
+            ],
+        ),
+        _FakeRun(
+            "steady",
+            {"eval/loss": 0.40},
+            history=[
+                {"eval/loss": 0.60, "_step": 10},
+                {"eval/loss": 0.40, "_step": 20},
+            ],
+        ),
+    ])
+    winner = self._controller().fetch_best_run_details(
+        "s", "eval/loss", goal="minimize", selection="final"
+    )
+    self.assertEqual(winner.run_id, "steady")
+    self.assertAlmostEqual(winner.value, 0.40)
+    self.assertIsNone(winner.step)
+
+  def test_best_selection_recovers_the_peak(self):
+    self._install_wandb([
+        _FakeRun(
+            "overfitter",
+            {"eval/loss": 0.90},
+            history=[
+                {"eval/loss": 0.80, "_step": 10},
+                {"eval/loss": 0.10, "_step": 20},
+                {"eval/loss": 0.90, "_step": 30},
+            ],
+        ),
+        _FakeRun(
+            "steady",
+            {"eval/loss": 0.40},
+            history=[
+                {"eval/loss": 0.60, "_step": 10},
+                {"eval/loss": 0.40, "_step": 20},
+            ],
+        ),
+    ])
+    winner = self._controller().fetch_best_run_details(
+        "s", "eval/loss", goal="minimize", selection="best"
+    )
+    self.assertEqual(winner.run_id, "overfitter")
+    self.assertAlmostEqual(winner.value, 0.10)
+    self.assertEqual(winner.step, 20)
+    self.assertAlmostEqual(winner.final_value, 0.90)
+    self.assertTrue(winner.from_history)
+
+  def test_best_selection_maximizes_for_roc_auc(self):
+    self._install_wandb([
+        _FakeRun(
+            "rm",
+            {"eval/roc_auc": 0.71},
+            history=[
+                {"eval/roc_auc": 0.65, "_step": 50},
+                {"eval/roc_auc": 0.93, "_step": 100},
+                {"eval/roc_auc": 0.71, "_step": 150},
+            ],
+        ),
+    ])
+    winner = self._controller().fetch_best_run_details(
+        "s", "eval/roc_auc", goal="maximize", selection="best"
+    )
+    self.assertAlmostEqual(winner.value, 0.93)
+    self.assertEqual(winner.step, 100)
+
+  def test_a_run_that_ends_at_its_peak_reports_no_step(self):
+    # Reporting a step here would suggest early stopping bought something.
+    self._install_wandb([
+        _FakeRun(
+            "monotonic",
+            {"eval/loss": 0.20},
+            history=[
+                {"eval/loss": 0.60, "_step": 10},
+                {"eval/loss": 0.20, "_step": 20},
+            ],
+        ),
+    ])
+    winner = self._controller().fetch_best_run_details(
+        "s", "eval/loss", goal="minimize", selection="best"
+    )
+    self.assertAlmostEqual(winner.value, 0.20)
+    self.assertIsNone(winner.step)
+    self.assertIn("also the final one", winner.describe_selection())
+
+  def test_unreadable_history_falls_back_to_the_summary(self):
+    # Losing a whole sweep because an API for a refinement is unavailable
+    # would be far worse than scoring the trial on its final value.
+    self._install_wandb([
+        _FakeRun("no_history", {"eval/loss": 0.33}, history=None),
+    ])
+    winner = self._controller().fetch_best_run_details(
+        "s", "eval/loss", goal="minimize", selection="best"
+    )
+    self.assertEqual(winner.run_id, "no_history")
+    self.assertAlmostEqual(winner.value, 0.33)
+    self.assertFalse(winner.from_history)
+    self.assertIn("history unavailable", winner.describe_selection())
+
+  def test_fallback_warns_on_the_live_line(self):
+    self._install_wandb([
+        _FakeRun("no_history", {"eval/loss": 0.33}, history=None),
+    ])
+    seen = []
+    self._controller().fetch_best_run_details(
+        "s",
+        "eval/loss",
+        goal="minimize",
+        selection="best",
+        live_line_callback=seen.append,
+    )
+    self.assertTrue(
+        any("best evaluation step" in line for line in seen),
+        f"no warning about the fallback in {seen}",
+    )
+
+  def test_nan_and_inf_history_rows_are_ignored(self):
+    # A diverged trial logging inf would otherwise win a maximize sweep.
+    self._install_wandb([
+        _FakeRun(
+            "diverged",
+            {"eval/roc_auc": 0.55},
+            history=[
+                {"eval/roc_auc": float("inf"), "_step": 10},
+                {"eval/roc_auc": float("nan"), "_step": 20},
+                {"eval/roc_auc": 0.60, "_step": 30},
+                {"eval/roc_auc": 0.55, "_step": 40},
+            ],
+        ),
+    ])
+    winner = self._controller().fetch_best_run_details(
+        "s", "eval/roc_auc", goal="maximize", selection="best"
+    )
+    self.assertAlmostEqual(winner.value, 0.60)
+    self.assertEqual(winner.step, 30)
+
+  def test_history_key_alias_matches_the_summary_key(self):
+    # HF Trainer logs eval_loss; the sweep YAML says eval/loss.
+    self._install_wandb([
+        _FakeRun(
+            "aliased",
+            {"eval_loss": 0.50},
+            history=[
+                {"eval_loss": 0.15, "_step": 10},
+                {"eval_loss": 0.50, "_step": 20},
+            ],
+        ),
+    ])
+    winner = self._controller().fetch_best_run_details(
+        "s", "eval/loss", goal="minimize", selection="best"
+    )
+    self.assertAlmostEqual(winner.value, 0.15)
+    self.assertEqual(winner.step, 10)
+
+  def test_missing_step_column_still_yields_the_peak(self):
+    self._install_wandb([
+        _FakeRun(
+            "no_steps",
+            {"eval/loss": 0.50},
+            history=[{"eval/loss": 0.15}, {"eval/loss": 0.50}],
+        ),
+    ])
+    winner = self._controller().fetch_best_run_details(
+        "s", "eval/loss", goal="minimize", selection="best"
+    )
+    self.assertAlmostEqual(winner.value, 0.15)
+    self.assertIsNone(winner.step)
+
+
+class TestStageSelectionDefaults(unittest.TestCase):
+  """SFT and RM early stop; PE-RL deliberately does not."""
+
+  def setUp(self):
+    self.config = CampaignConfig.create_default(task_name="npov")
+
+  def test_sft_and_rm_rank_trials_on_their_best_step(self):
+    self.assertEqual(self.config.sft.selection_strategy, "best")
+    self.assertEqual(self.config.rm.selection_strategy, "best")
+
+  def test_perl_ranks_trials_on_their_final_step(self):
+    # The PE-RL reward is a per-step training signal over 8 sampled
+    # generations: its maximum is a lucky batch, not a better policy.
+    self.assertEqual(self.config.perl.selection_strategy, "final")
+
+  def test_the_published_checkpoint_matches_the_ranking(self):
+    # Ranking on the peak only means something if the peak is what gets
+    # pushed, so every stage that selects on "best" must publish "best".
+    for stage in ("sft", "rm", "perl"):
+      with self.subTest(stage=stage):
+        stage_cfg = getattr(self.config, stage)
+        if stage_cfg.selection_strategy == "best":
+          self.assertEqual(stage_cfg.checkpoint_policy, "best")
+
+  def test_sft_materialization_evaluates_as_often_as_its_sweep(self):
+    # scripts/sweep_sft.yaml uses --eval_steps=10. Retraining once per
+    # epoch would make the selected peak unreachable.
+    self.assertEqual(self.config.sft.materialization_eval_steps, 10)
+    self.assertEqual(self.config.rm.materialization_eval_steps, 50)
+
+  def test_validate_rejects_an_unknown_strategy(self):
+    self.config.rm.selection_strategy = "peak"
+    with self.assertRaises(ValueError) as ctx:
+      self.config.validate()
+    self.assertIn("selection_strategy", str(ctx.exception))
+
+  def test_validate_rejects_an_unknown_policy(self):
+    self.config.rm.checkpoint_policy = "penultimate"
+    with self.assertRaises(ValueError) as ctx:
+      self.config.validate()
+    self.assertIn("checkpoint_policy", str(ctx.exception))
+
+  def test_validate_rejects_ranking_on_peak_while_shipping_the_last(self):
+    # The reported metric would then belong to a checkpoint nobody can load.
+    self.config.rm.checkpoint_policy = "final"  # selection is "best"
+    with self.assertRaises(ValueError) as ctx:
+      self.config.validate()
+    self.assertIn("never pushed", str(ctx.exception))
+
+  def test_the_default_campaign_validates(self):
+    self.config.validate()
+
+
+class TestMaterializationCheckpointFlags(unittest.TestCase):
+  """The retraining must be able to reproduce the checkpoint we selected."""
+
+  def setUp(self):
+    self.manager = ModelManager(user="u", dry_run=True)
+
+  def _flags(self, stage, policy="best", eval_steps=None):
+    return self.manager._checkpointing_flags(stage, policy, eval_steps)  # pylint: disable=protected-access
+
+  def _value_of(self, flags, flag):
+    return flags[flags.index(flag) + 1]
+
+  def test_best_policy_loads_the_best_checkpoint(self):
+    flags = self._flags("rm")
+    self.assertEqual(self._value_of(flags, "--load_best_model_at_end"), "True")
+    self.assertEqual(self._value_of(flags, "--metric_for_best_model"), "roc_auc")
+    self.assertEqual(self._value_of(flags, "--greater_is_better"), "True")
+
+  def test_final_policy_disables_early_stopping(self):
+    flags = self._flags("perl", policy="final")
+    self.assertEqual(self._value_of(flags, "--load_best_model_at_end"), "False")
+    self.assertNotIn("--metric_for_best_model", flags)
+
+  def test_eval_and_save_cadence_are_kept_identical(self):
+    # load_best_model_at_end requires the strategies to match and save_steps
+    # to be a multiple of eval_steps.
+    flags = self._flags("sft", eval_steps=10)
+    self.assertEqual(self._value_of(flags, "--eval_strategy"), "steps")
+    self.assertEqual(self._value_of(flags, "--save_strategy"), "steps")
+    self.assertEqual(self._value_of(flags, "--eval_steps"), "10")
+    self.assertEqual(self._value_of(flags, "--save_steps"), "10")
+
+  def test_no_cadence_falls_back_to_epochs(self):
+    flags = self._flags("sft")
+    self.assertEqual(self._value_of(flags, "--eval_strategy"), "epoch")
+    self.assertEqual(self._value_of(flags, "--save_strategy"), "epoch")
+    self.assertNotIn("--eval_steps", flags)
+
+  def test_unknown_policy_is_rejected(self):
+    with self.assertRaises(ValueError):
+      self._flags("sft", policy="whatever")
+
+
 
 
 class TestEvalStageSeed(unittest.TestCase):

@@ -19,6 +19,7 @@ from src.orchestrator.stages.sft_stage import SftStage
 from src.orchestrator.state import CampaignState
 from src.orchestrator.state import StageResult
 from src.orchestrator.state import StageStatus
+from src.orchestrator.sweep_controller import RunScore
 from src.orchestrator.sweep_controller import SweepController
 
 
@@ -442,7 +443,13 @@ class TestBestRunIsTagged(unittest.TestCase):
         # `remaining_runs` lives on the stage; this is what it really calls.
         controller.count_finished_runs.return_value = 0
         controller.run_sweep_agent.return_value = 0
-        controller.fetch_best_run.return_value = ("win1", 0.3, {"lora_r": 8})
+        controller.fetch_best_run_details.return_value = RunScore(
+            run_id="win1",
+            value=0.3,
+            params={"lora_r": 8},
+            final_value=0.3,
+            selection=getattr(config, stage_name).selection_strategy,
+        )
         model_manager = mock.MagicMock()
         model_manager.materialize_and_push.return_value = "u/out"
         context = CampaignContext(
@@ -458,6 +465,19 @@ class TestBestRunIsTagged(unittest.TestCase):
         kwargs = controller.mark_best_run.call_args.kwargs
         self.assertEqual(kwargs["stage_name"], stage_name)
         self.assertEqual(kwargs["run_id"], "win1")
+        # Each stage must rank its trials the way its config says, not the
+        # way whichever stage was edited last says.
+        self.assertEqual(
+            controller.fetch_best_run_details.call_args.kwargs["selection"],
+            getattr(config, stage_name).selection_strategy,
+        )
+        # ... and hand the matching checkpoint policy to the retraining.
+        self.assertEqual(
+            model_manager.materialize_and_push.call_args.kwargs[
+                "checkpoint_policy"
+            ],
+            getattr(config, stage_name).checkpoint_policy,
+        )
 
 
 class TestStaleErrorIsCleared(unittest.TestCase):

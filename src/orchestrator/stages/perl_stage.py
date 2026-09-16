@@ -156,23 +156,15 @@ class PerlStage(BaseStage):
             "the trials that did finish."
         )
 
-    # 3. Query Best Run (maximizing rewards/reward_fn/mean)
-    best_run_id, best_val, best_params = self.sweep_controller.fetch_best_run(
+    # 3. Query Best Run. Unlike SFT and RM this stage keeps
+    # selection_strategy="final": the reward is a *training* signal logged
+    # every step over 8 sampled generations, so its maximum is reached
+    # early, before the policy stabilises. Ranking on that peak selects the
+    # luckiest batch of completions rather than the best configuration.
+    winner = self.select_winner(
         sweep_id=sweep_id,
+        stage_config=cfg,
         metric_name=target_metric,
-        goal=cfg.goal,
-    )
-    logger.info("Best PE-RL Run: %s (%s=%.5f)", best_run_id, target_metric, best_val)
-    if live_line_callback:
-      live_line_callback(f"Best PE-RL Run: {best_run_id} ({target_metric}={best_val:.5f})")
-
-    # Make the winner findable in the W&B web UI. Best-effort by design.
-    self.sweep_controller.mark_best_run(
-        sweep_id=sweep_id,
-        run_id=best_run_id,
-        stage_name="perl",
-        metric_name=target_metric,
-        metric_value=best_val,
         live_line_callback=live_line_callback,
     )
 
@@ -185,13 +177,14 @@ class PerlStage(BaseStage):
         stage_name="perl",
         task_name=self.config.task_name,
         base_model=self.config.base_model,
-        best_params=best_params,
+        best_params=winner.params,
         seed=self.config.seed,
         sft_model_path=sft_model,
         reward_model_path=rm_model,
         live_line_callback=live_line_callback,
         tunable_keys=self.tunable_keys(sweep_dict),
         stop_requested_callback=self.materialization_stop_callback(),
+        **self.materialization_checkpoint_kwargs(cfg),
     )
 
     logger.info("PE-RL model pushed to: %s", perl_repo_id)
@@ -201,9 +194,7 @@ class PerlStage(BaseStage):
     return StageResult(
         status=StageStatus.COMPLETED,
         sweep_id=sweep_id,
-        best_run_id=best_run_id,
-        best_metric_val=best_val,
-        best_params=best_params,
         model_repo_id=perl_repo_id,
-        metrics={"rewards/reward_fn/mean": best_val},
+        metrics={"rewards/reward_fn/mean": winner.value},
+        **self.stage_result_selection_fields(winner),
     )

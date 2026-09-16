@@ -311,6 +311,60 @@ and what the training script logs. **The sweep itself is unaffected** - W&B
 optimises on its own copy of the metric, and the stage's final best run is
 queried from the API - so this is a display problem, not a lost experiment.
 
+#### How a trial is scored: `selection_strategy`
+
+A sweep trial produces a *curve*, not a number, so "the best trial" needs a
+rule. Each stage picks one:
+
+| Stage | `selection_strategy` | Scored on |
+|---|---|---|
+| SFT | `best` | Lowest `eval/loss` at **any** eval step |
+| RM | `best` | Highest `eval/roc_auc` at **any** eval step |
+| PE-RL | `final` | `train/rewards/reward_fn/mean` at the **last** step |
+
+**Why `best` for SFT and RM.** The materialization publishes the best-scoring
+checkpoint (`--load_best_model_at_end`), so a trial that bottoms out at step 60
+and then overfits is shipped as its step-60 checkpoint regardless. Ranking such
+a trial on its *last* eval would judge it by the tail we throw away. Before this
+was fixed, selection and deployment used two different criteria. The two now
+have to agree: `CampaignConfig.validate()` rejects `selection_strategy="best"`
+combined with `checkpoint_policy="final"`.
+
+**Why `final` for PE-RL.** `rewards/reward_fn/mean` is a *training* signal
+logged every optimizer step over 8 sampled generations. Its maximum reliably
+lands early, before the policy stabilises, so ranking on it would select the
+luckiest batch of completions rather than the best configuration. The converged
+level is the honest signal.
+
+**The caveat.** Maximising over (trials x eval steps) is a best-of-N over noisy
+estimates, so the reported number is optimistically biased - the model is still
+at least as good as a final-step pick in expectation, but the *score* is not an
+unbiased estimate of its quality. This matters most for the RM, which becomes
+PE-RL's reward: a reward model cherry-picked at a lucky ROC-AUC spike is a
+noisier signal for the policy to exploit. Two things keep this visible:
+
+* The campaign log prints how much early stopping recovered, e.g.
+  *"Early stopping recovered 0.04120 of eval/roc_auc versus the end of the run;
+  the published checkpoint is the step-150 one."* A large gap on a noisy metric
+  is a warning sign, not a result.
+* The markdown report records the selection step and the final-step value next
+  to the headline number.
+
+The trustworthy number remains the **eval stage's autorater score**, which is
+computed on a held-out test set that took no part in any of this selection.
+
+**Overriding it.** Per stage, in the campaign YAML:
+
+```yaml
+rm_stage:
+  selection_strategy: final   # rank trials on their last eval instead
+  checkpoint_policy: final    # ... and publish the last checkpoint
+```
+
+`materialization_eval_steps` controls how finely the winner's retraining can
+locate that best checkpoint; it defaults to each sweep YAML's `--eval_steps`
+(SFT 10, RM 50). Setting it coarser than the sweep means the peak the trial was
+ranked on may not be reachable in the run that produces the artifact.
 
 ### 8. Headless Mode (for `nohup` or logging to file)
 ```bash
@@ -411,6 +465,11 @@ sft_stage:
   max_runs: 30
   metric: "eval/loss"
   goal: "minimize"
+  # Rank trials on the best eval step, not the last one; publish that same
+  # checkpoint. See "How a trial is scored" above.
+  selection_strategy: "best"
+  checkpoint_policy: "best"
+  materialization_eval_steps: 10
 
 rm_stage:
   enabled: true
@@ -418,6 +477,9 @@ rm_stage:
   max_runs: 30
   metric: "eval/roc_auc"
   goal: "maximize"
+  selection_strategy: "best"
+  checkpoint_policy: "best"
+  materialization_eval_steps: 50
 
 perl_stage:
   enabled: true
@@ -425,6 +487,10 @@ perl_stage:
   max_runs: 10
   metric: "rewards/reward_fn/mean"
   goal: "maximize"
+  # Deliberately "final": the training reward is too noisy per step for its
+  # peak to mean anything.
+  selection_strategy: "final"
+  checkpoint_policy: "best"
   sft_model_path: "auto"
   reward_model_path: "auto"
 

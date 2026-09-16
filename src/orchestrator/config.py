@@ -53,6 +53,25 @@ def sweep_timeout_minutes(stage: str, max_runs: int) -> int:
   return int(max(MIN_TIMEOUT_MINUTES, math.ceil(estimate)))
 
 
+#: How a trial's score is read out of its W&B history.
+#:
+#: ``final``
+#:   The last value the trial logged - what ``run.summary`` holds. Correct
+#:   when the metric is noisy per step and only its *converged* level is
+#:   meaningful (the PE-RL training reward).
+#: ``best``
+#:   The extremum over every logged step, i.e. early-stopping semantics.
+#:   Correct when the deployed checkpoint is itself the best-step one, which
+#:   is what ``--load_best_model_at_end`` gives us for SFT and RM.
+SELECTION_STRATEGIES = ("final", "best")
+
+#: Which checkpoint of the materialization run is published.
+#:
+#: ``best``  - ``--load_best_model_at_end True`` (early stopping in-run).
+#: ``final`` - the last checkpoint, i.e. no in-run early stopping.
+CHECKPOINT_POLICIES = ("best", "final")
+
+
 @dataclass
 class SweepStageConfig:
   """Configuration for a W&B hyperparameter sweep stage (SFT, RM, or PE-RL)."""
@@ -64,6 +83,22 @@ class SweepStageConfig:
   metric: str = "eval/loss"
   goal: str = "minimize"  # "minimize" or "maximize"
   parameter_overrides: Dict[str, Any] = field(default_factory=dict)
+  #: How trials are ranked against each other; see SELECTION_STRATEGIES.
+  #: ``final`` is the conservative default so that a stage configured by hand
+  #: keeps the historical behaviour; :meth:`CampaignConfig.create_default`
+  #: opts SFT and RM into ``best``.
+  selection_strategy: str = "final"
+  #: Which checkpoint of the materialization run reaches the Hub; see
+  #: CHECKPOINT_POLICIES. Keep this consistent with ``selection_strategy``:
+  #: ranking trials on their peak and then publishing their last checkpoint
+  #: (or the reverse) selects on one criterion and ships another.
+  checkpoint_policy: str = "best"
+  #: Eval/save cadence (in optimizer steps) of the materialization run. Only
+  #: meaningful under ``checkpoint_policy="best"``: it decides how finely the
+  #: peak can be recovered. None keeps the stage's historical cadence.
+  #: It should mirror the sweep YAML's ``--eval_steps``, otherwise trials are
+  #: ranked at a resolution the winner's retraining cannot reproduce.
+  materialization_eval_steps: Optional[int] = None
   # Checkpoint paths (used specifically for PE-RL stage)
   sft_model_path: Optional[str] = None  # "auto" or explicit HF repo ID / local path
   reward_model_path: Optional[str] = None  # "auto" or explicit HF repo ID / local path
@@ -178,7 +213,13 @@ class CampaignConfig:
       self.state_file = f"./checkpoints/{self.task_name}/{self.name}_state.json"
 
   def validate(self) -> None:
-    """Validates the campaign configuration values."""
+    """Validates the campaign configuration values.
+
+    Raises:
+      ValueError: On an unknown task, stage, selection strategy or checkpoint
+        policy, or on a selection/checkpoint combination that would rank
+        trials on one criterion and publish a model chosen by another.
+    """
     if self.task_name not in VALID_TASKS:
       raise ValueError(
           f"Invalid task_name '{self.task_name}'. Must be one of {VALID_TASKS}"
@@ -188,6 +229,34 @@ class CampaignConfig:
         raise ValueError(
             f"Invalid stage '{stage_name}'. Must be one of ['sft', 'rm',"
             " 'perl', 'eval']"
+        )
+    for stage_name in ("sft", "rm", "perl"):
+      stage_cfg: SweepStageConfig = getattr(self, stage_name)
+      if stage_cfg.selection_strategy not in SELECTION_STRATEGIES:
+        raise ValueError(
+            f"Invalid selection_strategy "
+            f"'{stage_cfg.selection_strategy}' for the {stage_name.upper()} "
+            f"stage. Must be one of {list(SELECTION_STRATEGIES)}."
+        )
+      if stage_cfg.checkpoint_policy not in CHECKPOINT_POLICIES:
+        raise ValueError(
+            f"Invalid checkpoint_policy '{stage_cfg.checkpoint_policy}' for "
+            f"the {stage_name.upper()} stage. Must be one of "
+            f"{list(CHECKPOINT_POLICIES)}."
+        )
+      # Ranking trials by their peak and then shipping the winner's last
+      # checkpoint means the number in the report was never measured on the
+      # model that was published. Catch it here rather than in the report.
+      if (
+          stage_cfg.selection_strategy == "best"
+          and stage_cfg.checkpoint_policy == "final"
+      ):
+        raise ValueError(
+            f"The {stage_name.upper()} stage ranks trials on their best step "
+            "(selection_strategy='best') but publishes the last checkpoint "
+            "(checkpoint_policy='final'). The reported metric would then "
+            "belong to a checkpoint that was never pushed. Use "
+            "checkpoint_policy='best', or rank on 'final' too."
         )
 
   def to_dict(self) -> Dict[str, Any]:
@@ -268,6 +337,17 @@ class CampaignConfig:
             timeout_minutes=sweep_timeout_minutes("sft", sft_runs),
             metric="eval/loss",
             goal="minimize",
+            # A LoRA SFT run on a small dataset routinely bottoms out early
+            # and then climbs back as it memorises. Its *last* eval loss
+            # therefore says more about how long the run was than about how
+            # good its configuration is - and the checkpoint we publish is
+            # the best-step one anyway (--load_best_model_at_end).
+            selection_strategy="best",
+            checkpoint_policy="best",
+            # Mirrors --eval_steps in scripts/sweep_sft.yaml. Without this
+            # the retraining only evaluated per epoch, so the winner's peak
+            # (found among every-10-step evals) was unreachable.
+            materialization_eval_steps=10,
         ),
         rm=SweepStageConfig(
             enabled=True,
@@ -276,6 +356,12 @@ class CampaignConfig:
             timeout_minutes=sweep_timeout_minutes("rm", rm_runs),
             metric="eval/roc_auc",
             goal="maximize",
+            # Same reasoning as SFT; up to 15 epochs makes late overfitting
+            # the rule rather than the exception here.
+            selection_strategy="best",
+            checkpoint_policy="best",
+            # Mirrors --eval_steps in scripts/sweep_rm.yaml.
+            materialization_eval_steps=50,
         ),
         perl=SweepStageConfig(
             enabled=True,
@@ -284,6 +370,13 @@ class CampaignConfig:
             timeout_minutes=sweep_timeout_minutes("perl", perl_runs),
             metric="train/rewards/reward_fn/mean",
             goal="maximize",
+            # Deliberately NOT "best". The PE-RL objective is a *training*
+            # reward logged every step over 8 generations; its peak almost
+            # always lands early, before the policy stabilises, so ranking on
+            # it would select the luckiest batch rather than the best
+            # configuration. The converged level is the honest signal.
+            selection_strategy="final",
+            checkpoint_policy="best",
             sft_model_path="auto",
             reward_model_path="auto",
         ),

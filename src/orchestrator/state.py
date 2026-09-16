@@ -45,6 +45,20 @@ class StageResult:
   #: Trial budget, mirrored here so the counter is meaningful even if the
   #: config is later edited or unavailable.
   trials_total: int = 0
+  #: How ``best_metric_val`` was read out of the winning trial: ``final``
+  #: (its last logged value) or ``best`` (its peak over all eval steps).
+  #: Without this, two campaigns of the same task report numbers that are
+  #: not comparable and nothing on disk says why.
+  selection_strategy: Optional[str] = None
+  #: Step at which the winner's peak occurred, when that peak is strictly
+  #: better than where the run ended. None under ``final`` selection, and
+  #: also None when the run simply ended at its best point.
+  selection_step: Optional[int] = None
+  #: The winner's *last* logged value of the metric. Under ``best``
+  #: selection the gap to ``best_metric_val`` is the honest measure of how
+  #: much of the score is early stopping - a large gap on a noisy metric is
+  #: a warning sign, not a result.
+  final_metric_val: Optional[float] = None
 
   def to_dict(self) -> Dict[str, Any]:
     res = dataclasses.asdict(self)
@@ -171,6 +185,12 @@ class CampaignState:
       # a stage that visibly ran trials.
       if result.best_metric_val is None:
         result.best_metric_val = previous.best_metric_val
+        # The provenance describes that very number, so it has to travel
+        # with it; otherwise the report would label a carried-over score
+        # with the current attempt's (unused) strategy.
+        result.selection_strategy = previous.selection_strategy
+        result.selection_step = previous.selection_step
+        result.final_metric_val = previous.final_metric_val
       if not result.best_run_id:
         result.best_run_id = previous.best_run_id
     result.end_time = datetime.datetime.now().isoformat()
