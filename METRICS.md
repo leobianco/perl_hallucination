@@ -48,8 +48,8 @@ This codebase uses a **4-pillar evaluation framework**:
 ---
 
 ### 2. Fluency / Perplexity Model
-* **Default / Recommended Models**: `google/gemma-4-E2B-it`, `google/gemma-2b`, or `gpt2-xl`
-* **Configuration Flags**: `--compute_perplexity True --fluency_model "google/gemma-4-E2B-it"`
+* **Default / Recommended Models**: `google/gemma-4-E4B-it`, `google/gemma-2b`, or `gpt2-xl`
+* **Configuration Flags**: `--compute_perplexity True --fluency_model "google/gemma-4-E4B-it"`
 * **Why a Neutral Base LM?**
   * Evaluates whether the fine-tuned or RL-aligned model produces grammatical, natural, and probable English text under a general language distribution.
   * Detects language degradation, gibberish loops, or unnatural phrasing that may arise during aggressive preference tuning or RL exploration.
@@ -63,7 +63,7 @@ This codebase uses a **4-pillar evaluation framework**:
 
 ### 3. Autorater Model (Hallucination Scoring)
 * **Default Model**: `gemini-2.5-flash` (or `gemini-2.0-flash`) via Google GenAI Client (Vertex AI or AI Studio).
-* **Open-Weights Fallback**: `google/gemma-4-26B-A4B-it` or `google/gemma-4-E2B-it` via Hugging Face CausalLM.
+* **Open-Weights Fallback**: `google/gemma-4-26B-A4B-it` or `google/gemma-4-E4B-it` via Hugging Face CausalLM.
 * **Configuration Flags**: `--evaluator_model "gemini-2.5-flash" --use_gemini True --threshold 0.991`
 * **How It Works**:
   * Formats task-specific prompt with few-shot calibration examples.
