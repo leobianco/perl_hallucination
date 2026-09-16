@@ -44,6 +44,15 @@ DEFAULT_TUNABLE_KEYS: Set[str] = {
     "num_fewshot",
 }
 
+#: Token budget the reward model uses to score (prompt + completion).
+#:
+#: Deliberately NOT in ``DEFAULT_TUNABLE_KEYS``: this is a correctness setting,
+#: not a hyperparameter to sweep. The reward model must be trained and queried
+#: with the same value, so both the ``rm`` and the ``perl`` stage read this one
+#: constant. See ``_resolve_reward_max_length`` in ``src/pipelines.py`` for why
+#: the previous hardcoded 512 silently zeroed the RLOO advantage on RAGTruth.
+REWARD_MAX_LENGTH: int = 2048
+
 
 class ModelManager:
   """Manages model checkpoint materialization, Hugging Face uploads, and local retention."""
@@ -419,6 +428,10 @@ class ModelManager:
           "0",
           "--num_struct_hallus_to_keep",
           "0",
+          # Must equal the value passed to the PE-RL stage below: this model
+          # is trained here and queried there.
+          "--reward_max_length",
+          str(REWARD_MAX_LENGTH),
       ])
     elif stage_name == "perl":
       if not sft_model_path or not reward_model_path:
@@ -438,6 +451,8 @@ class ModelManager:
           "LORA",
           "--max_completion_length",
           "256",
+          "--reward_max_length",
+          str(REWARD_MAX_LENGTH),
           "--num_generations",
           "8",
           "--num_iterations",

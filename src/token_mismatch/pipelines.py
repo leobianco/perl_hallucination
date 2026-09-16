@@ -86,6 +86,8 @@ from src.pipelines import (
     RewardModelPipeline,
     WandbResumptionCallback,
     _clean_cli_args,
+    _REWARD_TRUNCATION_SIDE,
+    _resolve_reward_max_length,
 )
 from src.utils import (
     LLMSynthScriptArguments,
@@ -240,12 +242,19 @@ class TokenMismatchRewardModelPipeline(RewardModelPipeline):
       )
       return {"prompt": formatted_prompt}
 
-    # Tokenize and cast labels
+    # Tokenize and cast labels. Budget and truncation side must match
+    # `TokenMismatchPERLPipeline.setup_trainer`, which queries this model, and
+    # left truncation preserves the terminal token at the tail that this
+    # experiment is built to study.
+    reward_max_length = _resolve_reward_max_length(self.args)
+    self.tokenizer.truncation_side = _REWARD_TRUNCATION_SIDE
+
     def encode(examples):
       return self.tokenizer(
           examples["prompt"],
           padding=True,
           truncation=True,
+          max_length=reward_max_length,
           return_tensors="pt",
       )
 
@@ -336,6 +345,14 @@ class TokenMismatchPERLPipeline(PERLPipeline):
         scoring_token, reward_tokenizer
     )
 
+    # This experiment turns on the terminal token that `reward_fn` appends to
+    # the END of the completion. Right-truncation would cut off precisely the
+    # token being studied, so truncate from the left and keep the budget equal
+    # to the one used to train the reward model. See `src/pipelines.py` for the
+    # full rationale.
+    reward_max_length = _resolve_reward_max_length(self.args)
+    reward_tokenizer.truncation_side = _REWARD_TRUNCATION_SIDE
+
     def reward_fn(
         prompts: list[str], completions: list[str], **kwargs
     ) -> list[float]:
@@ -355,7 +372,7 @@ class TokenMismatchPERLPipeline(PERLPipeline):
           formatted_texts,
           padding=True,
           truncation=True,
-          max_length=512,
+          max_length=reward_max_length,
           return_tensors="pt",
       ).to(reward_model.device)
 

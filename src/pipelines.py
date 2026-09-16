@@ -133,6 +133,45 @@ def _clean_cli_args(cli_args: Sequence[str] | None = None) -> list[str]:
   return [arg for arg in raw if arg != "--"]
 
 
+# Token budget used whenever the reward model scores a (prompt, completion)
+# pair. This was previously hardcoded to 512 at the PE-RL call site while the
+# reward-model training call site passed no limit at all. For RAGTruth the
+# prompt alone exceeds 512 tokens in 93% of QA rows and 98% of summarization
+# rows, so right-truncation at 512 removed the completion entirely: every
+# rollout of a prompt then scored identically, the RLOO advantage was exactly
+# zero, and only the KL term was optimized. 2048 covers roughly the 98th
+# percentile of RAGTruth prompt+response length; 4096 covers all of it.
+_DEFAULT_REWARD_MAX_LENGTH = 2048
+
+# Truncation must drop the head of the context, never the tail, because the
+# completion lives at the tail and is the only part that varies across
+# rollouts of the same prompt.
+_REWARD_TRUNCATION_SIDE = "left"
+
+
+def _resolve_reward_max_length(args: Any) -> int:
+  """Return the reward-model token budget configured on ``args``.
+
+  Both the reward-model training pipeline and the PE-RL scoring path call
+  this, which is what keeps their tokenization consistent. Values that are
+  absent, non-numeric (for example a test double) or non-positive fall back
+  to the default rather than propagating a nonsensical limit.
+
+  Args:
+      args: A ScriptArguments instance, or any namespace-like object.
+
+  Returns:
+      A positive integer token budget.
+  """
+  value = getattr(args, "reward_max_length", None)
+  if isinstance(value, bool) or not isinstance(value, (int, float)):
+    return _DEFAULT_REWARD_MAX_LENGTH
+  value = int(value)
+  if value <= 0:
+    return _DEFAULT_REWARD_MAX_LENGTH
+  return value
+
+
 def parse_hf_repo_reference(
     ref: str,
 ) -> tuple[Optional[str], Optional[str], Optional[str]]:
@@ -1377,12 +1416,23 @@ class RewardModelPipeline(Pipeline):
         self.args.dataset_repo_id,
     )
 
-    # Tokenize and cast labels
+    # Tokenize and cast labels.
+    #
+    # The budget and the truncation side must match what `PERLPipeline`
+    # applies when it queries this reward model, otherwise the model is
+    # trained on one view of the text and queried on another. `prompt` here
+    # already has the response appended by the task processor, so the tail of
+    # the sequence is the response: truncating from the left sacrifices the
+    # head of the context and preserves the text the label actually describes.
+    reward_max_length = _resolve_reward_max_length(self.args)
+    self.tokenizer.truncation_side = _REWARD_TRUNCATION_SIDE
+
     def encode(examples):
       return self.tokenizer(
           examples["prompt"],
           padding=True,
           truncation=True,
+          max_length=reward_max_length,
           return_tensors="pt",
       )
 
@@ -1809,6 +1859,17 @@ class PERLPipeline(Pipeline):
     reward_model = self.reward_model
     reward_tokenizer = self.reward_tokenizer
 
+    # The reward model scores `prompt + completion`, and the completion sits
+    # at the tail. Truncating from the right would delete exactly the part of
+    # the text that differs between the rollouts of a prompt, making every
+    # rollout score identically, zeroing the RLOO advantage and leaving only
+    # the KL term to optimize -- silently, with no error and a flat reward
+    # curve. Truncate from the left instead, matching how the reward model was
+    # trained in `RewardModelPipeline.process_data`.
+    reward_max_length = _resolve_reward_max_length(self.args)
+    reward_tokenizer.truncation_side = _REWARD_TRUNCATION_SIDE
+    truncation_reported = False
+
     # Custom reward function that computes scalar reward as the logit difference
     # (log-odds) of label 1 ("No" hallucination) vs label 0 ("Yes" hallucination).
     # This matches the standard Bradley-Terry reward formulation r(x, y) = z_1 - z_0
@@ -1816,14 +1877,42 @@ class PERLPipeline(Pipeline):
     def reward_fn(
         prompts: list[str], completions: list[str], **kwargs
     ) -> list[float]:
+      nonlocal truncation_reported
       texts = [p + c for p, c in zip(prompts, completions)]
       inputs = reward_tokenizer(
           texts,
           padding=True,
           truncation=True,
-          max_length=512,
+          max_length=reward_max_length,
           return_tensors="pt",
       ).to(reward_model.device)
+
+      # Padding is to the longest sequence in the batch, so reaching the cap
+      # means at least one row was truncated. Say so once: the whole point of
+      # this failure mode is that it is otherwise invisible.
+      if not truncation_reported:
+        try:
+          batch_len = int(inputs["input_ids"].shape[1])
+        except (TypeError, KeyError, IndexError, AttributeError):
+          batch_len = None
+        if batch_len is not None and batch_len >= reward_max_length:
+          truncation_reported = True
+          print(
+              "\n"
+              + "=" * 80
+              + "\n[WARNING] Reward model input hit the token budget of"
+              f" {reward_max_length}.\n"
+              "  Context is being truncated from the left. The completion is"
+              " preserved,\n"
+              "  but the reward model is no longer seeing the full context."
+              " Consider\n"
+              "  raising --reward_max_length (and retraining the reward model"
+              " with the\n"
+              "  same value, otherwise training and scoring disagree).\n"
+              + "=" * 80
+              + "\n"
+          )
+
       with torch.no_grad():
         # Under DeepSpeed ZeRO Stage 3, all model parameters instantiated
         # in the process are partitioned into 1-D flat slices across GPUs.

@@ -19,6 +19,21 @@ LR_SCHEDULER_TYPE="cosine"
 WARMUP_RATIO=0.1
 BETA=1e-4
 MAX_COMPLETION_LENGTH=256
+
+# Token budget the reward model uses to score (prompt + completion).
+#
+# MUST be identical to REWARD_MAX_LENGTH in scripts/reward_model.sh, which is
+# where the reward model was trained. If they disagree, the model is trained
+# on one view of the text and queried on another.
+#
+# MUST also leave room for MAX_COMPLETION_LENGTH on top of the prompt.
+# Truncation is applied from the LEFT so the completion always survives, but
+# if the budget is too small the reward model stops seeing enough context to
+# judge groundedness. The previous hardcoded value of 512 was smaller than the
+# RAGTruth prompt itself in 93% of QA rows: the completion was dropped
+# entirely, every rollout scored the same, and the RLOO advantage was exactly
+# zero, so PE-RL optimized nothing but the KL term.
+REWARD_MAX_LENGTH="${REWARD_MAX_LENGTH:-2048}"
 NUM_GENERATIONS="${NUM_GENERATIONS:-8}"
 NUM_ITERATIONS=1
 STEPS_PER_GENERATION=16
@@ -119,6 +134,7 @@ accelerate launch \
   --lr_scheduler_type "$LR_SCHEDULER_TYPE" \
   --warmup_ratio "$WARMUP_RATIO" \
   --max_completion_length "$MAX_COMPLETION_LENGTH" \
+  --reward_max_length "$REWARD_MAX_LENGTH" \
   --weight_decay 0.0 \
   --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
   --reward_penalty_alpha "$REWARD_PENALTY_ALPHA" \

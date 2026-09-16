@@ -25,6 +25,18 @@ LORA_DROPOUT=0.0
 LR_SCHEDULER_TYPE="cosine"
 WARMUP_RATIO=0.1
 
+# Token budget for scoring (prompt + response) pairs.
+#
+# MUST be identical to REWARD_MAX_LENGTH in scripts/perl.sh. The reward model
+# is trained here and queried there; if the two disagree, the model is trained
+# on one view of the text and scored on another.
+#
+# It must comfortably exceed prompt + response. For RAGTruth the prompt alone
+# is over 512 tokens in 93% of QA rows and 98% of summarization rows, which is
+# why the old hardcoded 512 silently removed the response entirely. 2048
+# covers ~p98 of RAGTruth; 4096 covers all of it.
+REWARD_MAX_LENGTH="${REWARD_MAX_LENGTH:-2048}"
+
 # Infrastructure Parameters
 PRECISION="BF16"
 EVAL_STEPS=50
@@ -139,4 +151,5 @@ accelerate launch \
   --lora_r "$LORA_RANK" \
   --lora_alpha "$LORA_ALPHA" \
   --lora_dropout "$LORA_DROPOUT" \
+  --reward_max_length "$REWARD_MAX_LENGTH" \
   "${EXTRA_ARGS[@]}" 

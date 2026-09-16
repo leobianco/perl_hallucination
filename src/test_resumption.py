@@ -1116,6 +1116,150 @@ class TestRewardPenaltyAlpha(unittest.TestCase):
       self.assertAlmostEqual(c, e)
 
 
+class TestRewardMaxLength(unittest.TestCase):
+  """Tests for the reward-model token budget and its truncation side.
+
+  The PE-RL scoring path used to tokenize prompt+completion at
+  ``max_length=512`` with the default right truncation. RAGTruth prompts
+  alone exceed 512 tokens in the overwhelming majority of rows, so the
+  completion was cut off entirely: every rollout of a prompt scored
+  identically, the RLOO advantage was exactly zero, and only the KL term was
+  optimized. Nothing crashed. These tests make that regression loud.
+  """
+
+  def test_resolver_returns_configured_value(self):
+    from src.pipelines import _resolve_reward_max_length
+
+    args = MagicMock()
+    args.reward_max_length = 4096
+    self.assertEqual(_resolve_reward_max_length(args), 4096)
+
+  def test_resolver_falls_back_on_unusable_values(self):
+    """A test double or a nonsensical limit must not silently shrink."""
+    from src.pipelines import _DEFAULT_REWARD_MAX_LENGTH
+    from src.pipelines import _resolve_reward_max_length
+
+    for bad in (None, 0, -1, True, "2048", MagicMock()):
+      args = MagicMock()
+      args.reward_max_length = bad
+      self.assertEqual(
+          _resolve_reward_max_length(args),
+          _DEFAULT_REWARD_MAX_LENGTH,
+          f"unexpected budget for {bad!r}",
+      )
+
+  def test_default_budget_leaves_room_for_the_completion(self):
+    """The budget must exceed what scripts/perl.sh can generate."""
+    from src.pipelines import _DEFAULT_REWARD_MAX_LENGTH
+
+    # scripts/perl.sh caps generation at 256 tokens.
+    self.assertGreater(_DEFAULT_REWARD_MAX_LENGTH, 256)
+    # And the old value is exactly the bug being prevented.
+    self.assertNotEqual(_DEFAULT_REWARD_MAX_LENGTH, 512)
+
+  def _build_perl_pipeline(self, budget):
+    pipeline = PERLPipeline()
+    pipeline.args = MagicMock()
+    pipeline.args.reward_penalty_alpha = 1.0
+    pipeline.args.reward_max_length = budget
+    pipeline.reward_model = MagicMock()
+    pipeline.reward_tokenizer = MagicMock()
+    pipeline.policy = MagicMock()
+    pipeline.training_args = MagicMock()
+    pipeline.data = {"train": [], "test": None}
+    pipeline.tokenizer = MagicMock()
+    return pipeline
+
+  def test_reward_fn_tokenizes_at_the_configured_budget(self):
+    pipeline = self._build_perl_pipeline(4096)
+
+    mock_diff = MagicMock()
+    mock_diff.cpu.return_value.tolist.return_value = [0.5]
+
+    with patch("src.pipelines.RLOOTrainer") as mock_rloo_cls, patch(
+        "src.pipelines.torch.where"
+    ):
+      pipeline.setup_trainer()
+      reward_fn = mock_rloo_cls.call_args.kwargs["reward_funcs"]
+
+      mock_logits = MagicMock()
+      mock_logits.__getitem__.return_value = mock_diff
+      mock_diff.__sub__.return_value = mock_diff
+      pipeline.reward_model.return_value.logits = mock_logits
+
+      reward_fn(["prompt"], ["completion"])
+
+    kwargs = pipeline.reward_tokenizer.call_args.kwargs
+    self.assertEqual(kwargs["max_length"], 4096)
+    self.assertTrue(kwargs["truncation"])
+
+  def test_reward_fn_truncates_from_the_left(self):
+    """The completion lives at the tail and is the only part that varies.
+
+    Right truncation drops it, which is precisely how the reward signal went
+    flat without any error being raised.
+    """
+    pipeline = self._build_perl_pipeline(2048)
+
+    with patch("src.pipelines.RLOOTrainer"), patch("src.pipelines.torch.where"):
+      pipeline.setup_trainer()
+
+    self.assertEqual(pipeline.reward_tokenizer.truncation_side, "left")
+
+  def test_training_and_scoring_share_one_budget(self):
+    """Train/serve skew here is silent, so pin the parity explicitly.
+
+    The reward model is trained by `RewardModelPipeline.process_data` and
+    queried by `PERLPipeline`. If the two tokenize differently the model is
+    trained on one view of the text and queried on another.
+    """
+    from src.pipelines import RewardModelPipeline
+    from src.pipelines import _REWARD_TRUNCATION_SIDE
+
+    rm = RewardModelPipeline()
+    rm.args = MagicMock()
+    rm.args.reward_max_length = 4096
+    rm.tokenizer = MagicMock()
+    rm.tokenizer.return_value = {"input_ids": [[1, 2, 3]]}
+    rm.training_args = MagicMock()
+    rm.training_args.fp16 = False
+    rm.training_args.bf16 = True
+    # process_data builds a LoRA config and runs the synthetic-augmentation
+    # hook before it tokenizes.
+    rm._lora_args = MagicMock()
+    rm._llm_synth_args = MagicMock()
+
+    class _Split:
+
+      def map(self, fn, batched=False):
+        del batched
+        fn({"prompt": ["text"]})
+        return self
+
+      def set_format(self, _):
+        return self
+
+      @property
+      def features(self):
+        return {"label": None}
+
+      def cast(self, _):
+        return self
+
+    rm.data = {"train": _Split()}
+
+    with patch("src.pipelines.get_task_processor") as mock_get_processor, patch(
+        "src.pipelines.Value"
+    ):
+      mock_get_processor.return_value.augment_training_split.side_effect = (
+          lambda split, *a, **k: split
+      )
+      rm.process_data()
+
+    self.assertEqual(rm.tokenizer.truncation_side, _REWARD_TRUNCATION_SIDE)
+    self.assertEqual(rm.tokenizer.call_args.kwargs["max_length"], 4096)
+
+
 class TestBestAndLastCheckpointSaving(unittest.TestCase):
   """Tests for preserving both the best reward checkpoint and the very last step checkpoint locally."""
 

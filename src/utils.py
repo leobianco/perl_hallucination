@@ -42,6 +42,9 @@ class ScriptArguments:
         (e.g. 0.5 for SCOPE Stage 1).
       reward_penalty_alpha (float): Multiplier on negative logit differences to
         asymmetrically penalize hallucinations (defaults to 1.0, symmetric).
+      reward_max_length (int): Token budget used whenever the reward model
+        scores a (prompt, completion) pair, both at reward-model training time
+        and at PE-RL scoring time.
   """
 
   task_name: str
@@ -52,6 +55,13 @@ class ScriptArguments:
   sft_model_path: Optional[str] = None
   sft_data_fraction: Optional[float] = None
   reward_penalty_alpha: float = 1.0
+  # Token budget for reward-model scoring. Used BOTH when training the reward
+  # model and when querying it during PE-RL; the two must never diverge.
+  # It must hold the prompt *and* the completion: if the completion is
+  # truncated away, every rollout of a prompt gets an identical reward, the
+  # RLOO advantage is exactly zero, and only the KL term is optimized.
+  # RAGTruth: 2048 covers ~p98 of prompt+response, 4096 covers all of it.
+  reward_max_length: int = 2048
 
 
 
