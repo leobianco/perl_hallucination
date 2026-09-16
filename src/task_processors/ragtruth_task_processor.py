@@ -6,6 +6,7 @@ dataset generation, PERL prompt extraction, and autorater evaluation formatting.
 """
 
 import collections
+import hashlib
 import json
 import random
 import re
@@ -275,9 +276,226 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
         """Format the standardized RAG prompt ending with Answer delimiter."""
         return f"Context:\n{context}\n\nQuestion: {query}\n\nAnswer:\n"
 
+    @staticmethod
+    def _group_key(entry: dict) -> str:
+        """Return a stable grouping key identifying the underlying passage.
+
+        RAGTruth ships up to six responses per ``source_id``, all sharing one
+        context and prompt. Every split in this processor is performed over
+        these keys rather than over rows, so that no passage can leak between
+        train and validation, or between the SFT, PE-RL and reward-model
+        stages.
+
+        Falls back to a hash of context+query when ``source_id`` is absent,
+        so derived datasets that dropped the column still group correctly.
+
+        Args:
+            entry: A dataset row.
+
+        Returns:
+            A stable string key shared by all rows of the same passage.
+        """
+        s_id = entry.get("source_id")
+        if s_id is not None and str(s_id).strip():
+            return f"sid:{s_id}"
+        basis = (
+            str(entry.get("context", ""))
+            + "||"
+            + str(entry.get("user_query", ""))
+        ).strip("| ")
+        if not basis:
+            basis = str(entry.get("prompt", ""))
+        return "h:" + hashlib.sha1(basis.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _dataset_from_list(rows: list, template: Dataset) -> Dataset:
+        """Build a Dataset from rows, preserving schema when rows is empty.
+
+        ``Dataset.from_list([])`` raises, so an empty result is materialised
+        as an empty selection of the template instead.
+
+        Args:
+            rows: The rows to wrap.
+            template: Dataset whose schema is reused when ``rows`` is empty.
+
+        Returns:
+            A Dataset holding ``rows``, or an empty Dataset with the
+            template's schema.
+        """
+        if rows:
+            return Dataset.from_list(rows)
+        return template.select([])
+
+    def _arg_value(self, name: str, default):
+        """Read an argument, falling back only when it is missing or None.
+
+        The `getattr(self.args, name, default) or default` idiom silently
+        rewrites a deliberate 0 or 0.0 into the default, which hides
+        misconfiguration instead of surfacing it.
+
+        Args:
+            name: Attribute name on the argument namespace.
+            default: Value to use when the attribute is absent or None.
+
+        Returns:
+            The configured value, or the default.
+        """
+        value = getattr(self.args, name, None)
+        return default if value is None else value
+
+    def _block_fractions(self) -> Tuple[float, float]:
+        """Return the (SFT, PE-RL) source fractions; the rest goes to the RM.
+
+        Returns:
+            The SFT and PE-RL fractions of the training sources.
+
+        Raises:
+            ValueError: If the fractions leave no sources for the reward model.
+        """
+        frac_sft = float(self._arg_value("split_frac_sft", 0.40))
+        frac_perl = float(self._arg_value("split_frac_perl", 0.25))
+        if frac_sft <= 0 or frac_perl <= 0 or frac_sft + frac_perl >= 1.0:
+            raise ValueError(
+                "split_frac_sft and split_frac_perl must be positive and sum "
+                f"to less than 1.0 (got {frac_sft} and {frac_perl}); the "
+                "remainder is the reward-model block."
+            )
+        return frac_sft, frac_perl
+
+    def _assign_source_blocks(self, train_ds: Dataset) -> dict:
+        """Deterministically partition training sources into disjoint blocks.
+
+        Each unique source key is assigned to exactly one of 'sft', 'perl' or
+        'rm'. The assignment depends only on the seed and the set of source
+        keys -- not on row order, and not on when it is called -- so every
+        builder sees the identical partition. This matters because the reward
+        model splits are built before the SFT split exists.
+
+        The result is memoised per key set, so repeated calls during one run
+        do not re-shuffle.
+
+        Args:
+            train_ds: The training split whose sources are to be partitioned.
+
+        Returns:
+            A mapping from source key to one of 'sft', 'perl' or 'rm'.
+        """
+        if "source_id" in train_ds.column_names:
+            keys = [
+                self._group_key({"source_id": s})
+                for s in train_ds["source_id"]
+            ]
+        else:
+            keys = [self._group_key(e) for e in train_ds]
+
+        unique_keys = sorted(set(keys))
+        # Hash the whole key set: sampling only the endpoints would let two
+        # different sets of equal length reuse a stale partition.
+        signature = hashlib.sha1(
+            "\x00".join(unique_keys).encode("utf-8")
+        ).hexdigest()
+        if (
+            getattr(self, "_block_signature", None) == signature
+            and getattr(self, "_block_map", None) is not None
+        ):
+            return self._block_map
+
+        seed = int(self._arg_value("seed", 12345))
+        rng = random.Random(seed)
+        shuffled = list(unique_keys)
+        rng.shuffle(shuffled)
+
+        frac_sft, frac_perl = self._block_fractions()
+        n_total = len(shuffled)
+        n_sft = min(int(round(n_total * frac_sft)), n_total)
+        n_perl = min(int(round(n_total * frac_perl)), n_total - n_sft)
+
+        mapping = {}
+        for idx, key in enumerate(shuffled):
+            if idx < n_sft:
+                mapping[key] = "sft"
+            elif idx < n_sft + n_perl:
+                mapping[key] = "perl"
+            else:
+                mapping[key] = "rm"
+
+        self._block_map = mapping
+        self._block_signature = signature
+        return mapping
+
+    def _select_block(self, train_ds: Dataset, block: str) -> Dataset:
+        """Return only the rows whose source belongs to the given block.
+
+        Args:
+            train_ds: The training split to filter.
+            block: One of 'sft', 'perl' or 'rm'.
+
+        Returns:
+            The subset of rows whose source was assigned to that block.
+        """
+        mapping = self._assign_source_blocks(train_ds)
+        return train_ds.filter(
+            lambda e: mapping.get(self._group_key(e)) == block
+        )
+
+    def _cap_responses_per_source(self, ds: Dataset, seed: int) -> Dataset:
+        """Limit how many responses per source enter synthetic generation.
+
+        All responses of a source share one context, so tampering each of them
+        yields near-duplicate rows.
+
+        Args:
+            ds: Rows eligible for synthesis.
+            seed: Seed for the shuffle that decides which responses survive.
+
+        Returns:
+            A subset holding at most ``synth_struct_max_responses_per_source``
+            rows per source. Returns ``ds`` unchanged when the cap is <= 0.
+        """
+        max_per = int(
+            self._arg_value("synth_struct_max_responses_per_source", 2)
+        )
+        if max_per <= 0:
+            return ds
+        shuffled = ds.shuffle(seed=seed)
+        counts: dict = {}
+        keep_indices = []
+        for idx, entry in enumerate(shuffled):
+            key = self._group_key(entry)
+            seen = counts.get(key, 0)
+            if seen < max_per:
+                counts[key] = seen + 1
+                keep_indices.append(idx)
+        return shuffled.select(keep_indices)
+
+    def _split_synthesis_arms(self, ds: Dataset, seed: int) -> Tuple[set, set]:
+        """Partition sources into (perturbed, clean) synthesis arms.
+
+        The arms are disjoint at source level so that the reward model never
+        sees the same context with both a hallucinated and a faithful label.
+
+        Args:
+            ds: Rows eligible for synthesis.
+            seed: Base seed; offset internally to decorrelate from the block
+                assignment, which is drawn from the same seed.
+
+        Returns:
+            A (perturbed_keys, clean_keys) pair of disjoint source-key sets.
+        """
+        keys = sorted({self._group_key(e) for e in ds})
+        # Offset the seed so the arm split is not correlated with the
+        # SFT/PE-RL/RM block assignment drawn from the same seed.
+        rng = random.Random(int(seed) + 1)
+        shuffled = list(keys)
+        rng.shuffle(shuffled)
+        frac = float(self._arg_value("synth_perturb_fraction", 0.5))
+        n_perturb = int(round(len(shuffled) * frac))
+        return set(shuffled[:n_perturb]), set(shuffled[n_perturb:])
+
     def _preprocess_data(self, data: DatasetDict) -> DatasetDict:
         """Standardize raw RAGTruth entries into unified schema across all splits."""
         target_subtask = self._get_target_subtask()
+        drop_bad_quality = getattr(self.args, "drop_bad_quality", True)
         processed = {}
 
         for split in data.keys():
@@ -296,6 +514,16 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
                     return True
 
             filtered_split = split_data.filter(is_target_subtask)
+
+            # Drop annotator-flagged rows ('incorrect_refusal', 'truncated').
+            # These are labelled non-hallucinated, so without this filter the
+            # refusals flow into the SFT targets and teach the policy to
+            # refuse. In QA they are 142 train / 25 test rows.
+            if drop_bad_quality and "quality" in filtered_split.column_names:
+                filtered_split = filtered_split.filter(
+                    lambda e: str(e.get("quality", "good")).strip().lower()
+                    == "good"
+                )
 
             def process_entry(entry: dict) -> dict:
                 context = self._normalize_context(
@@ -344,27 +572,37 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
         return DatasetDict(processed)
 
     def _make_sft_data(self, data: DatasetDict) -> DatasetDict:
-        """Extract verified faithful samples from training split for SFT."""
-        faithful = data["train"].filter(lambda entry: entry["class_hall"] == "No")
+        """Extract verified faithful samples from the SFT source block."""
+        sft_pool = self._select_block(data["train"], "sft")
+        faithful = sft_pool.filter(lambda entry: entry["class_hall"] == "No")
 
         if "response" in faithful.column_names:
             faithful = faithful.rename_column("response", "completion")
 
-        seed = getattr(self.args, "seed", 12345)
-        # Deterministic 85/15 train/validation split
-        try:
-            sft_splits = faithful.train_test_split(test_size=0.15, seed=seed)
-        except AttributeError:
-            shuffled = faithful.shuffle(seed=seed)
-            n_total = len(shuffled)
-            n_val = max(1, int(n_total * 0.15)) if n_total > 1 else 0
-            n_train = n_total - n_val
-            sft_splits = DatasetDict({
-                "train": shuffled.select(range(n_train)),
-                "test": shuffled.select(range(n_train, n_total)),
-            })
+        seed = int(self._arg_value("seed", 12345))
+        val_fraction = float(self._arg_value("sft_val_fraction", 0.15))
 
-        return sft_splits
+        # Split by source, never by row. A row-level split puts the same
+        # prompt in both train and validation, because one source contributes
+        # up to six responses.
+        keys = sorted({self._group_key(e) for e in faithful})
+        rng = random.Random(seed)
+        shuffled_keys = list(keys)
+        rng.shuffle(shuffled_keys)
+
+        n_val = int(len(shuffled_keys) * val_fraction)
+        # Guarantee a non-empty validation split when one was requested, but
+        # honour an explicit 0.0 meaning "no validation split".
+        if val_fraction > 0 and len(shuffled_keys) > 1:
+            n_val = max(1, n_val)
+        val_keys = set(shuffled_keys[:n_val])
+
+        train_split = faithful.filter(
+            lambda e: self._group_key(e) not in val_keys
+        )
+        val_split = faithful.filter(lambda e: self._group_key(e) in val_keys)
+
+        return DatasetDict({"train": train_split, "test": val_split})
 
     @staticmethod
     def _rm_prompt(entry: dict) -> dict:
@@ -376,8 +614,22 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
         return entry
 
     def _make_organic_hallucinations_data(self, data: DatasetDict) -> DatasetDict:
-        """Create organic reward model dataset from human-annotated LLM outputs."""
-        organic_train = data["train"].map(self._rm_prompt)
+        """Create organic reward model dataset from the RM source block.
+
+        Training rows are restricted to the reward-model block so the RM is
+        never trained on prompts the policy was fine-tuned on or will be
+        rolled out on. The test split is left whole: it is held out from every
+        other stage already, so there is nothing to leak.
+
+        Args:
+            data: Preprocessed dataset with 'train' and 'test' splits.
+
+        Returns:
+            A DatasetDict of reward-model rows whose 'prompt' already has the
+            response appended.
+        """
+        rm_train = self._select_block(data["train"], "rm")
+        organic_train = rm_train.map(self._rm_prompt)
         organic_test = data["test"].map(self._rm_prompt)
         return DatasetDict({"train": organic_train, "test": organic_test})
 
@@ -553,26 +805,85 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
         max_nonhall_per_entry = getattr(args, "synth_struct_max_nonhall_per_entry", 2)
         balance_ratio = getattr(args, "synth_struct_balance_ratio", 1.25)
 
-        faithful_train = data["train"].filter(lambda entry: entry["class_hall"] == "No")
-        shuffled = faithful_train.shuffle(seed=seed)
-
-        use_all = (
-            num_synth_hallus is None
-            or num_synth_hallus == -1
-            or num_synth_hallus >= len(shuffled)
+        # Restrict synthesis to the reward-model source block (disjoint from
+        # the SFT and PE-RL blocks) so the reward model never scores contexts
+        # the policy was fine-tuned on or will be rolled out on.
+        rm_faithful = self._select_block(data["train"], "rm").filter(
+            lambda entry: entry["class_hall"] == "No"
         )
-        if not use_all and num_synth_hallus > 0:
-            source_pool = shuffled.select(range(num_synth_hallus))
-            rest_pool = shuffled.select(range(num_synth_hallus, len(shuffled)))
-        else:
-            source_pool = shuffled
-            rest_pool = None
+        # RAGTruth ships up to 6 responses per source_id, all sharing a single
+        # context. Tampering every one of them produces near-duplicate rows
+        # that teach the reward model to memorise contexts, so cap how many
+        # responses per source enter synthesis.
+        rm_faithful = self._cap_responses_per_source(rm_faithful, seed)
+
+        # Split into two source-disjoint arms: contexts in the perturbed arm
+        # only ever yield hallucinated rows, contexts in the clean arm only
+        # ever yield faithful rows. Without this, the same context appears on
+        # both sides of the label boundary differing only by which sentences
+        # were deleted, and "how much context was removed" becomes the easiest
+        # discriminative signal.
+        perturb_keys, clean_keys = self._split_synthesis_arms(rm_faithful, seed)
+        source_pool = rm_faithful.filter(
+            lambda e: self._group_key(e) in perturb_keys
+        )
+        rest_pool = rm_faithful.filter(
+            lambda e: self._group_key(e) in clean_keys
+        )
+
+        # num_synth_hallus, when positive, further caps the perturbed arm.
+        if 0 < num_synth_hallus < len(source_pool):
+            source_pool = source_pool.shuffle(seed=seed).select(
+                range(num_synth_hallus)
+            )
+
+        max_hallu_per_entry = int(
+            self._arg_value("synth_struct_max_hallu_per_entry", 1)
+        )
+        effective_top_k = max(1, min(int(top_k), max_hallu_per_entry))
 
         rouge_metric = self._get_rouge_scorer()
         hallucinations: list[dict[str, Any]] = []
         non_hallucinations: list[dict[str, Any]] = []
 
+        # Perturbed arm: hallucinated rows only (schema 1).
         for entry in source_pool:
+            query = entry.get("user_query", "")
+            context = entry.get("context", "")
+            response = entry.get("response", "")
+
+            sentences_context, ctx_delimiter = self._split_into_sentences(context)
+            sentences_response, _ = self._split_into_sentences(response)
+
+            if not sentences_context or not sentences_response:
+                continue
+            if len(sentences_context) < 2:
+                continue
+
+            scores = self._compute_sentence_rouge_scores(
+                sentences_context=sentences_context,
+                sentences_response=sentences_response,
+                rouge_metric=rouge_metric,
+            )
+
+            generated = self._generate_hallucinations_top_k(
+                query=query,
+                sentences_context=sentences_context,
+                response=response,
+                scores=scores,
+                top_k=effective_top_k,
+                hallu_threshold=hallu_threshold,
+                delimiter=ctx_delimiter,
+            )
+            # Keep provenance: the generators build fresh dicts, and without
+            # the originating source_id the synthetic rows cannot be traced
+            # back to their passage or grouped for any later split.
+            for row in generated:
+                row["source_id"] = entry.get("source_id")
+            hallucinations.extend(generated)
+
+        # Clean arm: faithful rows only (schemas 2 and 3, plus the original).
+        for entry in rest_pool:
             query = entry.get("user_query", "")
             context = entry.get("context", "")
             response = entry.get("response", "")
@@ -583,54 +894,44 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
             if not sentences_context or not sentences_response:
                 continue
 
-            scores = self._compute_sentence_rouge_scores(
-                sentences_context=sentences_context,
-                sentences_response=sentences_response,
-                rouge_metric=rouge_metric,
-            )
-
-            entry_hallus = []
             entry_nonhallus = []
 
-            # Schema 1: Top-k context removal (hallucination)
+            # Schema 2: Irrelevant context removal (still faithful). This also
+            # shortens the context, matching the perturbed arm, so context
+            # length alone cannot separate the classes.
             if len(sentences_context) >= 2:
-                entry_hallus = self._generate_hallucinations_top_k(
-                    query=query,
+                scores = self._compute_sentence_rouge_scores(
                     sentences_context=sentences_context,
-                    response=response,
-                    scores=scores,
-                    top_k=top_k,
-                    hallu_threshold=hallu_threshold,
-                    delimiter=ctx_delimiter,
-                )
-
-            # Schema 2: Irrelevant context removal (faithful)
-            if len(sentences_context) >= 2:
-                irrelevant_samples = self._generate_nonhallucinations_irrelevant_context(
-                    query=query,
-                    sentences_context=sentences_context,
-                    response=response,
-                    scores=scores,
-                    irrelevant_threshold=irrelevant_threshold,
-                    max_candidates=max_nonhall_per_entry,
-                    delimiter=ctx_delimiter,
-                )
-                entry_nonhallus.extend(irrelevant_samples)
-
-            # Schema 3: Response sentence removal (faithful)
-            if len(sentences_response) >= 2:
-                resp_drops = self._generate_nonhallucinations_response_removal(
-                    query=query,
-                    context=context,
                     sentences_response=sentences_response,
-                    max_drops=max_nonhall_per_entry,
-                    delimiter=resp_delimiter,
+                    rouge_metric=rouge_metric,
                 )
-                entry_nonhallus.extend(resp_drops)
+                entry_nonhallus.extend(
+                    self._generate_nonhallucinations_irrelevant_context(
+                        query=query,
+                        sentences_context=sentences_context,
+                        response=response,
+                        scores=scores,
+                        irrelevant_threshold=irrelevant_threshold,
+                        max_candidates=max_nonhall_per_entry,
+                        delimiter=ctx_delimiter,
+                    )
+                )
+
+            # Schema 3: Response sentence removal (still faithful).
+            if len(sentences_response) >= 2:
+                entry_nonhallus.extend(
+                    self._generate_nonhallucinations_response_removal(
+                        query=query,
+                        context=context,
+                        sentences_response=sentences_response,
+                        max_drops=max_nonhall_per_entry,
+                        delimiter=resp_delimiter,
+                    )
+                )
 
             # Original grounded non-hallucinated entry
             base_p = self._format_prompt(context, query)
-            orig_grounded = {
+            entry_nonhallus.append({
                 "context": context,
                 "user_query": query,
                 "response": response,
@@ -641,31 +942,11 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
                 "erased_context": "",
                 "erased_response": "",
                 "rouge1_score": 0.0,
-            }
-            entry_nonhallus.append(orig_grounded)
+            })
 
-            hallucinations.extend(entry_hallus)
+            for row in entry_nonhallus:
+                row["source_id"] = entry.get("source_id")
             non_hallucinations.extend(entry_nonhallus)
-
-        # Include remaining unedited faithful samples if split
-        if rest_pool is not None:
-            for entry in rest_pool:
-                q = entry.get("user_query", "")
-                c = entry.get("context", "")
-                r = entry.get("response", "")
-                base_p = self._format_prompt(c, q)
-                non_hallucinations.append({
-                    "context": c,
-                    "user_query": q,
-                    "response": r,
-                    "prompt": base_p + r,
-                    "class_hall": "No",
-                    "label": 1,
-                    "synthetic_strategy": "original_non_hallucinated",
-                    "erased_context": "",
-                    "erased_response": "",
-                    "rouge1_score": 0.0,
-                })
 
         # Class balancing
         rng = random.Random(seed)
@@ -744,24 +1025,35 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
         api_key = getattr(args, "gemini_api_key", None)
         client = genai.Client(api_key=api_key) if api_key else genai.Client()
 
-        # Extract faithful training samples
-        faithful = data["train"].filter(lambda entry: entry["class_hall"] == "No")
-        shuffled = faithful.shuffle(seed=args.seed)
+        # Restrict synthesis to the reward-model source block (disjoint from
+        # the SFT and PE-RL blocks), then split that block into two
+        # source-disjoint arms so that no context is ever seen by the reward
+        # model with both a faithful and a hallucinated label.
+        rm_faithful = self._select_block(data["train"], "rm").filter(
+            lambda entry: entry["class_hall"] == "No"
+        )
+        rm_faithful = self._cap_responses_per_source(rm_faithful, args.seed)
+        perturb_keys, clean_keys = self._split_synthesis_arms(
+            rm_faithful, args.seed
+        )
 
-        num_synth = getattr(args, "num_synth_hallus", 0)
+        to_perturb = rm_faithful.filter(
+            lambda e: self._group_key(e) in perturb_keys
+        )
+        rest = rm_faithful.filter(lambda e: self._group_key(e) in clean_keys)
+
+        # num_synth_hallus, when positive, further caps the perturbed arm.
+        num_synth = getattr(args, "num_synth_hallus", -1)
         if not isinstance(num_synth, int):
             try:
                 num_synth = int(num_synth)
-            except Exception:
-                num_synth = 0
+            except (TypeError, ValueError):
+                num_synth = -1
+        if 0 < num_synth < len(to_perturb):
+            to_perturb = to_perturb.shuffle(seed=args.seed).select(
+                range(num_synth)
+            )
 
-        use_all = num_synth is None or num_synth == -1 or num_synth >= len(shuffled)
-        if not use_all and num_synth > 0:
-            to_perturb = shuffled.select(range(num_synth))
-            rest = shuffled.select(range(num_synth, len(shuffled)))
-        else:
-            to_perturb = shuffled
-            rest = shuffled.select([])
 
         # Select few-shot examples from organic hallucinations
         organic_hallus = organic_hallucinations_data["train"].filter(
@@ -848,19 +1140,44 @@ Guidelines:
     def _make_perl_data(
         self, data: DatasetDict, sft_data: DatasetDict, seed: int = 12345
     ) -> DatasetDict:
-        """Prepare prompts for online policy rollouts in PE-RL (RLOO)."""
-        # Deduplicate prompts from sft_data["train"] while retaining full metadata
-        sft_train = sft_data["train"].shuffle(seed=seed)
+        """Prepare prompts for online policy rollouts in PE-RL (RLOO).
+
+        Prompts are drawn from the dedicated PE-RL source block, which is
+        disjoint (at ``source_id`` level) from both the SFT and the reward
+        model blocks.
+
+        ``sft_data`` is accepted for signature compatibility with
+        ``BaseTaskProcessor.run`` but is deliberately unused: rolling out on
+        the very prompts the policy was fine-tuned on biases PE-RL towards
+        memorised completions, and scoring those rollouts with a reward model
+        trained on the same prompts hides reward hacking.
+
+        Args:
+            data: Preprocessed dataset with 'train' and 'test' splits.
+            sft_data: Unused; see above.
+            seed: Seed for the shuffle applied before prompt deduplication.
+
+        Returns:
+            A DatasetDict with 'train' rollout prompts drawn from the PE-RL
+            block and 'test' prompts drawn from the held-out test split.
+        """
+        del sft_data  # Intentionally unused; see docstring.
+
+        perl_train = self._select_block(data["train"], "perl")
+
+        # Deduplicate prompts while retaining full metadata.
+        shuffled = perl_train.shuffle(seed=seed)
         seen_train_prompts = set()
         unique_train_rows = []
-        for entry in sft_train:
+        for entry in shuffled:
             p = entry.get("prompt", "")
             if p not in seen_train_prompts:
                 seen_train_prompts.add(p)
                 unique_train_rows.append(entry)
-        train_prompts = Dataset.from_list(unique_train_rows)
+        train_prompts = self._dataset_from_list(unique_train_rows, perl_train)
 
-        # Deduplicate prompts from data["test"] and select up to 50
+        # Deduplicate prompts from the held-out test split.
+        max_test_prompts = int(self._arg_value("perl_num_test_prompts", 50))
         seen_test_prompts = set()
         unique_test_rows = []
         for entry in data["test"]:
@@ -868,9 +1185,9 @@ Guidelines:
             if p not in seen_test_prompts:
                 seen_test_prompts.add(p)
                 unique_test_rows.append(entry)
-                if len(unique_test_rows) >= 50:
+                if len(unique_test_rows) >= max_test_prompts:
                     break
-        test_prompts = Dataset.from_list(unique_test_rows)
+        test_prompts = self._dataset_from_list(unique_test_rows, data["test"])
 
         return DatasetDict({"train": train_prompts, "test": test_prompts})
 

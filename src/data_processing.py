@@ -61,6 +61,78 @@ def main():
       help="Maximum allowable ratio between majority and minority classes.",
   )
   parser.add_argument(
+      "--drop_bad_quality",
+      default=True,
+      type=lambda x: (str(x).lower() == "true"),
+      help=(
+          "Drop annotator-flagged rows (quality != 'good', i.e."
+          " 'incorrect_refusal' and 'truncated'). RAGTruth labels these as"
+          " non-hallucinated, so keeping them injects refusals into the SFT"
+          " targets."
+      ),
+  )
+  parser.add_argument(
+      "--split_frac_sft",
+      type=float,
+      default=0.40,
+      help=(
+          "Fraction of training source_ids reserved for SFT. Splits are made"
+          " over source_ids, never rows, because one RAGTruth source yields up"
+          " to six responses sharing a single prompt."
+      ),
+  )
+  parser.add_argument(
+      "--split_frac_perl",
+      type=float,
+      default=0.25,
+      help=(
+          "Fraction of training source_ids reserved for PE-RL rollout prompts."
+          " The remainder (1 - sft - perl) goes to the reward model. The three"
+          " blocks are disjoint."
+      ),
+  )
+  parser.add_argument(
+      "--sft_val_fraction",
+      type=float,
+      default=0.15,
+      help="Fraction of SFT-block sources held out for SFT validation.",
+  )
+  parser.add_argument(
+      "--perl_num_test_prompts",
+      type=int,
+      default=50,
+      help="Number of held-out test prompts kept for PE-RL evaluation.",
+  )
+  parser.add_argument(
+      "--synth_struct_max_responses_per_source",
+      type=int,
+      default=2,
+      help=(
+          "Max responses per source fed to synthetic generation. All responses"
+          " of a source share one context, so tampering each yields"
+          " near-duplicates."
+      ),
+  )
+  parser.add_argument(
+      "--synth_struct_max_hallu_per_entry",
+      type=int,
+      default=1,
+      help=(
+          "Max hallucinated variants generated per entry (caps"
+          " synth_struct_top_k)."
+      ),
+  )
+  parser.add_argument(
+      "--synth_perturb_fraction",
+      type=float,
+      default=0.5,
+      help=(
+          "Fraction of reward-model sources assigned to the hallucinated"
+          " synthesis arm; the rest form the faithful arm. The arms are"
+          " disjoint by source_id so no context is seen under both labels."
+      ),
+  )
+  parser.add_argument(
       "--subtask",
       type=str,
       default=None,

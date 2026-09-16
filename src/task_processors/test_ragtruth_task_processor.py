@@ -209,6 +209,43 @@ from src.task_processors.ragtruth_task_processor import (
 )
 
 
+def make_mock_args(**overrides):
+  """Builds a Mock args namespace with realistic numeric defaults.
+
+  A bare `Mock()` returns a `Mock` for every attribute access, so any knob the
+  processor reads with `getattr(self.args, name, default)` resolves to a Mock
+  rather than the default. That blows up as soon as the value is used in
+  arithmetic. This factory pins the values that actually matter.
+
+  Args:
+    **overrides: Attribute values to override on top of the defaults.
+
+  Returns:
+    A Mock configured with the processor's expected argument namespace.
+  """
+  args = Mock()
+  args.seed = 12345
+  args.task_name = "ragtruth"
+  args.subtask = None
+  args.drop_bad_quality = True
+  args.split_frac_sft = 0.40
+  args.split_frac_perl = 0.25
+  args.sft_val_fraction = 0.15
+  args.perl_num_test_prompts = 50
+  args.num_synth_hallus = -1
+  args.synth_struct_top_k = 3
+  args.synth_struct_hallu_threshold = 0.40
+  args.synth_struct_irrelevant_threshold = 0.15
+  args.synth_struct_max_nonhall_per_entry = 2
+  args.synth_struct_balance_ratio = 1.25
+  args.synth_struct_max_responses_per_source = 2
+  args.synth_struct_max_hallu_per_entry = 1
+  args.synth_perturb_fraction = 0.5
+  for key, value in overrides.items():
+    setattr(args, key, value)
+  return args
+
+
 class TestPurePythonRougeScorer(unittest.TestCase):
   """Tests for the zero-dependency pure-Python in-memory ROUGE-1 scorer."""
 
@@ -258,9 +295,7 @@ class TestRagtruthTaskProcessorPreprocessing(unittest.TestCase):
   """Tests for context normalization, query extraction, label conversion, and preprocessing."""
 
   def setUp(self):
-    self.mock_args = Mock()
-    self.mock_args.seed = 12345
-    self.mock_args.task_name = "ragtruth"
+    self.mock_args = make_mock_args(seed=12345, task_name="ragtruth")
     self.processor = RagtruthTaskProcessor(self.mock_args)
 
   def test_normalize_context_string(self):
@@ -562,28 +597,31 @@ class TestRagtruthTaskProcessorSFTAndRM(unittest.TestCase):
   """Tests for SFT dataset filtering, column renaming, and organic RM formatting."""
 
   def setUp(self):
-    self.mock_args = Mock()
-    self.mock_args.seed = 42
-    self.mock_args.task_name = "ragtruth"
+    self.mock_args = make_mock_args(seed=42, task_name="ragtruth")
     self.processor = RagtruthTaskProcessor(self.mock_args)
 
   def test_make_sft_data(self):
+    # 12 sources x 3 responses. Sources 0-8 are faithful, 9-11 hallucinated.
     train_rows = [
         {
             "prompt": f"Context:\nC{i}\n\nQuestion: Q{i}\n\nAnswer:\n",
-            "response": f"Faithful answer {i}",
+            "response": f"Faithful answer {i}-{j}",
             "class_hall": "No",
             "label": 1,
+            "source_id": f"s{i}",
         }
-        for i in range(10)
+        for i in range(9)
+        for j in range(3)
     ] + [
         {
-            "prompt": "Context:\nHall\n\nQuestion: Q\n\nAnswer:\n",
-            "response": "Hallucinated answer",
+            "prompt": f"Context:\nC{i}\n\nQuestion: Q{i}\n\nAnswer:\n",
+            "response": f"Hallucinated answer {i}-{j}",
             "class_hall": "Yes",
             "label": 0,
+            "source_id": f"s{i}",
         }
-        for _ in range(5)
+        for i in range(9, 12)
+        for j in range(3)
     ]
     data = DatasetDict({"train": Dataset.from_list(train_rows)})
 
@@ -591,30 +629,45 @@ class TestRagtruthTaskProcessorSFTAndRM(unittest.TestCase):
     self.assertIn("train", sft_data)
     self.assertIn("test", sft_data)
 
-    total_sft = len(sft_data["train"]) + len(sft_data["test"])
-    # Only the 10 faithful rows should be included
-    self.assertEqual(total_sft, 10)
-
-    # Column 'response' should be renamed to 'completion'
+    # Column 'response' should be renamed to 'completion'.
     self.assertIn("completion", sft_data["train"].column_names)
     self.assertNotIn("response", sft_data["train"].column_names)
 
-    # Check 85/15 ratio: 10 total -> 1 val (test), 9 train
-    self.assertEqual(len(sft_data["test"]), 1)
-    self.assertEqual(len(sft_data["train"]), 9)
+    train_sources = set(sft_data["train"]["source_id"])
+    val_sources = set(sft_data["test"]["source_id"])
 
-  def test_make_sft_data_single_example(self):
+    # Only faithful sources may appear.
+    self.assertTrue(train_sources.issubset({f"s{i}" for i in range(9)}))
+    self.assertTrue(val_sources.issubset({f"s{i}" for i in range(9)}))
+
+    # SFT must consume only its own block, never the whole training pool.
+    self.assertLess(len(train_sources | val_sources), 9)
+
+    # The SFT train/val boundary must be drawn over sources, not rows: a
+    # single source fans out into several responses sharing one prompt, so a
+    # row-level split would put the same prompt on both sides.
+    self.assertEqual(train_sources & val_sources, set())
+    self.assertEqual(
+        set(sft_data["train"]["prompt"]) & set(sft_data["test"]["prompt"]),
+        set(),
+    )
+
+  def test_make_sft_data_degenerate_single_source(self):
+    """A one-source corpus cannot fill three disjoint blocks; must not crash."""
     single_data = DatasetDict({
         "train": Dataset.from_list([{
             "prompt": "Context:\nC\n\nQuestion: Q\n\nAnswer:\n",
             "response": "Single answer",
             "class_hall": "No",
             "label": 1,
+            "source_id": "s0",
         }])
     })
     sft_data = self.processor._make_sft_data(single_data)
-    self.assertEqual(len(sft_data["train"]), 1)
-    self.assertEqual(len(sft_data["test"]), 0)
+    self.assertIn("train", sft_data)
+    self.assertIn("test", sft_data)
+    # The lone source lands in exactly one block, so SFT gets 1 row or 0.
+    self.assertLessEqual(len(sft_data["train"]) + len(sft_data["test"]), 1)
 
   def test_rm_prompt_formatting(self):
     entry = {
@@ -662,14 +715,15 @@ class TestRagtruthTaskProcessorSynthetic(unittest.TestCase):
   """Tests for ROUGE scoring and Schemas 1, 2, 3 of structured synthetic perturbations."""
 
   def setUp(self):
-    self.mock_args = Mock()
-    self.mock_args.seed = 12345
-    self.mock_args.num_synth_hallus = 10
-    self.mock_args.synth_struct_top_k = 3
-    self.mock_args.synth_struct_hallu_threshold = 0.40
-    self.mock_args.synth_struct_irrelevant_threshold = 0.15
-    self.mock_args.synth_struct_max_nonhall_per_entry = 2
-    self.mock_args.synth_struct_balance_ratio = 1.30
+    self.mock_args = make_mock_args(
+        seed=12345,
+        num_synth_hallus=10,
+        synth_struct_top_k=3,
+        synth_struct_hallu_threshold=0.40,
+        synth_struct_irrelevant_threshold=0.15,
+        synth_struct_max_nonhall_per_entry=2,
+        synth_struct_balance_ratio=1.30,
+    )
     self.processor = RagtruthTaskProcessor(self.mock_args)
     self.rouge_metric = MockRougeMetric()
 
@@ -859,7 +913,10 @@ class TestRagtruthTaskProcessorSynthetic(unittest.TestCase):
     self.assertEqual(len(resp_drops), 0)
 
   def test_make_structured_hallucinations_data_balancing_and_columns(self):
-    train_entries = [
+    # The reward-model block is a fraction of the corpus and is then split
+    # into two disjoint synthesis arms, so the fixture needs enough distinct
+    # sources for both arms to be non-empty.
+    templates = [
         {
             "user_query": "What is photon entanglement?",
             "context": (
@@ -872,12 +929,6 @@ class TestRagtruthTaskProcessorSynthetic(unittest.TestCase):
                 "Quantum entanglement occurs when particles interact."
                 " Their states cannot be described independently."
             ),
-            "prompt": (
-                "Context:\n...\n\nQuestion: What is photon"
-                " entanglement?\n\nAnswer:\n"
-            ),
-            "class_hall": "No",
-            "label": 1,
         },
         {
             "user_query": "Explain photosynthesis.",
@@ -891,14 +942,23 @@ class TestRagtruthTaskProcessorSynthetic(unittest.TestCase):
                 "Photosynthesis converts light into chemical energy using"
                 " chlorophyll. Oxygen is released as a byproduct."
             ),
-            "prompt": (
-                "Context:\n...\n\nQuestion: Explain"
-                " photosynthesis?\n\nAnswer:\n"
-            ),
-            "class_hall": "No",
-            "label": 1,
         },
     ]
+    train_entries = []
+    for i in range(12):
+      template = templates[i % len(templates)]
+      train_entries.append({
+          "user_query": template["user_query"],
+          "context": template["context"],
+          "response": template["response"],
+          "prompt": (
+              f"Context:\n...\n\nQuestion: {template['user_query']}"
+              f" (variant {i})\n\nAnswer:\n"
+          ),
+          "class_hall": "No",
+          "label": 1,
+          "source_id": f"s{i}",
+      })
     test_entries = [{
         "user_query": "Test query",
         "context": "Test context",
@@ -906,6 +966,7 @@ class TestRagtruthTaskProcessorSynthetic(unittest.TestCase):
         "prompt": "Context:\n...\n\nQuestion: Test\n\nAnswer:\n",
         "class_hall": "Yes",
         "label": 0,
+        "source_id": "t0",
     }]
 
     raw_data = DatasetDict({
@@ -937,6 +998,17 @@ class TestRagtruthTaskProcessorSynthetic(unittest.TestCase):
     )
     # Balance ratio threshold (with rounding buffer)
     self.assertLessEqual(ratio, self.mock_args.synth_struct_balance_ratio + 0.5)
+
+    # Provenance must survive synthesis, otherwise leakage is unauditable.
+    self.assertIn("source_id", train_split.column_names)
+    self.assertNotIn(None, list(train_split["source_id"]))
+
+    # The two synthesis arms must be disjoint by source. If one context were
+    # emitted both perturbed and clean, the reward model could learn to key on
+    # the context itself rather than on the faithfulness of the response.
+    hallu_sources = {row["source_id"] for row in hallus}
+    faithful_sources = {row["source_id"] for row in non_hallus}
+    self.assertEqual(hallu_sources & faithful_sources, set())
 
   def test_split_into_sentences_newline_structured(self):
     """Test that newline-separated key-value tables (Data2text) are split by lines with newline delimiter."""
@@ -983,17 +1055,13 @@ class TestRagtruthTaskProcessorSynthetic(unittest.TestCase):
     raw_data = DatasetDict({
         "train": Dataset.from_list([
             {
-                "prompt": "Context:\nC1\n\nQuestion: Q1\n\nAnswer:\n",
-                "response": "Faithful Answer 1",
+                "prompt": f"Context:\nC{i}\n\nQuestion: Q{i}\n\nAnswer:\n",
+                "response": f"Faithful Answer {i}",
                 "class_hall": "No",
                 "label": 1,
-            },
-            {
-                "prompt": "Context:\nC2\n\nQuestion: Q2\n\nAnswer:\n",
-                "response": "Faithful Answer 2",
-                "class_hall": "No",
-                "label": 1,
-            },
+                "source_id": f"s{i}",
+            }
+            for i in range(12)
         ]),
         "test": Dataset.from_list([]),
     })
@@ -1004,15 +1072,18 @@ class TestRagtruthTaskProcessorSynthetic(unittest.TestCase):
                 "response": "Org Hallu",
                 "class_hall": "Yes",
                 "label": 0,
+                "source_id": "org0",
             }
         ]),
         "test": Dataset.from_list([]),
     })
-    # Set num_synth_hallus=1 so 1 sample is perturbed and 1 sample is in rest
     self.mock_args.num_synth_hallus = 1
     llm_data = self.processor._make_llm_hallucinations_data(raw_data, organic_rm)
     train_split = llm_data["train"]
-    self.assertEqual(len(train_split), 2)
+    self.assertGreater(len(train_split), 0)
+
+    # Only the reward-model block may be consumed, never the whole pool.
+    self.assertLess(len(train_split), 12)
 
     # Both perturbed and rest samples MUST have their response appended to prompt
     for row in train_split:
@@ -1021,38 +1092,67 @@ class TestRagtruthTaskProcessorSynthetic(unittest.TestCase):
             f"Prompt '{row['prompt']}' should end with response '{row['response']}'",
         )
 
+    # Perturbed and clean arms must not share a source.
+    hallu_sources = {
+        row["source_id"] for row in train_split if row["class_hall"] == "Yes"
+    }
+    faithful_sources = {
+        row["source_id"] for row in train_split if row["class_hall"] == "No"
+    }
+    self.assertEqual(hallu_sources & faithful_sources, set())
+
 
 class TestRagtruthTaskProcessorDownstream(unittest.TestCase):
   """Tests for PERL, autorater, evaluation splits, and prompt callables."""
 
   def setUp(self):
-    self.mock_args = Mock()
-    self.mock_args.seed = 12345
-    self.mock_args.task_name = "ragtruth"
+    self.mock_args = make_mock_args(seed=12345, task_name="ragtruth")
     self.processor = RagtruthTaskProcessor(self.mock_args)
 
   def test_make_perl_data(self):
-    sft_data = DatasetDict({
-        "train": Dataset.from_list([
-            {"prompt": "Prompt 1", "completion": "Comp 1", "user_query": "Q1", "context": "C1"},
-            {"prompt": "Prompt 1", "completion": "Comp 1 dup", "user_query": "Q1", "context": "C1"},
-            {"prompt": "Prompt 2", "completion": "Comp 2", "user_query": "Q2", "context": "C2"},
-        ]),
+    # 12 sources x 2 faithful responses each, so prompts repeat within a
+    # source and the PE-RL block must dedupe them down to one per source.
+    train_rows = [
+        {
+            "prompt": f"Prompt {i}",
+            "response": f"Resp {i}-{j}",
+            "user_query": f"Q{i}",
+            "context": f"C{i}",
+            "class_hall": "No",
+            "label": 1,
+            "source_id": f"s{i}",
+        }
+        for i in range(12)
+        for j in range(2)
+    ]
+    data = DatasetDict({
+        "train": Dataset.from_list(train_rows),
         "test": Dataset.from_list([
-            {"prompt": "Prompt Val", "completion": "Comp Val"}
-        ]),
-    })
-    rm_data = DatasetDict({
-        "test": Dataset.from_list([
-            {"prompt": f"Test Prompt {i // 2}", "response": f"R {i}", "user_query": f"Q {i // 2}", "context": f"C {i // 2}"}
+            {
+                "prompt": f"Test Prompt {i // 2}",
+                "response": f"R {i}",
+                "user_query": f"Q {i // 2}",
+                "context": f"C {i // 2}",
+                "source_id": f"t{i // 2}",
+            }
             for i in range(10)
-        ])
+        ]),
     })
 
-    perl_data = self.processor._make_perl_data(rm_data, sft_data, seed=42)
-    # Deduplication should reduce train from 3 to 2 unique prompts
-    self.assertEqual(len(perl_data["train"]), 2)
-    # Deduplication should reduce test from 10 (with duplicates) to 5 unique prompts
+    sft_data = self.processor._make_sft_data(data)
+    perl_data = self.processor._make_perl_data(data, sft_data, seed=42)
+
+    # PE-RL must draw rollout prompts from its own block. Reusing SFT prompts
+    # would mean optimizing the policy on exactly what it memorized.
+    perl_prompts = set(perl_data["train"]["prompt"])
+    self.assertTrue(perl_prompts)
+    self.assertEqual(perl_prompts & set(sft_data["train"]["prompt"]), set())
+    self.assertEqual(perl_prompts & set(sft_data["test"]["prompt"]), set())
+
+    # One prompt per source: duplicates collapse.
+    self.assertEqual(len(perl_data["train"]), len(perl_prompts))
+
+    # Test prompts dedupe from 10 rows to 5 unique prompts.
     self.assertEqual(len(perl_data["test"]), 5)
 
     # Columns must retain prompt, user_query, context, and completion/response
@@ -1152,6 +1252,177 @@ class TestRagtruthTaskProcessorDownstream(unittest.TestCase):
     self.assertIn("--- EXAMPLES ---", prompt_fs)
     self.assertIn("Context example", prompt_fs)
     self.assertIn("Yes", prompt_fs)
+
+
+class TestRagtruthTaskProcessorLeakageControls(unittest.TestCase):
+  """Tests for quality filtering and the disjoint source-block partition."""
+
+  def setUp(self):
+    self.mock_args = make_mock_args(seed=12345, task_name="ragtruth-qa")
+    self.processor = RagtruthTaskProcessor(self.mock_args)
+
+  def _qa_rows(self, n):
+    return [
+        {
+            "task_type": "qa",
+            "base_content": f"Context {i}",
+            "question": f"Q{i}?",
+            "response": f"A{i}",
+            "labels": [],
+            "source_id": f"s{i}",
+        }
+        for i in range(n)
+    ]
+
+  def test_preprocess_drops_bad_quality_rows(self):
+    """'incorrect_refusal' and 'truncated' rows must not reach any split.
+
+    RAGTruth labels these rows non-hallucinated, so leaving them in would push
+    refusals and cut-off text into the SFT targets as if they were good
+    answers.
+    """
+    rows = self._qa_rows(3)
+    rows[0]["quality"] = "good"
+    rows[1]["quality"] = "incorrect_refusal"
+    rows[2]["quality"] = "truncated"
+    raw_data = DatasetDict({
+        "train": Dataset.from_list(rows),
+        "test": Dataset.from_list([]),
+    })
+
+    processed = self.processor._preprocess_data(raw_data)
+    self.assertEqual(len(processed["train"]), 1)
+    self.assertEqual(processed["train"][0]["user_query"], "Q0?")
+
+  def test_preprocess_keeps_bad_quality_when_disabled(self):
+    rows = self._qa_rows(3)
+    rows[0]["quality"] = "good"
+    rows[1]["quality"] = "incorrect_refusal"
+    rows[2]["quality"] = "truncated"
+    args = make_mock_args(
+        seed=12345, task_name="ragtruth-qa", drop_bad_quality=False
+    )
+    processor = RagtruthTaskProcessor(args)
+    raw_data = DatasetDict({
+        "train": Dataset.from_list(rows),
+        "test": Dataset.from_list([]),
+    })
+
+    processed = processor._preprocess_data(raw_data)
+    self.assertEqual(len(processed["train"]), 3)
+
+  def test_preprocess_tolerates_missing_quality_column(self):
+    raw_data = DatasetDict({
+        "train": Dataset.from_list(self._qa_rows(3)),
+        "test": Dataset.from_list([]),
+    })
+    processed = self.processor._preprocess_data(raw_data)
+    self.assertEqual(len(processed["train"]), 3)
+
+  def test_source_blocks_partition_all_sources(self):
+    train_ds = Dataset.from_list([
+        {"source_id": f"s{i}", "prompt": f"P{i}", "response": f"R{i}"}
+        for i in range(100)
+    ])
+    mapping = self.processor._assign_source_blocks(train_ds)
+
+    self.assertEqual(len(mapping), 100)
+    self.assertEqual(set(mapping.values()), {"sft", "perl", "rm"})
+
+    blocks = {"sft": set(), "perl": set(), "rm": set()}
+    for key, block in mapping.items():
+      blocks[block].add(key)
+
+    # Disjoint by construction, and together they cover every source.
+    self.assertEqual(blocks["sft"] & blocks["perl"], set())
+    self.assertEqual(blocks["sft"] & blocks["rm"], set())
+    self.assertEqual(blocks["perl"] & blocks["rm"], set())
+    self.assertEqual(
+        len(blocks["sft"]) + len(blocks["perl"]) + len(blocks["rm"]), 100
+    )
+
+    # Sizes follow the requested fractions (40 / 25 / 35).
+    self.assertEqual(len(blocks["sft"]), 40)
+    self.assertEqual(len(blocks["perl"]), 25)
+    self.assertEqual(len(blocks["rm"]), 35)
+
+  def test_source_blocks_are_deterministic_across_processors(self):
+    """Builders run at different times must see the same partition.
+
+    The reward-model splits are built before the SFT split exists, so the two
+    can only stay disjoint if the partition is a pure function of the seed and
+    the set of source keys.
+    """
+    rows = [
+        {"source_id": f"s{i}", "prompt": f"P{i}", "response": f"R{i}"}
+        for i in range(50)
+    ]
+    first = RagtruthTaskProcessor(
+        make_mock_args(seed=777)
+    )._assign_source_blocks(Dataset.from_list(rows))
+    # Shuffled row order must not change the outcome.
+    second = RagtruthTaskProcessor(
+        make_mock_args(seed=777)
+    )._assign_source_blocks(Dataset.from_list(list(reversed(rows))))
+    self.assertEqual(first, second)
+
+    different_seed = RagtruthTaskProcessor(
+        make_mock_args(seed=778)
+    )._assign_source_blocks(Dataset.from_list(rows))
+    self.assertNotEqual(first, different_seed)
+
+  def test_all_responses_of_a_source_land_in_one_block(self):
+    """The whole point of the source-level split.
+
+    Six responses share one prompt; if they scattered across blocks the same
+    prompt would appear in SFT, PE-RL and the reward model at once.
+    """
+    train_ds = Dataset.from_list([
+        {"source_id": f"s{i}", "prompt": f"P{i}", "response": f"R{i}-{j}"}
+        for i in range(30)
+        for j in range(6)
+    ])
+    mapping = self.processor._assign_source_blocks(train_ds)
+
+    seen = {}
+    for block in ("sft", "perl", "rm"):
+      for row in self.processor._select_block(train_ds, block):
+        sid = row["source_id"]
+        self.assertEqual(seen.setdefault(sid, block), block)
+    self.assertEqual(len(seen), 30)
+    self.assertEqual(len(mapping), 30)
+
+  def test_block_fractions_reject_impossible_split(self):
+    """A split leaving nothing for the reward model must fail loudly."""
+    for bad in ((0.8, 0.3), (0.0, 0.25), (0.4, -0.1), (0.75, 0.25)):
+      processor = RagtruthTaskProcessor(
+          make_mock_args(split_frac_sft=bad[0], split_frac_perl=bad[1])
+      )
+      with self.assertRaises(ValueError):
+        processor._block_fractions()
+
+  def test_split_synthesis_arms_are_disjoint(self):
+    ds = Dataset.from_list([
+        {"source_id": f"s{i}", "prompt": f"P{i}", "response": f"R{i}"}
+        for i in range(40)
+    ])
+    perturbed, clean = self.processor._split_synthesis_arms(ds, seed=12345)
+    self.assertEqual(perturbed & clean, set())
+    self.assertEqual(len(perturbed) + len(clean), 40)
+    self.assertEqual(len(perturbed), 20)
+
+  def test_cap_responses_per_source(self):
+    ds = Dataset.from_list([
+        {"source_id": f"s{i}", "prompt": f"P{i}", "response": f"R{i}-{j}"}
+        for i in range(10)
+        for j in range(6)
+    ])
+    capped = self.processor._cap_responses_per_source(ds, seed=1)
+    counts = {}
+    for row in capped:
+      counts[row["source_id"]] = counts.get(row["source_id"], 0) + 1
+    self.assertEqual(len(counts), 10)
+    self.assertTrue(all(c <= 2 for c in counts.values()))
 
 
 if __name__ == "__main__":
