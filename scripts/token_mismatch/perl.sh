@@ -37,7 +37,7 @@
 # Core Parameters
 USER="leobianco"
 SEED=130104
-MODEL_REPO_ID="google/gemma-4-E2B-it"
+MODEL_REPO_ID="google/gemma-4-E4B-it"
 SFT_MODEL_PATH="${USER}/"
 REWARD_MODEL_PATH="${USER}/"
 

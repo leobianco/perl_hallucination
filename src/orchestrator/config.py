@@ -200,7 +200,7 @@ class CampaignConfig:
   user: str = "leobianco"
   project: str = "new_perl"
   wandb_entity: Optional[str] = None
-  base_model: str = "google/gemma-4-E2B-it"
+  base_model: str = "google/gemma-4-E4B-it"
   stages: List[str] = field(
       default_factory=lambda: ["sft", "rm", "perl", "eval"]
   )

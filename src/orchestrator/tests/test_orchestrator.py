@@ -987,6 +987,8 @@ class TestSweepNaming(unittest.TestCase):
     with tempfile.TemporaryDirectory() as temp_dir:
       config = CampaignConfig.create_default(task_name="bosch", dry_run=True)
       config.state_file = os.path.join(temp_dir, "bosch_state.json")
+      # Pinned explicitly so the assertion is independent of the default.
+      config.base_model = "google/gemma-4-E2B-it"
       state = CampaignState(campaign_id="test_camp", task_name="bosch")
       context = CampaignContext(
           config=config,
@@ -1028,6 +1030,8 @@ class TestSweepNaming(unittest.TestCase):
     with tempfile.TemporaryDirectory() as temp_dir:
       config = CampaignConfig.create_default(task_name="npov", dry_run=True)
       config.state_file = os.path.join(temp_dir, "npov_state.json")
+      # Pinned explicitly so the assertion is independent of the default.
+      config.base_model = "google/gemma-4-E2B-it"
       state = CampaignState(campaign_id="test_camp", task_name="npov")
       context = CampaignContext(
           config=config,
@@ -1051,6 +1055,8 @@ class TestSweepNaming(unittest.TestCase):
       config = CampaignConfig.create_default(task_name="bosch", dry_run=True)
       config.state_file = os.path.join(temp_dir, "bosch", "camp2_state.json")
       os.makedirs(os.path.join(temp_dir, "bosch"), exist_ok=True)
+      # Pinned explicitly so the assertion is independent of the default.
+      config.base_model = "google/gemma-4-E2B-it"
 
       # Create prior state file with an existing SFT sweep
       prior_state = CampaignState(campaign_id="camp1", task_name="bosch")

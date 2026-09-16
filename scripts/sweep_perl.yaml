@@ -30,7 +30,7 @@ command:
   - --task_name=npov
   - --seed=130104
   - --dataset_repo_id=leobianco/npov_perl
-  - --model_repo_id=google/gemma-4-E2B-it
+  - --model_repo_id=google/gemma-4-E4B-it
   - --sft_model_path=leobianco/
   - --reward_model_path=leobianco/
   - --do_train=True
