@@ -18,7 +18,7 @@ LEARNING_RATE=2e-5
 LR_SCHEDULER_TYPE="cosine"
 WARMUP_RATIO=0.1
 BETA=1e-4
-MAX_COMPLETION_LENGTH=256
+MAX_COMPLETION_LENGTH=512
 
 # Token budget the reward model uses to score (prompt + completion).
 #
@@ -29,11 +29,9 @@ MAX_COMPLETION_LENGTH=256
 # MUST also leave room for MAX_COMPLETION_LENGTH on top of the prompt.
 # Truncation is applied from the LEFT so the completion always survives, but
 # if the budget is too small the reward model stops seeing enough context to
-# judge groundedness. The previous hardcoded value of 512 was smaller than the
-# RAGTruth prompt itself in 93% of QA rows: the completion was dropped
-# entirely, every rollout scored the same, and the RLOO advantage was exactly
-# zero, so PE-RL optimized nothing but the KL term.
+# judge groundedness.
 REWARD_MAX_LENGTH="${REWARD_MAX_LENGTH:-2048}"
+
 NUM_GENERATIONS="${NUM_GENERATIONS:-8}"
 NUM_ITERATIONS=1
 STEPS_PER_GENERATION=16
@@ -45,10 +43,10 @@ NUM_FEWSHOT=0
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-8}"
 REWARD_PENALTY_ALPHA="${REWARD_PENALTY_ALPHA:-1.0}"
 SAVE_STRATEGY="steps"
-SAVE_STEPS=50
+SAVE_STEPS=25
 DO_EVAL=True
 EVAL_STRATEGY="steps"
-EVAL_STEPS=50
+EVAL_STEPS=25
 EVAL_ON_START=True
 
 # Infrastructure Parameters

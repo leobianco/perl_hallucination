@@ -3,18 +3,6 @@
 # Core Parameters
 USER="leobianco"
 SEED=12345
-# Reward model backbone. Now matched to the policy (gemma-4-E4B-it).
-#
-# This was previously google/gemma-3-1b-it: the PE-RL pipeline keeps a separate
-# `reward_tokenizer`, so mixing model families works. Matching families instead
-# removes any tokenization divergence between the policy and the scorer.
-#
-# Cost: during PE-RL the policy AND the reward model are both resident, so this
-# is a large VRAM increase over a 1B scorer. If you OOM, lower
-# PER_DEVICE_BATCH_SIZE / NUM_GENERATIONS in scripts/perl.sh before reverting.
-# Gemma-4 sequence classification is supported via
-# src/models/gemma4_sequence_classification.py, which RewardModelPipeline
-# registers with AutoModelForSequenceClassification at setup_model time.
 MODEL_REPO_ID="google/gemma-4-E4B-it"
 
 # Dataset Parameters
@@ -43,15 +31,12 @@ WARMUP_RATIO=0.1
 # is trained here and queried there; if the two disagree, the model is trained
 # on one view of the text and scored on another.
 #
-# It must comfortably exceed prompt + response. For RAGTruth the prompt alone
-# is over 512 tokens in 93% of QA rows and 98% of summarization rows, which is
-# why the old hardcoded 512 silently removed the response entirely. 2048
-# covers ~p98 of RAGTruth; 4096 covers all of it.
+# It must comfortably exceed prompt + response. 2048 covers ~98th percentile of RAGTruth.
 REWARD_MAX_LENGTH="${REWARD_MAX_LENGTH:-2048}"
 
 # Infrastructure Parameters
 PRECISION="BF16"
-EVAL_STEPS=50
+EVAL_STEPS=25
 DEEPSPEED_CONFIG="scripts/deepspeed_config.yaml"
 
 # Parameters derived from above
