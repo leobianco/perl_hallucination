@@ -104,6 +104,26 @@ def main():
       help="Number of held-out test prompts kept for PE-RL evaluation.",
   )
   parser.add_argument(
+      "--test_dev_fraction",
+      type=float,
+      default=1.0 / 3.0,
+      help=(
+          "Fraction of the official test SOURCES reserved as the 'dev' pool"
+          " used for every model-selection decision (reward-model eval,"
+          " autorater threshold, PE-RL eval prompts). The remaining sources"
+          " form the 'final' pool, read only by the reported evaluation set."
+          " Without this split the number you report is the best of many"
+          " noisy estimates on the rows you tuned against, not a held-out"
+          " score. Must be strictly between 0 and 1."
+          " RAGTruth ships exactly 150 held-out test SOURCE passages per"
+          " subtask (900 test responses = 150 sources x 6 generator LLMs),"
+          " and every consumer dedupes to one prompt per source, so 150 is"
+          " the hard ceiling on unique evaluation prompts. The 1/3 default"
+          " therefore yields 50 dev (tuning) and 100 final (reported)"
+          " prompts."
+      ),
+  )
+  parser.add_argument(
       "--synth_struct_max_responses_per_source",
       type=int,
       default=2,

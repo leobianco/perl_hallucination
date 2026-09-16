@@ -204,6 +204,7 @@ else:
   from datasets import Dataset, DatasetDict, concatenate_datasets
 
 from src.task_processors.ragtruth_task_processor import (
+    _DEFAULT_TEST_DEV_FRACTION,
     _PurePythonRougeScorer,
     RagtruthTaskProcessor,
 )
@@ -232,6 +233,7 @@ def make_mock_args(**overrides):
   args.split_frac_perl = 0.25
   args.sft_val_fraction = 0.15
   args.perl_num_test_prompts = 50
+  args.test_dev_fraction = 0.5
   args.num_synth_hallus = -1
   args.synth_struct_top_k = 3
   args.synth_struct_hallu_threshold = 0.40
@@ -1152,8 +1154,28 @@ class TestRagtruthTaskProcessorDownstream(unittest.TestCase):
     # One prompt per source: duplicates collapse.
     self.assertEqual(len(perl_data["train"]), len(perl_prompts))
 
-    # Test prompts dedupe from 10 rows to 5 unique prompts.
-    self.assertEqual(len(perl_data["test"]), 5)
+    # PE-RL's eval prompts are a model-selection signal, so they must come
+    # from the 'dev' pool of the official test split and must never touch the
+    # 'final' pool that the reported score is computed on.
+    pools = self.processor._assign_test_pools(data["test"])
+    dev_prompts = {
+        e["prompt"] for e in data["test"]
+        if pools[self.processor._group_key(e)] == "dev"
+    }
+    final_prompts = {
+        e["prompt"] for e in data["test"]
+        if pools[self.processor._group_key(e)] == "final"
+    }
+    self.assertTrue(dev_prompts)
+    self.assertTrue(final_prompts)
+
+    perl_test_prompts = set(perl_data["test"]["prompt"])
+    self.assertTrue(perl_test_prompts)
+    self.assertTrue(perl_test_prompts <= dev_prompts)
+    self.assertEqual(perl_test_prompts & final_prompts, set())
+
+    # One prompt per source on the test side too: duplicates collapse.
+    self.assertEqual(len(perl_data["test"]), len(perl_test_prompts))
 
     # Columns must retain prompt, user_query, context, and completion/response
     for split in ("train", "test"):
@@ -1162,22 +1184,61 @@ class TestRagtruthTaskProcessorDownstream(unittest.TestCase):
         self.assertIn("context", perl_data[split].column_names)
 
   def test_make_autorater_and_evaluation_data(self):
-    test_ds = Dataset.from_list([{
-        "prompt": "Context:\nC\n\nQuestion: Q\n\nAnswer:\n",
-        "response": "Answer text",
-        "class_hall": "No",
-        "label": 1,
-    }])
+    # Two sources, so the official test split can be carved into a non-empty
+    # 'dev' pool (model selection) and a non-empty 'final' pool (reported
+    # score). The autorater reads 'dev'; the evaluation set reads 'final'.
+    test_ds = Dataset.from_list([
+        {
+            "prompt": f"Context:\nC{i}\n\nQuestion: Q{i}\n\nAnswer:\n",
+            "response": f"Answer text {i}",
+            "user_query": f"Q{i}",
+            "context": f"C{i}",
+            "class_hall": "No",
+            "label": 1,
+            "source_id": f"t{i}",
+        }
+        for i in range(2)
+    ])
     data = DatasetDict({"test": test_ds})
 
+    pools = self.processor._assign_test_pools(test_ds)
+    dev_keys = {k for k, v in pools.items() if v == "dev"}
+    final_keys = {k for k, v in pools.items() if v == "final"}
+    self.assertTrue(dev_keys)
+    self.assertTrue(final_keys)
+    self.assertEqual(dev_keys & final_keys, set())
+
+    dev_rows = [
+        e for e in test_ds
+        if pools[self.processor._group_key(e)] == "dev"
+    ]
+    final_rows = [
+        e for e in test_ds
+        if pools[self.processor._group_key(e)] == "final"
+    ]
+
+    # The autorater scores the model-selection pool only.
     autorater = self.processor._make_autorater_data(data)
+    self.assertEqual(len(autorater), len(dev_rows))
     self.assertEqual(
-        autorater[0]["prompt"],
-        "Context:\nC\n\nQuestion: Q\n\nAnswer:\nAnswer text",
+        set(autorater["prompt"]),
+        {e["prompt"] + e["response"] for e in dev_rows},
     )
 
+    # The reported score reads the disjoint reporting pool.
     eval_data = self.processor._make_evaluation_data(data)
-    self.assertEqual(len(eval_data["test"]), 1)
+    self.assertEqual(len(eval_data["test"]), len(final_rows))
+    self.assertEqual(
+        set(eval_data["test"]["prompt"]),
+        {e["prompt"] for e in final_rows},
+    )
+
+    # The two must never overlap: that overlap is the selection leak.
+    self.assertEqual(
+        set(eval_data["test"]["prompt"])
+        & {e["prompt"] for e in dev_rows},
+        set(),
+    )
 
   def test_get_formatting_prompts_and_response_template(self):
     formatting_fn, resp_template = (
@@ -1423,6 +1484,248 @@ class TestRagtruthTaskProcessorLeakageControls(unittest.TestCase):
       counts[row["source_id"]] = counts.get(row["source_id"], 0) + 1
     self.assertEqual(len(counts), 10)
     self.assertTrue(all(c <= 2 for c in counts.values()))
+
+
+class TestRagtruthTestPoolControls(unittest.TestCase):
+  """Tests for the 'dev'/'final' carve of the official test split.
+
+  Holding the official test split out of training does not by itself make a
+  number computed on it a held-out number. The reward model's eval arm, the
+  autorater and the PE-RL eval prompts all read that split, and sweep trials
+  are ranked on their best step, so reporting the final score on the same
+  rows reports the maximum of many noisy estimates. These tests pin the
+  partition that keeps the reported score untouched by model selection.
+  """
+
+  def setUp(self):
+    self.mock_args = make_mock_args(seed=12345, task_name="ragtruth-qa")
+    self.processor = RagtruthTaskProcessor(self.mock_args)
+
+  def _test_rows(self, n, responses_per_source=1):
+    return [
+        {
+            "prompt": f"Context:\nC{i}\n\nQuestion: Q{i}\n\nAnswer:\n",
+            "response": f"A{i}-{j}",
+            "user_query": f"Q{i}",
+            "context": f"C{i}",
+            "class_hall": "No",
+            "label": 1,
+            "source_id": f"t{i}",
+        }
+        for i in range(n)
+        for j in range(responses_per_source)
+    ]
+
+  def test_pools_partition_every_source_exactly_once(self):
+    ds = Dataset.from_list(self._test_rows(20))
+    pools = self.processor._assign_test_pools(ds)
+
+    self.assertEqual(len(pools), 20)
+    self.assertEqual(set(pools.values()), {"dev", "final"})
+    dev = {k for k, v in pools.items() if v == "dev"}
+    final = {k for k, v in pools.items() if v == "final"}
+    self.assertEqual(dev & final, set())
+    self.assertEqual(len(dev) + len(final), 20)
+    # The fixture pins test_dev_fraction=0.5 (the production default is 1/3,
+    # covered by test_production_default_yields_fifty_dev_hundred_final), so
+    # the carve here is even.
+    self.assertEqual(len(dev), 10)
+
+  def test_pools_split_by_source_not_by_row(self):
+    """All responses of one source must land in the same pool.
+
+    A source carries up to six responses sharing a single prompt. Splitting
+    at row level would put the same prompt in both pools, which is exactly
+    the leak this partition exists to prevent.
+    """
+    ds = Dataset.from_list(self._test_rows(10, responses_per_source=6))
+    pools = self.processor._assign_test_pools(ds)
+
+    by_source = {}
+    for row in ds:
+      key = self.processor._group_key(row)
+      by_source.setdefault(row["source_id"], set()).add(pools[key])
+    self.assertEqual(len(by_source), 10)
+    for source_id, assigned in by_source.items():
+      self.assertEqual(len(assigned), 1, f"{source_id} straddles two pools")
+
+  def test_pool_assignment_is_deterministic_across_processors(self):
+    """Every consumer runs the partition independently, so it must agree.
+
+    Organic RM data is built before the SFT split exists, so the pools cannot
+    be computed once and threaded through. They must be a pure function of
+    (seed, key set).
+    """
+    ds = Dataset.from_list(self._test_rows(20))
+    first = self.processor._assign_test_pools(ds)
+    second = RagtruthTaskProcessor(
+        make_mock_args(seed=12345, task_name="ragtruth-qa")
+    )._assign_test_pools(ds)
+    self.assertEqual(first, second)
+
+    # And it is memoised: repeated calls on the same keys are stable.
+    self.assertEqual(first, self.processor._assign_test_pools(ds))
+
+  def test_pool_assignment_changes_with_seed(self):
+    ds = Dataset.from_list(self._test_rows(20))
+    a = self.processor._assign_test_pools(ds)
+    b = RagtruthTaskProcessor(
+        make_mock_args(seed=999, task_name="ragtruth-qa")
+    )._assign_test_pools(ds)
+    self.assertNotEqual(a, b)
+
+  def test_single_source_goes_to_dev(self):
+    """One source cannot be split two ways; 'dev' must still get it.
+
+    `round(1 * 0.5)` is 0 under Python's banker's rounding, so a naive
+    implementation silently empties the 'dev' pool and quietly disables the
+    reward-model eval arm and the autorater. An empty 'final' pool is the
+    correct, visible signal that one source cannot support a reported score.
+    """
+    ds = Dataset.from_list(self._test_rows(1))
+    pools = self.processor._assign_test_pools(ds)
+    self.assertEqual(set(pools.values()), {"dev"})
+
+  def test_no_pool_is_starved_by_rounding(self):
+    """With more than one source both pools must be non-empty.
+
+    An extreme fraction plus rounding could otherwise hand everything to one
+    pool, silently restoring the leak.
+    """
+    for fraction in (0.05, 0.1, 0.5, 0.9, 0.95):
+      for n_sources in (2, 3, 5, 11):
+        processor = RagtruthTaskProcessor(
+            make_mock_args(test_dev_fraction=fraction)
+        )
+        ds = Dataset.from_list(self._test_rows(n_sources))
+        pools = processor._assign_test_pools(ds)
+        dev = [k for k, v in pools.items() if v == "dev"]
+        final = [k for k, v in pools.items() if v == "final"]
+        self.assertTrue(dev, f"empty dev at {fraction}/{n_sources}")
+        self.assertTrue(final, f"empty final at {fraction}/{n_sources}")
+
+  def test_degenerate_fractions_are_rejected(self):
+    """0 or 1 would make selection and reporting read the same rows."""
+    for bad in (0.0, 1.0, -0.2, 1.5):
+      processor = RagtruthTaskProcessor(
+          make_mock_args(test_dev_fraction=bad)
+      )
+      with self.assertRaises(ValueError):
+        processor._test_dev_fraction()
+
+  def test_select_test_pool_returns_only_that_pool(self):
+    ds = Dataset.from_list(self._test_rows(10, responses_per_source=3))
+    dev = self.processor._select_test_pool(ds, "dev")
+    final = self.processor._select_test_pool(ds, "final")
+
+    self.assertEqual(len(dev) + len(final), len(ds))
+    dev_prompts = set(dev["prompt"])
+    final_prompts = set(final["prompt"])
+    self.assertTrue(dev_prompts)
+    self.assertTrue(final_prompts)
+    self.assertEqual(dev_prompts & final_prompts, set())
+
+  def test_consumers_read_the_pool_they_should(self):
+    """Selection consumers read 'dev'; only the reported score reads 'final'.
+
+    This is the invariant that makes the final number a generalisation
+    estimate rather than the maximum of many noisy selection estimates.
+    """
+    train_rows = [
+        {
+            "prompt": f"Train Prompt {i}",
+            "response": f"Resp {i}",
+            "user_query": f"TQ{i}",
+            "context": f"TC{i}",
+            "class_hall": "No",
+            "label": 1,
+            "source_id": f"s{i}",
+        }
+        for i in range(20)
+    ]
+    test_ds = Dataset.from_list(self._test_rows(10, responses_per_source=2))
+    data = DatasetDict({
+        "train": Dataset.from_list(train_rows),
+        "test": test_ds,
+    })
+
+    pools = self.processor._assign_test_pools(test_ds)
+    dev_sources = {
+        e["source_id"] for e in test_ds
+        if pools[self.processor._group_key(e)] == "dev"
+    }
+    final_sources = {
+        e["source_id"] for e in test_ds
+        if pools[self.processor._group_key(e)] == "final"
+    }
+    self.assertTrue(dev_sources)
+    self.assertTrue(final_sources)
+    self.assertEqual(dev_sources & final_sources, set())
+
+    organic = self.processor._make_organic_hallucinations_data(data)
+    sft_data = self.processor._make_sft_data(data)
+    perl_data = self.processor._make_perl_data(data, sft_data, seed=42)
+    autorater = self.processor._make_autorater_data(data)
+    eval_data = self.processor._make_evaluation_data(data)
+
+    # Model selection: reward-model eval arm, PE-RL eval, autorater. Note the
+    # reward-model and autorater rows carry prompt+response concatenated, so
+    # source_id is the only reliable key here.
+    for name, ds in (
+        ("organic RM eval", organic["test"]),
+        ("PE-RL eval", perl_data["test"]),
+        ("autorater", autorater),
+    ):
+      sources = set(ds["source_id"])
+      self.assertTrue(sources, f"{name} is empty")
+      self.assertEqual(
+          sources - dev_sources, set(), f"{name} read outside the dev pool"
+      )
+
+    # Reporting: the final score reads the disjoint pool, and nothing else.
+    eval_sources = set(eval_data["test"]["source_id"])
+    self.assertTrue(eval_sources)
+    self.assertEqual(eval_sources - final_sources, set())
+    self.assertEqual(eval_sources & dev_sources, set())
+
+
+  def test_production_default_yields_fifty_dev_hundred_final(self):
+    """The shipped default must give 50 tuning and 100 reported prompts.
+
+    RAGTruth ships exactly 150 test SOURCE passages per subtask (900 test
+    responses = 150 sources x 6 generating LLMs), and every consumer dedupes
+    to one prompt per source, so 150 is the hard ceiling on unique evaluation
+    prompts. The default fraction spends 50 of them on model selection and
+    leaves 100 for the reported number. This is a product decision, so pin it.
+    """
+    processor = RagtruthTaskProcessor(
+        make_mock_args(
+            seed=12345,
+            task_name="ragtruth-qa",
+            test_dev_fraction=_DEFAULT_TEST_DEV_FRACTION,
+        )
+    )
+    ds = Dataset.from_list(
+        [
+            {
+                "prompt": f"Context:\nC{i}\n\nQuestion: Q{i}\n\nAnswer:\n",
+                "response": f"A{i}-{j}",
+                "user_query": f"Q{i}",
+                "context": f"C{i}",
+                "class_hall": "No",
+                "label": 1,
+                "source_id": f"t{i}",
+            }
+            for i in range(150)
+            for j in range(6)
+        ]
+    )
+
+    pools = processor._assign_test_pools(ds)
+
+    self.assertEqual(len(pools), 150)
+    self.assertEqual(sum(1 for v in pools.values() if v == "dev"), 50)
+    self.assertEqual(sum(1 for v in pools.values() if v == "final"), 100)
 
 
 if __name__ == "__main__":

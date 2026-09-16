@@ -30,6 +30,20 @@ except ImportError:
     nltk = None
 
 
+# Fraction of the official test split reserved for model selection ('dev');
+# the remainder is the 'final' pool used only for the reported score.
+#
+# RAGTruth ships 150 test SOURCE passages per subtask (900 test responses =
+# 150 sources x 6 generating LLMs). Because every consumer is deduplicated to
+# one prompt per source, 150 is the hard ceiling on unique evaluation prompts
+# for a subtask -- there is no way to reach 1,000 from the official test split.
+#
+# 1/3 therefore gives 50 sources for tuning (reward-model early stopping, the
+# autorater threshold, PE-RL eval prompts) and 100 for the reported number,
+# which is the largest reported set that still leaves a usable selection pool.
+_DEFAULT_TEST_DEV_FRACTION = 1.0 / 3.0
+
+
 class _PurePythonRougeScorer:
     """Pure-Python in-memory ROUGE-1 F1 scorer with zero network or filesystem overhead."""
 
@@ -438,6 +452,111 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
             lambda e: mapping.get(self._group_key(e)) == block
         )
 
+    def _test_dev_fraction(self) -> float:
+        """Return the fraction of test sources reserved for model selection.
+
+        Returns:
+            The 'dev' fraction of the official test split.
+
+        Raises:
+            ValueError: If the fraction would leave one of the pools empty.
+        """
+        frac = float(self._arg_value("test_dev_fraction", _DEFAULT_TEST_DEV_FRACTION))
+        if frac <= 0 or frac >= 1.0:
+            raise ValueError(
+                "test_dev_fraction must be strictly between 0 and 1 (got "
+                f"{frac}). Setting it to 0 or 1 would make the reported score "
+                "and the model-selection score read the same rows, which is "
+                "the leak this split exists to prevent."
+            )
+        return frac
+
+    def _assign_test_pools(self, test_ds: Dataset) -> dict:
+        """Partition the official test sources into 'dev' and 'final' pools.
+
+        The official RAGTruth test split is held out from training, but that
+        alone does not make a number computed on it a held-out number. The
+        reward model's eval arm, the autorater, and the PE-RL eval prompts all
+        read this split, and sweep trials are ranked on their best step, so
+        reporting the final score on the same rows reports the maximum of many
+        noisy estimates rather than generalisation.
+
+        Splitting by source, not by row, matters for the same reason it does
+        on the train side: one source carries up to six responses sharing a
+        single prompt.
+
+        The partition depends only on the seed and the key set, and is
+        memoised, so every consumer observes the identical pools.
+
+        Args:
+            test_ds: The official test split.
+
+        Returns:
+            A mapping from source key to either 'dev' or 'final'.
+        """
+        if "source_id" in test_ds.column_names:
+            keys = [
+                self._group_key({"source_id": s})
+                for s in test_ds["source_id"]
+            ]
+        else:
+            keys = [self._group_key(e) for e in test_ds]
+
+        unique_keys = sorted(set(keys))
+        signature = hashlib.sha1(
+            "\x00".join(unique_keys).encode("utf-8")
+        ).hexdigest()
+        if (
+            getattr(self, "_test_pool_signature", None) == signature
+            and getattr(self, "_test_pool_map", None) is not None
+        ):
+            return self._test_pool_map
+
+        # Offset the seed so this partition is not correlated with the
+        # train-side block assignment (seed) or the synthesis arms (seed + 1).
+        seed = int(self._arg_value("seed", 12345)) + 2
+        rng = random.Random(seed)
+        shuffled = list(unique_keys)
+        rng.shuffle(shuffled)
+
+        n_total = len(shuffled)
+        n_dev = int(round(n_total * self._test_dev_fraction()))
+        if n_total == 1:
+            # One source cannot be split two ways. Give it to 'dev' so the
+            # selection machinery still has data; 'final' is then empty, which
+            # is the correct and visible signal that a single source cannot
+            # support a reported score. Note round(1 * 0.5) == 0 in Python
+            # (banker's rounding), so without this the 'dev' pool would have
+            # silently come out empty instead.
+            n_dev = 1
+        elif n_total > 1:
+            # Never let rounding starve a pool when both can be non-empty.
+            n_dev = max(1, min(n_dev, n_total - 1))
+
+        mapping = {
+            key: ("dev" if idx < n_dev else "final")
+            for idx, key in enumerate(shuffled)
+        }
+
+        self._test_pool_map = mapping
+        self._test_pool_signature = signature
+        return mapping
+
+    def _select_test_pool(self, test_ds: Dataset, pool: str) -> Dataset:
+        """Return only the test rows belonging to the given pool.
+
+        Args:
+            test_ds: The official test split.
+            pool: Either 'dev' (model selection) or 'final' (reported score).
+
+        Returns:
+            The subset of rows whose source was assigned to that pool.
+        """
+        mapping = self._assign_test_pools(test_ds)
+        return test_ds.filter(
+            lambda e: mapping.get(self._group_key(e)) == pool
+        )
+
     def _cap_responses_per_source(self, ds: Dataset, seed: int) -> Dataset:
         """Limit how many responses per source enter synthetic generation.
 
@@ -618,8 +737,14 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
 
         Training rows are restricted to the reward-model block so the RM is
         never trained on prompts the policy was fine-tuned on or will be
-        rolled out on. The test split is left whole: it is held out from every
-        other stage already, so there is nothing to leak.
+        rolled out on.
+
+        The eval arm reads the test 'dev' pool, not the whole test split.
+        Holding the official test split out of *training* is not by itself
+        enough: the reward model is early-stopped and selected on this arm, so
+        scoring the final result on the same rows would report the best of
+        many noisy estimates rather than generalisation. The 'final' pool is
+        reserved for `_make_evaluation_data` alone.
 
         Args:
             data: Preprocessed dataset with 'train' and 'test' splits.
@@ -630,7 +755,9 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
         """
         rm_train = self._select_block(data["train"], "rm")
         organic_train = rm_train.map(self._rm_prompt)
-        organic_test = data["test"].map(self._rm_prompt)
+        organic_test = self._select_test_pool(data["test"], "dev").map(
+            self._rm_prompt
+        )
         return DatasetDict({"train": organic_train, "test": organic_test})
 
     def _compute_sentence_rouge_scores(
@@ -1176,32 +1303,62 @@ Guidelines:
                 unique_train_rows.append(entry)
         train_prompts = self._dataset_from_list(unique_train_rows, perl_train)
 
-        # Deduplicate prompts from the held-out test split.
+        # Deduplicate prompts from the test 'dev' pool. These prompts drive
+        # eval during PE-RL and therefore checkpoint selection, so they must
+        # not come from the 'final' pool the reported score is computed on.
         max_test_prompts = int(self._arg_value("perl_num_test_prompts", 50))
+        dev_pool = self._select_test_pool(data["test"], "dev")
         seen_test_prompts = set()
         unique_test_rows = []
-        for entry in data["test"]:
+        for entry in dev_pool:
             p = entry.get("prompt", "")
             if p not in seen_test_prompts:
                 seen_test_prompts.add(p)
                 unique_test_rows.append(entry)
                 if len(unique_test_rows) >= max_test_prompts:
                     break
-        test_prompts = self._dataset_from_list(unique_test_rows, data["test"])
+        test_prompts = self._dataset_from_list(unique_test_rows, dev_pool)
 
         return DatasetDict({"train": train_prompts, "test": test_prompts})
 
     def _make_autorater_data(self, data: DatasetDict) -> Dataset:
-        """Prepare autorater evaluation split from test data with rm_prompt."""
-        target_split = (
-            data["test"] if "test" in data else next(iter(data.values()))
-        )
+        """Prepare autorater calibration data from the test 'dev' pool.
+
+        The autorater's decision threshold is fitted on these rows, which
+        makes this a model-selection step. It therefore reads the 'dev' pool
+        and never the 'final' pool that the reported score is computed on.
+
+        Args:
+            data: Preprocessed dataset, normally with a 'test' split.
+
+        Returns:
+            A Dataset whose 'prompt' already has the response appended.
+        """
+        if "test" in data:
+            target_split = self._select_test_pool(data["test"], "dev")
+        else:
+            target_split = next(iter(data.values()))
         autorater_ds = target_split.map(self._rm_prompt)
         return autorater_ds
 
     def _make_evaluation_data(self, data: DatasetDict) -> DatasetDict:
-        """Prepare test split for model completion generation."""
-        return DatasetDict({"test": data["test"]})
+        """Prepare the reported evaluation set: the test 'final' pool.
+
+        This is the only consumer of the 'final' pool. Nothing else -- not the
+        reward model's eval arm, not the autorater's threshold, not the PE-RL
+        eval prompts, and therefore not checkpoint or trial selection -- is
+        allowed to observe these sources, so the score computed here measures
+        generalisation rather than the maximum of many noisy estimates.
+
+        Args:
+            data: Preprocessed dataset with a 'test' split.
+
+        Returns:
+            A DatasetDict with a single 'test' split holding the final pool.
+        """
+        return DatasetDict({
+            "test": self._select_test_pool(data["test"], "final")
+        })
 
     @classmethod
     def get_formatting_prompts_and_response_template(
