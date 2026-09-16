@@ -3,7 +3,19 @@
 # Core Parameters
 USER="leobianco"
 SEED=12345
-MODEL_REPO_ID="google/gemma-3-1b-it"
+# Reward model backbone. Now matched to the policy (gemma-4-E4B-it).
+#
+# This was previously google/gemma-3-1b-it: the PE-RL pipeline keeps a separate
+# `reward_tokenizer`, so mixing model families works. Matching families instead
+# removes any tokenization divergence between the policy and the scorer.
+#
+# Cost: during PE-RL the policy AND the reward model are both resident, so this
+# is a large VRAM increase over a 1B scorer. If you OOM, lower
+# PER_DEVICE_BATCH_SIZE / NUM_GENERATIONS in scripts/perl.sh before reverting.
+# Gemma-4 sequence classification is supported via
+# src/models/gemma4_sequence_classification.py, which RewardModelPipeline
+# registers with AutoModelForSequenceClassification at setup_model time.
+MODEL_REPO_ID="google/gemma-4-E4B-it"
 
 # Dataset Parameters
 ORGANIC=true

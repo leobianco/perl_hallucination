@@ -1016,13 +1016,20 @@ class TestSweepNaming(unittest.TestCase):
       from src.orchestrator.stages.rm_stage import RmStage  # pylint: disable=g-import-not-at-top
 
       stage = RmStage(context)
-      # Default organic
-      name_org = stage.generate_sweep_name({"command": []})
+      # Pin the model explicitly: this test covers the *naming format*, not
+      # whatever the current RM default happens to be. Relying on the default
+      # made it break every time the base model was migrated.
+      name_org = stage.generate_sweep_name({
+          "command": ["--model_repo_id=google/gemma-3-1b-it"]
+      })
       self.assertEqual(name_org, "BOSCH gemma-3-1b-it RM Organic Sweep #1")
 
       # Synthetic dataset
       name_synth = stage.generate_sweep_name({
-          "command": ["--dataset_repo_id=leobianco/bosch_rm_synthetic"]
+          "command": [
+              "--model_repo_id=google/gemma-3-1b-it",
+              "--dataset_repo_id=leobianco/bosch_rm_synthetic",
+          ]
       })
       self.assertEqual(name_synth, "BOSCH gemma-3-1b-it RM Synthetic Sweep #1")
 

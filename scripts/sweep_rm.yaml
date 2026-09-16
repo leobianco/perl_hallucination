@@ -29,7 +29,7 @@ command:
   - --task_name=npov
   - --seed=130104
   - --dataset_repo_id=leobianco/npov_rm_organic
-  - --model_repo_id=google/gemma-3-1b-it
+  - --model_repo_id=google/gemma-4-E4B-it
   - --num_organic_hallus_to_keep=0
   - --num_struct_hallus_to_keep=0
   - --do_train=True

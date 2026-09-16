@@ -86,8 +86,8 @@ If SFT and RM were already trained, run only PE-RL and Evaluation by passing the
 ```bash
 python3 scripts/run_campaign.py run --task npov \
   --stages perl,eval \
-  --sft-model "leobianco/npov_SFT_gemma-4-E2B-it_..." \
-  --reward-model "leobianco/npov_RM_gemma-3-1b-it_..."
+  --sft-model "leobianco/npov_SFT_gemma-4-E4B-it_..." \
+  --reward-model "leobianco/npov_RM_gemma-4-E4B-it_..."
 ```
 Omitting a required checkpoint is caught before launch, not three hours in.
 
@@ -513,7 +513,7 @@ campaign:
   seed: 130104
   user: "leobianco"
   project: "new_perl"
-  base_model: "google/gemma-4-E2B-it"
+  base_model: "google/gemma-4-E4B-it"
 
 stages: [sft, rm, perl, eval]
 

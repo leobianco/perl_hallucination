@@ -20,7 +20,7 @@ class RmStage(BaseStage):
     return "rm"
 
   def get_sweep_descriptor(self, sweep_dict: Dict[str, Any]) -> Tuple[str, str]:
-    rm_model = "google/gemma-3-1b-it"
+    rm_model = "google/gemma-4-E4B-it"
     dataset = f"{self.config.user}/{self.config.task_name}_rm_organic"
     cmd = sweep_dict.get("command", [])
     if isinstance(cmd, list):
@@ -55,7 +55,7 @@ class RmStage(BaseStage):
 
     # Load and adjust sweep configuration
     sweep_dict = {}
-    rm_base_model = "google/gemma-3-1b-it"
+    rm_base_model = "google/gemma-4-E4B-it"
     if os.path.exists(yaml_path):
       with open(yaml_path, "r", encoding="utf-8") as f:
         sweep_dict = yaml.safe_load(f)
