@@ -263,7 +263,7 @@ class ModelManager:
         "--save_strategy",
         "steps" if stage_name in ("rm", "perl") else "epoch",
         "--save_total_limit",
-        "1",
+        "2",
     ]
 
     # Inject stage-specific flags and defaults matching scripts/*.sh and sweep configs

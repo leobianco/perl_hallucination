@@ -24,6 +24,7 @@ import math
 import os
 import random
 import re
+import shutil
 import sys
 import threading
 import time
@@ -193,7 +194,7 @@ def parse_hf_repo_reference(
 
 
 class WandbResumptionCallback(TrainerCallback):
-  """TrainerCallback that records the active WandB run ID to disk and HF Hub for seamless cross-machine resumption."""
+  """TrainerCallback that records the active WandB run ID to disk and HF Hub for seamless cross-machine resumption, and ensures the final step checkpoint is saved locally."""
 
   def on_train_begin(
       self,
@@ -202,6 +203,18 @@ class WandbResumptionCallback(TrainerCallback):
       control: TrainerControl,
       **kwargs,
   ):
+    if getattr(args, "load_best_model_at_end", False) and getattr(
+        args, "save_strategy", "no"
+    ) != "no":
+      limit = getattr(args, "save_total_limit", None)
+      if limit is not None and int(limit) == 1:
+        args.save_total_limit = 2
+        if getattr(state, "is_world_process_zero", True):
+          print(
+              "[Checkpoint] Bumping save_total_limit from 1 to 2 so both best"
+              " model and last step checkpoints are preserved locally."
+          )
+
     if (
         getattr(state, "is_world_process_zero", True)
         and wandb is not None
@@ -239,6 +252,49 @@ class WandbResumptionCallback(TrainerCallback):
             )
           except Exception:
             pass
+
+  def on_step_end(
+      self,
+      args: TrainingArguments,
+      state: TrainerState,
+      control: TrainerControl,
+      **kwargs,
+  ):
+    if getattr(args, "save_strategy", "no") != "no":
+      max_steps = getattr(state, "max_steps", 0)
+      if (
+          (max_steps > 0 and state.global_step >= max_steps)
+          or getattr(control, "should_training_stop", False)
+      ):
+        if getattr(args, "do_eval", False) and getattr(
+            args, "eval_strategy", "no"
+        ) != "no":
+          control.should_evaluate = True
+        control.should_save = True
+
+  def on_epoch_end(
+      self,
+      args: TrainingArguments,
+      state: TrainerState,
+      control: TrainerControl,
+      **kwargs,
+  ):
+    if getattr(args, "save_strategy", "no") != "no":
+      num_epochs = getattr(args, "num_train_epochs", None)
+      current_epoch = getattr(state, "epoch", None)
+      if (
+          (
+              num_epochs is not None
+              and current_epoch is not None
+              and current_epoch >= num_epochs - 1e-6
+          )
+          or getattr(control, "should_training_stop", False)
+      ):
+        if getattr(args, "do_eval", False) and getattr(
+            args, "eval_strategy", "no"
+        ) != "no":
+          control.should_evaluate = True
+        control.should_save = True
 
   def on_save(
       self,
@@ -316,7 +372,90 @@ class Pipeline(abc.ABC):
     self._configure_warmup_steps()
     self.setup_model()
     self.setup_trainer()
+    self._configure_best_and_last_checkpoint_saving()
     self.run_and_save()
+
+  def _configure_best_and_last_checkpoint_saving(self) -> None:
+    """Ensures both the best model and the final step checkpoint are saved locally, while Hugging Face Hub receives the best model."""
+    if self.trainer is None or self.training_args is None:
+      return
+    if getattr(self.training_args, "load_best_model_at_end", False) and getattr(
+        self.training_args, "save_strategy", "no"
+    ) != "no":
+      limit = getattr(self.training_args, "save_total_limit", None)
+      if limit is not None and int(limit) == 1:
+        self.training_args.save_total_limit = 2
+
+    orig_load_best_model = getattr(self.trainer, "_load_best_model", None)
+    if callable(orig_load_best_model):
+      trainer_ref = self.trainer
+
+      def _wrapped_load_best_model(*args, **kwargs):
+        output_dir = getattr(trainer_ref.args, "output_dir", None)
+        global_step = getattr(trainer_ref.state, "global_step", 0)
+        last_ckpt_dir = None
+        if (
+            output_dir
+            and global_step > 0
+            and getattr(trainer_ref.args, "save_strategy", "no") != "no"
+        ):
+          last_ckpt_dir = os.path.join(output_dir, f"checkpoint-{global_step}")
+          has_saved_weights = os.path.isdir(last_ckpt_dir) and any(
+              os.path.isfile(os.path.join(last_ckpt_dir, fname))
+              for fname in (
+                  "adapter_config.json",
+                  "config.json",
+                  "adapter_model.safetensors",
+                  "model.safetensors",
+                  "pytorch_model.bin",
+              )
+          )
+          if not has_saved_weights:
+            if getattr(trainer_ref.state, "is_world_process_zero", True):
+              print(
+                  "[Checkpoint] Saving final step checkpoint "
+                  f"(step {global_step}) locally to "
+                  f"{last_ckpt_dir} before loading best model..."
+              )
+            os.makedirs(last_ckpt_dir, exist_ok=True)
+            trainer_ref.save_model(last_ckpt_dir)
+            if getattr(trainer_ref.state, "is_world_process_zero", True):
+              try:
+                trainer_ref.state.save_to_json(
+                    os.path.join(last_ckpt_dir, "trainer_state.json")
+                )
+              except Exception:
+                pass
+
+        result = orig_load_best_model(*args, **kwargs)
+
+        if (
+            output_dir
+            and getattr(trainer_ref.state, "is_world_process_zero", True)
+            and os.path.isdir(output_dir)
+        ):
+          best_ckpt = getattr(trainer_ref.state, "best_model_checkpoint", None)
+          best_ckpt_norm = os.path.abspath(best_ckpt) if best_ckpt else None
+          last_ckpt_norm = (
+              os.path.abspath(last_ckpt_dir) if last_ckpt_dir else None
+          )
+          limit_val = getattr(trainer_ref.args, "save_total_limit", None)
+          if limit_val is not None and int(limit_val) <= 2:
+            for item in os.listdir(output_dir):
+              if item.startswith("checkpoint-"):
+                cand_path = os.path.abspath(os.path.join(output_dir, item))
+                if (
+                    cand_path != best_ckpt_norm
+                    and cand_path != last_ckpt_norm
+                    and os.path.isdir(cand_path)
+                ):
+                  try:
+                    shutil.rmtree(cand_path)
+                  except Exception:
+                    pass
+        return result
+
+      setattr(self.trainer, "_load_best_model", _wrapped_load_best_model)
 
   def _setup_wandb_resumption(self) -> None:
     """Inspects resume_from_checkpoint (local or HF Hub) and output_dir to restore WandB run ID."""
@@ -523,10 +662,12 @@ class Pipeline(abc.ABC):
       ):
         return True, last_ckpt
       adapter_files = sorted(
-          glob.glob(
+          p
+          for p in glob.glob(
               os.path.join(cleaned_ref, "**/adapter_config.json"),
               recursive=True,
           )
+          if os.path.basename(os.path.dirname(p)) != "ref"
       )
       if adapter_files:
         return True, os.path.dirname(adapter_files[-1])
@@ -564,10 +705,12 @@ class Pipeline(abc.ABC):
           ):
             return True, last_ckpt
           adapter_files = sorted(
-              glob.glob(
+              p
+              for p in glob.glob(
                   os.path.join(target_dir, "**/adapter_config.json"),
                   recursive=True,
               )
+              if os.path.basename(os.path.dirname(p)) != "ref"
           )
           if adapter_files:
             return True, os.path.dirname(adapter_files[-1])
@@ -892,6 +1035,8 @@ class SFTPipeline(Pipeline):
   def run_and_save(self) -> None:
     resume_ckpt = self._resolve_resume_checkpoint()
     self.trainer.train(resume_from_checkpoint=resume_ckpt)
+    if getattr(self.training_args, "output_dir", None):
+      self.trainer.save_model(self.training_args.output_dir)
     if getattr(self.training_args, "push_to_hub", False):
       _push_to_hub_with_retry(self.trainer.push_to_hub, description="SFT model push")
 
@@ -1463,8 +1608,12 @@ class PERLPipeline(Pipeline):
     if self.training_args.do_train:
       resume_ckpt = self._resolve_resume_checkpoint()
       self.trainer.train(resume_from_checkpoint=resume_ckpt)
+      if getattr(self.training_args, "output_dir", None):
+        self.trainer.save_model(self.training_args.output_dir)
       if getattr(self.training_args, "push_to_hub", False):
-        _push_to_hub_with_retry(self.trainer.push_to_hub, description="PERL model push")
+        _push_to_hub_with_retry(
+            self.trainer.push_to_hub, description="PERL model push"
+        )
 
 
 class DPOPipeline(Pipeline):
@@ -1582,8 +1731,12 @@ class DPOPipeline(Pipeline):
     if self.training_args.do_train:
       resume_ckpt = self._resolve_resume_checkpoint()
       self.trainer.train(resume_from_checkpoint=resume_ckpt)
+      if getattr(self.training_args, "output_dir", None):
+        self.trainer.save_model(self.training_args.output_dir)
       if getattr(self.training_args, "push_to_hub", False):
-        _push_to_hub_with_retry(self.trainer.push_to_hub, description="DPO model push")
+        _push_to_hub_with_retry(
+            self.trainer.push_to_hub, description="DPO model push"
+        )
 
 
 class ScopeMixtureLogitsProcessor(LogitsProcessor):

@@ -86,7 +86,7 @@ accelerate launch \
   --load_best_model_at_end True \
   --metric_for_best_model "loss" \
   --greater_is_better False \
-  --save_total_limit 1 \
+  --save_total_limit 2 \
   --num_train_epochs "$NUM_TRAIN_EPOCHS" \
   --learning_rate "$LEARNING_RATE" \
   --lr_scheduler_type "$LR_SCHEDULER_TYPE" \

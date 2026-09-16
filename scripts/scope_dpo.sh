@@ -91,7 +91,7 @@ accelerate launch \
   --load_best_model_at_end True \
   --metric_for_best_model "loss" \
   --greater_is_better False \
-  --save_total_limit 1 \
+  --save_total_limit 2 \
   --beta "$BETA" \
   --max_length "$MAX_LENGTH" \
   --num_train_epochs "$NUM_TRAIN_EPOCHS" \

@@ -1116,6 +1116,110 @@ class TestRewardPenaltyAlpha(unittest.TestCase):
       self.assertAlmostEqual(c, e)
 
 
+class TestBestAndLastCheckpointSaving(unittest.TestCase):
+  """Tests for preserving both the best reward checkpoint and the very last step checkpoint locally."""
+
+  def test_callback_bumps_save_total_limit_to_2_and_triggers_final_save(self):
+    from src.pipelines import WandbResumptionCallback
+
+    cb = WandbResumptionCallback()
+    args = MagicMock()
+    args.load_best_model_at_end = True
+    args.save_strategy = "steps"
+    args.save_total_limit = 1
+    args.do_eval = True
+    args.eval_strategy = "steps"
+    args.output_dir = None
+
+    state = MagicMock()
+    state.is_world_process_zero = True
+    state.max_steps = 220
+    state.global_step = 220
+
+    control = MagicMock()
+    control.should_save = False
+    control.should_evaluate = False
+    control.should_training_stop = False
+
+    cb.on_train_begin(args, state, control)
+    self.assertEqual(args.save_total_limit, 2)
+
+    cb.on_step_end(args, state, control)
+    self.assertTrue(control.should_save)
+    self.assertTrue(control.should_evaluate)
+
+  def test_load_best_model_wrapper_saves_last_step_and_prunes_intermediates(self):
+    pipeline = PERLPipeline()
+    with tempfile.TemporaryDirectory() as tmpdir:
+      best_dir = os.path.join(tmpdir, "checkpoint-150")
+      mid_dir = os.path.join(tmpdir, "checkpoint-200")
+      os.makedirs(best_dir)
+      os.makedirs(mid_dir)
+      with open(os.path.join(best_dir, "adapter_config.json"), "w") as f:
+        f.write("{}")
+      with open(os.path.join(mid_dir, "adapter_config.json"), "w") as f:
+        f.write("{}")
+
+      args = MagicMock()
+      args.output_dir = tmpdir
+      args.load_best_model_at_end = True
+      args.save_strategy = "steps"
+      args.save_total_limit = 2
+
+      state = MagicMock()
+      state.global_step = 220
+      state.is_world_process_zero = True
+      state.best_model_checkpoint = best_dir
+
+      trainer = MagicMock()
+      trainer.args = args
+      trainer.state = state
+      orig_load_called = []
+
+      def fake_orig_load():
+        orig_load_called.append(True)
+
+      trainer._load_best_model = fake_orig_load
+
+      def fake_save_model(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, "adapter_config.json"), "w") as f:
+          f.write('{"step": 220}')
+
+      trainer.save_model.side_effect = fake_save_model
+
+      pipeline.trainer = trainer
+      pipeline.training_args = args
+      pipeline._configure_best_and_last_checkpoint_saving()
+
+      # Trigger wrapped _load_best_model
+      trainer._load_best_model()
+
+      self.assertEqual(len(orig_load_called), 1)
+      last_dir = os.path.join(tmpdir, "checkpoint-220")
+      self.assertTrue(os.path.isdir(best_dir), "Best checkpoint (150) must be preserved")
+      self.assertTrue(os.path.isdir(last_dir), "Last step checkpoint (220) must be saved and preserved")
+      self.assertFalse(os.path.exists(mid_dir), "Intermediate checkpoint (200) must be pruned")
+
+  def test_resolve_lora_adapter_path_excludes_ref_subfolder(self):
+    pipeline = PERLPipeline()
+    with tempfile.TemporaryDirectory() as tmpdir:
+      # Simulate a parent directory where get_last_checkpoint returns None
+      # and recursive glob finds both checkpoint-220/adapter_config.json and checkpoint-220/ref/adapter_config.json
+      ckpt_dir = os.path.join(tmpdir, "nested", "checkpoint-220")
+      ref_dir = os.path.join(ckpt_dir, "ref")
+      os.makedirs(ref_dir)
+      with open(os.path.join(ckpt_dir, "adapter_config.json"), "w") as f:
+        f.write("{}")
+      with open(os.path.join(ref_dir, "adapter_config.json"), "w") as f:
+        f.write("{}")
+
+      with patch("src.pipelines.get_last_checkpoint", return_value=None):
+        enable_lora, resolved = pipeline._resolve_lora_adapter_path(tmpdir)
+        self.assertTrue(enable_lora)
+        self.assertEqual(resolved, ckpt_dir)
+
+
 if __name__ == "__main__":
   unittest.main()
 
