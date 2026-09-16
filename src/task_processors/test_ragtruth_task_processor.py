@@ -1727,6 +1727,108 @@ class TestRagtruthTestPoolControls(unittest.TestCase):
     self.assertEqual(sum(1 for v in pools.values() if v == "dev"), 50)
     self.assertEqual(sum(1 for v in pools.values() if v == "final"), 100)
 
+  @unittest.mock.patch("src.task_processors.ragtruth_task_processor.load_dataset")
+  @unittest.mock.patch("urllib.request.urlopen")
+  def test_load_data_github_fallback(self, mock_urlopen, mock_load_dataset):
+    """When HF Hub fails for ParticleMedia/RAGTruth, fallback loads GitHub JSONL."""
+    mock_load_dataset.side_effect = RuntimeError("HF Dataset not found")
+
+    si_lines = [
+        json.dumps({
+            "source_id": "1001",
+            "task_type": "QA",
+            "source": "MARCO",
+            "source_info": {
+                "question": "What is the capital of Brazil?",
+                "passages": "passage 1: Brasilia is the federal capital of Brazil.",
+            },
+            "prompt": "Briefly answer...",
+        }),
+        json.dumps({
+            "source_id": "1002",
+            "task_type": "Summary",
+            "source": "CNN/DM",
+            "source_info": "Anne Frank died in 1945.",
+            "prompt": "Summarize...",
+        }),
+    ]
+    resp_lines = [
+        json.dumps({
+            "id": "r1",
+            "source_id": "1001",
+            "model": "gpt-4",
+            "split": "train",
+            "quality": "good",
+            "response": "Brasilia.",
+            "labels": [],
+        }),
+        json.dumps({
+            "id": "r2",
+            "source_id": "1002",
+            "model": "gpt-4",
+            "split": "test",
+            "quality": "good",
+            "response": "Summary text.",
+            "labels": [],
+        }),
+    ]
+
+    def fake_urlopen(url):
+      mock_resp = MagicMock()
+      if "source_info.jsonl" in str(url):
+        mock_resp.read.return_value = "\n".join(si_lines).encode("utf-8")
+      else:
+        mock_resp.read.return_value = "\n".join(resp_lines).encode("utf-8")
+      mock_resp.__enter__.return_value = mock_resp
+      mock_resp.__exit__.return_value = False
+      return mock_resp
+
+    mock_urlopen.side_effect = fake_urlopen
+
+    processor = RagtruthTaskProcessor(
+        make_mock_args(task_name="ragtruth-qa", hf_repo="leobianco/ragtruth-qa")
+    )
+    loaded = processor._load_data()
+    self.assertIn("train", loaded)
+    self.assertIn("test", loaded)
+    self.assertEqual(len(loaded["train"]), 1)
+    self.assertEqual(
+        loaded["train"][0]["question"], "What is the capital of Brazil?"
+    )
+    self.assertEqual(
+        loaded["train"][0]["base_content"],
+        "passage 1: Brasilia is the federal capital of Brazil.",
+    )
+
+  def test_preprocess_data_with_source_info_dict(self):
+    """_preprocess_data extracts context and query from source_info dict/JSON."""
+    processor = RagtruthTaskProcessor(make_mock_args(task_name="ragtruth-qa"))
+    raw = DatasetDict({
+        "train": Dataset.from_list([
+            {
+                "source_id": "2001",
+                "task_type": "QA",
+                "source_info": {
+                    "question": "Who wrote Dom Casmurro?",
+                    "passages": "passage 1: Machado de Assis wrote Dom Casmurro in 1899.",
+                },
+                "response": "Machado de Assis.",
+                "labels": [],
+                "quality": "good",
+            }
+        ]),
+        "test": Dataset.from_list([]),
+    })
+    processed = processor._preprocess_data(raw)
+    row = processed["train"][0]
+    self.assertEqual(row["user_query"], "Who wrote Dom Casmurro?")
+    self.assertEqual(
+        row["context"],
+        "passage 1: Machado de Assis wrote Dom Casmurro in 1899.",
+    )
+    self.assertIn("Context:\npassage 1: Machado de Assis", row["prompt"])
+    self.assertIn("Question: Who wrote Dom Casmurro?", row["prompt"])
+
 
 if __name__ == "__main__":
   unittest.main()

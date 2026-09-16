@@ -4,14 +4,15 @@
 TASK_NAME="$1"
 USER="leobianco"
 SEED=12345
-HF_REPO="${USER}/${TASK_NAME}"
-SYNTH_STRUCT="True"
-SYNTH_LLM="False"
+SYNTH_STRUCT="${SYNTH_STRUCT:-True}"
+SYNTH_LLM="${SYNTH_LLM:-False}"
 if [[ "$TASK_NAME" == ragtruth* ]]; then
+    HF_REPO="${HF_REPO:-ParticleMedia/RAGTruth}"
     # -1 means "no extra cap on the hallucinated synthesis arm"; the arm is
     # already bounded by SYNTH_PERTURB_FRACTION and the per-source caps below.
     NUM_SYNTH_HALLUS="${NUM_SYNTH_HALLUS:--1}"
 else
+    HF_REPO="${HF_REPO:-${USER}/${TASK_NAME}}"
     NUM_SYNTH_HALLUS="${NUM_SYNTH_HALLUS:-70}"
 fi
 SYNTH_LLM_TEMPERATURE=0.7

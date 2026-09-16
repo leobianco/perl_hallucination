@@ -11,6 +11,7 @@ import json
 import random
 import re
 from typing import Any, Callable, Optional, Tuple
+import urllib.request
 
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
 from google import genai
@@ -120,12 +121,73 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
         except ImportError:
             return _PurePythonRougeScorer(use_stemmer=True)
 
+    _GITHUB_RAGTRUTH_BASE_URL = (
+        "https://raw.githubusercontent.com/ParticleMedia/RAGTruth/main/dataset"
+    )
+
+    def _load_github_ragtruth(self) -> DatasetDict:
+        """Load relational JSONL files directly from official ParticleMedia/RAGTruth GitHub."""
+        url_si = f"{self._GITHUB_RAGTRUTH_BASE_URL}/source_info.jsonl"
+        url_r = f"{self._GITHUB_RAGTRUTH_BASE_URL}/response.jsonl"
+
+        source_rows = []
+        with urllib.request.urlopen(url_si) as resp:
+            for line in resp.read().decode("utf-8").splitlines():
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                si = item.get("source_info")
+                if isinstance(si, dict):
+                    if "passages" in si and not item.get("base_content"):
+                        item["base_content"] = str(si["passages"]).strip()
+                    elif not item.get("base_content"):
+                        item["base_content"] = self._normalize_context(si)
+                    if "question" in si and not item.get("question"):
+                        item["question"] = str(si["question"]).strip()
+                    item["source_info"] = json.dumps(si)
+                elif isinstance(si, str) and not item.get("base_content"):
+                    item["base_content"] = si.strip()
+                source_rows.append(item)
+
+        source_info_ds = Dataset.from_list(source_rows)
+
+        train_resp, test_resp, unsplit_resp = [], [], []
+        with urllib.request.urlopen(url_r) as resp:
+            for line in resp.read().decode("utf-8").splitlines():
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                sp = row.get("split")
+                if sp == "train":
+                    train_resp.append(row)
+                elif sp == "test":
+                    test_resp.append(row)
+                else:
+                    unsplit_resp.append(row)
+
+        if train_resp or test_resp:
+            raw_dict = DatasetDict({
+                "train": Dataset.from_list(train_resp),
+                "test": Dataset.from_list(test_resp),
+            })
+        else:
+            all_ds = Dataset.from_list(unsplit_resp)
+            splits = all_ds.train_test_split(
+                test_size=0.15, seed=getattr(self.args, "seed", 12345)
+            )
+            raw_dict = DatasetDict({
+                "train": splits["train"],
+                "test": splits["test"],
+            })
+
+        return self._merge_source_info(raw_dict, source_info_ds)
+
     def _load_data(self) -> DatasetDict:
-        """Load RAGTruth dataset from Hugging Face Hub or local files.
+        """Load RAGTruth dataset from Hugging Face Hub, GitHub, or local files.
 
         Supports:
         - Standard pre-split Hugging Face repositories (e.g. wandb/RAGTruth-processed or user repo)
-        - Relational JSONL datasets with source_info.jsonl and response.jsonl
+        - Relational JSONL datasets with source_info.jsonl and response.jsonl (HF Hub or GitHub)
         - Explicit file mapping for train and test splits
         """
         repo_or_path = (
@@ -154,6 +216,11 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
                 return self._merge_source_info(raw_dict, source_info)
             except Exception as e:
                 last_error = e
+                if current_repo == "ParticleMedia/RAGTruth":
+                    try:
+                        return self._load_github_ragtruth()
+                    except Exception as gh_e:
+                        last_error = gh_e
 
             # 2. Attempt loading standard train/test splits or direct dataset
             try:
@@ -212,17 +279,30 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
     def _merge_source_info(data: DatasetDict, source_info_ds: Dataset) -> DatasetDict:
         """Join response records with source_info records on source_id."""
         source_map = {}
-        for item in source_info_ds:
+        for raw_item in source_info_ds:
+            item = dict(raw_item)
             s_id = item.get("source_id")
             if s_id is not None:
+                si = item.get("source_info")
+                if isinstance(si, dict):
+                    if "passages" in si and not item.get("base_content"):
+                        item["base_content"] = str(si["passages"]).strip()
+                    elif not item.get("base_content"):
+                        item["base_content"] = RagtruthTaskProcessor._normalize_context(si)
+                    if "question" in si and not item.get("question"):
+                        item["question"] = str(si["question"]).strip()
+                    item["source_info"] = json.dumps(si)
+                elif isinstance(si, str) and not item.get("base_content"):
+                    item["base_content"] = si.strip()
                 source_map[s_id] = item
+                source_map[str(s_id)] = item
 
         merged_splits = {}
         for split_name, split_ds in data.items():
             merged_rows = []
             for row in split_ds:
                 s_id = row.get("source_id")
-                src_meta = source_map.get(s_id, {})
+                src_meta = source_map.get(s_id, source_map.get(str(s_id), {}))
                 combined = {**src_meta, **row}
                 merged_rows.append(combined)
             merged_splits[split_name] = Dataset.from_list(merged_rows)
@@ -272,6 +352,23 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
             val = entry.get(key)
             if val and str(val).strip():
                 return str(val).strip()
+
+        si = entry.get("source_info")
+        if isinstance(si, dict):
+            for key in ("question", "query", "user_query"):
+                val = si.get(key)
+                if val and str(val).strip():
+                    return str(val).strip()
+        elif isinstance(si, str) and si.strip().startswith("{"):
+            try:
+                si_dict = json.loads(si)
+                if isinstance(si_dict, dict):
+                    for key in ("question", "query", "user_query"):
+                        val = si_dict.get(key)
+                        if val and str(val).strip():
+                            return str(val).strip()
+            except Exception:
+                pass
 
         task_type = str(entry.get("task_type", "")).lower()
         if "sum" in task_type or target_subtask == "summarization":
@@ -645,12 +742,26 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
                 )
 
             def process_entry(entry: dict) -> dict:
-                context = self._normalize_context(
-                    entry.get(
-                        "base_content",
-                        entry.get("context", entry.get("passage", "")),
-                    )
+                raw_ctx = entry.get(
+                    "base_content",
+                    entry.get("context", entry.get("passage")),
                 )
+                if not raw_ctx:
+                    si = entry.get("source_info")
+                    if isinstance(si, dict):
+                        raw_ctx = si.get("passages", si)
+                    elif isinstance(si, str) and si.strip().startswith("{"):
+                        try:
+                            si_dict = json.loads(si)
+                            if isinstance(si_dict, dict):
+                                raw_ctx = si_dict.get("passages", si_dict)
+                            else:
+                                raw_ctx = si
+                        except Exception:
+                            raw_ctx = si
+                    else:
+                        raw_ctx = si
+                context = self._normalize_context(raw_ctx)
                 query = self._extract_query(entry, target_subtask=target_subtask)
                 prompt = self._format_prompt(context, query)
 
