@@ -7,6 +7,7 @@ including ROC analysis and histogram plotting.
 
 import argparse
 from dataclasses import dataclass, field
+import hashlib
 import re
 from typing import Any, Dict, Optional, Sequence, Union
 
@@ -320,6 +321,19 @@ class EvalArguments:
           "help": (
               "Optional path or Hugging Face repo ID of the SFT LoRA adapter "
               "to combine with writer_model_lora when evaluating RL/DPO models."
+          )
+      },
+  )
+
+  allow_missing_sft_adapter: bool = field(
+      default=False,
+      metadata={
+          "help": (
+              "Allow evaluating an RL/DPO checkpoint without its SFT adapter. "
+              "Off by default: such a checkpoint is a LoRA delta trained on "
+              "merged SFT weights, so serving it on the bare base model is a "
+              "different model from the one that was trained. Set True only "
+              "for a deliberate ablation."
           )
       },
   )
@@ -929,15 +943,152 @@ def sanitize_hf_repo_id(repo_id: str, max_length: int = 96) -> str:
     return repo_name
 
 
+#: String spellings of "no model here" that shells and configs keep producing.
+#: ``scripts/*.sh`` expand an unset variable to an empty string, and the CLI
+#: wizard writes the literal ``"none"``/``"false"``; both must mean the same
+#: thing to the adapter loader and to the dataset naming, otherwise a run can
+#: silently serve one model and be filed under another model's name.
+FALSY_MODEL_REFS = frozenset({"", "none", "false", "null", "no", '""', "''"})
+
+#: Substrings that identify a checkpoint as an RL/preference-tuned adapter,
+#: which by construction is a delta on top of the SFT weights.
+_RL_CHECKPOINT_MARKERS = (
+    "perl",
+    "rloo",
+    "rlhf",
+    "grpo",
+    "ppo",
+    "dpo",
+    "ssfo",
+    "scope",
+)
+
+
+def is_falsy_model_ref(model_ref: Optional[str]) -> bool:
+  """Returns True when a model reference means "no model".
+
+  Args:
+      model_ref (Optional[str]): Adapter path, repo ID, or a placeholder.
+
+  Returns:
+      bool: True for None, empty/whitespace, or a "none"-like spelling.
+  """
+  if model_ref is None:
+    return True
+  return str(model_ref).strip().lower() in FALSY_MODEL_REFS
+
+
+def normalize_model_ref(model_ref: Optional[str]) -> str:
+  """Normalizes a model reference for comparison and fingerprinting.
+
+  Args:
+      model_ref (Optional[str]): Adapter path or Hugging Face repo ID.
+
+  Returns:
+      str: The trimmed reference without trailing slashes, or '' if falsy.
+  """
+  if is_falsy_model_ref(model_ref):
+    return ""
+  return str(model_ref).strip().rstrip("/")
+
+
+def is_sft_adapter_stacked(
+    sft_model_path: Optional[str],
+    writer_model_lora: Optional[str] = None,
+) -> bool:
+  """Returns True when an SFT adapter is stacked on top of the writer adapter.
+
+  Mirrors the condition used by
+  ``EvaluationGenerationPipeline.setup_model`` to decide whether to combine
+  two LoRA adapters. Keep the two in sync: the served weights and the
+  dataset name are derived from this single predicate.
+
+  Args:
+      sft_model_path (Optional[str]): SFT adapter reference, if any.
+      writer_model_lora (Optional[str]): The adapter being evaluated. When it
+        is the SFT adapter itself, nothing is stacked.
+
+  Returns:
+      bool: True when two distinct adapters are combined for serving.
+  """
+  sft_ref = normalize_model_ref(sft_model_path)
+  if not sft_ref:
+    return False
+  writer_ref = normalize_model_ref(writer_model_lora)
+  return not (writer_ref and writer_ref.casefold() == sft_ref.casefold())
+
+
+def sft_stacking_marker(
+    sft_model_path: Optional[str],
+    writer_model_lora: Optional[str] = None,
+    hash_len: int = 6,
+) -> str:
+  """Builds the repo-name marker describing the SFT stacking configuration.
+
+  The marker distinguishes the two ways the same RL checkpoint can be served:
+  on the bare base model ('_nosft') or on top of an SFT adapter
+  ('_sft<fingerprint>'). Without it both runs would push their completions to
+  the same dataset repository and silently overwrite each other.
+
+  The fingerprint is taken over the *reference string*, so the same checkpoint
+  addressed as a local path and as a Hub repo ID yields two names. That is the
+  safe direction to err in: a spurious split is visible, a spurious merge is
+  not.
+
+  Args:
+      sft_model_path (Optional[str]): SFT adapter reference, if any.
+      writer_model_lora (Optional[str]): The adapter being evaluated.
+      hash_len (int): Number of hex characters of the fingerprint.
+
+  Returns:
+      str: '_nosft', or '_sft' followed by ``hash_len`` hex characters.
+  """
+  if not is_sft_adapter_stacked(sft_model_path, writer_model_lora):
+    return "_nosft"
+  digest = hashlib.sha256(
+      normalize_model_ref(sft_model_path).casefold().encode("utf-8")
+  ).hexdigest()[:hash_len]
+  return f"_sft{digest}"
+
+
+def looks_like_rl_checkpoint(model_ref: Optional[str]) -> bool:
+  """Heuristically detects an RL/preference-tuned checkpoint from its name.
+
+  Such a checkpoint is a LoRA delta trained on top of *merged* SFT weights, so
+  evaluating it without its SFT adapter serves a model that never existed
+  during training. Names produced by the orchestrator carry an explicit stage
+  tag ('..._PERL_...', '..._SFT_...'), which makes this reliable in practice;
+  an SFT tag always wins to avoid false positives from project prefixes such
+  as 'new_perl'.
+
+  Args:
+      model_ref (Optional[str]): Adapter path or Hugging Face repo ID.
+
+  Returns:
+      bool: True when the reference looks like an RL/DPO checkpoint.
+  """
+  name = normalize_model_ref(model_ref).split("/")[-1].casefold()
+  if not name or "sft" in name:
+    return False
+  return any(marker in name for marker in _RL_CHECKPOINT_MARKERS)
+
+
 def build_eval_dataset_repo_id(
     user: str,
     writer_model_lora: str,
     temperature: float = 0.0,
     writer_num_fewshot: int = 0,
     task_name: Optional[str] = None,
+    sft_model_path: Optional[str] = None,
     max_length: int = 96,
 ) -> str:
   """Constructs a deterministic and valid Hugging Face dataset repo ID for generation completions.
+
+  The ID must capture every input that changes the generated completions,
+  otherwise two configurations push to the same repository and silently
+  overwrite each other. Besides the writer adapter and the sampling settings,
+  that includes whether an SFT adapter was stacked underneath the writer
+  adapter: '..._nosft' versus '..._sft<fingerprint>'.
 
   Args:
       user (str): Hugging Face username / namespace.
@@ -946,6 +1097,8 @@ def build_eval_dataset_repo_id(
       writer_num_fewshot (int): Number of fewshot examples prepended to prompts.
       task_name (Optional[str]): Task name (e.g., 'npov', 'bosch', 'ragtruth').
         Prefixes the repository name to prevent collision between tasks.
+      sft_model_path (Optional[str]): SFT adapter combined with
+        ``writer_model_lora`` at serving time, if any.
       max_length (int): Maximum allowed repo ID length (default 96).
 
   Returns:
@@ -970,7 +1123,8 @@ def build_eval_dataset_repo_id(
       if temp_val.is_integer()
       else f"{temp_val:.2g}".replace(".", "_")
   )
-  suffix = f"_gens_T{temp_str}_wfs{writer_num_fewshot}"
+  marker = sft_stacking_marker(sft_model_path, writer_model_lora)
+  suffix = f"_gens_T{temp_str}_wfs{writer_num_fewshot}{marker}"
 
   if task_name:
     task_clean = re.sub(r"[^a-zA-Z0-9_\-]", "_", task_name.strip().lower())
@@ -984,8 +1138,13 @@ def build_eval_dataset_repo_id(
   else:
     prefix = "eval_"
 
+  # The model name absorbs the whole overflow: `sanitize_hf_repo_id` trims from
+  # the right, which would otherwise eat the SFT marker and merge two distinct
+  # configurations back into one repository.
   allowed_model_len = max_length - len(user) - 1 - len(prefix) - len(suffix)
-  if len(compacted_model) > allowed_model_len and allowed_model_len > 0:
+  if allowed_model_len <= 0:
+    compacted_model = ""
+  elif len(compacted_model) > allowed_model_len:
     compacted_model = compacted_model[:allowed_model_len].rstrip(".-_")
 
   full_name = f"{prefix}{compacted_model}{suffix}"

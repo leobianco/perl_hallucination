@@ -6,6 +6,10 @@ SEED=12345
 RUN_IDENTIFIER="${RUN_IDENTIFIER:-google/gemma-4-E4B-it}"
 BASE_MODEL="${BASE_MODEL:-google/gemma-4-E4B-it}"
 SFT_MODEL_LORA="${SFT_MODEL_LORA:-}"
+# Evaluating a PE-RL/DPO checkpoint without SFT_MODEL_LORA now fails fast: that
+# adapter is a delta on top of merged SFT weights. Set this to True to run the
+# un-stacked configuration on purpose (its completions go to a '_nosft' repo).
+ALLOW_MISSING_SFT="${ALLOW_MISSING_SFT:-}"
 EVALUATOR_MODEL="gemini-2.5-flash"
 USE_GEMINI="True"
 RUN_AUTORATER="True"
@@ -69,6 +73,7 @@ if [ "$2" == "generate" ]; then
         --writer_model_base ${BASE_MODEL} \
         --writer_model_lora "${RUN_IDENTIFIER}" \
         ${SFT_MODEL_LORA:+--sft_model_path "$SFT_MODEL_LORA"} \
+        ${ALLOW_MISSING_SFT:+--allow_missing_sft_adapter "$ALLOW_MISSING_SFT"} \
         --max_tokens "$MAX_TOKENS" \
         --temperature "$TEMPERATURE" \
         --top_p "$TOP_P" \
@@ -90,6 +95,7 @@ elif [ "$2" == "score" ]; then
         --writer_model_base ${BASE_MODEL} \
         --writer_model_lora "${RUN_IDENTIFIER}" \
         ${SFT_MODEL_LORA:+--sft_model_path "$SFT_MODEL_LORA"} \
+        ${ALLOW_MISSING_SFT:+--allow_missing_sft_adapter "$ALLOW_MISSING_SFT"} \
         --run_autorater $RUN_AUTORATER \
         --evaluator_model ${EVALUATOR_MODEL} \
         --use_gemini $USE_GEMINI \

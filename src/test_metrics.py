@@ -225,7 +225,9 @@ except ImportError:
 from src.utils import (
     build_eval_dataset_repo_id,
     compact_model_name,
+    looks_like_rl_checkpoint,
     sanitize_hf_repo_id,
+    sft_stacking_marker,
 )
 
 
@@ -700,9 +702,11 @@ class TestEvalRepoNaming(unittest.TestCase):
     )
     self.assertLessEqual(len(repo_id), 96)
     self.assertNotIn(".", repo_id)
-    self.assertEqual(
-        repo_id,
-        "leobianco/eval_npov_PERL_google_S130104_epo0_2_lr2_4e-05_beta0_043_2608141244_gens_T0_wfs0",
+    self.assertTrue(repo_id.endswith("_gens_T0_wfs0_nosft"))
+    self.assertTrue(
+        repo_id.startswith(
+            "leobianco/eval_npov_PERL_google_S130104_epo0_2_lr2_4e-05_beta0_043"
+        )
     )
 
   def test_sanitize_hf_repo_id_matches_build(self):
@@ -726,7 +730,119 @@ class TestEvalRepoNaming(unittest.TestCase):
     self.assertLessEqual(len(repo_id), 96)
     self.assertNotIn(".", repo_id)
     self.assertTrue(repo_id.startswith("leobianco/eval_"))
-    self.assertTrue(repo_id.endswith("_gens_T0_7_wfs2"))
+    self.assertTrue(repo_id.endswith("_gens_T0_7_wfs2_nosft"))
+
+  def test_build_eval_dataset_repo_id_marker_survives_truncation(self):
+    """An overlong name must lose model characters, never the SFT marker.
+
+    `sanitize_hf_repo_id` trims from the right, so a marker that is merely
+    appended would be the first thing dropped - silently merging the stacked
+    and un-stacked runs back into one repository.
+    """
+    huge_model_name = "leobianco/" + ("very_long_model_name_identifier_" * 10)
+    stacked = build_eval_dataset_repo_id(
+        user="leobianco",
+        writer_model_lora=huge_model_name,
+        temperature=0.0,
+        writer_num_fewshot=0,
+        task_name="npov",
+        sft_model_path="leobianco/npov_SFT_ckpt",
+    )
+    unstacked = build_eval_dataset_repo_id(
+        user="leobianco",
+        writer_model_lora=huge_model_name,
+        temperature=0.0,
+        writer_num_fewshot=0,
+        task_name="npov",
+    )
+    self.assertLessEqual(len(stacked), 96)
+    self.assertLessEqual(len(unstacked), 96)
+    self.assertNotEqual(stacked, unstacked)
+    self.assertTrue(unstacked.endswith("_gens_T0_wfs0_nosft"))
+    self.assertRegex(stacked, r"_gens_T0_wfs0_sft[0-9a-f]{6}$")
+
+  def test_build_eval_dataset_repo_id_distinguishes_sft_stacking(self):
+    """The same PE-RL checkpoint served two ways gets two repositories."""
+    perl_ckpt = "leobianco/npov_PERL_gemma-4-E4B-it_S130104"
+    with_sft = build_eval_dataset_repo_id(
+        user="leobianco",
+        writer_model_lora=perl_ckpt,
+        temperature=0.0,
+        writer_num_fewshot=0,
+        task_name="npov",
+        sft_model_path="leobianco/npov_SFT_gemma-4-E4B-it_S130104",
+    )
+    without_sft = build_eval_dataset_repo_id(
+        user="leobianco",
+        writer_model_lora=perl_ckpt,
+        temperature=0.0,
+        writer_num_fewshot=0,
+        task_name="npov",
+        sft_model_path="",
+    )
+    other_sft = build_eval_dataset_repo_id(
+        user="leobianco",
+        writer_model_lora=perl_ckpt,
+        temperature=0.0,
+        writer_num_fewshot=0,
+        task_name="npov",
+        sft_model_path="leobianco/npov_SFT_a_different_run",
+    )
+    self.assertNotEqual(with_sft, without_sft)
+    self.assertNotEqual(with_sft, other_sft)
+    self.assertTrue(without_sft.endswith("_nosft"))
+    self.assertRegex(with_sft, r"_sft[0-9a-f]{6}$")
+
+  def test_build_eval_dataset_repo_id_falsy_sft_refs_are_nosft(self):
+    """Shell and config spellings of "nothing" must not fork the name."""
+    names = {
+        build_eval_dataset_repo_id(
+            user="leobianco",
+            writer_model_lora="leobianco/npov_PERL_ckpt",
+            task_name="npov",
+            sft_model_path=value,
+        )
+        for value in (None, "", "   ", "none", "None", "false", "null")
+    }
+    self.assertEqual(len(names), 1)
+    self.assertTrue(names.pop().endswith("_nosft"))
+
+  def test_build_eval_dataset_repo_id_self_stacking_is_nosft(self):
+    """Evaluating the SFT checkpoint itself stacks nothing."""
+    sft_ckpt = "leobianco/npov_SFT_gemma-4-E4B-it_S130104"
+    self.assertEqual(
+        build_eval_dataset_repo_id(
+            user="leobianco",
+            writer_model_lora=sft_ckpt,
+            task_name="npov",
+            sft_model_path=sft_ckpt,
+        ),
+        build_eval_dataset_repo_id(
+            user="leobianco",
+            writer_model_lora=sft_ckpt,
+            task_name="npov",
+        ),
+    )
+
+  def test_build_eval_dataset_repo_id_marker_ignores_trailing_slash(self):
+    """A trailing slash is not a different checkpoint."""
+    self.assertEqual(
+        sft_stacking_marker("leobianco/npov_SFT_ckpt/"),
+        sft_stacking_marker("leobianco/npov_SFT_ckpt"),
+    )
+
+  def test_looks_like_rl_checkpoint(self):
+    self.assertTrue(
+        looks_like_rl_checkpoint("leobianco/npov_PERL_gemma-4-E4B-it_S1")
+    )
+    self.assertTrue(looks_like_rl_checkpoint("leobianco/bosch_DPO_ssfo_run"))
+    # An SFT tag wins, so the 'new_perl' project prefix cannot false-positive.
+    self.assertFalse(
+        looks_like_rl_checkpoint("leobianco/new_perl_npov_SFT_run")
+    )
+    self.assertFalse(looks_like_rl_checkpoint("google/gemma-4-E4B-it"))
+    self.assertFalse(looks_like_rl_checkpoint(""))
+    self.assertFalse(looks_like_rl_checkpoint(None))
 
   def test_build_eval_dataset_repo_id_distinct_for_different_tasks(self):
     base_model = "google/gemma-4-E4B-it"
@@ -753,9 +869,16 @@ class TestEvalRepoNaming(unittest.TestCase):
     )
     self.assertNotEqual(bosch_id, npov_id)
     self.assertNotEqual(bosch_id, ragtruth_id)
-    self.assertEqual(bosch_id, "leobianco/eval_bosch_gemma-4-E4B-it_gens_T0_wfs0")
-    self.assertEqual(npov_id, "leobianco/eval_npov_gemma-4-E4B-it_gens_T0_wfs0")
-    self.assertEqual(ragtruth_id, "leobianco/eval_ragtruth_gemma-4-E4B-it_gens_T0_wfs0")
+    self.assertEqual(
+        bosch_id, "leobianco/eval_bosch_gemma-4-E4B-it_gens_T0_wfs0_nosft"
+    )
+    self.assertEqual(
+        npov_id, "leobianco/eval_npov_gemma-4-E4B-it_gens_T0_wfs0_nosft"
+    )
+    self.assertEqual(
+        ragtruth_id,
+        "leobianco/eval_ragtruth_gemma-4-E4B-it_gens_T0_wfs0_nosft",
+    )
 
   def test_build_eval_dataset_repo_id_no_duplicate_task_prefix(self):
     adapter = "leobianco/bosch_PERL_gemma-4-E2B-it_S130104"

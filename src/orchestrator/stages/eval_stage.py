@@ -240,9 +240,30 @@ class EvalStage(BaseStage):
         temperature=cfg.temperature,
         writer_num_fewshot=cfg.writer_num_fewshot,
         task_name=self.config.task_name,
+        # Must mirror `_generation_command`: the completions repo name encodes
+        # whether the SFT adapter was stacked, so passing a different value
+        # here would send the stage looking for another run's dataset.
+        sft_model_path=self._stacked_sft_repo_id(model_repo_id),
     )
     name = repo.split("/")[-1]
     return repo, os.path.join("logs", "eval", f"{name}_summary.json")
+
+  def _stacked_sft_repo_id(self, model_repo_id: str) -> Optional[str]:
+    """Returns the SFT adapter stacked under ``model_repo_id``, if any.
+
+    Evaluating the SFT checkpoint itself stacks nothing: it is already the
+    single adapter being served.
+
+    Args:
+      model_repo_id: The adapter being evaluated.
+
+    Returns:
+      The SFT repo ID, or None when nothing is stacked.
+    """
+    sft_repo = self.context.sft_model_repo_id
+    if sft_repo and model_repo_id != sft_repo:
+      return sft_repo
+    return None
 
   def _load_summary(self, model_repo_id: str) -> Dict[str, Any]:
     """Loads the metrics JSON written by the scoring pipeline.
@@ -310,8 +331,8 @@ class EvalStage(BaseStage):
         "--writer_model_lora",
         model_repo_id,
     ]
-    sft_repo = self.context.sft_model_repo_id
-    if sft_repo and model_repo_id != sft_repo:
+    sft_repo = self._stacked_sft_repo_id(model_repo_id)
+    if sft_repo:
       cmd.extend(["--sft_model_path", sft_repo])
     cmd.extend([
         "--max_tokens",
@@ -356,6 +377,14 @@ class EvalStage(BaseStage):
         self.config.base_model,
         "--writer_model_lora",
         model_repo_id,
+    ]
+    # Scoring derives the completions repo from the same inputs as generation,
+    # SFT stacking included; without this flag it would load the '_nosft'
+    # dataset of the same checkpoint.
+    sft_repo = self._stacked_sft_repo_id(model_repo_id)
+    if sft_repo:
+      cmd.extend(["--sft_model_path", sft_repo])
+    cmd.extend([
         "--temperature",
         str(cfg.temperature),
         "--writer_num_fewshot",
@@ -384,7 +413,7 @@ class EvalStage(BaseStage):
         str(cfg.log_to_wandb),
         "--wandb_project",
         cfg.wandb_project,
-    ]
+    ])
     if cfg.overwrite_scores:
       cmd.extend(["--overwrite_scores", "True"])
     if cfg.scores_checkpoint_path:

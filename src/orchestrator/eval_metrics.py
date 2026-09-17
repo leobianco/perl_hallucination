@@ -24,6 +24,11 @@ METRIC_ORDER: Tuple[str, ...] = (
     "num_samples",
 )
 
+#: Summary keys with this prefix describe *which model* produced the
+#: completions (adapters, stacking, directories) rather than how good they
+#: are. They are kept in the metric map for auditing but never tabulated.
+PROVENANCE_PREFIX: str = "provenance_"
+
 
 def headline_metric(
     metrics: Dict[str, Any], name: str = "hallucination_rate"
@@ -64,7 +69,12 @@ def metric_names(metrics: Dict[str, Any]) -> List[str]:
     text = str(key)
     for label, _ in TARGETS:
       if text.startswith(f"{label}/"):
-        bare.add(text[len(label) + 1:])
+        name = text[len(label) + 1:]
+        # `provenance_*` entries record which adapters produced the
+        # completions. They are strings, not measurements, so they belong in
+        # the summary file rather than in the comparison table.
+        if not name.startswith(PROVENANCE_PREFIX):
+          bare.add(name)
   ordered = [name for name in METRIC_ORDER if name in bare]
   ordered.extend(sorted(bare - set(ordered)))
   return ordered

@@ -19,6 +19,7 @@ from __future__ import annotations
 import abc
 import concurrent.futures
 import contextlib
+import datetime
 import glob
 import json
 import math
@@ -83,7 +84,12 @@ from src.utils import (
     compute_best_roc_threshold,
     create_lora_argument_parser,
     get_task_processor,
+    is_falsy_model_ref,
+    is_sft_adapter_stacked,
+    looks_like_rl_checkpoint,
+    normalize_model_ref,
     sanitize_hf_repo_id,
+    sft_stacking_marker,
 )
 import torch
 from tqdm import tqdm
@@ -3118,6 +3124,78 @@ class EvaluationPipeline(Pipeline):
     # Evaluation pipelines do not have trainers
     pass
 
+  def _assert_sft_adapter_expectation(self) -> None:
+    """Refuses to silently evaluate an RL checkpoint without its SFT adapter.
+
+    PE-RL and DPO train a fresh LoRA adapter on top of *merged* SFT weights,
+    so the published adapter is a delta relative to ``base + SFT``. Serving it
+    on the bare base model produces a model that never existed during
+    training. That used to happen silently whenever ``SFT_MODEL_LORA`` was
+    unset, because ``${VAR:+--flag}`` simply drops the flag.
+
+    Raises:
+      ValueError: If an RL/DPO-looking checkpoint is evaluated without an SFT
+        adapter and the ablation was not explicitly requested.
+    """
+    writer_ref = normalize_model_ref(
+        getattr(self.args, "writer_model_lora", None)
+    )
+    if not writer_ref or not looks_like_rl_checkpoint(writer_ref):
+      return
+    if is_sft_adapter_stacked(
+        getattr(self.args, "sft_model_path", None), writer_ref
+    ):
+      return
+
+    message = (
+        f"'{writer_ref}' looks like an RL/DPO checkpoint, but no SFT adapter"
+        " was provided (--sft_model_path is empty). That adapter was trained"
+        " on top of merged SFT weights, so evaluating it on the bare base"
+        " model serves a model that was never trained.\n"
+        "  - To evaluate the trained policy: pass --sft_model_path"
+        " <sft_repo_or_path> (or set SFT_MODEL_LORA in scripts/evaluator.sh).\n"
+        "  - To run this as a deliberate ablation: pass"
+        " --allow_missing_sft_adapter True (or set ALLOW_MISSING_SFT=True)."
+        " Its completions land in a separate '_nosft' dataset."
+    )
+    if not getattr(self.args, "allow_missing_sft_adapter", False):
+      raise ValueError(message)
+    print(
+        "\n"
+        + "=" * 80
+        + "\n[WARNING] Evaluating an RL checkpoint WITHOUT its SFT adapter.\n"
+        + message
+        + "\n"
+        + "=" * 80
+        + "\n",
+        flush=True,
+    )
+
+  def _completions_repo_id(self) -> Optional[str]:
+    """Resolves the dataset repo holding this configuration's completions.
+
+    Generation and scoring must land on the same name, and two different
+    serving configurations must land on different names, otherwise runs
+    overwrite each other's completions on the Hub.
+
+    Returns:
+      The explicit ``--dataset_with_completions`` override when given, the
+      derived repo ID when a writer adapter is known, else None.
+    """
+    explicit = getattr(self.args, "dataset_with_completions", None)
+    if explicit:
+      return sanitize_hf_repo_id(explicit)
+    if not getattr(self.args, "writer_model_lora", None):
+      return None
+    return build_eval_dataset_repo_id(
+        user=self.args.user,
+        writer_model_lora=self.args.writer_model_lora,
+        temperature=self.args.temperature,
+        writer_num_fewshot=self.args.writer_num_fewshot,
+        task_name=getattr(self.args, "task_name", None),
+        sft_model_path=getattr(self.args, "sft_model_path", None),
+    )
+
   def safe_load_dataset(
       self, path: str, split: Optional[str] = None
   ) -> Dataset:
@@ -4201,6 +4279,8 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
     return output_dir, r_target
 
   def setup_model(self) -> None:
+    self._assert_sft_adapter_expectation()
+
     enable_lora, lora_path = self._resolve_lora_adapter_path(
         self.args.writer_model_lora, self.args.writer_model_base
     )
@@ -4210,15 +4290,32 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
     self.max_lora_rank = 64
 
     sft_model_path = getattr(self.args, "sft_model_path", None)
+    # Provenance of the served weights. Recorded even when nothing is stacked,
+    # because "which model produced these completions" is precisely the
+    # question that is impossible to answer after the fact.
+    self.serving_provenance: Dict[str, Any] = {
+        "writer_model_base": self.args.writer_model_base,
+        "writer_model_lora": self.args.writer_model_lora,
+        "sft_model_path": normalize_model_ref(sft_model_path) or None,
+        "sft_stacking_marker": sft_stacking_marker(
+            sft_model_path, self.args.writer_model_lora
+        ),
+        "sft_adapter_stacked": False,
+        "writer_adapter_dir": lora_path,
+        "sft_adapter_dir": None,
+        "combined_adapter_dir": None,
+        "combined_lora_rank": None,
+    }
+
     if (
         self.enable_lora
         and self.lora_path is not None
-        and sft_model_path
-        and str(sft_model_path).strip().lower() not in ("", "none", "false")
+        and not is_falsy_model_ref(sft_model_path)
     ):
       sft_enable_lora, resolved_sft_path = self._resolve_lora_adapter_path(
           sft_model_path, self.args.writer_model_base
       )
+      self.serving_provenance["sft_adapter_dir"] = resolved_sft_path
       if (
           sft_enable_lora
           and resolved_sft_path is not None
@@ -4231,6 +4328,54 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
         )
         self.lora_path = combined_path
         self.max_lora_rank = max(64, combined_rank)
+        self.serving_provenance.update({
+            "sft_adapter_stacked": True,
+            "combined_adapter_dir": combined_path,
+            "combined_lora_rank": combined_rank,
+        })
+
+  def _write_generation_provenance(self, repo_id: Optional[str]) -> None:
+    """Records which weights produced the completions in ``repo_id``.
+
+    The dataset name now encodes *whether* an SFT adapter was stacked; this
+    sidecar records *which one*, plus the resolved adapter directories and the
+    combined LoRA rank. It is written next to the scoring summary so both ends
+    of an evaluation can be audited from one directory.
+
+    Args:
+      repo_id: Dataset repository receiving the completions.
+    """
+    if not repo_id:
+      return
+    provenance = dict(getattr(self, "serving_provenance", {}) or {})
+    provenance.update({
+        "dataset_with_completions": repo_id,
+        "task_name": getattr(self.args, "task_name", None),
+        "temperature": getattr(self.args, "temperature", None),
+        "top_p": getattr(self.args, "top_p", None),
+        "top_k": getattr(self.args, "top_k", None),
+        "max_tokens": getattr(self.args, "max_tokens", None),
+        "seed": getattr(self.args, "seed", None),
+        "writer_num_fewshot": getattr(self.args, "writer_num_fewshot", None),
+        "max_lora_rank": getattr(self, "max_lora_rank", None),
+        "served_lora_path": getattr(self, "lora_path", None),
+        "allow_missing_sft_adapter": getattr(
+            self.args, "allow_missing_sft_adapter", False
+        ),
+        "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+    })
+    output_dir = os.path.join("logs", "eval")
+    path = os.path.join(
+        output_dir, f"{repo_id.split('/')[-1]}_generation_provenance.json"
+    )
+    try:
+      os.makedirs(output_dir, exist_ok=True)
+      with open(path, "w", encoding="utf-8") as f:
+        json.dump(provenance, f, indent=2, sort_keys=True)
+      print(f"Generation provenance written to: {path}", flush=True)
+    except OSError as e:
+      # Never lose a finished generation over a logging failure.
+      print(f"[WARNING] Could not write generation provenance to {path}: {e}")
 
   def run_and_save(self) -> None:
     if not _VLLM_AVAILABLE:
@@ -4297,16 +4442,8 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
     self.dataset_prompts = self.dataset_prompts.add_column(
         "completion", generations
     )
-    if getattr(self.args, "dataset_with_completions", None):
-      repo_id = sanitize_hf_repo_id(self.args.dataset_with_completions)
-    else:
-      repo_id = build_eval_dataset_repo_id(
-          user=self.args.user,
-          writer_model_lora=self.args.writer_model_lora,
-          temperature=self.args.temperature,
-          writer_num_fewshot=self.args.writer_num_fewshot,
-          task_name=getattr(self.args, "task_name", None),
-      )
+    repo_id = self._completions_repo_id()
+    self._write_generation_provenance(repo_id)
 
     print(f"Pushing dataset with generations to {repo_id}...")
     clean_dataset = Dataset.from_dict(self.dataset_prompts.to_dict())
@@ -4341,20 +4478,8 @@ class EvaluationScoringPipeline(EvaluationPipeline):
         self.fluency_tokenizer = None
 
   def load_data(self):
-    if not self.args.dataset_with_completions and getattr(
-        self.args, "writer_model_lora", None
-    ):
-      self.args.dataset_with_completions = build_eval_dataset_repo_id(
-          user=self.args.user,
-          writer_model_lora=self.args.writer_model_lora,
-          temperature=self.args.temperature,
-          writer_num_fewshot=self.args.writer_num_fewshot,
-          task_name=getattr(self.args, "task_name", None),
-      )
-    elif self.args.dataset_with_completions:
-      self.args.dataset_with_completions = sanitize_hf_repo_id(
-          self.args.dataset_with_completions
-      )
+    self._assert_sft_adapter_expectation()
+    self.args.dataset_with_completions = self._completions_repo_id()
 
     if self.args.dataset_with_completions is None:
       raise ValueError("dataset_with_completions is required for scoring mode")
@@ -4439,6 +4564,69 @@ class EvaluationScoringPipeline(EvaluationPipeline):
       else:
         self.fluency_model = None
 
+  def _scoring_provenance(self, dataset_name: str) -> Dict[str, Any]:
+    """Builds the ``provenance_*`` block recorded in the summary JSON.
+
+    Prefers the sidecar written by the generation run, which knows the
+    resolved adapter directories and the combined LoRA rank; falls back to the
+    scoring arguments when that file is absent (e.g. completions generated on
+    another machine).
+
+    Args:
+      dataset_name: Repo name (without namespace) of the scored completions.
+
+    Returns:
+      A flat, JSON-serializable dict of provenance fields.
+    """
+    sft_ref = normalize_model_ref(getattr(self.args, "sft_model_path", None))
+    provenance: Dict[str, Any] = {
+        "provenance_dataset_with_completions": (
+            self.args.dataset_with_completions
+        ),
+        "provenance_writer_model_base": getattr(
+            self.args, "writer_model_base", None
+        ),
+        "provenance_writer_model_lora": getattr(
+            self.args, "writer_model_lora", None
+        ),
+        "provenance_sft_model_path": sft_ref or None,
+        "provenance_sft_adapter_stacked": is_sft_adapter_stacked(
+            sft_ref, getattr(self.args, "writer_model_lora", None)
+        ),
+        "provenance_sft_stacking_marker": sft_stacking_marker(
+            sft_ref, getattr(self.args, "writer_model_lora", None)
+        ),
+    }
+
+    sidecar = os.path.join(
+        "logs", "eval", f"{dataset_name}_generation_provenance.json"
+    )
+    try:
+      with open(sidecar, "r", encoding="utf-8") as f:
+        generation = json.load(f)
+    except (OSError, ValueError):
+      provenance["provenance_generation_record"] = "missing"
+      return provenance
+
+    if isinstance(generation, dict):
+      provenance["provenance_generation_record"] = sidecar
+      for key in (
+          "sft_adapter_dir",
+          "writer_adapter_dir",
+          "combined_adapter_dir",
+          "combined_lora_rank",
+          "max_lora_rank",
+          "allow_missing_sft_adapter",
+          "generated_at",
+      ):
+        if key in generation:
+          provenance[f"provenance_{key}"] = generation[key]
+      # The generation run is the authority on what was actually served.
+      for key in ("sft_model_path", "sft_adapter_stacked"):
+        if key in generation:
+          provenance[f"provenance_{key}"] = generation[key]
+    return provenance
+
   def run_and_save(self):
     autorater_score_list = None
     if getattr(self.args, "run_autorater", True):
@@ -4521,6 +4709,7 @@ class EvaluationScoringPipeline(EvaluationPipeline):
           ),
       )
       dataset_name = self.args.dataset_with_completions.split("/")[-1]
+      summary.update(self._scoring_provenance(dataset_name))
       evaluator.save_and_log_results(
           self.val_data,
           summary,

@@ -197,7 +197,9 @@ from src.orchestrator.state import StageResult  # pylint: disable=g-import-not-a
 from src.orchestrator.state import StageStatus  # pylint: disable=g-import-not-at-top
 from src.orchestrator.sweep_controller import SweepController  # pylint: disable=g-import-not-at-top
 from src.pipelines import EvaluationGenerationPipeline  # pylint: disable=g-import-not-at-top
+from src.pipelines import EvaluationScoringPipeline  # pylint: disable=g-import-not-at-top
 from src.utils import EvalArguments  # pylint: disable=g-import-not-at-top
+from src.utils import build_eval_dataset_repo_id  # pylint: disable=g-import-not-at-top
 
 
 class TestEvalAdapterMerging(unittest.TestCase):
@@ -372,6 +374,176 @@ class TestEvalAdapterMerging(unittest.TestCase):
     self.assertIn("--sft_model_path", perl_cmd)
     idx = perl_cmd.index("--sft_model_path")
     self.assertEqual(perl_cmd[idx + 1], "leobianco/npov_SFT_winner")
+
+
+class TestMissingSftAdapterGuard(unittest.TestCase):
+  """The un-stacked RL configuration must be explicit, never accidental."""
+
+  def _pipeline(self, **overrides):
+    pipeline = EvaluationGenerationPipeline.__new__(
+        EvaluationGenerationPipeline
+    )
+    kwargs = dict(
+        task_name="npov",
+        user="leobianco",
+        writer_model_base="google/gemma-4-E4B-it",
+        writer_model_lora="leobianco/npov_PERL_ckpt",
+    )
+    kwargs.update(overrides)
+    pipeline.args = EvalArguments(**kwargs)
+    return pipeline
+
+  def test_raises_for_rl_checkpoint_without_sft(self):
+    pipeline = self._pipeline()
+    with self.assertRaises(ValueError) as ctx:
+      pipeline._assert_sft_adapter_expectation()
+    self.assertIn("--sft_model_path", str(ctx.exception))
+    self.assertIn("--allow_missing_sft_adapter", str(ctx.exception))
+
+  def test_raises_for_falsy_sft_spellings(self):
+    for value in ("", "   ", "none", "False", "null"):
+      with self.subTest(value=value):
+        pipeline = self._pipeline(sft_model_path=value)
+        with self.assertRaises(ValueError):
+          pipeline._assert_sft_adapter_expectation()
+
+  def test_allows_when_ablation_is_explicit(self):
+    pipeline = self._pipeline(allow_missing_sft_adapter=True)
+    pipeline._assert_sft_adapter_expectation()  # must not raise
+
+  def test_allows_when_sft_is_provided(self):
+    pipeline = self._pipeline(sft_model_path="leobianco/npov_SFT_ckpt")
+    pipeline._assert_sft_adapter_expectation()  # must not raise
+
+  def test_allows_sft_and_base_checkpoints(self):
+    for writer in (
+        "leobianco/npov_SFT_ckpt",
+        "google/gemma-4-E4B-it",
+        "leobianco/new_perl_npov_SFT_run",
+    ):
+      with self.subTest(writer=writer):
+        pipeline = self._pipeline(writer_model_lora=writer)
+        pipeline._assert_sft_adapter_expectation()  # must not raise
+
+  def test_setup_model_refuses_before_downloading_anything(self):
+    """The guard runs first: a bad config costs no vLLM warm-up."""
+    pipeline = self._pipeline()
+    with patch.object(
+        pipeline, "_resolve_lora_adapter_path"
+    ) as mock_resolve:
+      with self.assertRaises(ValueError):
+        pipeline.setup_model()
+      mock_resolve.assert_not_called()
+
+
+class TestCompletionsRepoIdAgreement(unittest.TestCase):
+  """Generation and scoring must always resolve the same dataset repo."""
+
+  def _args(self, **overrides):
+    kwargs = dict(
+        task_name="npov",
+        user="leobianco",
+        writer_model_base="google/gemma-4-E4B-it",
+        writer_model_lora="leobianco/npov_PERL_ckpt",
+        temperature=0.0,
+        writer_num_fewshot=0,
+    )
+    kwargs.update(overrides)
+    return EvalArguments(**kwargs)
+
+  def _repo_id(self, cls, **overrides):
+    pipeline = cls.__new__(cls)
+    pipeline.args = self._args(**overrides)
+    return pipeline._completions_repo_id()
+
+  def test_generation_and_scoring_agree(self):
+    for overrides in (
+        {"sft_model_path": "leobianco/npov_SFT_ckpt"},
+        {"allow_missing_sft_adapter": True},
+    ):
+      with self.subTest(overrides=overrides):
+        self.assertEqual(
+            self._repo_id(EvaluationGenerationPipeline, **overrides),
+            self._repo_id(EvaluationScoringPipeline, **overrides),
+        )
+
+  def test_stacked_and_unstacked_runs_do_not_collide(self):
+    stacked = self._repo_id(
+        EvaluationGenerationPipeline,
+        sft_model_path="leobianco/npov_SFT_ckpt",
+    )
+    unstacked = self._repo_id(
+        EvaluationGenerationPipeline, allow_missing_sft_adapter=True
+    )
+    self.assertNotEqual(stacked, unstacked)
+    self.assertLessEqual(len(stacked), 96)
+    self.assertLessEqual(len(unstacked), 96)
+    self.assertTrue(unstacked.endswith("_nosft"))
+
+  def test_explicit_override_is_respected(self):
+    self.assertEqual(
+        self._repo_id(
+            EvaluationGenerationPipeline,
+            dataset_with_completions="leobianco/my_own_dataset",
+            sft_model_path="leobianco/npov_SFT_ckpt",
+        ),
+        "leobianco/my_own_dataset",
+    )
+
+
+class TestEvalStageSftWiring(unittest.TestCase):
+  """The orchestrator must pass the SFT adapter to *both* eval phases."""
+
+  def setUp(self):
+    super().setUp()
+    config = CampaignConfig.create_default(task_name="npov", dry_run=True)
+    state = CampaignState(campaign_id="test_camp", task_name="npov")
+    state.stages["sft"] = StageResult(
+        status=StageStatus.COMPLETED, model_repo_id="leobianco/npov_SFT_winner"
+    )
+    state.stages["perl"] = StageResult(
+        status=StageStatus.COMPLETED,
+        model_repo_id="leobianco/npov_PERL_winner",
+    )
+    ctx = CampaignContext(
+        config=config,
+        state=state,
+        sweep_controller=SweepController(dry_run=True),
+        model_manager=ModelManager(dry_run=True),
+    )
+    self.stage = EvalStage(ctx)
+
+  def test_scoring_command_passes_sft_model_path_for_perl_only(self):
+    sft_cmd = self.stage._scoring_command("leobianco/npov_SFT_winner")
+    self.assertNotIn("--sft_model_path", sft_cmd)
+
+    perl_cmd = self.stage._scoring_command("leobianco/npov_PERL_winner")
+    idx = perl_cmd.index("--sft_model_path")
+    self.assertEqual(perl_cmd[idx + 1], "leobianco/npov_SFT_winner")
+
+  def test_scoring_command_keeps_trailing_arguments(self):
+    """Inserting the flag mid-list must not truncate the command."""
+    perl_cmd = self.stage._scoring_command("leobianco/npov_PERL_winner")
+    for flag in ("--temperature", "--threshold", "--wandb_project"):
+      self.assertIn(flag, perl_cmd)
+
+  def test_summary_path_matches_generation_configuration(self):
+    """The stage looks for the dataset its own flags would have produced."""
+    perl_repo, _ = self.stage._summary_path("leobianco/npov_PERL_winner")
+    sft_repo, _ = self.stage._summary_path("leobianco/npov_SFT_winner")
+    self.assertNotEqual(perl_repo, sft_repo)
+    self.assertRegex(perl_repo, r"_sft[0-9a-f]{6}$")
+    self.assertTrue(sft_repo.endswith("_nosft"))
+
+    expected = build_eval_dataset_repo_id(
+        user="leobianco",
+        writer_model_lora="leobianco/npov_PERL_winner",
+        temperature=self.stage.config.eval.temperature,
+        writer_num_fewshot=self.stage.config.eval.writer_num_fewshot,
+        task_name="npov",
+        sft_model_path="leobianco/npov_SFT_winner",
+    )
+    self.assertEqual(perl_repo, expected)
 
 
 if __name__ == "__main__":
