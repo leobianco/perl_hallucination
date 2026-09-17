@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import abc
 import concurrent.futures
+import contextlib
 import glob
 import json
 import math
@@ -110,6 +111,9 @@ from trl import (
     SFTConfig,
     SFTTrainer,
 )
+
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 try:
   from vllm import LLM, SamplingParams
@@ -4088,49 +4092,62 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
     lora_a_keys = sorted(k for k in all_keys if ".lora_A." in k)
 
     combined_state: Dict[str, torch.Tensor] = {}
-    for a_key in lora_a_keys:
-      b_key = a_key.replace(".lora_A.", ".lora_B.")
-      ref_a = rl_norm.get(a_key, sft_norm.get(a_key))
-      ref_b = rl_norm.get(b_key, sft_norm.get(b_key))
-      d_in = ref_a.shape[1]
-      d_out = ref_b.shape[0]
-      dtype = ref_a.dtype
-      device = ref_a.device
+    orig_num_threads = (
+        torch.get_num_threads() if hasattr(torch, "get_num_threads") else None
+    )
+    try:
+      if hasattr(torch, "set_num_threads"):
+        torch.set_num_threads(1)
+      ctx = torch.no_grad() if hasattr(torch, "no_grad") else contextlib.nullcontext()
+      with ctx:
+        for a_key in lora_a_keys:
+          b_key = a_key.replace(".lora_A.", ".lora_B.")
+          ref_a = rl_norm.get(a_key, sft_norm.get(a_key))
+          ref_b = rl_norm.get(b_key, sft_norm.get(b_key))
+          d_in = ref_a.shape[1]
+          d_out = ref_b.shape[0]
+          dtype = ref_a.dtype
+          device = ref_a.device
 
-      if a_key in sft_norm and b_key in sft_norm:
-        a1 = sft_norm[a_key]
-        b1 = sft_norm[b_key]
-      else:
-        a1 = torch.zeros((r1, d_in), dtype=dtype, device=device)
-        b1 = torch.zeros((d_out, r1), dtype=dtype, device=device)
+          if a_key in sft_norm and b_key in sft_norm:
+            a1 = sft_norm[a_key]
+            b1 = sft_norm[b_key]
+          else:
+            a1 = torch.zeros((r1, d_in), dtype=dtype, device=device)
+            b1 = torch.zeros((d_out, r1), dtype=dtype, device=device)
 
-      if a_key in rl_norm and b_key in rl_norm:
-        a2 = rl_norm[a_key]
-        b2 = rl_norm[b_key]
-      else:
-        a2 = torch.zeros((r2, d_in), dtype=dtype, device=device)
-        b2 = torch.zeros((d_out, r2), dtype=dtype, device=device)
+          if a_key in rl_norm and b_key in rl_norm:
+            a2 = rl_norm[a_key]
+            b2 = rl_norm[b_key]
+          else:
+            a2 = torch.zeros((r2, d_in), dtype=dtype, device=device)
+            b2 = torch.zeros((d_out, r2), dtype=dtype, device=device)
 
-      b1_scaled = (b1.float() * s1).to(dtype)
-      b2_scaled = (b2.float() * s2).to(dtype)
+          b1_scaled = (b1.float() * s1).to(dtype)
+          b2_scaled = (b2.float() * s2).to(dtype)
 
-      a_cat = torch.cat([a1, a2], dim=0)
-      b_cat = torch.cat([b1_scaled, b2_scaled], dim=1)
+          a_cat = torch.cat([a1, a2], dim=0)
+          b_cat = torch.cat([b1_scaled, b2_scaled], dim=1)
 
-      if r_target > r_sum:
-        pad_rows = r_target - r_sum
-        a_pad = torch.zeros((pad_rows, d_in), dtype=dtype, device=device)
-        b_pad = torch.zeros((d_out, pad_rows), dtype=dtype, device=device)
-        a_cat = torch.cat([a_cat, a_pad], dim=0)
-        b_cat = torch.cat([b_cat, b_pad], dim=1)
+          if r_target > r_sum:
+            pad_rows = r_target - r_sum
+            a_pad = torch.zeros((pad_rows, d_in), dtype=dtype, device=device)
+            b_pad = torch.zeros((d_out, pad_rows), dtype=dtype, device=device)
+            a_cat = torch.cat([a_cat, a_pad], dim=0)
+            b_cat = torch.cat([b_cat, b_pad], dim=1)
 
-      combined_state[a_key] = a_cat.contiguous()
-      combined_state[b_key] = b_cat.contiguous()
+          combined_state[a_key] = a_cat.contiguous()
+          combined_state[b_key] = b_cat.contiguous()
 
-    for k in all_keys:
-      if ".lora_A." not in k and ".lora_B." not in k:
-        val = rl_norm.get(k, sft_norm.get(k))
-        combined_state[k] = val.contiguous() if hasattr(val, "contiguous") else val
+        for k in all_keys:
+          if ".lora_A." not in k and ".lora_B." not in k:
+            val = rl_norm.get(k, sft_norm.get(k))
+            combined_state[k] = (
+                val.contiguous() if hasattr(val, "contiguous") else val
+            )
+    finally:
+      if orig_num_threads is not None and hasattr(torch, "set_num_threads"):
+        torch.set_num_threads(orig_num_threads)
 
     combo_hash = hashlib.sha256(
         f"{os.path.abspath(sft_adapter_dir)}::{os.path.abspath(rl_adapter_dir)}".encode(
@@ -4222,6 +4239,12 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
           " installed. Please run generation on a GPU environment with"
           " vLLM installed."
       )
+    # Force 'spawn' multiprocessing for vLLM workers to prevent os.fork()
+    # deadlocks after multi-threaded dataset loading, HF Hub downloads, and
+    # PyTorch CPU tensor operations.
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
     # Prepare sampling parameters for vLLM
     top_k = self.args.top_k if self.args.top_k > 0 else -1
     sampling_params = SamplingParams(
@@ -4243,7 +4266,8 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
     }
     print(
         f"Initializing vLLM engine with base model '{self.vllm_model}' "
-        f"(enable_lora={self.enable_lora}, max_lora_rank={llm_kwargs['max_lora_rank']})...",
+        f"(enable_lora={self.enable_lora}, max_lora_rank={llm_kwargs['max_lora_rank']}, "
+        f"multiproc={os.environ.get('VLLM_WORKER_MULTIPROC_METHOD')})...",
         flush=True,
     )
     try:
