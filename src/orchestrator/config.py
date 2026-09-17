@@ -136,6 +136,10 @@ class EvalStageConfig:
   timeout_minutes: int = 180
 
   evaluator_num_fewshot: int = 2
+  #: Independent autorater calls per sample. The judge jitters between calls
+  #: even at temperature 0, so k > 1 takes the median and reports the spread.
+  #: Costs k times the API budget; 1 keeps the historical single call.
+  autorater_num_samples: int = 1
   writer_num_fewshot: int = 0
   max_tokens: int = 250
   temperature: float = 0.0

@@ -542,8 +542,61 @@ class TestEvalStageSftWiring(unittest.TestCase):
         writer_num_fewshot=self.stage.config.eval.writer_num_fewshot,
         task_name="npov",
         sft_model_path="leobianco/npov_SFT_winner",
+        seed=self.stage.config.eval.seed,
+        max_tokens=self.stage.config.eval.max_tokens,
     )
     self.assertEqual(perl_repo, expected)
+
+  def test_summary_path_tracks_seed_and_max_tokens(self):
+    """Two seeds must not share a completions repository."""
+    baseline, _ = self.stage._summary_path("leobianco/npov_PERL_winner")
+    self.stage.config.eval.seed = 999
+    other_seed, _ = self.stage._summary_path("leobianco/npov_PERL_winner")
+    self.stage.config.eval.seed = 12345
+    self.stage.config.eval.max_tokens = 64
+    other_len, _ = self.stage._summary_path("leobianco/npov_PERL_winner")
+    self.assertNotEqual(baseline, other_seed)
+    self.assertNotEqual(baseline, other_len)
+    self.assertNotEqual(other_seed, other_len)
+
+  def _flags(self, cmd):
+    """Turns a command list into a {flag: value} mapping."""
+    return {
+        cmd[i]: cmd[i + 1]
+        for i in range(len(cmd) - 1)
+        if str(cmd[i]).startswith("--")
+    }
+
+  def test_scoring_command_carries_every_name_defining_flag(self):
+    """Scoring must be able to recompute generation's dataset name.
+
+    The repo name is derived from the CLI arguments, so a flag the stage
+    forgets to pass silently sends scoring to a different repository - which
+    is exactly how `--sft_model_path` went missing before.
+    """
+    for phase in ("_generation_command", "_scoring_command"):
+      with self.subTest(phase=phase):
+        cmd = getattr(self.stage, phase)("leobianco/npov_PERL_winner")
+        flags = self._flags(cmd)
+        args = EvalArguments(
+            task_name=flags["--task_name"],
+            user=flags["--user"],
+            writer_model_lora=flags["--writer_model_lora"],
+            sft_model_path=flags.get("--sft_model_path"),
+            temperature=float(flags["--temperature"]),
+            writer_num_fewshot=int(flags["--writer_num_fewshot"]),
+            seed=int(flags["--seed"]),
+            max_tokens=int(flags["--max_tokens"]),
+        )
+        pipeline = EvaluationScoringPipeline.__new__(EvaluationScoringPipeline)
+        pipeline.args = args
+        expected, _ = self.stage._summary_path("leobianco/npov_PERL_winner")
+        self.assertEqual(pipeline._completions_repo_id(), expected)
+
+  def test_scoring_command_passes_autorater_num_samples(self):
+    cmd = self.stage._scoring_command("leobianco/npov_PERL_winner")
+    idx = cmd.index("--autorater_num_samples")
+    self.assertEqual(cmd[idx + 1], "1")
 
 
 if __name__ == "__main__":

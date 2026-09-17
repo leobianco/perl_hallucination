@@ -27,6 +27,7 @@ import os
 import random
 import re
 import shutil
+import statistics
 import sys
 import threading
 import time
@@ -3194,6 +3195,8 @@ class EvaluationPipeline(Pipeline):
         writer_num_fewshot=self.args.writer_num_fewshot,
         task_name=getattr(self.args, "task_name", None),
         sft_model_path=getattr(self.args, "sft_model_path", None),
+        seed=self.args.seed,
+        max_tokens=self.args.max_tokens,
     )
 
   def safe_load_dataset(
@@ -3555,6 +3558,25 @@ class EvaluationPipeline(Pipeline):
     save_frequency = 50  # Save progress every 50 entries
     server_retry_wait = 5  # Base seconds to wait between server error retries
     server_max_retries = 4  # Number of times to retry on server error
+    # Independent judge calls per sample. k = 1 is one call and no
+    # aggregation, i.e. exactly the historical behaviour.
+    num_samples = max(
+        1, int(getattr(script_args, "autorater_num_samples", 1) or 1)
+    )
+    # How many samples had to fall back to a degraded request shape. These
+    # used to be one shared flag, so a single transient error silently
+    # downgraded every *later* sample from a continuous probability to a
+    # binary 0/1 score, with the split decided by thread scheduling. The flags
+    # are per request now; these counters make a degraded run visible.
+    fallback_counts = {
+        "logprobs": 0,
+        "thinking_config": 0,
+        "system_instruction": 0,
+        "response_schema": 0,
+    }
+    # Per-sample max-min over the k draws: a direct measurement of how much
+    # the judge disagrees with itself.
+    observed_spreads: list[float] = []
     entries_to_score = [i for i, score in enumerate(scores) if score is None]
     already_scored = len(scores) - len(entries_to_score)
     if already_scored > 0:
@@ -3568,93 +3590,116 @@ class EvaluationPipeline(Pipeline):
     if entries_to_score:
       print(
           f"Scoring {len(entries_to_score)} entries concurrently with"
-          f" {max_workers} worker threads..."
+          f" {max_workers} worker threads"
+          + (f", {num_samples} calls per sample" if num_samples > 1 else "")
+          + "..."
       )
 
       lock = threading.Lock()
-      use_logprobs_flag = [True]
       completed_count = 0
 
-      def score_single_entry(idx: int) -> tuple[int, Optional[float]]:
+      def note_fallback(kind: str) -> None:
+        with lock:
+          fallback_counts[kind] += 1
+
+      def score_once(idx: int) -> Optional[float]:
+        """Runs a single autorater call for one sample.
+
+        Every capability downgrade (logprobs, thinking budget, system
+        instruction, structured schema) is local to this call: a transient
+        error on one sample must not change how the rest of the run is scored.
+
+        Args:
+            idx: Row index into ``dataset``.
+
+        Returns:
+            The normalized score, or None if the call could not be resolved.
+        """
         prompt_content = dataset[idx]["evaluator_prompt"]
         retry_count = 0
-        while retry_count < server_max_retries:
-          current_use_logprobs = True
-          try:
-            with lock:
-              current_use_logprobs = use_logprobs_flag[0]
+        use_logprobs = True
+        use_thinking = hasattr(types, "ThinkingConfig")
+        use_system_instruction = True
+        use_schema = True
+        # A capability downgrade retries without consuming a server retry, so
+        # the total attempt count is bounded explicitly: there are four
+        # downgrades and each can only be taken once.
+        attempts_left = server_max_retries + 4
 
-            config_kwargs = {
-                "response_mime_type": "application/json",
-                "response_schema": schema,
-                "temperature": 0,
-                "max_output_tokens": 64,
-                "seed": script_args.seed,
-                "system_instruction": (
-                    "You are an evaluator. Output strictly 'Yes' or 'No' with"
-                    " no conversational preamble or markdown."
-                ),
-            }
-
-            if current_use_logprobs:
-              config_kwargs["response_logprobs"] = True
-              config_kwargs["logprobs"] = 5
-
-            # Explicitly set zero thinking budget to ensure immediate
-            # classification token
+        while retry_count < server_max_retries and attempts_left > 0:
+          attempts_left -= 1
+          config_kwargs = {
+              "temperature": 0,
+              "max_output_tokens": 64,
+              "seed": script_args.seed,
+          }
+          if use_schema:
+            config_kwargs["response_mime_type"] = "application/json"
+            config_kwargs["response_schema"] = schema
+          if use_system_instruction:
+            config_kwargs["system_instruction"] = (
+                "You are an evaluator. Output strictly 'Yes' or 'No' with"
+                " no conversational preamble or markdown."
+            )
+          if use_logprobs:
+            config_kwargs["response_logprobs"] = True
+            config_kwargs["logprobs"] = 5
+          if use_thinking:
+            # Zero thinking budget keeps the classification token immediate.
             try:
-              if hasattr(types, "ThinkingConfig"):
-                config_kwargs["thinking_config"] = types.ThinkingConfig(
-                    thinking_budget=0
-                )
-            except Exception:
-              pass
+              config_kwargs["thinking_config"] = types.ThinkingConfig(
+                  thinking_budget=0
+              )
+            except Exception:  # pylint: disable=broad-exception-caught
+              use_thinking = False
 
+          try:
             response = client.models.generate_content(
                 model=model,
                 contents=prompt_content,
                 config=types.GenerateContentConfig(**config_kwargs),
             )
-            score = self.gemini_score_response(response, entry_idx=idx)
-            return idx, score
+            return self.gemini_score_response(response, entry_idx=idx)
 
-          except Exception as e:
+          except Exception as e:  # pylint: disable=broad-exception-caught
             error_str = str(e).lower()
-            if "thinking" in error_str and "thinking_config" in config_kwargs:
+            if "thinking" in error_str and use_thinking:
               print(
                   f"[Autorater fallback - sample #{idx}] ThinkingConfig not"
                   f" supported by model/API ({error_str[:60]}),"
                   " retrying without thinking_config."
               )
-              config_kwargs.pop("thinking_config", None)
+              use_thinking = False
+              note_fallback("thinking_config")
               continue
-            if (
-                "system_instruction" in error_str
-                and "system_instruction" in config_kwargs
-            ):
+            if "system_instruction" in error_str and use_system_instruction:
               print(
                   f"[Autorater fallback - sample #{idx}] System instruction not"
                   f" supported by model/API ({error_str[:80]}), retrying"
                   " without system_instruction."
               )
-              config_kwargs.pop("system_instruction", None)
+              use_system_instruction = False
+              note_fallback("system_instruction")
               continue
-            if "schema" in error_str and "response_schema" in config_kwargs:
+            if "schema" in error_str and use_schema:
               print(
                   f"[Autorater fallback - sample #{idx}] Response schema not"
                   f" supported by model/API ({error_str[:80]}), retrying with"
                   " unconstrained decoding."
               )
-              config_kwargs.pop("response_schema", None)
-              config_kwargs.pop("response_mime_type", None)
+              use_schema = False
+              note_fallback("response_schema")
               continue
-            if "logprob" in error_str and current_use_logprobs:
+            if "logprob" in error_str and use_logprobs:
+              # Text-only mode returns a binary 0/1 instead of a probability,
+              # so this downgrade is confined to this one request.
               print(
                   f"[Autorater fallback - sample #{idx}] Logprobs error"
-                  f" ({error_str[:80]}), retrying in text-only mode."
+                  f" ({error_str[:80]}), retrying this sample in text-only"
+                  " mode."
               )
-              with lock:
-                use_logprobs_flag[0] = False
+              use_logprobs = False
+              note_fallback("logprobs")
               continue
             if (
                 "unavailable" in error_str
@@ -3676,13 +3721,39 @@ class EvaluationPipeline(Pipeline):
                   f"[Autorater failure - sample #{idx}] Gemini API failed with"
                   f" error: {error_str[:120]}. No score assigned."
               )
-              return idx, None
+              return None
 
         print(
             f"[Autorater failure - sample #{idx}] Failed to score entry after"
             f" {server_max_retries} attempts. No score assigned."
         )
-        return idx, None
+        return None
+
+      def score_single_entry(
+          idx: int,
+      ) -> tuple[int, Optional[float], Optional[float]]:
+        """Scores one sample, aggregating ``num_samples`` independent calls.
+
+        The judge is a remote LLM whose output jitters between calls even at
+        temperature 0, so k > 1 takes the median and reports the spread of the
+        draws as a direct measurement of that jitter.
+
+        Args:
+            idx: Row index into ``dataset``.
+
+        Returns:
+            ``(idx, score, spread)``; ``score`` is None when every call
+            failed, and ``spread`` is None unless at least two calls returned.
+        """
+        draws = [
+            draw
+            for draw in (score_once(idx) for _ in range(num_samples))
+            if draw is not None
+        ]
+        if not draws:
+          return idx, None, None
+        spread = float(max(draws) - min(draws)) if len(draws) > 1 else None
+        return idx, float(statistics.median(draws)), spread
 
       try:
         with concurrent.futures.ThreadPoolExecutor(
@@ -3698,16 +3769,19 @@ class EvaluationPipeline(Pipeline):
               desc="Scoring with Gemini API (parallel)",
           ):
             try:
-              idx, score = future.result()
+              idx, score, spread = future.result()
             except Exception as thread_err:
               idx = future_to_idx[future]
               score = None
+              spread = None
               print(
                   f"[Autorater failure - sample #{idx}] Thread execution error:"
                   f" {thread_err}. No score assigned."
               )
             with lock:
               scores[idx] = score
+              if spread is not None:
+                observed_spreads.append(spread)
               completed_count += 1
               if checkpoint_path and completed_count % save_frequency == 0:
                 try:
@@ -3779,6 +3853,47 @@ class EvaluationPipeline(Pipeline):
         f" (1.0), {n_zeros} Yes (0.0). ({unscored_count} entries"
         " unscored/empty)."
     )
+
+    # The denominator of every downstream metric moves with `unscored_count`,
+    # and a run where some samples were scored in text-only mode is not
+    # comparable to one where all of them had logprobs. Both facts belong in
+    # the summary JSON rather than only in the console scrollback.
+    degraded = sum(fallback_counts.values())
+    if degraded:
+      print(
+          f"[WARNING] {degraded} autorater call(s) ran with a degraded request"
+          f" shape: {fallback_counts}. Samples that fell back to 'logprobs'"
+          " carry a binary 0/1 score instead of a probability."
+      )
+    self.autorater_stats = {
+        "autorater_n_total": n_total,
+        "autorater_n_scored": scored_count,
+        "autorater_n_dropped": unscored_count,
+        "autorater_n_continuous": n_probabilistic,
+        "autorater_n_binary_no": n_ones,
+        "autorater_n_binary_yes": n_zeros,
+        "autorater_num_samples": num_samples,
+        "autorater_model": model,
+        "autorater_fallback_logprobs": fallback_counts["logprobs"],
+        "autorater_fallback_thinking_config": fallback_counts[
+            "thinking_config"
+        ],
+        "autorater_fallback_system_instruction": fallback_counts[
+            "system_instruction"
+        ],
+        "autorater_fallback_response_schema": fallback_counts[
+            "response_schema"
+        ],
+        "autorater_spread_mean": (
+            float(statistics.fmean(observed_spreads))
+            if observed_spreads
+            else None
+        ),
+        "autorater_spread_max": (
+            float(max(observed_spreads)) if observed_spreads else None
+        ),
+        "autorater_spread_samples": len(observed_spreads),
+    }
     return scores
 
 
@@ -4710,6 +4825,10 @@ class EvaluationScoringPipeline(EvaluationPipeline):
       )
       dataset_name = self.args.dataset_with_completions.split("/")[-1]
       summary.update(self._scoring_provenance(dataset_name))
+      # How many samples the judge actually scored, and whether any of them
+      # were scored in a degraded mode. Without this the metric denominator
+      # silently moves between runs.
+      summary.update(getattr(self, "autorater_stats", {}))
       evaluator.save_and_log_results(
           self.val_data,
           summary,

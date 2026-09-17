@@ -702,12 +702,15 @@ class TestEvalRepoNaming(unittest.TestCase):
     )
     self.assertLessEqual(len(repo_id), 96)
     self.assertNotIn(".", repo_id)
-    self.assertTrue(repo_id.endswith("_gens_T0_wfs0_nosft"))
+    self.assertTrue(repo_id.endswith("_gens_T0_wfs0_s12345_mt250_nosft"))
     self.assertTrue(
         repo_id.startswith(
-            "leobianco/eval_npov_PERL_google_S130104_epo0_2_lr2_4e-05_beta0_043"
+            "leobianco/eval_npov_PERL_google_S130104_epo0_2_lr2_4e-05_be"
         )
     )
+    # The overflowing tail is replaced by a digest of the full name rather
+    # than simply cut, so two checkpoints differing only there stay distinct.
+    self.assertRegex(repo_id, r"_[0-9a-f]{4}_gens_T0_wfs0_s12345_mt250_nosft$")
 
   def test_sanitize_hf_repo_id_matches_build(self):
     uncompacted_eval = "leobianco/eval_npov_PERL_google_S130104_epo0.2_lr2.3663655877360862e-05_beta0.04259128063013425_2608141244_gens_T0.0_wfs0"
@@ -730,7 +733,7 @@ class TestEvalRepoNaming(unittest.TestCase):
     self.assertLessEqual(len(repo_id), 96)
     self.assertNotIn(".", repo_id)
     self.assertTrue(repo_id.startswith("leobianco/eval_"))
-    self.assertTrue(repo_id.endswith("_gens_T0_7_wfs2_nosft"))
+    self.assertTrue(repo_id.endswith("_gens_T0_7_wfs2_s12345_mt250_nosft"))
 
   def test_build_eval_dataset_repo_id_marker_survives_truncation(self):
     """An overlong name must lose model characters, never the SFT marker.
@@ -758,8 +761,8 @@ class TestEvalRepoNaming(unittest.TestCase):
     self.assertLessEqual(len(stacked), 96)
     self.assertLessEqual(len(unstacked), 96)
     self.assertNotEqual(stacked, unstacked)
-    self.assertTrue(unstacked.endswith("_gens_T0_wfs0_nosft"))
-    self.assertRegex(stacked, r"_gens_T0_wfs0_sft[0-9a-f]{6}$")
+    self.assertTrue(unstacked.endswith("_gens_T0_wfs0_s12345_mt250_nosft"))
+    self.assertRegex(stacked, r"_gens_T0_wfs0_s12345_mt250_sft[0-9a-f]{6}$")
 
   def test_build_eval_dataset_repo_id_distinguishes_sft_stacking(self):
     """The same PE-RL checkpoint served two ways gets two repositories."""
@@ -870,14 +873,14 @@ class TestEvalRepoNaming(unittest.TestCase):
     self.assertNotEqual(bosch_id, npov_id)
     self.assertNotEqual(bosch_id, ragtruth_id)
     self.assertEqual(
-        bosch_id, "leobianco/eval_bosch_gemma-4-E4B-it_gens_T0_wfs0_nosft"
+        bosch_id, "leobianco/eval_bosch_gemma-4-E4B-it_gens_T0_wfs0_s12345_mt250_nosft"
     )
     self.assertEqual(
-        npov_id, "leobianco/eval_npov_gemma-4-E4B-it_gens_T0_wfs0_nosft"
+        npov_id, "leobianco/eval_npov_gemma-4-E4B-it_gens_T0_wfs0_s12345_mt250_nosft"
     )
     self.assertEqual(
         ragtruth_id,
-        "leobianco/eval_ragtruth_gemma-4-E4B-it_gens_T0_wfs0_nosft",
+        "leobianco/eval_ragtruth_gemma-4-E4B-it_gens_T0_wfs0_s12345_mt250_nosft",
     )
 
   def test_build_eval_dataset_repo_id_no_duplicate_task_prefix(self):
@@ -1253,6 +1256,185 @@ class TestGeminiScoreDataset(unittest.TestCase):
     self.assertGreaterEqual(max_tokens, 64)
     self.assertIn("Yes", str(sys_inst))
     self.assertIn("No", str(sys_inst))
+
+  def _continuous_response(self, p_no: float = -0.01):
+    """Builds a response carrying both logprobs, i.e. a continuous score."""
+    cand = MagicMock()
+    cand.logprobs_result.top_candidates = [
+        MagicMock(
+            candidates=[
+                MagicMock(token="No", log_prob=p_no),
+                MagicMock(token="Yes", log_prob=-4.0),
+            ]
+        )
+    ]
+    return MagicMock(candidates=[cand], text='"No"')
+
+  def _text_only_response(self):
+    """Builds a response without logprobs, i.e. a binary 0/1 score."""
+    cand = MagicMock()
+    cand.logprobs_result = None
+    cand.avg_logprobs = None
+    return MagicMock(candidates=[cand], text='"No"')
+
+  def test_logprobs_downgrade_is_confined_to_one_sample(self):
+    """One logprobs error must not flip the rest of the run to binary scores.
+
+    The downgrade used to be a shared flag, so a single transient failure
+    silently changed the scoring function for every sample handled after it,
+    with the split decided by thread scheduling.
+    """
+    script_args = MagicMock(
+        seed=42,
+        evaluator_model="gemini-2.5-flash",
+        evaluator_num_fewshot=0,
+        overwrite_scores=False,
+        max_workers=1,
+        autorater_num_samples=1,
+        dataset_with_completions=None,
+        dataset_labels="test_eval",
+        scores_checkpoint_path=None,
+    )
+    dataset = self._make_dummy_dataset(["Prompt 0", "Prompt 1", "Prompt 2"])
+
+    def mock_generate(model, contents, config):
+      del model, config
+      prompt = str(contents)
+      # The stubbed `types` module records the real kwargs, which is the only
+      # way to see whether *this* request asked for logprobs.
+      from google.genai import types as genai_types  # pylint: disable=g-import-not-at-top
+
+      kwargs = genai_types.GenerateContentConfig.call_args.kwargs
+      if not kwargs.get("response_logprobs", False):
+        return self._text_only_response()
+      if "Prompt 0" in prompt:
+        raise RuntimeError("logprobs are not supported for this request")
+      return self._continuous_response()
+
+    client = MagicMock()
+    client.models.generate_content.side_effect = mock_generate
+
+    scores = self.pipeline.gemini_score_dataset(client, dataset, script_args)
+
+    # Sample 0 degraded to the binary path, samples 1 and 2 kept probabilities.
+    self.assertEqual(scores[0], 1.0)
+    for score in scores[1:]:
+      self.assertGreater(score, 0.0)
+      self.assertLess(score, 1.0)
+    stats = self.pipeline.autorater_stats
+    self.assertEqual(stats["autorater_fallback_logprobs"], 1)
+    self.assertEqual(stats["autorater_n_continuous"], 2)
+
+  def test_capability_downgrade_terminates(self):
+    """A permanently rejected option must not loop forever.
+
+    The fallbacks rebuilt the request from scratch on every iteration without
+    consuming a retry, so a model that always rejects one of them spun
+    forever.
+    """
+    script_args = MagicMock(
+        seed=42,
+        evaluator_model="gemini-2.5-flash",
+        evaluator_num_fewshot=0,
+        overwrite_scores=False,
+        max_workers=1,
+        autorater_num_samples=1,
+        dataset_with_completions=None,
+        dataset_labels="test_eval",
+        scores_checkpoint_path=None,
+    )
+    dataset = self._make_dummy_dataset(["Prompt 0"])
+    calls = []
+
+    def mock_generate(model, contents, config):
+      del model, contents
+      calls.append(config)
+      raise RuntimeError("thinking_config is not supported by this model")
+
+    client = MagicMock()
+    client.models.generate_content.side_effect = mock_generate
+
+    scores = self.pipeline.gemini_score_dataset(client, dataset, script_args)
+    self.assertEqual(scores, [None])
+    # Bounded: one downgrade, then the error is treated as unrecoverable.
+    self.assertLessEqual(len(calls), 8)
+
+  def test_k_samples_take_the_median_and_report_spread(self):
+    """k > 1 queries the judge k times and keeps the median of the draws."""
+    script_args = MagicMock(
+        seed=42,
+        evaluator_model="gemini-2.5-flash",
+        evaluator_num_fewshot=0,
+        overwrite_scores=False,
+        max_workers=1,
+        autorater_num_samples=3,
+        dataset_with_completions=None,
+        dataset_labels="test_eval",
+        scores_checkpoint_path=None,
+    )
+    dataset = self._make_dummy_dataset(["Prompt 0"])
+    # P(No) for log_prob(No) in {-4, -2, -1} against a fixed log_prob(Yes).
+    draws = [-4.0, -1.0, -2.0]
+    calls = {"n": 0}
+
+    def mock_generate(model, contents, config):
+      del model, contents, config
+      value = draws[calls["n"] % len(draws)]
+      calls["n"] += 1
+      return self._continuous_response(p_no=value)
+
+    client = MagicMock()
+    client.models.generate_content.side_effect = mock_generate
+
+    scores = self.pipeline.gemini_score_dataset(client, dataset, script_args)
+    self.assertEqual(calls["n"], 3)
+
+    def expected(log_no):
+      p_no = math.exp(log_no)
+      return p_no / (p_no + math.exp(-4.0))
+
+    self.assertAlmostEqual(scores[0], expected(-2.0), places=6)
+    stats = self.pipeline.autorater_stats
+    self.assertEqual(stats["autorater_num_samples"], 3)
+    self.assertEqual(stats["autorater_spread_samples"], 1)
+    self.assertAlmostEqual(
+        stats["autorater_spread_max"],
+        expected(-1.0) - expected(-4.0),
+        places=6,
+    )
+
+  def test_autorater_stats_report_scored_and_dropped_counts(self):
+    """The moving metric denominator must be recorded, not just printed."""
+    script_args = MagicMock(
+        seed=42,
+        evaluator_model="gemini-2.5-flash",
+        evaluator_num_fewshot=0,
+        overwrite_scores=False,
+        max_workers=1,
+        autorater_num_samples=1,
+        dataset_with_completions=None,
+        dataset_labels="test_eval",
+        scores_checkpoint_path=None,
+    )
+    dataset = self._make_dummy_dataset(["Prompt 0", "Prompt 1", "Prompt 2"])
+
+    def mock_generate(model, contents, config):
+      del model, config
+      if "Prompt 1" in str(contents):
+        raise RuntimeError("Simulated unrecoverable API error")
+      return self._continuous_response()
+
+    client = MagicMock()
+    client.models.generate_content.side_effect = mock_generate
+
+    self.pipeline.gemini_score_dataset(client, dataset, script_args)
+    stats = self.pipeline.autorater_stats
+    self.assertEqual(stats["autorater_n_total"], 3)
+    self.assertEqual(stats["autorater_n_scored"], 2)
+    self.assertEqual(stats["autorater_n_dropped"], 1)
+    self.assertEqual(stats["autorater_model"], "gemini-2.5-flash")
+    # k = 1 means there is no spread to measure.
+    self.assertIsNone(stats["autorater_spread_mean"])
 
 
 class TestCpuCompatibility(unittest.TestCase):

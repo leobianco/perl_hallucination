@@ -13,6 +13,11 @@ ALLOW_MISSING_SFT="${ALLOW_MISSING_SFT:-}"
 EVALUATOR_MODEL="gemini-2.5-flash"
 USE_GEMINI="True"
 RUN_AUTORATER="True"
+# Independent autorater calls per sample. The judge is a remote LLM and its
+# scores jitter between calls even at temperature 0; k > 1 keeps the median
+# and reports the observed spread in the summary JSON, at k times the API
+# cost. Keep 1 unless you are explicitly measuring judge noise.
+AUTORATER_NUM_SAMPLES="${AUTORATER_NUM_SAMPLES:-1}"
 THRESHOLD=0.1025
 EVALUATOR_NUM_FEWSHOT=2
 WRITER_NUM_FEWSHOT=0
@@ -97,6 +102,7 @@ elif [ "$2" == "score" ]; then
         ${SFT_MODEL_LORA:+--sft_model_path "$SFT_MODEL_LORA"} \
         ${ALLOW_MISSING_SFT:+--allow_missing_sft_adapter "$ALLOW_MISSING_SFT"} \
         --run_autorater $RUN_AUTORATER \
+        --autorater_num_samples "$AUTORATER_NUM_SAMPLES" \
         --evaluator_model ${EVALUATOR_MODEL} \
         --use_gemini $USE_GEMINI \
         --gemini_api_key ${GEMINI_API_KEY} \
@@ -104,6 +110,7 @@ elif [ "$2" == "score" ]; then
         --evaluate_evaluator False \
         --threshold $THRESHOLD \
         --temperature "$TEMPERATURE" \
+        --max_tokens "$MAX_TOKENS" \
         --writer_num_fewshot $WRITER_NUM_FEWSHOT \
         ${DATASET_WITH_COMPLETIONS:+--dataset_with_completions "$DATASET_WITH_COMPLETIONS"} \
         ${OVERWRITE_SCORES:+--overwrite_scores "$OVERWRITE_SCORES"} \
@@ -131,6 +138,7 @@ elif [ "$2" == "autoratereval" ]; then
         --use_gemini $USE_GEMINI \
         --gemini_api_key ${GEMINI_API_KEY} \
         --evaluator_num_fewshot $EVALUATOR_NUM_FEWSHOT \
+        --autorater_num_samples "$AUTORATER_NUM_SAMPLES" \
         --evaluate_evaluator True \
         --threshold $THRESHOLD \
         ${OVERWRITE_SCORES:+--overwrite_scores "$OVERWRITE_SCORES"} \

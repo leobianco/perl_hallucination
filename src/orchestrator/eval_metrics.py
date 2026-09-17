@@ -9,7 +9,7 @@ way, including metrics written by older single-model runs.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 #: Evaluated policies in report order, with their display names.
 TARGETS: Tuple[Tuple[str, str], ...] = (("sft", "SFT"), ("perl", "PE-RL"))
@@ -28,6 +28,20 @@ METRIC_ORDER: Tuple[str, ...] = (
 #: completions (adapters, stacking, directories) rather than how good they
 #: are. They are kept in the metric map for auditing but never tabulated.
 PROVENANCE_PREFIX: str = "provenance_"
+
+#: Prefixes of summary keys that audit *how the evaluation ran* rather than
+#: how the model performed. Tabulating all of them would bury the four numbers
+#: the campaign is actually about.
+AUDIT_PREFIXES: Tuple[str, ...] = (PROVENANCE_PREFIX, "autorater_")
+
+#: Audit keys that earn a row anyway: `autorater_accuracy` is a real metric,
+#: and the dropped count and judge spread are needed to know whether a delta
+#: between two policies means anything.
+TABULATED_AUDIT_KEYS: FrozenSet[str] = frozenset({
+    "autorater_accuracy",
+    "autorater_n_dropped",
+    "autorater_spread_mean",
+})
 
 
 def headline_metric(
@@ -71,9 +85,10 @@ def metric_names(metrics: Dict[str, Any]) -> List[str]:
       if text.startswith(f"{label}/"):
         name = text[len(label) + 1:]
         # `provenance_*` entries record which adapters produced the
-        # completions. They are strings, not measurements, so they belong in
+        # completions, and most `autorater_*` entries record how the judge
+        # behaved. They are audit trail, not measurements, so they belong in
         # the summary file rather than in the comparison table.
-        if not name.startswith(PROVENANCE_PREFIX):
+        if name in TABULATED_AUDIT_KEYS or not name.startswith(AUDIT_PREFIXES):
           bare.add(name)
   ordered = [name for name in METRIC_ORDER if name in bare]
   ordered.extend(sorted(bare - set(ordered)))

@@ -338,6 +338,20 @@ class EvalArguments:
       },
   )
 
+  autorater_num_samples: int = field(
+      default=1,
+      metadata={
+          "help": (
+              "Number of independent autorater calls per sample. The judge is "
+              "a remote LLM whose scores jitter between calls even at "
+              "temperature 0, so k > 1 queries it k times and keeps the "
+              "median, additionally reporting the observed spread. Default 1 "
+              "(one call per sample, no aggregation); k > 1 multiplies the "
+              "API cost by k."
+          )
+      },
+  )
+
   mode: Optional[str] = field(
       default=None,
       metadata={
@@ -1073,6 +1087,33 @@ def looks_like_rl_checkpoint(model_ref: Optional[str]) -> bool:
   return any(marker in name for marker in _RL_CHECKPOINT_MARKERS)
 
 
+def _truncate_with_digest(name: str, allowed_len: int) -> str:
+  """Shortens ``name`` to ``allowed_len`` chars while keeping it injective.
+
+  Checkpoint names differ in their tail ('..._lr2_4e-05' versus
+  '..._lr2_5e-05'), so a plain truncation can map two different runs onto one
+  repository. Appending a digest of the full name keeps distinct inputs
+  distinct.
+
+  Args:
+      name (str): The already-sanitized model name component.
+      allowed_len (int): Maximum number of characters available.
+
+  Returns:
+      str: ``name`` when it already fits, else a truncation carrying a 4-hex
+        digest of the full name.
+  """
+  if allowed_len <= 0:
+    return ""
+  if len(name) <= allowed_len:
+    return name
+  digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:4]
+  if allowed_len <= len(digest):
+    return digest[:allowed_len]
+  keep = allowed_len - len(digest) - 1
+  return f"{name[:keep].rstrip('.-_')}_{digest}"
+
+
 def build_eval_dataset_repo_id(
     user: str,
     writer_model_lora: str,
@@ -1080,6 +1121,8 @@ def build_eval_dataset_repo_id(
     writer_num_fewshot: int = 0,
     task_name: Optional[str] = None,
     sft_model_path: Optional[str] = None,
+    seed: int = 12345,
+    max_tokens: int = 250,
     max_length: int = 96,
 ) -> str:
   """Constructs a deterministic and valid Hugging Face dataset repo ID for generation completions.
@@ -1088,7 +1131,13 @@ def build_eval_dataset_repo_id(
   otherwise two configurations push to the same repository and silently
   overwrite each other. Besides the writer adapter and the sampling settings,
   that includes whether an SFT adapter was stacked underneath the writer
-  adapter: '..._nosft' versus '..._sft<fingerprint>'.
+  adapter ('..._nosft' versus '..._sft<fingerprint>') and the seed, which
+  selects *which* prompts the evaluation subsamples.
+
+  Not encoded, deliberately: ``top_p`` / ``top_k`` are inert at the
+  temperature 0 this pipeline runs at, and ``max_eval_samples`` only ever
+  shrinks the row set of the same repository. Change either of those together
+  with something that is encoded, or regenerate into a fresh repo.
 
   Args:
       user (str): Hugging Face username / namespace.
@@ -1099,6 +1148,9 @@ def build_eval_dataset_repo_id(
         Prefixes the repository name to prevent collision between tasks.
       sft_model_path (Optional[str]): SFT adapter combined with
         ``writer_model_lora`` at serving time, if any.
+      seed (int): Seed driving the test-set subsample and the few-shot draw.
+      max_tokens (int): Generation length cap, which truncates completions and
+        therefore changes every downstream metric.
       max_length (int): Maximum allowed repo ID length (default 96).
 
   Returns:
@@ -1124,7 +1176,10 @@ def build_eval_dataset_repo_id(
       else f"{temp_val:.2g}".replace(".", "_")
   )
   marker = sft_stacking_marker(sft_model_path, writer_model_lora)
-  suffix = f"_gens_T{temp_str}_wfs{writer_num_fewshot}{marker}"
+  suffix = (
+      f"_gens_T{temp_str}_wfs{writer_num_fewshot}"
+      f"_s{int(seed)}_mt{int(max_tokens)}{marker}"
+  )
 
   if task_name:
     task_clean = re.sub(r"[^a-zA-Z0-9_\-]", "_", task_name.strip().lower())
@@ -1145,7 +1200,7 @@ def build_eval_dataset_repo_id(
   if allowed_model_len <= 0:
     compacted_model = ""
   elif len(compacted_model) > allowed_model_len:
-    compacted_model = compacted_model[:allowed_model_len].rstrip(".-_")
+    compacted_model = _truncate_with_digest(compacted_model, allowed_model_len)
 
   full_name = f"{prefix}{compacted_model}{suffix}"
   return sanitize_hf_repo_id(f"{user}/{full_name}", max_length=max_length)

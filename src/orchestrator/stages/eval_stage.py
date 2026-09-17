@@ -244,6 +244,8 @@ class EvalStage(BaseStage):
         # whether the SFT adapter was stacked, so passing a different value
         # here would send the stage looking for another run's dataset.
         sft_model_path=self._stacked_sft_repo_id(model_repo_id),
+        seed=cfg.seed,
+        max_tokens=cfg.max_tokens,
     )
     name = repo.split("/")[-1]
     return repo, os.path.join("logs", "eval", f"{name}_summary.json")
@@ -385,12 +387,18 @@ class EvalStage(BaseStage):
     if sft_repo:
       cmd.extend(["--sft_model_path", sft_repo])
     cmd.extend([
+        # Part of the completions repo name, so scoring must be told the same
+        # value generation used; the pipeline default (128) is not it.
+        "--max_tokens",
+        str(cfg.max_tokens),
         "--temperature",
         str(cfg.temperature),
         "--writer_num_fewshot",
         str(cfg.writer_num_fewshot),
         "--run_autorater",
         "True",
+        "--autorater_num_samples",
+        str(cfg.autorater_num_samples),
         "--evaluator_model",
         cfg.evaluator_model,
         "--use_gemini",
