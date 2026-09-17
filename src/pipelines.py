@@ -4003,6 +4003,185 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
 
     self.prompts = prompts
 
+  def _combine_lora_adapters(
+      self,
+      sft_adapter_dir: str,
+      rl_adapter_dir: str,
+      base_model_name_or_path: Optional[str] = None,
+  ) -> Tuple[str, int]:
+    """Combines an SFT LoRA adapter and an RL/DPO LoRA adapter into a single LoRA adapter.
+
+    Mathematically, for each linear layer, the sum of two LoRA deltas
+    Delta W_1 = (alpha_1 / r_1) B_1 A_1 and Delta W_2 = (alpha_2 / r_2) B_2 A_2
+    is exactly represented by concatenating A_comb = [A_1; A_2] along dim 0 and
+    B_comb = [(alpha_1 / r_1) B_1, (alpha_2 / r_2) B_2] along dim 1, with
+    combined rank r_target >= r_1 + r_2 and alpha_target = r_target (scaling = 1.0).
+    Ranks are padded with zeros to the next power of 2 (>= 8) for vLLM kernel
+    compatibility.
+
+    Args:
+      sft_adapter_dir: Local directory of the SFT LoRA adapter.
+      rl_adapter_dir: Local directory of the RL/DPO LoRA adapter.
+      base_model_name_or_path: Base model identifier for adapter_config.json.
+
+    Returns:
+      Tuple of (combined_adapter_directory, combined_lora_rank).
+    """
+    import hashlib  # pylint: disable=g-import-not-at-top
+
+    sft_cfg_path = os.path.join(sft_adapter_dir, "adapter_config.json")
+    rl_cfg_path = os.path.join(rl_adapter_dir, "adapter_config.json")
+    with open(sft_cfg_path, "r", encoding="utf-8") as f:
+      sft_config = json.load(f)
+    with open(rl_cfg_path, "r", encoding="utf-8") as f:
+      rl_config = json.load(f)
+
+    if rl_config.get("sft_merged_into_lora") is True:
+      print(
+          f"Adapter at '{rl_adapter_dir}' already contains merged SFT weights."
+          " Skipping adapter combination."
+      )
+      return rl_adapter_dir, int(rl_config.get("r", 64))
+
+    r1 = int(sft_config["r"])
+    alpha1 = float(sft_config.get("lora_alpha", r1))
+    s1 = alpha1 / r1
+
+    r2 = int(rl_config["r"])
+    alpha2 = float(rl_config.get("lora_alpha", r2))
+    s2 = alpha2 / r2
+
+    r_sum = r1 + r2
+    r_target = 8
+    while r_target < r_sum:
+      r_target *= 2
+
+    def _load_state_dict(adapter_dir: str) -> Dict[str, torch.Tensor]:
+      st_path = os.path.join(adapter_dir, "adapter_model.safetensors")
+      bin_path = os.path.join(adapter_dir, "adapter_model.bin")
+      if os.path.isfile(st_path):
+        try:
+          from safetensors.torch import load_file  # pylint: disable=g-import-not-at-top
+          return load_file(st_path)
+        except ImportError:
+          pass
+      if os.path.isfile(bin_path):
+        return torch.load(bin_path, map_location="cpu")
+      if os.path.isfile(st_path):
+        from safetensors.torch import load_file  # pylint: disable=g-import-not-at-top
+        return load_file(st_path)
+      raise FileNotFoundError(
+          f"No adapter_model.safetensors or adapter_model.bin found in {adapter_dir}"
+      )
+
+    def _normalize_key(k: str) -> str:
+      k = k.replace(".lora_A.default.weight", ".lora_A.weight")
+      k = k.replace(".lora_B.default.weight", ".lora_B.weight")
+      return k
+
+    raw_sft = _load_state_dict(sft_adapter_dir)
+    raw_rl = _load_state_dict(rl_adapter_dir)
+    sft_norm = {_normalize_key(k): v for k, v in raw_sft.items()}
+    rl_norm = {_normalize_key(k): v for k, v in raw_rl.items()}
+
+    all_keys = set(sft_norm.keys()) | set(rl_norm.keys())
+    lora_a_keys = sorted(k for k in all_keys if ".lora_A." in k)
+
+    combined_state: Dict[str, torch.Tensor] = {}
+    for a_key in lora_a_keys:
+      b_key = a_key.replace(".lora_A.", ".lora_B.")
+      ref_a = rl_norm.get(a_key, sft_norm.get(a_key))
+      ref_b = rl_norm.get(b_key, sft_norm.get(b_key))
+      d_in = ref_a.shape[1]
+      d_out = ref_b.shape[0]
+      dtype = ref_a.dtype
+      device = ref_a.device
+
+      if a_key in sft_norm and b_key in sft_norm:
+        a1 = sft_norm[a_key]
+        b1 = sft_norm[b_key]
+      else:
+        a1 = torch.zeros((r1, d_in), dtype=dtype, device=device)
+        b1 = torch.zeros((d_out, r1), dtype=dtype, device=device)
+
+      if a_key in rl_norm and b_key in rl_norm:
+        a2 = rl_norm[a_key]
+        b2 = rl_norm[b_key]
+      else:
+        a2 = torch.zeros((r2, d_in), dtype=dtype, device=device)
+        b2 = torch.zeros((d_out, r2), dtype=dtype, device=device)
+
+      b1_scaled = (b1.float() * s1).to(dtype)
+      b2_scaled = (b2.float() * s2).to(dtype)
+
+      a_cat = torch.cat([a1, a2], dim=0)
+      b_cat = torch.cat([b1_scaled, b2_scaled], dim=1)
+
+      if r_target > r_sum:
+        pad_rows = r_target - r_sum
+        a_pad = torch.zeros((pad_rows, d_in), dtype=dtype, device=device)
+        b_pad = torch.zeros((d_out, pad_rows), dtype=dtype, device=device)
+        a_cat = torch.cat([a_cat, a_pad], dim=0)
+        b_cat = torch.cat([b_cat, b_pad], dim=1)
+
+      combined_state[a_key] = a_cat.contiguous()
+      combined_state[b_key] = b_cat.contiguous()
+
+    for k in all_keys:
+      if ".lora_A." not in k and ".lora_B." not in k:
+        val = rl_norm.get(k, sft_norm.get(k))
+        combined_state[k] = val.contiguous() if hasattr(val, "contiguous") else val
+
+    combo_hash = hashlib.sha256(
+        f"{os.path.abspath(sft_adapter_dir)}::{os.path.abspath(rl_adapter_dir)}".encode(
+            "utf-8"
+        )
+    ).hexdigest()[:12]
+    output_dir = os.path.join(
+        "checkpoints", "eval_combined_lora", f"sft_plus_rl_{combo_hash}"
+    )
+    os.makedirs(output_dir, exist_ok=True)
+
+    saved_safetensors = False
+    try:
+      from safetensors.torch import save_file  # pylint: disable=g-import-not-at-top
+      save_file(
+          combined_state, os.path.join(output_dir, "adapter_model.safetensors")
+      )
+      saved_safetensors = True
+    except ImportError:
+      pass
+    if not saved_safetensors:
+      torch.save(combined_state, os.path.join(output_dir, "adapter_model.bin"))
+
+    combined_config = dict(rl_config)
+    combined_config["r"] = r_target
+    combined_config["lora_alpha"] = r_target
+    if base_model_name_or_path:
+      combined_config["base_model_name_or_path"] = base_model_name_or_path
+    if isinstance(sft_config.get("target_modules"), list) and isinstance(
+        rl_config.get("target_modules"), list
+    ):
+      combined_config["target_modules"] = sorted(
+          list(
+              set(sft_config["target_modules"])
+              | set(rl_config["target_modules"])
+          )
+      )
+    combined_config["sft_merged_into_lora"] = True
+
+    with open(
+        os.path.join(output_dir, "adapter_config.json"), "w", encoding="utf-8"
+    ) as f:
+      json.dump(combined_config, f, indent=2)
+
+    print(
+        f"Combined SFT LoRA adapter ('{sft_adapter_dir}', r={r1}, alpha={alpha1})"
+        f" and RL LoRA adapter ('{rl_adapter_dir}', r={r2}, alpha={alpha2})"
+        f" into '{output_dir}' (combined rank r={r_target})."
+    )
+    return output_dir, r_target
+
   def setup_model(self) -> None:
     enable_lora, lora_path = self._resolve_lora_adapter_path(
         self.args.writer_model_lora, self.args.writer_model_base
@@ -4010,6 +4189,30 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
     self.enable_lora = enable_lora
     self.lora_path = lora_path
     self.vllm_model = self.args.writer_model_base
+    self.max_lora_rank = 64
+
+    sft_model_path = getattr(self.args, "sft_model_path", None)
+    if (
+        self.enable_lora
+        and self.lora_path is not None
+        and sft_model_path
+        and str(sft_model_path).strip().lower() not in ("", "none", "false")
+    ):
+      sft_enable_lora, resolved_sft_path = self._resolve_lora_adapter_path(
+          sft_model_path, self.args.writer_model_base
+      )
+      if (
+          sft_enable_lora
+          and resolved_sft_path is not None
+          and os.path.abspath(resolved_sft_path) != os.path.abspath(self.lora_path)
+      ):
+        combined_path, combined_rank = self._combine_lora_adapters(
+            sft_adapter_dir=resolved_sft_path,
+            rl_adapter_dir=self.lora_path,
+            base_model_name_or_path=self.args.writer_model_base,
+        )
+        self.lora_path = combined_path
+        self.max_lora_rank = max(64, combined_rank)
 
   def run_and_save(self) -> None:
     if not _VLLM_AVAILABLE:
@@ -4033,7 +4236,7 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
     llm_kwargs = {
         "model": self.vllm_model,
         "enable_lora": self.enable_lora,
-        "max_lora_rank": 64,
+        "max_lora_rank": getattr(self, "max_lora_rank", 64),
         "dtype": "bfloat16",
         "hf_overrides": {"allow_global_per_layer_attribute_access": True},
     }

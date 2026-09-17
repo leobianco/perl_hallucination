@@ -314,6 +314,16 @@ class EvalArguments:
       metadata={"help": "The path to the LoRA adapters of the writer model."}
   )
 
+  sft_model_path: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Optional path or Hugging Face repo ID of the SFT LoRA adapter "
+              "to combine with writer_model_lora when evaluating RL/DPO models."
+          )
+      },
+  )
+
   mode: Optional[str] = field(
       default=None,
       metadata={

@@ -283,7 +283,7 @@ class EvalStage(BaseStage):
   def _generation_command(self, model_repo_id: str) -> List[str]:
     """Builds the ``--mode generate`` invocation for one policy."""
     cfg = self.config.eval
-    return [
+    cmd = [
         "python3",
         "-m",
         "src.evaluator",
@@ -309,6 +309,11 @@ class EvalStage(BaseStage):
         self.config.base_model,
         "--writer_model_lora",
         model_repo_id,
+    ]
+    sft_repo = self.context.sft_model_repo_id
+    if sft_repo and model_repo_id != sft_repo:
+      cmd.extend(["--sft_model_path", sft_repo])
+    cmd.extend([
         "--max_tokens",
         str(cfg.max_tokens),
         "--temperature",
@@ -319,7 +324,8 @@ class EvalStage(BaseStage):
         str(cfg.top_k),
         "--writer_num_fewshot",
         str(cfg.writer_num_fewshot),
-    ]
+    ])
+    return cmd
 
   def _scoring_command(self, model_repo_id: str) -> List[str]:
     """Builds the ``--mode score`` invocation for one policy."""

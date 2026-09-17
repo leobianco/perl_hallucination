@@ -5,6 +5,7 @@ USER="leobianco"
 SEED=12345
 RUN_IDENTIFIER="${RUN_IDENTIFIER:-google/gemma-4-E4B-it}"
 BASE_MODEL="${BASE_MODEL:-google/gemma-4-E4B-it}"
+SFT_MODEL_LORA="${SFT_MODEL_LORA:-}"
 EVALUATOR_MODEL="gemini-2.5-flash"
 USE_GEMINI="True"
 RUN_AUTORATER="True"
@@ -65,6 +66,7 @@ if [ "$2" == "generate" ]; then
         --dataset_prompts_split "$DATASET_PROMPTS_SPLIT" \
         --writer_model_base ${BASE_MODEL} \
         --writer_model_lora "${RUN_IDENTIFIER}" \
+        ${SFT_MODEL_LORA:+--sft_model_path "$SFT_MODEL_LORA"} \
         --max_tokens "$MAX_TOKENS" \
         --temperature "$TEMPERATURE" \
         --top_p "$TOP_P" \
@@ -85,6 +87,7 @@ elif [ "$2" == "score" ]; then
         --dataset_labels_split "$DATASET_LABELS_SPLIT" \
         --writer_model_base ${BASE_MODEL} \
         --writer_model_lora "${RUN_IDENTIFIER}" \
+        ${SFT_MODEL_LORA:+--sft_model_path "$SFT_MODEL_LORA"} \
         --run_autorater $RUN_AUTORATER \
         --evaluator_model ${EVALUATOR_MODEL} \
         --use_gemini $USE_GEMINI \
