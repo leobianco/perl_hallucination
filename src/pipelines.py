@@ -4178,7 +4178,8 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
     print(
         f"Combined SFT LoRA adapter ('{sft_adapter_dir}', r={r1}, alpha={alpha1})"
         f" and RL LoRA adapter ('{rl_adapter_dir}', r={r2}, alpha={alpha2})"
-        f" into '{output_dir}' (combined rank r={r_target})."
+        f" into '{output_dir}' (combined rank r={r_target}).",
+        flush=True,
     )
     return output_dir, r_target
 
@@ -4240,6 +4241,11 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
         "dtype": "bfloat16",
         "hf_overrides": {"allow_global_per_layer_attribute_access": True},
     }
+    print(
+        f"Initializing vLLM engine with base model '{self.vllm_model}' "
+        f"(enable_lora={self.enable_lora}, max_lora_rank={llm_kwargs['max_lora_rank']})...",
+        flush=True,
+    )
     try:
       llm = LLM(**llm_kwargs)
     except TypeError:
@@ -4247,6 +4253,11 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
       llm = LLM(**llm_kwargs)
 
     # Run generation
+    print(
+        f"Running vLLM generation for {len(self.prompts)} prompts "
+        f"(lora_path='{self.lora_path}')...",
+        flush=True,
+    )
     if self.enable_lora and self.lora_path is not None:
       outputs = llm.generate(
           self.prompts,
