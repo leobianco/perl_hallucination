@@ -6,17 +6,10 @@ SEED=12345
 RUN_IDENTIFIER="${RUN_IDENTIFIER:-google/gemma-4-E4B-it}"
 BASE_MODEL="${BASE_MODEL:-google/gemma-4-E4B-it}"
 SFT_MODEL_LORA="${SFT_MODEL_LORA:-}"
-# Evaluating a PE-RL/DPO checkpoint without SFT_MODEL_LORA now fails fast: that
-# adapter is a delta on top of merged SFT weights. Set this to True to run the
-# un-stacked configuration on purpose (its completions go to a '_nosft' repo).
 ALLOW_MISSING_SFT="${ALLOW_MISSING_SFT:-}"
 EVALUATOR_MODEL="gemini-2.5-flash"
 USE_GEMINI="True"
 RUN_AUTORATER="True"
-# Independent autorater calls per sample. The judge is a remote LLM and its
-# scores jitter between calls even at temperature 0; k > 1 keeps the median
-# and reports the observed spread in the summary JSON, at k times the API
-# cost. Keep 1 unless you are explicitly measuring judge noise.
 AUTORATER_NUM_SAMPLES="${AUTORATER_NUM_SAMPLES:-1}"
 THRESHOLD=0.1025
 EVALUATOR_NUM_FEWSHOT=2
