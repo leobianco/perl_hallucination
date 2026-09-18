@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import logging
 import os
@@ -52,6 +53,25 @@ DEFAULT_TUNABLE_KEYS: Set[str] = {
 #: constant. See ``_resolve_reward_max_length`` in ``src/pipelines.py`` for why
 #: the previous hardcoded 512 silently zeroed the RLOO advantage on RAGTruth.
 REWARD_MAX_LENGTH: int = 2048
+
+
+@dataclasses.dataclass(frozen=True)
+class MaterializationPlan:
+  """Everything needed to retrain and publish a sweep's winning trial.
+
+  Attributes:
+    repo_id: Hugging Face repository the retrained model is pushed to.
+    command: The full ``accelerate launch`` argument vector.
+    output_dir: Local directory the run writes its checkpoints to.
+    injected: Winning hyperparameters that were replayed on the command line.
+    skipped: Keys of the W&B run config that were deliberately not replayed.
+  """
+
+  repo_id: str
+  command: List[str]
+  output_dir: str
+  injected: Dict[str, Any] = dataclasses.field(default_factory=dict)
+  skipped: List[str] = dataclasses.field(default_factory=list)
 
 
 class ModelManager:
@@ -235,7 +255,7 @@ class ModelManager:
       flags.extend(["--load_best_model_at_end", "True"])
     return flags
 
-  def materialize_and_push(
+  def build_materialization_command(
       self,
       stage_name: str,
       task_name: str,
@@ -244,13 +264,20 @@ class ModelManager:
       seed: int = 130104,
       sft_model_path: Optional[str] = None,
       reward_model_path: Optional[str] = None,
-      live_line_callback: Optional[Callable[[str], None]] = None,
       tunable_keys: Optional[Iterable[str]] = None,
-      stop_requested_callback: Optional[Callable[[], bool]] = None,
       checkpoint_policy: str = "best",
       eval_steps: Optional[int] = None,
-  ) -> str:
-    """Executes a single training run with winning hyperparameters and pushes to HF Hub.
+      timestamp: Optional[str] = None,
+  ) -> MaterializationPlan:
+    """Builds the retraining command for a sweep's winning configuration.
+
+    Kept free of side effects so the command can be asserted on. The training
+    flags it emits must reproduce the trial that won the sweep: every flag the
+    sweep YAML pins is pinned here to the same value, and only the
+    checkpointing and publication flags differ (the sweep saves nothing, see
+    ``--save_strategy=no`` in ``scripts/sweep_*.yaml``). That correspondence is
+    enforced by ``TestSweepMaterializationParity``; read its allowlists before
+    adding or removing a flag below.
 
     Args:
         stage_name: 'sft', 'rm', or 'perl'.
@@ -260,34 +287,23 @@ class ModelManager:
         seed: Random seed.
         sft_model_path: Required for PE-RL stage.
         reward_model_path: Required for PE-RL stage.
-        live_line_callback: Callback for streaming logs.
         tunable_keys: Keys of ``best_params`` that are genuine hyperparameters
           of the training script (normally the sweep's ``parameters:`` block).
-          Everything else in the W&B run config is ignored, because it also
-          contains the full ``TrainingArguments`` dump and the model config.
-        stop_requested_callback: Predicate polled while training; when it
-          returns True the training subprocess is terminated.
-        checkpoint_policy: ``"best"`` publishes the best-scoring checkpoint
-          (``--load_best_model_at_end``); ``"final"`` publishes the last one.
-          This must agree with how the sweep ranked its trials - see
-          ``SweepStageConfig.checkpoint_policy``.
-        eval_steps: Eval/save cadence in optimizer steps. Only used under
-          ``checkpoint_policy="best"``, where it bounds how finely the best
-          checkpoint can be located; it should mirror the sweep YAML's
-          ``--eval_steps``. None keeps the stage's historical cadence.
+        checkpoint_policy: See :meth:`materialize_and_push`.
+        eval_steps: See :meth:`materialize_and_push`.
+        timestamp: Overrides the ``%y%m%d%H%M`` stamp of the repo id; only
+          meant for tests that need a stable name.
 
     Returns:
-        The uploaded Hugging Face model repository ID.
+        The :class:`MaterializationPlan` describing the run.
 
     Raises:
         ValueError: If the stage is unknown or PE-RL dependencies are missing.
-        RuntimeError: If the training subprocess fails or is interrupted
-          before the checkpoint is pushed.
     """
-
     allowed_keys = {str(k) for k in (tunable_keys or DEFAULT_TUNABLE_KEYS)}
 
-    timestamp = datetime.datetime.now().strftime("%y%m%d%H%M")
+    if timestamp is None:
+      timestamp = datetime.datetime.now().strftime("%y%m%d%H%M")
     model_short = base_model.split("/")[-1]
 
     # Compute clean repo identifier
@@ -329,14 +345,14 @@ class ModelManager:
     repo_id = sanitize_hf_repo_id(repo_id)
 
     if self.dry_run:
-      logger.info("[DRY-RUN] Simulating materialization for %s -> %s", stage_name, repo_id)
-      if live_line_callback:
-        live_line_callback(f"[DRY-RUN] Training {stage_name} with best hyperparams...")
-        live_line_callback(f"[DRY-RUN] Checkpoint pushed to HuggingFace Hub: {repo_id}")
-      return repo_id
+      logger.info(
+          "[DRY-RUN] Simulating materialization for %s -> %s",
+          stage_name,
+          repo_id,
+      )
 
     output_dir = f"./checkpoints/{task_name}/{stage_name}/{repo_id}"
-    os.makedirs(output_dir, exist_ok=True)
+
 
     cmd = [
         "accelerate",
@@ -363,6 +379,12 @@ class ModelManager:
         "True",
         "--do_eval",
         "True",
+        # Pinned rather than left to the HuggingFace default, because every
+        # scripts/sweep_*.yaml pins it; a default that changes upstream would
+        # otherwise silently make the retrain log on a different cadence than
+        # the trials it is reproducing.
+        "--logging_strategy",
+        "steps",
         "--bf16",
         "True",
         "--save_total_limit",
@@ -435,9 +457,16 @@ class ModelManager:
       ])
     elif stage_name == "perl":
       if not sft_model_path or not reward_model_path:
-        raise ValueError(
-            "PE-RL stage requires both sft_model_path and reward_model_path"
-        )
+        if not self.dry_run:
+          raise ValueError(
+              "PE-RL stage requires both sft_model_path and reward_model_path"
+          )
+        # A rehearsal has no published checkpoints to point at. This used to
+        # be unreachable because the dry-run short circuit came before the
+        # command was built; keep the rehearsal printable rather than
+        # failing it on a dependency that only a real run can have.
+        sft_model_path = sft_model_path or f"{self.user}/DRY_RUN_sft"
+        reward_model_path = reward_model_path or f"{self.user}/DRY_RUN_rm"
       cmd.extend([
           "--dataset_repo_id",
           f"{self.user}/{task_name}_perl",
@@ -449,6 +478,17 @@ class ModelManager:
           "CAUSAL_LM",
           "--peft_type",
           "LORA",
+          # The schedule is NOT part of the PE-RL search space, so it is never
+          # replayed from the winner's run config; it has to be pinned here to
+          # the value every trial of scripts/sweep_perl.yaml used. Omitting it
+          # silently retrained the winner on the HuggingFace defaults (linear
+          # decay, no warmup) - a different optimisation problem from the one
+          # that was searched, and at num_train_epochs=0.2 the warmup alone is
+          # a large fraction of the run.
+          "--lr_scheduler_type",
+          "cosine",
+          "--warmup_ratio",
+          "0.1",
           "--max_completion_length",
           "256",
           "--reward_max_length",
@@ -500,16 +540,101 @@ class ModelManager:
       cmd.extend([flag, str(v)])
       injected[key] = v
 
+    return MaterializationPlan(
+        repo_id=repo_id,
+        command=cmd,
+        output_dir=output_dir,
+        injected=injected,
+        skipped=skipped,
+    )
+
+  def materialize_and_push(
+      self,
+      stage_name: str,
+      task_name: str,
+      base_model: str,
+      best_params: Dict[str, Any],
+      seed: int = 130104,
+      sft_model_path: Optional[str] = None,
+      reward_model_path: Optional[str] = None,
+      live_line_callback: Optional[Callable[[str], None]] = None,
+      tunable_keys: Optional[Iterable[str]] = None,
+      stop_requested_callback: Optional[Callable[[], bool]] = None,
+      checkpoint_policy: str = "best",
+      eval_steps: Optional[int] = None,
+  ) -> str:
+    """Executes a single training run with winning hyperparameters and pushes to HF Hub.
+
+    Args:
+        stage_name: 'sft', 'rm', or 'perl'.
+        task_name: 'npov', 'bosch', etc.
+        base_model: Foundation model repo ID.
+        best_params: Winning hyperparameter dictionary from the sweep.
+        seed: Random seed.
+        sft_model_path: Required for PE-RL stage.
+        reward_model_path: Required for PE-RL stage.
+        live_line_callback: Callback for streaming logs.
+        tunable_keys: Keys of ``best_params`` that are genuine hyperparameters
+          of the training script (normally the sweep's ``parameters:`` block).
+          Everything else in the W&B run config is ignored, because it also
+          contains the full ``TrainingArguments`` dump and the model config.
+        stop_requested_callback: Predicate polled while training; when it
+          returns True the training subprocess is terminated.
+        checkpoint_policy: ``"best"`` publishes the best-scoring checkpoint
+          (``--load_best_model_at_end``); ``"final"`` publishes the last one.
+          This must agree with how the sweep ranked its trials - see
+          ``SweepStageConfig.checkpoint_policy``.
+        eval_steps: Eval/save cadence in optimizer steps. Only used under
+          ``checkpoint_policy="best"``, where it bounds how finely the best
+          checkpoint can be located; it should mirror the sweep YAML's
+          ``--eval_steps``. None keeps the stage's historical cadence.
+
+    Returns:
+        The uploaded Hugging Face model repository ID.
+
+    Raises:
+        ValueError: If the stage is unknown or PE-RL dependencies are missing.
+        RuntimeError: If the training subprocess fails or is interrupted
+          before the checkpoint is pushed.
+    """
+    plan = self.build_materialization_command(
+        stage_name=stage_name,
+        task_name=task_name,
+        base_model=base_model,
+        best_params=best_params,
+        seed=seed,
+        sft_model_path=sft_model_path,
+        reward_model_path=reward_model_path,
+        tunable_keys=tunable_keys,
+        checkpoint_policy=checkpoint_policy,
+        eval_steps=eval_steps,
+    )
+    repo_id = plan.repo_id
+    output_dir = plan.output_dir
+    cmd = plan.command
+
+    if self.dry_run:
+      if live_line_callback:
+        live_line_callback(
+            f"[DRY-RUN] Training {stage_name} with best hyperparams..."
+        )
+        live_line_callback(
+            f"[DRY-RUN] Checkpoint pushed to HuggingFace Hub: {repo_id}"
+        )
+      return repo_id
+
+    os.makedirs(output_dir, exist_ok=True)
+
     logger.info(
         "Materializing %s with hyperparameters %s (%d config keys ignored)",
         stage_name,
-        injected,
-        len(skipped),
+        plan.injected,
+        len(plan.skipped),
     )
     if live_line_callback:
       live_line_callback(
-          f"Retraining winner with: "
-          + ", ".join(f"{k}={v}" for k, v in sorted(injected.items()))
+          "Retraining winner with: "
+          + ", ".join(f"{k}={v}" for k, v in sorted(plan.injected.items()))
       )
     logger.info("Launching materialization: %s", " ".join(cmd))
 
