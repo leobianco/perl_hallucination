@@ -43,8 +43,14 @@ SYSTEM_INSTRUCTION = (
 
 
 def make_client() -> genai.Client:
-  """Mirrors `EvaluationPipeline.create_gemini_client`."""
-  use_vertex = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() in (
+  """Mirrors `EvaluationPipeline.create_gemini_client` *and* evaluator.sh.
+
+  `scripts/evaluator.sh` exports `GOOGLE_GENAI_USE_VERTEXAI=true` by default,
+  so the probe must default the same way. Probing the AI Studio endpoint while
+  the evaluator talks to Vertex compares two different backends and tells you
+  nothing about the run you are debugging.
+  """
+  use_vertex = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "true").lower() in (
       "true",
       "1",
   ) or bool(os.environ.get("GOOGLE_CLOUD_PROJECT"))
@@ -53,10 +59,15 @@ def make_client() -> genai.Client:
     location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
     print(f"Client: Vertex AI (project={project}, location={location})")
     return genai.Client(vertexai=True, project=project, location=location)
+  print(
+      "Client: AI Studio API key\n"
+      "  [WARNING] evaluator.sh defaults to Vertex AI"
+      " (GOOGLE_GENAI_USE_VERTEXAI=true). You set GOOGLE_GENAI_USE_VERTEXAI to"
+      " a false value, so this probe is testing a DIFFERENT backend than your"
+      " scoring runs."
+  )
   if os.environ.get("GEMINI_API_KEY"):
-    print("Client: AI Studio API key")
     return genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-  print("Client: default credentials")
   return genai.Client()
 
 
@@ -115,16 +126,37 @@ def dump(tag: str, response) -> bool:
   return saw_value
 
 
+def list_reachable_models(client: genai.Client) -> None:
+  """Prints the models this endpoint will actually serve."""
+  print("\nModels reachable from this endpoint:")
+  try:
+    names = []
+    for model in client.models.list():
+      name = getattr(model, "name", "") or ""
+      if any(k in name for k in ("flash", "pro")):
+        names.append(name)
+    for name in sorted(set(names))[:30]:
+      print(f"  {name}")
+    if not names:
+      print("  (none matched 'flash'/'pro')")
+  except Exception as e:  # pylint: disable=broad-exception-caught
+    print(f"  could not list models: {str(e)[:200]}")
+
+
 def main() -> None:
   print(f"Model: {MODEL}")
   client = make_client()
   verdict = {}
+  not_found = 0
   for schema_on, logprobs_on in ((True, True), (False, True), (True, False)):
     tag = f"schema={schema_on} logprobs={logprobs_on}"
     try:
       verdict[tag] = dump(tag, call(client, schema_on, logprobs_on))
     except Exception as e:  # pylint: disable=broad-exception-caught
-      print(f"\n=== {tag} ===\n  EXCEPTION: {str(e)[:300]}")
+      message = str(e)
+      if "404" in message or "NOT_FOUND" in message:
+        not_found += 1
+      print(f"\n=== {tag} ===\n  EXCEPTION: {message[:300]}")
       verdict[tag] = False
 
   print("\n================ VERDICT ================")
@@ -136,6 +168,12 @@ def main() -> None:
   elif no_schema:
     print("Logprobs are suppressed by `response_schema` (controlled decoding).")
     print("Fix: drop response_schema/response_mime_type when logprobs are on.")
+  elif not_found == 3:
+    print(f"INCONCLUSIVE: '{MODEL}' is not served by this endpoint at all, so")
+    print("nothing was learned about logprobs. Check that the probe is hitting")
+    print("the same backend as scripts/evaluator.sh (Vertex AI by default),")
+    print("or set EVALUATOR_MODEL to a model this endpoint serves.")
+    list_reachable_models(client)
   else:
     print("No logprobs from this model/endpoint in any shape.")
     print("Fix: use self-consistency (k samples, temperature > 0, mean) or a")
