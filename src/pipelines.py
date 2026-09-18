@@ -3405,11 +3405,20 @@ class EvaluationPipeline(Pipeline):
           cand_token = (
               getattr(cand, "token", "").strip().strip("\"'`").lower()
           )
-          logprob = getattr(cand, "log_prob", getattr(cand, "logprob", None))
+          # The google-genai SDK names this field `log_probability`
+          # (`LogprobsResultCandidate.log_probability`). The legacy names are
+          # kept only as a defensive fallback: reading the wrong name silently
+          # yields None, which collapses every score onto the binary text
+          # fallback below.
+          logprob = getattr(cand, "log_probability", None)
+          if logprob is None:
+            logprob = getattr(cand, "log_prob", getattr(cand, "logprob", None))
+          if not isinstance(logprob, (int, float)):
+            continue
           if cand_token == "no":
-            logp_no = logprob
+            logp_no = float(logprob)
           elif cand_token == "yes":
-            logp_yes = logprob
+            logp_yes = float(logprob)
 
         if logp_no is not None and logp_yes is not None:
           p_no = float(math.exp(logp_no))
@@ -3418,9 +3427,11 @@ class EvaluationPipeline(Pipeline):
           if denom > 0:
             return float(p_no / denom)
         elif logp_no is not None:
-          return 1.0
+          # Only 'No' made the top-k. exp(logp_no) is already P(No) over the
+          # full vocabulary, so use it instead of collapsing to a hard 1.0.
+          return float(min(1.0, max(0.0, math.exp(logp_no))))
         elif logp_yes is not None:
-          return 0.0
+          return float(min(1.0, max(0.0, 1.0 - math.exp(logp_yes))))
 
       # Check chosen_candidates as fallback if top_candidates was not structured
       chosen = getattr(logprobs_res, "chosen_candidates", None)
@@ -3429,14 +3440,21 @@ class EvaluationPipeline(Pipeline):
           cand_token = (
               getattr(cand, "token", "").strip().strip("\"'`").lower()
           )
-          if cand_token == "no":
-            return 1.0
-          elif cand_token == "yes":
-            return 0.0
+          if cand_token not in ("no", "yes"):
+            continue
+          logprob = getattr(cand, "log_probability", None)
+          if logprob is None:
+            logprob = getattr(cand, "log_prob", getattr(cand, "logprob", None))
+          if isinstance(logprob, (int, float)):
+            p_chosen = min(1.0, max(0.0, math.exp(float(logprob))))
+            return float(p_chosen if cand_token == "no" else 1.0 - p_chosen)
+          return 1.0 if cand_token == "no" else 0.0
 
-    # 2. Check avg_logprobs if available
+    # 2. Check avg_logprobs if available. A value of exactly 0.0 is what the
+    # backend returns when it did not compute logprobs at all; exp(0) == 1
+    # would masquerade as a perfectly confident answer, so it is rejected.
     avg_logprob = getattr(candidate, "avg_logprobs", None)
-    if isinstance(avg_logprob, (int, float)):
+    if isinstance(avg_logprob, (int, float)) and avg_logprob != 0.0:
       if clean_text.startswith("no"):
         return float(math.exp(avg_logprob))
       elif clean_text.startswith("yes"):
@@ -3854,6 +3872,21 @@ class EvaluationPipeline(Pipeline):
         " unscored/empty)."
     )
 
+    # An all-binary score vector makes threshold tuning vacuous: the ROC curve
+    # has a single interior operating point, the "best threshold" degenerates
+    # to 1.0, and the reported AUC is just balanced accuracy. That is a broken
+    # run, not a result, so say so instead of letting it reach the plots.
+    if scored_count > 0 and n_probabilistic == 0:
+      print(
+          "\n[WARNING] The autorater returned NO continuous probabilities:"
+          f" all {scored_count} scores are exactly 0.0 or 1.0. Logprobs were"
+          " most likely absent from the API response (controlled decoding"
+          " with `response_schema` can suppress them, and some models do not"
+          " support `response_logprobs` at all). Threshold tuning on these"
+          " scores is meaningless - the ROC curve has a single operating"
+          " point and the AUC equals balanced accuracy.\n"
+      )
+
     # The denominator of every downstream metric moves with `unscored_count`,
     # and a run where some samples were scored in text-only mode is not
     # comparable to one where all of them had logprobs. Both facts belong in
@@ -4028,7 +4061,10 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
         if score is None:
           f.write("None\n")
         else:
-          f.write(f"{score:.5f}\n")
+          # Full precision: a confident judge puts most scores within 1e-5 of
+          # 0 or 1, and "%.5f" rounds that structure away, making the saved
+          # file useless for re-tuning a threshold or measuring saturation.
+          f.write(f"{score!r}\n")
     print(f"Scores saved to {filepath}")
 
     valid_indices = [i for i, s in enumerate(scores_list) if s is not None]
@@ -4062,13 +4098,55 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
         0 if score < threshold else 1 for score in clean_scores
     ]
 
+    # How much usable resolution does the score actually carry? A judge at
+    # temperature 0 saturates, and a saturated score behaves like a hard
+    # decision no matter how many decimals it is printed with.
+    n_scored = len(clean_scores)
+    n_unique = int(np.unique(clean_scores).size)
+    n_exact_one = int(np.sum(clean_scores == 1.0))
+    n_exact_zero = int(np.sum(clean_scores == 0.0))
+    n_saturated = int(
+        np.sum((clean_scores > 1.0 - 1e-4) | (clean_scores < 1e-4))
+    )
+    balanced_accuracy = (tpr + (1.0 - fpr)) / 2.0
+
+    print("\n--- Autorater score distribution ---")
+    print(f"Distinct score values : {n_unique}/{n_scored}")
+    print(
+        f"Exactly 1.0 / 0.0     : {n_exact_one} / {n_exact_zero}"
+        f" ({100.0 * (n_exact_one + n_exact_zero) / n_scored:.1f}%)"
+    )
+    print(
+        f"Within 1e-4 of 0 or 1 : {n_saturated}"
+        f" ({100.0 * n_saturated / n_scored:.1f}%)"
+    )
+    print(f"Balanced accuracy     : {balanced_accuracy:.5f}")
+
+    # If the AUC is (numerically) the balanced accuracy at a single operating
+    # point, the ranking inside each cluster is uninformative: the judge is a
+    # hard classifier wearing a probability costume. Tuning a threshold on it
+    # is fitting noise, and the fitted value sits inside the saturated cluster
+    # where a 1e-5 difference flips a label.
+    if abs(auc - balanced_accuracy) < 1e-5:
+      print(
+          "\n[WARNING] AUC == balanced accuracy at the best threshold"
+          f" ({auc:.5f}). The ROC curve is effectively a single operating"
+          " point, so the score ordering carries no information beyond the"
+          " binary Yes/No decision. Do NOT report this as a ranking AUC and do"
+          " NOT use the fitted threshold as an operating point: prefer a fixed"
+          " threshold of 0.5 and report classifier agreement metrics"
+          " (accuracy / precision / recall / F1 / Cohen's kappa) instead."
+      )
+
     metrics_filepath = f"logs/{name_for_saving}/eval_autorater_metrics.txt"
     os.makedirs(os.path.dirname(metrics_filepath), exist_ok=True)
     with open(metrics_filepath, "w") as f:
       f.write(f"Scored Samples: {len(valid_indices)}/{len(scores_list)}\n")
       f.write(f"Unscored Samples: {unscored_count}\n")
       f.write("AUC: {:.5f}\n".format(auc))
-      f.write("Threshold: {:.5f}\n".format(threshold))
+      # Full precision: a threshold of 0.9999887757936129 prints as "1.00000"
+      # at 5 decimals, which is both wrong and unusable as a config value.
+      f.write(f"Threshold: {threshold!r}\n")
       f.write("TPR (recall): {:.5f}\n".format(tpr))
       f.write("FPR: {:.5f}\n".format(fpr))
       f.write("Accuracy: {:.5f}\n".format(accuracy))
@@ -4077,10 +4155,14 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
               precision_score(clean_gt, classif_at_threshold)
           )
       )
+      f.write("Balanced Accuracy: {:.5f}\n".format(balanced_accuracy))
+      f.write(f"Distinct Scores: {n_unique}/{n_scored}\n")
+      f.write(f"Exactly 0.0 or 1.0: {n_exact_one + n_exact_zero}\n")
+      f.write(f"Saturated (within 1e-4 of 0/1): {n_saturated}\n")
     print(f"Metrics saved to {metrics_filepath}")
 
     print("AUC: {:.5f}".format(auc))
-    print("Threshold: {:.5f}".format(threshold))
+    print(f"Threshold: {threshold!r}")
     print("TPR (recall): {:.5f}".format(tpr))
     print("FPR: {:.5f}".format(fpr))
     print("Accuracy: {:.5f}".format(accuracy))
@@ -4101,8 +4183,10 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
     )
     plt.clf()
 
-    # Histogram of scores
-    bins = np.arange(0, 1, 0.05)
+    # Histogram of scores. `np.arange(0, 1, 0.05)` stopped at 0.95, so every
+    # score above it -- i.e. the entire saturated cluster a confident judge
+    # produces -- fell outside the bins and never appeared in the plot.
+    bins = np.linspace(0.0, 1.0, 21)
     scores_no = [
         clean_scores[idx]
         for idx, gt_val in enumerate(clean_gt)
@@ -4124,6 +4208,7 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
         + f"eval_autorater_{self.args.evaluator_num_fewshot}_shot"
     )
     plt.clf()
+
 
 class EvaluationGenerationPipeline(EvaluationPipeline):
   """Pipeline for generation: create completions with writer model."""
@@ -4507,11 +4592,17 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
 
     # Prepare sampling parameters for vLLM
     top_k = self.args.top_k if self.args.top_k > 0 else -1
+    # `repetition_penalty` is a documented EvalArguments field and the SSFO
+    # generation path honours it, but this path used to drop it silently, so
+    # setting the flag changed nothing. Default is 1.0 (a no-op), so passing
+    # it through leaves existing runs bit-identical.
+    rep_penalty = getattr(self.args, "repetition_penalty", 1.0) or 1.0
     sampling_params = SamplingParams(
         seed=self.args.seed,
         temperature=self.args.temperature,
         top_p=self.args.top_p,
         top_k=top_k,
+        repetition_penalty=rep_penalty,
         min_tokens=getattr(self.args, "min_tokens", 10),
         max_tokens=self.args.max_tokens,
     )

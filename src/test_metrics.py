@@ -896,6 +896,32 @@ class TestEvalRepoNaming(unittest.TestCase):
     self.assertTrue(repo_id.startswith("leobianco/eval_bosch_PERL_gemma-4-E2B-it_S130104"))
 
 
+class _LogprobCandidate:
+  """Mirrors `google.genai.types.LogprobsResultCandidate`.
+
+  A plain `MagicMock` invents any attribute that is read, so a test written
+  against the wrong field name (`log_prob`) passed while production code read
+  `None` from every real response. This stub exposes exactly the fields the
+  SDK exposes, so a field rename breaks the test instead of the pipeline.
+  """
+
+  __slots__ = ("token", "token_id", "log_probability")
+
+  def __init__(self, token: str, log_probability: Optional[float] = None):
+    self.token = token
+    self.token_id = 0
+    self.log_probability = log_probability
+
+
+class _LogprobStep:
+  """Mirrors `google.genai.types.LogprobsResultTopCandidates`."""
+
+  __slots__ = ("candidates",)
+
+  def __init__(self, candidates):
+    self.candidates = candidates
+
+
 class TestGeminiScoreResponse(unittest.TestCase):
   """Unit tests for gemini_score_response in EvaluationPipeline."""
 
@@ -904,63 +930,96 @@ class TestGeminiScoreResponse(unittest.TestCase):
       self.skipTest("pipelines module not available in lightweight test env")
     self.pipeline = EvaluationScoringPipeline()
 
-  def test_both_tokens_in_logprobs(self):
+  def _response(self, text, top_candidates=None, chosen=None, avg=None):
     candidate = MagicMock()
-    candidate.logprobs_result.top_candidates = [
-        MagicMock(
-            candidates=[
-                MagicMock(token='"', log_prob=-0.01),
-            ]
-        ),
-        MagicMock(
-            candidates=[
-                MagicMock(token="No", log_prob=-0.2),
-                MagicMock(token="Yes", log_prob=-1.8),
-            ]
-        ),
-    ]
-    response = MagicMock(candidates=[candidate], text='"No"')
+    if top_candidates is None and chosen is None:
+      candidate.logprobs_result = None
+    else:
+      candidate.logprobs_result.top_candidates = top_candidates or []
+      candidate.logprobs_result.chosen_candidates = chosen or []
+    candidate.avg_logprobs = avg
+    return MagicMock(candidates=[candidate], text=text)
+
+  def test_sdk_field_name_is_log_probability(self):
+    """Guards the exact field the production parser reads.
+
+    Reading a field the SDK does not have (`log_prob`) returns None silently
+    and collapses every score onto the binary text fallback, which is exactly
+    how the autorater produced 0 continuous probabilities.
+    """
+    try:
+      from google.genai import types as genai_types  # pylint: disable=g-import-not-at-top
+    except ImportError:
+      self.skipTest("google-genai not installed in this environment")
+    fields = getattr(
+        getattr(genai_types, "LogprobsResultCandidate", None),
+        "model_fields",
+        None,
+    )
+    if not isinstance(fields, dict):
+      self.skipTest("google.genai is stubbed out in this test environment")
+    self.assertIn("log_probability", fields)
+
+  def test_both_tokens_in_logprobs(self):
+    response = self._response(
+        '"No"',
+        top_candidates=[
+            _LogprobStep([_LogprobCandidate('"', -0.01)]),
+            _LogprobStep([
+                _LogprobCandidate("No", -0.2),
+                _LogprobCandidate("Yes", -1.8),
+            ]),
+        ],
+    )
     score = self.pipeline.gemini_score_response(response)
     expected = math.exp(-0.2) / (math.exp(-0.2) + math.exp(-1.8))
     self.assertAlmostEqual(score, expected, places=4)
 
-  def test_only_no_token_in_logprobs(self):
-    candidate = MagicMock()
-    candidate.logprobs_result.top_candidates = [
-        MagicMock(
-            candidates=[
-                MagicMock(token="No", log_prob=-0.001),
-            ]
-        ),
-    ]
-    response = MagicMock(candidates=[candidate], text='"No"')
+  def test_only_no_token_in_logprobs_is_continuous(self):
+    response = self._response(
+        '"No"',
+        top_candidates=[_LogprobStep([_LogprobCandidate("No", -0.7)])],
+    )
     score = self.pipeline.gemini_score_response(response)
-    self.assertEqual(score, 1.0)
+    self.assertAlmostEqual(score, math.exp(-0.7), places=6)
 
-  def test_only_yes_token_in_logprobs(self):
-    candidate = MagicMock()
-    candidate.logprobs_result.top_candidates = [
-        MagicMock(
-            candidates=[
-                MagicMock(token="Yes", log_prob=-0.001),
-            ]
-        ),
-    ]
-    response = MagicMock(candidates=[candidate], text='"Yes"')
+  def test_only_yes_token_in_logprobs_is_continuous(self):
+    response = self._response(
+        '"Yes"',
+        top_candidates=[_LogprobStep([_LogprobCandidate("Yes", -0.7)])],
+    )
     score = self.pipeline.gemini_score_response(response)
-    self.assertEqual(score, 0.0)
+    self.assertAlmostEqual(score, 1.0 - math.exp(-0.7), places=6)
+
+  def test_missing_logprob_values_do_not_crash(self):
+    """A step whose candidates carry no logprob must not poison the score."""
+    response = self._response(
+        '"No"',
+        top_candidates=[
+            _LogprobStep([
+                _LogprobCandidate("No", None),
+                _LogprobCandidate("Yes", None),
+            ])
+        ],
+    )
+    score = self.pipeline.gemini_score_response(response)
+    self.assertEqual(score, 1.0)  # Falls through to the text classifier.
 
   def test_text_fallback_no_quotes(self):
-    candidate = MagicMock(logprobs_result=None)
-    response = MagicMock(candidates=[candidate], text="No")
+    response = self._response("No")
     score = self.pipeline.gemini_score_response(response)
     self.assertEqual(score, 1.0)
 
   def test_text_fallback_json_string_yes(self):
-    candidate = MagicMock(logprobs_result=None)
-    response = MagicMock(candidates=[candidate], text='  "Yes"  ')
+    response = self._response('  "Yes"  ')
     score = self.pipeline.gemini_score_response(response)
     self.assertEqual(score, 0.0)
+
+  def test_zero_avg_logprobs_is_not_treated_as_confidence(self):
+    """avg_logprobs == 0.0 means 'not computed', not 'P == 1'."""
+    response = self._response("No", avg=0.0)
+    score = self.pipeline.gemini_score_response(response)
+    self.assertEqual(score, 1.0)  # From the text classifier, not exp(0.0).
 
   def test_empty_response_fallback(self):
     response = MagicMock(candidates=[])
@@ -972,44 +1031,43 @@ class TestGeminiScoreResponse(unittest.TestCase):
     candidate.finish_reason = "SAFETY"
     candidate.content.parts = []
     candidate.logprobs_result = None
+    candidate.avg_logprobs = None
     response = MagicMock(candidates=[candidate], text="")
     score = self.pipeline.gemini_score_response(response)
     self.assertIsNone(score)
 
   def test_unresolved_text_fallback(self):
-    candidate = MagicMock(logprobs_result=None)
-    response = MagicMock(
-        candidates=[candidate],
-        text="I cannot determine faithfulness for this sample.",
+    response = self._response(
+        "I cannot determine faithfulness for this sample."
     )
     score = self.pipeline.gemini_score_response(response)
     self.assertIsNone(score)
 
-  def test_chosen_candidates_fallback(self):
-    candidate = MagicMock()
-    candidate.logprobs_result.top_candidates = []
-    candidate.logprobs_result.chosen_candidates = [
-        MagicMock(token="No", log_prob=-0.0001)
-    ]
-    response = MagicMock(candidates=[candidate], text='"No"')
+  def test_chosen_candidates_fallback_uses_logprob(self):
+    response = self._response(
+        '"No"',
+        top_candidates=[],
+        chosen=[_LogprobCandidate("No", -0.3)],
+    )
+    score = self.pipeline.gemini_score_response(response)
+    self.assertAlmostEqual(score, math.exp(-0.3), places=6)
+
+  def test_chosen_candidates_fallback_without_logprob(self):
+    response = self._response(
+        '"No"', top_candidates=[], chosen=[_LogprobCandidate("No", None)]
+    )
     score = self.pipeline.gemini_score_response(response)
     self.assertEqual(score, 1.0)
 
   def test_structured_json_with_preamble(self):
-    candidate = MagicMock(logprobs_result=None)
-    response = MagicMock(
-        candidates=[candidate],
-        text='Here is the JSON requested:\n```json\n{"answer": "No"}\n```',
+    response = self._response(
+        'Here is the JSON requested:\n```json\n{"answer": "No"}\n```'
     )
     score = self.pipeline.gemini_score_response(response)
     self.assertEqual(score, 1.0)
 
   def test_truncated_preamble_returns_none(self):
-    candidate = MagicMock(logprobs_result=None)
-    response = MagicMock(
-        candidates=[candidate],
-        text="Here is the JSON requested:\n```json",
-    )
+    response = self._response("Here is the JSON requested:\n```json")
     score = self.pipeline.gemini_score_response(response)
     self.assertIsNone(score)
 
@@ -1229,8 +1287,10 @@ class TestGeminiScoreDataset(unittest.TestCase):
       captured_calls.append(config)
       cand = MagicMock()
       cand.logprobs_result.top_candidates = [
-          MagicMock(candidates=[MagicMock(token="No", log_prob=-0.01)])
+          _LogprobStep([_LogprobCandidate("No", -0.01)])
       ]
+      cand.logprobs_result.chosen_candidates = []
+      cand.avg_logprobs = None
       return MagicMock(candidates=[cand], text='"No"')
 
     client = MagicMock()
@@ -1238,7 +1298,8 @@ class TestGeminiScoreDataset(unittest.TestCase):
 
     scores = self.pipeline.gemini_score_dataset(client, dataset, script_args)
     self.assertEqual(len(captured_calls), 1)
-    self.assertEqual(scores, [1.0])
+    # Only 'No' was in the top-k, so the score is exp(-0.01), not a hard 1.0.
+    self.assertAlmostEqual(scores[0], math.exp(-0.01), places=6)
 
     call_config = captured_calls[0]
     from google.genai import types as genai_types
@@ -1261,13 +1322,13 @@ class TestGeminiScoreDataset(unittest.TestCase):
     """Builds a response carrying both logprobs, i.e. a continuous score."""
     cand = MagicMock()
     cand.logprobs_result.top_candidates = [
-        MagicMock(
-            candidates=[
-                MagicMock(token="No", log_prob=p_no),
-                MagicMock(token="Yes", log_prob=-4.0),
-            ]
-        )
+        _LogprobStep([
+            _LogprobCandidate("No", p_no),
+            _LogprobCandidate("Yes", -4.0),
+        ])
     ]
+    cand.logprobs_result.chosen_candidates = []
+    cand.avg_logprobs = None
     return MagicMock(candidates=[cand], text='"No"')
 
   def _text_only_response(self):
