@@ -157,6 +157,17 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
                 if not line.strip():
                     continue
                 row = json.loads(line)
+                if (
+                    row.get("class_hall") is None
+                    and row.get("hallucination_label") is None
+                ):
+                    row["class_hall"] = (
+                        "Yes"
+                        if self._has_hallucination_spans(row.get("labels"))
+                        else "No"
+                    )
+                if "labels" in row and not isinstance(row["labels"], str):
+                    row["labels"] = json.dumps(row["labels"])
                 sp = row.get("split")
                 if sp == "train":
                     train_resp.append(row)
@@ -304,10 +315,58 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
                 s_id = row.get("source_id")
                 src_meta = source_map.get(s_id, source_map.get(str(s_id), {}))
                 combined = {**src_meta, **row}
+                if (
+                    combined.get("class_hall") is None
+                    and combined.get("hallucination_label") is None
+                    and "labels" in combined
+                ):
+                    combined["class_hall"] = (
+                        "Yes"
+                        if RagtruthTaskProcessor._has_hallucination_spans(
+                            combined.get("labels")
+                        )
+                        else "No"
+                    )
+                if "labels" in combined and not isinstance(
+                    combined["labels"], str
+                ):
+                    combined["labels"] = json.dumps(combined["labels"])
                 merged_rows.append(combined)
             merged_splits[split_name] = Dataset.from_list(merged_rows)
 
         return DatasetDict(merged_splits)
+
+    @classmethod
+    def _has_hallucination_spans(cls, labels: Any) -> bool:
+        """Determine whether a RAGTruth ``labels`` field contains hallucination spans.
+
+        Handles raw Python lists of span dicts (``[{"start": 0, ...}]``),
+        JSON-encoded span lists (``"[]"``), and Hugging Face ``datasets``
+        ``Sequence(struct)`` column representations
+        (``{"start": [], "end": [], "text": [], ...}``), where ``len(labels)``
+        equals the number of struct keys even when the span list is empty.
+        """
+        if not labels:
+            return False
+        if isinstance(labels, dict):
+            for v in labels.values():
+                if isinstance(v, (list, tuple)) and len(v) > 0:
+                    return True
+            return False
+        if isinstance(labels, str):
+            stripped = labels.strip()
+            if not stripped or stripped in ("[]", "{}", "null", "None", "none"):
+                return False
+            if stripped.startswith(("[", "{")):
+                try:
+                    parsed = json.loads(stripped)
+                    return cls._has_hallucination_spans(parsed)
+                except Exception:
+                    return True
+            return True
+        if isinstance(labels, (list, tuple)):
+            return len(labels) > 0
+        return bool(labels)
 
     @staticmethod
     def _normalize_context(base_content: Any) -> str:
@@ -783,7 +842,7 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
                         else "No"
                     )
                 else:
-                    has_hall = bool(labels and len(labels) > 0)
+                    has_hall = self._has_hallucination_spans(labels)
                     class_hall = "Yes" if has_hall else "No"
 
                 label = 0 if class_hall == "Yes" else 1
@@ -797,7 +856,10 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
                 out["label"] = label
                 return out
 
-            processed[split] = filtered_split.map(process_entry)
+            mapped_split = filtered_split.map(process_entry)
+            if "labels" in mapped_split.column_names:
+                mapped_split = mapped_split.remove_columns("labels")
+            processed[split] = mapped_split
 
         return DatasetDict(processed)
 
@@ -808,6 +870,8 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
 
         if "response" in faithful.column_names:
             faithful = faithful.rename_column("response", "completion")
+        if "labels" in faithful.column_names:
+            faithful = faithful.remove_columns("labels")
 
         seed = int(self._arg_value("seed", 12345))
         val_fraction = float(self._arg_value("sft_val_fraction", 0.15))
@@ -831,6 +895,12 @@ class RagtruthTaskProcessor(BaseTaskProcessor):
             lambda e: self._group_key(e) not in val_keys
         )
         val_split = faithful.filter(lambda e: self._group_key(e) in val_keys)
+
+        if len(sft_pool) > 0 and len(faithful) == 0:
+            raise RuntimeError(
+                "SFT split is empty (0 faithful samples found in non-empty SFT block). "
+                "Check hallucination span label parsing in _preprocess_data."
+            )
 
         return DatasetDict({"train": train_split, "test": val_split})
 

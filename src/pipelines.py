@@ -1270,17 +1270,30 @@ class SFTPipeline(Pipeline):
 
   def load_data(self) -> None:
     train_dataset = load_dataset(self.args.dataset_repo_id, split="train")
+    test_dataset = load_dataset(self.args.dataset_repo_id, split="test")
+    if "labels" in train_dataset.column_names and "completion" in train_dataset.column_names:
+      train_dataset = train_dataset.remove_columns(["labels"])
+    if "labels" in test_dataset.column_names and "completion" in test_dataset.column_names:
+      test_dataset = test_dataset.remove_columns(["labels"])
+
+    if len(train_dataset) == 0:
+      raise RuntimeError(
+          f"SFT training dataset '{self.args.dataset_repo_id}' has 0 samples in "
+          f"split='train'. Please re-run './scripts/data_processing.sh "
+          f"{self.args.task_name}' to regenerate and re-upload the dataset."
+      )
+
     if (
         getattr(self.args, "sft_data_fraction", None) is not None
         and 0.0 < self.args.sft_data_fraction < 1.0
     ):
       train_dataset = train_dataset.shuffle(seed=self.training_args.seed)
-      num_samples = int(len(train_dataset) * self.args.sft_data_fraction)
+      num_samples = max(1, int(len(train_dataset) * self.args.sft_data_fraction))
       train_dataset = train_dataset.select(range(num_samples))
 
     self.data = {
         "train": train_dataset,
-        "test": load_dataset(self.args.dataset_repo_id, split="test"),
+        "test": test_dataset,
     }
 
   def process_data(self) -> None:
@@ -1448,12 +1461,24 @@ class RewardModelPipeline(Pipeline):
       )
 
     for split in self.data.keys():
+      if (
+          "labels" in self.data[split].column_names
+          and "label" in self.data[split].column_names
+      ):
+        self.data[split] = self.data[split].remove_columns(["labels"])
       self.data[split] = self.data[split].map(encode, batched=True)
       self.data[split].set_format("torch")
 
       new_features = self.data[split].features.copy()
       new_features["label"] = Value("int32")
       self.data[split] = self.data[split].cast(new_features)
+
+    if "train" in self.data and len(self.data["train"]) == 0:
+      raise RuntimeError(
+          f"Reward model training dataset '{self.args.dataset_repo_id}' has 0 "
+          f"samples in split='train'. Please re-run "
+          f"'./scripts/data_processing.sh {self.args.task_name}'."
+      )
 
   def setup_model(self) -> None:
     register_gemma4_for_sequence_classification(self.args.model_repo_id)

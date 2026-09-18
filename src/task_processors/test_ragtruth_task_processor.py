@@ -484,6 +484,52 @@ class TestRagtruthTaskProcessorPreprocessing(unittest.TestCase):
     test_split = preprocessed["test"]
     self.assertEqual(test_split[0]["class_hall"], "No")
     self.assertEqual(test_split[0]["label"], 1)
+    self.assertNotIn("labels", train_split.column_names)
+    self.assertNotIn("labels", test_split.column_names)
+
+  def test_preprocess_data_sequence_struct_labels_and_column_removal(self):
+    """Verify HF datasets Sequence(struct) dict format for 'labels' is parsed accurately."""
+    raw_data = DatasetDict({
+        "train": Dataset.from_list([
+            {
+                "source_id": "s1",
+                "task_type": "QA",
+                "base_content": "Passage 1.",
+                "question": "Q1?",
+                "response": "Faithful response.",
+                "labels": {
+                    "start": [],
+                    "end": [],
+                    "text": [],
+                    "label_type": [],
+                    "meta": [],
+                },
+            },
+            {
+                "source_id": "s2",
+                "task_type": "QA",
+                "base_content": "Passage 2.",
+                "question": "Q2?",
+                "response": "Hallucinated response.",
+                "labels": {
+                    "start": [0],
+                    "end": [12],
+                    "text": ["Hallucinated"],
+                    "label_type": ["Evident Conflict"],
+                    "meta": [""],
+                },
+            },
+        ]),
+        "test": Dataset.from_list([]),
+    })
+
+    preprocessed = self.processor._preprocess_data(raw_data)
+    train_split = preprocessed["train"]
+    self.assertEqual(train_split[0]["class_hall"], "No")
+    self.assertEqual(train_split[0]["label"], 1)
+    self.assertEqual(train_split[1]["class_hall"], "Yes")
+    self.assertEqual(train_split[1]["label"], 0)
+    self.assertNotIn("labels", train_split.column_names)
 
   def test_get_target_subtask(self):
     proc_qa = RagtruthTaskProcessor(Mock(task_name="ragtruth-qa"))
