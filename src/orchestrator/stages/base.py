@@ -82,6 +82,37 @@ class CampaignContext:
         flavors.stage_id_for_flavor(self.config, "perl", flavor)
     )
 
+  def perl_rollout_temperature_for(
+      self, flavor: Optional[str]
+  ) -> Optional[float]:
+    """Returns the sampling temperature one PE-RL branch was trained at.
+
+    Read from the winning trial's recorded hyperparameters - the same
+    ``best_params`` that ``materialize_and_push`` retrained the published
+    checkpoint with - so the value is by construction the one that produced
+    the policy, not whatever the sweep file currently says.
+
+    Args:
+      flavor: The reward-model dataset flavor naming the branch, or None for
+        an unbranched campaign.
+
+    Returns:
+      The rollout temperature, or None when the branch never ran or its sweep
+      did not search temperature (in which case it was pinned in the sweep
+      file's ``command`` block and is not recorded per trial).
+    """
+    record = self.state.stages.get(
+        flavors.stage_id_for_flavor(self.config, "perl", flavor)
+    )
+    if record is None:
+      return None
+    value = (record.best_params or {}).get("temperature")
+    # Explicit isinstance rather than truthiness: a pinned temperature of 0.0
+    # is falsy but is a perfectly good answer, and must not read as absent.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+      return None
+    return float(value)
+
   @property
   def calibrated_threshold(self) -> Optional[float]:
     """Returns the decision threshold the ``autorater`` stage fitted.

@@ -181,7 +181,30 @@ class EvalStageConfig:
   autorater_num_samples: int = 1
   writer_num_fewshot: int = 0
   max_tokens: int = 250
+  #: Decoding temperature for the SFT baseline, and for every target when
+  #: ``match_perl_rollout_temperature`` is off. 0.0 means greedy: SFT has no
+  #: training temperature of its own (``sweep_sft.yaml`` does not search one),
+  #: so there is nothing for it to match and the deterministic decode is the
+  #: cleanest reference point.
   temperature: float = 0.0
+  #: Score each PE-RL policy at the rollout temperature its winning trial was
+  #: trained with, rather than at ``temperature``.
+  #:
+  #: ``sweep_perl.yaml`` searches ``temperature`` over {0.3, 0.6, 1.0}, and
+  #: RLOO optimises the reward under samples drawn at that temperature. Scoring
+  #: the resulting policy greedily measures a decode it was never optimised
+  #: for, so a real reward improvement can fail to show up in the evaluation.
+  #:
+  #: Because temperature moves the hallucination rate on its own, matching it
+  #: would make ``delta`` conflate decoding with weights. To prevent that the
+  #: stage also re-scores the SFT baseline at each distinct rollout
+  #: temperature in play, and every delta is taken against the baseline
+  #: sampled the same way. That costs one extra generation and autorating pass
+  #: per distinct temperature.
+  #:
+  #: Set to False to put every target back on a single fixed ``temperature``,
+  #: which is what campaigns run before this option did.
+  match_perl_rollout_temperature: bool = True
   top_p: float = 1.0
   top_k: int = 0
   compute_bertscore: bool = True

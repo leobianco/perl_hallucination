@@ -15,7 +15,14 @@ from src.orchestrator import flavors
 
 #: Bookkeeping entries that are identical by construction; a delta on them is
 #: pure noise in the report.
-NO_DELTA: FrozenSet[str] = frozenset({"num_samples", "num_examples", "seed"})
+NO_DELTA: FrozenSet[str] = frozenset({
+    "num_samples",
+    "num_examples",
+    "seed",
+    # Not a measurement but the condition the measurement was taken under.
+    # A "delta" on it would read as if decoding had improved by 0.6.
+    "decoding_temperature",
+})
 
 #: Metrics where a *lower* value is better. Used both to sign the SFT->PE-RL
 #: delta and to decide which branch of a fan-out campaign is the headline.
@@ -32,6 +39,21 @@ LOWER_IS_BETTER: FrozenSet[str] = frozenset({
 BASELINE_LABEL: str = "sft"
 KIND_TITLES: Dict[str, str] = {"sft": "SFT", "perl": "PE-RL"}
 
+#: Separates a stage id from the decoding temperature it was scored at, as in
+#: ``sft@t0.6``. PE-RL labels are deliberately left bare: a branch is scored at
+#: exactly one temperature (its own rollout temperature), so tagging it would
+#: rename every existing ``perl/`` key for no new information. Only the extra
+#: SFT baselines - the ones evaluated a second time to match a policy - carry
+#: the marker, which is also what keeps a single-temperature campaign's metric
+#: keys byte-identical to those of every campaign run before this feature.
+TEMPERATURE_MARKER: str = "@t"
+
+#: Per-target metric recording the temperature its completions were sampled
+#: at. Written for every target so that the report states the decoding regime
+#: outright, and so that :func:`baseline_label_for` can pair a policy with the
+#: baseline measured under the same regime without consulting the config.
+DECODING_TEMPERATURE_KEY: str = "decoding_temperature"
+
 #: Evaluated policies in report order, with their display names. Retained for
 #: callers that only ever deal with unbranched campaigns; prefer
 #: :func:`present_targets`, which also sees the branches.
@@ -45,6 +67,7 @@ METRIC_ORDER: Tuple[str, ...] = (
     "bertscore_f1",
     "perplexity",
     "num_samples",
+    "decoding_temperature",
 )
 
 #: Summary keys with this prefix describe *which model* produced the
@@ -67,6 +90,116 @@ TABULATED_AUDIT_KEYS: FrozenSet[str] = frozenset({
 })
 
 
+def format_temperature(value: float) -> str:
+  """Renders a temperature as the canonical token used in labels and titles.
+
+  Args:
+    value: The sampling temperature.
+
+  Returns:
+    A short decimal string, at least one place after the point, with no
+    trailing zeros beyond that: 0.6, 1.0, 0.25. Used both to build labels and
+    to compare them, so that two temperatures that print the same are treated
+    as the same regime regardless of float round-tripping.
+  """
+  text = f"{float(value):.4f}".rstrip("0")
+  if text.endswith("."):
+    text += "0"
+  return text
+
+
+def make_target_label(stage_id: str, temperature: Optional[float]) -> str:
+  """Tags ``stage_id`` with the temperature it is being scored at.
+
+  Args:
+    stage_id: The bare stage id, e.g. ``sft``.
+    temperature: The decoding temperature, or None to leave the label bare.
+
+  Returns:
+    ``sft@t0.6``, or ``stage_id`` unchanged when ``temperature`` is None.
+  """
+  if temperature is None:
+    return stage_id
+  return f"{stage_id}{TEMPERATURE_MARKER}{format_temperature(temperature)}"
+
+
+def split_target_label(label: str) -> Tuple[str, Optional[float]]:
+  """Splits a target label into its stage id and temperature tag.
+
+  Args:
+    label: A target label, tagged or not.
+
+  Returns:
+    ``('sft', 0.6)`` for ``sft@t0.6``; ``('perl:organic', None)`` for an
+    untagged label. An unparseable tag is returned as no tag rather than
+    raising: a metric map is sometimes hand-edited, and a malformed label
+    should cost its temperature row, not the whole report.
+  """
+  if TEMPERATURE_MARKER not in label:
+    return label, None
+  stage_id, _, tag = label.partition(TEMPERATURE_MARKER)
+  try:
+    return stage_id, float(tag)
+  except ValueError:
+    return label, None
+
+
+def target_kind(label: str) -> str:
+  """Returns the stage kind of a target label, ignoring flavor and tag."""
+  stage_id, _ = split_target_label(label)
+  kind, _ = flavors.split_stage_id(stage_id)
+  return kind
+
+
+def is_baseline(label: str) -> bool:
+  """True when ``label`` is an SFT row rather than a trained policy.
+
+  Every SFT row is a baseline, including the extra ones evaluated at a
+  policy's rollout temperature. Getting this wrong gives ``sft@t0.6`` a delta
+  column against itself.
+
+  Args:
+    label: A target label.
+
+  Returns:
+    Whether the label names the campaign's baseline.
+  """
+  return target_kind(label) == BASELINE_LABEL
+
+
+def baseline_label_for(
+    metrics: Dict[str, Any], label: str
+) -> Optional[str]:
+  """Returns the baseline ``label`` should be compared against.
+
+  A policy is compared against the SFT row sampled at the *same* temperature,
+  so that the difference between them is the weights and nothing else. When
+  no matching baseline was evaluated - an older state file, or a campaign run
+  with temperature matching switched off - the plain ``sft`` row is used and
+  the comparison silently spans two decoding regimes, which is exactly what
+  the extra baselines exist to avoid.
+
+  Args:
+    metrics: The eval stage metric map.
+    label: The policy to find a baseline for.
+
+  Returns:
+    The baseline's label, or None when the campaign has no SFT row at all.
+  """
+  baselines = [name for name in target_labels(metrics) if is_baseline(name)]
+  if not baselines:
+    return None
+  own = metrics.get(f"{label}/{DECODING_TEMPERATURE_KEY}")
+  if isinstance(own, (int, float)) and not isinstance(own, bool):
+    wanted = format_temperature(own)
+    for name in baselines:
+      theirs = metrics.get(f"{name}/{DECODING_TEMPERATURE_KEY}")
+      if isinstance(theirs, (int, float)) and not isinstance(theirs, bool):
+        if format_temperature(theirs) == wanted:
+          return name
+  return BASELINE_LABEL if BASELINE_LABEL in baselines else baselines[0]
+
+
 def delta_label(target_label: str) -> str:
   """Returns the namespace holding ``target_label``'s improvement over SFT.
 
@@ -79,26 +212,45 @@ def delta_label(target_label: str) -> str:
     namespaces rather than one that silently holds whichever branch was
     scored last.
   """
-  _, flavor = flavors.split_stage_id(target_label)
+  stage_id, _ = split_target_label(target_label)
+  _, flavor = flavors.split_stage_id(stage_id)
   return "delta" if not flavor else f"delta{flavors.SEPARATOR}{flavor}"
 
 
 def target_title(target_label: str) -> str:
   """Returns the display name of an evaluated policy."""
-  kind, flavor = flavors.split_stage_id(target_label)
+  stage_id, temperature = split_target_label(target_label)
+  kind, flavor = flavors.split_stage_id(stage_id)
   base = KIND_TITLES.get(kind, kind.upper())
-  return f"{base} ({flavors.flavor_title(flavor)})" if flavor else base
+  qualifiers = []
+  if flavor:
+    qualifiers.append(flavors.flavor_title(flavor))
+  if temperature is not None:
+    qualifiers.append(f"T={format_temperature(temperature)}")
+  return f"{base} ({', '.join(qualifiers)})" if qualifiers else base
 
 
-def _target_sort_key(target_label: str) -> Tuple[int, int, str]:
-  """Orders policies as SFT first, then PE-RL branches in flavor order."""
-  kind, flavor = flavors.split_stage_id(target_label)
+def _target_sort_key(target_label: str) -> Tuple[int, float, int, str]:
+  """Orders SFT rows first (untagged, then by temperature), then PE-RL.
+
+  Args:
+    target_label: The label to rank.
+
+  Returns:
+    A sort key placing every baseline ahead of every policy, the untagged
+    baseline ahead of its warmer siblings, and the branches in flavor order.
+  """
+  stage_id, temperature = split_target_label(target_label)
+  kind, flavor = flavors.split_stage_id(stage_id)
   kind_rank = 0 if kind == BASELINE_LABEL else 1
+  # The untagged row is the campaign's nominal baseline and leads the table;
+  # -1.0 sorts it ahead of any real temperature, including 0.0.
+  temperature_rank = -1.0 if temperature is None else float(temperature)
   if flavor in flavors.RM_DATASET_FLAVORS:
     flavor_rank = flavors.RM_DATASET_FLAVORS.index(flavor)
   else:
     flavor_rank = len(flavors.RM_DATASET_FLAVORS)
-  return (kind_rank, flavor_rank, flavor or "")
+  return (kind_rank, temperature_rank, flavor_rank, flavor or "")
 
 
 def target_labels(metrics: Dict[str, Any]) -> List[str]:
@@ -121,8 +273,7 @@ def target_labels(metrics: Dict[str, Any]) -> List[str]:
     if "/" not in text:
       continue
     label = text.split("/", 1)[0]
-    kind, _ = flavors.split_stage_id(label)
-    if kind in KIND_TITLES:
+    if target_kind(label) in KIND_TITLES:
       found.add(label)
   return sorted(found, key=_target_sort_key)
 
@@ -147,7 +298,7 @@ def headline_metric(
     The metric value, or None when absent.
   """
   policies = [
-      label for label in target_labels(metrics) if label != BASELINE_LABEL
+      label for label in target_labels(metrics) if not is_baseline(label)
   ]
   values = []
   for label in policies:
@@ -205,7 +356,7 @@ def comparison_rows(
     comparison is unavailable.
   """
   targets = target_labels(metrics)
-  policies = [label for label in targets if label != BASELINE_LABEL]
+  policies = [label for label in targets if not is_baseline(label)]
   rows = []
   for name in metric_names(metrics):
     values = [metrics.get(f"{label}/{name}") for label in targets]
@@ -217,6 +368,26 @@ def comparison_rows(
       deltas.append(delta)
     rows.append((name, values, deltas))
   return rows
+
+
+def format_row_value(name: str, value: Any) -> str:
+  """Formats a value for the comparison table, given which metric it is.
+
+  Everything in that table is a measurement rendered to four decimals, except
+  the decoding temperature, which is a *setting*. Printing it as ``0.3000``
+  invites the reader to treat it as something that was measured.
+
+  Args:
+    name: The bare metric name.
+    value: The value to render.
+
+  Returns:
+    The formatted value.
+  """
+  if name == DECODING_TEMPERATURE_KEY and isinstance(value, (int, float)):
+    if not isinstance(value, bool):
+      return format_temperature(value)
+  return format_value(value)
 
 
 def format_value(value: Any) -> str:

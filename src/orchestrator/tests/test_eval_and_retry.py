@@ -52,19 +52,35 @@ class TestEvalTargets(unittest.TestCase):
       )
     return EvalStage(_context(config, state, state_path)), state
 
+  def _pairs(self, stage):
+    """Returns the (label, repo) of each pass, dropping the temperature.
+
+    These tests are about *which* policies get scored and in what order;
+    temperature matching has its own suite. With no ``best_params`` recorded
+    every target falls back to ``eval.temperature``, so no extra baseline is
+    scheduled here.
+
+    Args:
+      stage: The eval stage to resolve.
+
+    Returns:
+      One (label, model repo id) pair per pass.
+    """
+    return [(t.label, t.model_repo_id) for t in stage.resolve_targets()]
+
   def test_both_policies_are_evaluated_in_order(self):
     stage, _ = self._stage(sft="u/sft_ckpt", perl="u/perl_ckpt")
     self.assertEqual(
-        stage.resolve_targets(),
+        self._pairs(stage),
         [("sft", "u/sft_ckpt"), ("perl", "u/perl_ckpt")],
     )
 
   def test_base_model_is_never_a_target(self):
     stage, _ = self._stage(sft="u/sft_ckpt")
     targets = stage.resolve_targets()
-    self.assertEqual(targets, [("sft", "u/sft_ckpt")])
+    self.assertEqual(self._pairs(stage), [("sft", "u/sft_ckpt")])
     self.assertNotIn(
-        stage.config.base_model, [repo for _, repo in targets]
+        stage.config.base_model, [t.model_repo_id for t in targets]
     )
 
   def test_no_policy_raises_instead_of_scoring_the_base_model(self):
@@ -75,7 +91,7 @@ class TestEvalTargets(unittest.TestCase):
 
   def test_duplicate_repo_is_evaluated_once(self):
     stage, _ = self._stage(sft="u/same", perl="u/same")
-    self.assertEqual(stage.resolve_targets(), [("sft", "u/same")])
+    self.assertEqual(self._pairs(stage), [("sft", "u/same")])
 
   def test_dry_run_produces_namespaced_metrics_and_deltas(self):
     stage, _ = self._stage(sft="u/sft_ckpt", perl="u/perl_ckpt")

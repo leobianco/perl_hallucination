@@ -68,6 +68,28 @@ def _selection_lines(result: StageResult, metric_label: str) -> List[str]:
 
 
 
+def _metric_text(value: Optional[float], spec: str = ".5f") -> str:
+  """Formats a stage's headline metric, tolerating a missing one.
+
+  ``StageResult.best_metric_val`` is optional, and a stage can legitimately
+  complete without it - a resumed state file written before the field existed,
+  or a sweep whose metric query came back empty after the checkpoint was
+  already published. Formatting None raises, and because these lines are
+  assembled for the whole document at once, that used to lose the *entire*
+  report rather than one bullet.
+
+  Args:
+    value: The metric, if it was recorded.
+    spec: Format spec applied when it was.
+
+  Returns:
+    The formatted number, or a dash.
+  """
+  if isinstance(value, bool) or not isinstance(value, (int, float)):
+    return "-"
+  return format(float(value), spec)
+
+
 class CampaignReporter:
   """Generates publication-ready Markdown summaries and interactive reports."""
 
@@ -294,7 +316,7 @@ class CampaignReporter:
           "### 2.1. Supervised Fine-Tuning (SFT)",
           f"* **Sweep**: {sft_sw}",
           f"* **Winning Run ID**: `{sft_res.best_run_id}`",
-          f"* **Best Eval Loss**: `{sft_res.best_metric_val:.5f}`",
+          f"* **Best Eval Loss**: `{_metric_text(sft_res.best_metric_val)}`",
           *_selection_lines(sft_res, "eval loss"),
           f"* **Hugging Face Model**: [{sft_res.model_repo_id}](https://huggingface.co/{sft_res.model_repo_id})",
           "* **Optimal Hyperparameters**:",
@@ -328,7 +350,7 @@ class CampaignReporter:
           f" Reward Model (RM){rm_suffix}",
           f"* **Sweep**: {rm_sw}",
           f"* **Winning Run ID**: `{rm_res.best_run_id}`",
-          f"* **Best ROC-AUC**: `{rm_res.best_metric_val:.5f}`",
+          f"* **Best ROC-AUC**: `{_metric_text(rm_res.best_metric_val)}`",
           *_selection_lines(rm_res, "ROC-AUC"),
           f"* **Hugging Face Model**: [{rm_res.model_repo_id}](https://huggingface.co/{rm_res.model_repo_id})",
           "* **Optimal Hyperparameters**:",
@@ -362,7 +384,7 @@ class CampaignReporter:
           f" Parameter-Efficient Reinforcement Learning (PE-RL){perl_suffix}",
           f"* **Sweep**: {perl_sw}",
           f"* **Winning Run ID**: `{perl_res.best_run_id}`",
-          f"* **Best Mean Reward**: `{perl_res.best_metric_val:.5f}`",
+          f"* **Best Mean Reward**: `{_metric_text(perl_res.best_metric_val)}`",
           *_selection_lines(perl_res, "mean reward"),
           f"* **Hugging Face Model**: [{perl_res.model_repo_id}](https://huggingface.co/{perl_res.model_repo_id})",
           "* **Optimal Hyperparameters**:",
@@ -389,11 +411,13 @@ class CampaignReporter:
       if targets:
         # Δ is signed so that positive always means PE-RL improved on SFT,
         # regardless of whether the metric is minimized or maximized. One Δ
-        # column per PE-RL branch; they all share the same SFT baseline.
+        # column per PE-RL branch. Every SFT row is a baseline and gets no Δ
+        # of its own - including the extra ones scored at a policy's rollout
+        # temperature, which would otherwise be compared against themselves.
         policies = [
             (label, title)
             for label, title in targets
-            if label != eval_metrics.BASELINE_LABEL
+            if not eval_metrics.is_baseline(label)
         ]
         delta_heads = [
             "Δ" if len(policies) == 1 else f"Δ {title}"
@@ -411,17 +435,20 @@ class CampaignReporter:
             + "".join(" | ---:" for _ in delta_heads)
             + " |"
         )
-        lines.extend([
-            "* **Per-policy results** (Δ = PE-RL improvement over SFT):",
-            "",
-            header,
-            divider,
-        ])
+        baselines = [
+            label for label, _ in targets if eval_metrics.is_baseline(label)
+        ]
+        caption = "* **Per-policy results** (Δ = PE-RL improvement over SFT"
+        if len(baselines) > 1:
+          caption += ", each against the SFT column sampled at its own"
+          caption += " temperature"
+        caption += "):"
+        lines.extend([caption, "", header, divider])
         for name, values, deltas in eval_metrics.comparison_rows(
             eval_res.metrics
         ):
           cells = " | ".join(
-              f"**{eval_metrics.format_value(v)}**" for v in values
+              f"**{eval_metrics.format_row_value(name, v)}**" for v in values
           )
           delta_cells = "".join(
               f" | {d:+.4f}" if isinstance(d, float) else " | -"

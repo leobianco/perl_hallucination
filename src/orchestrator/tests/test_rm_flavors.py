@@ -376,6 +376,21 @@ class BranchedEvaluationTest(unittest.TestCase):
       )
     return EvalStage(_context(config, state))
 
+  def _pairs(self, stage):
+    """Returns each pass as (label, repo), dropping the temperature.
+
+    No ``best_params`` are recorded by this fixture, so every target falls
+    back to ``eval.temperature`` and the plan has one pass per policy. See
+    test_eval_temperature.py for the matched-baseline behaviour.
+
+    Args:
+      stage: The eval stage to resolve.
+
+    Returns:
+      One (label, model repo id) pair per pass.
+    """
+    return [(t.label, t.model_repo_id) for t in stage.resolve_targets()]
+
   def test_every_branch_is_a_target(self):
     stage = self._stage(
         [flavors.ORGANIC, flavors.SYNTHETIC_STRUCT],
@@ -385,7 +400,7 @@ class BranchedEvaluationTest(unittest.TestCase):
         },
     )
     self.assertEqual(
-        stage.resolve_targets(),
+        self._pairs(stage),
         [
             ("sft", "u/sft"),
             ("perl:organic", "u/policy_org"),
@@ -396,7 +411,7 @@ class BranchedEvaluationTest(unittest.TestCase):
   def test_single_flavor_targets_are_unchanged(self):
     stage = self._stage([flavors.ORGANIC], {"perl": "u/policy"})
     self.assertEqual(
-        stage.resolve_targets(), [("sft", "u/sft"), ("perl", "u/policy")]
+        self._pairs(stage), [("sft", "u/sft"), ("perl", "u/policy")]
     )
 
   def test_each_branch_gets_its_own_delta_namespace(self):

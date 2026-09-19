@@ -125,6 +125,53 @@ this repository has settled on. Note that calibration deliberately has no
 configuration of its own - it reads `eval_stage`, because a threshold fitted
 against a 4-shot judge does not apply to a 2-shot one.
 
+### 4c. Decoding temperature: PE-RL is scored the way it was trained
+
+`sweep_perl.yaml` searches the rollout `temperature` over `{0.3, 0.6, 1.0}`,
+and RLOO optimises the reward under samples drawn at whatever value the
+winning trial used. Scoring the resulting policy greedily measures a decode it
+was never optimised for, so a genuine reward improvement can simply fail to
+appear in the evaluation.
+
+By default (`match_perl_rollout_temperature: true`) each PE-RL policy is
+therefore generated at **its own** rollout temperature, read from the winning
+trial's recorded hyperparameters - the same `best_params` that were used to
+retrain the published checkpoint.
+
+Temperature moves the hallucination rate on its own, so matching it would make
+`delta` conflate decoding with weights. To prevent that, the stage **also
+re-scores the SFT baseline at each distinct rollout temperature in play**, and
+every delta is taken against the baseline sampled the same way:
+
+| Target | Temperature | Compared against |
+| :--- | ---: | :--- |
+| `sft` | `eval_stage.temperature` (0.0) | - |
+| `sft@t0.6` | 0.6 | - |
+| `perl` | 0.6 | `sft@t0.6` |
+
+The greedy `sft` row is kept because it is the cleanest reference point and
+the one earlier campaigns reported. SFT itself has no training temperature to
+match - `sweep_sft.yaml` does not search one.
+
+Costs and caveats:
+
+* **One extra generation + autorating pass per distinct rollout temperature.**
+  Branches that won at the same temperature share one extra baseline. A policy
+  that happened to train at `eval_stage.temperature` adds nothing at all.
+* **Sampled rows carry sampling noise** that the greedy row does not, even
+  with `seed` fixed. At `max_eval_samples: 1000` the mean is stable, but do
+  not read the last decimal of a `T=1.0` row as precise.
+* **The temperature is tabulated**, as a `decoding_temperature` row in the
+  comparison table, so a report always states which regime each column was
+  measured under.
+* If a sweep pins `temperature` in its `command:` block rather than under
+  `parameters:`, it is never logged per trial; the stage falls back to
+  `eval_stage.temperature` and says so in the log.
+
+Set `match_perl_rollout_temperature: false` to put every target back on a
+single fixed temperature, which is exactly what campaigns run before this
+option did - same passes, same metric keys, no `@t` labels.
+
 ### 5. Choosing the reward model's training dataset
 
 The reward model can be trained on human-labelled hallucinations
@@ -656,6 +703,13 @@ eval_stage:
   # ROC-AUC below which the judge is flagged as too weak to trust. Advisory:
   # it warns in the dashboard and the report, it does not stop the campaign.
   min_autorater_auc: 0.85
+  # Decoding temperature for the SFT baseline. 0.0 is greedy.
+  temperature: 0.0
+  # Score each PE-RL policy at the rollout temperature its winning trial
+  # trained at, and re-score the SFT baseline at that temperature too so the
+  # delta is not part decoding. Costs one extra pass per distinct temperature.
+  # See section 4c. Set false to put every target on `temperature` above.
+  match_perl_rollout_temperature: true
 
 reporting:
   generate_markdown: true

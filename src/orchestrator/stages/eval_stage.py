@@ -9,10 +9,17 @@ would cost a third of the eval budget for a number that never changes.
 Each target goes through the same two phases as ``scripts/evaluator.sh``:
 generation of test completions, then Gemini autorating plus BertScore and
 perplexity.
+
+A target is a (policy, temperature) pair rather than just a policy. PE-RL
+searches its rollout temperature, and a policy is scored at the temperature it
+was trained to sample at; the SFT baseline is additionally re-scored at each
+of those temperatures so that no delta ever spans two decoding regimes. See
+``EvalStageConfig.match_perl_rollout_temperature``.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -42,6 +49,24 @@ NO_DELTA = eval_metrics.NO_DELTA
 LOWER_IS_BETTER = eval_metrics.LOWER_IS_BETTER
 
 
+@dataclasses.dataclass(frozen=True)
+class EvalTarget:
+  """One generation-and-scoring pass: a policy at a decoding temperature.
+
+  Attributes:
+    label: Metric namespace and display key, e.g. ``sft``, ``sft@t0.6`` or
+      ``perl:organic``.
+    model_repo_id: The LoRA adapter to serve.
+    temperature: Sampling temperature for generation. Part of the completions
+      repo name, so two targets differing only here keep separate datasets and
+      neither has to be regenerated when the other is.
+  """
+
+  label: str
+  model_repo_id: str
+  temperature: float
+
+
 class EvalStage(BaseStage):
   """Orchestrates test completion generation and multi-metric autorating."""
 
@@ -60,7 +85,7 @@ class EvalStage(BaseStage):
       return StageResult(status=StageStatus.SKIPPED)
 
     targets = self.resolve_targets()
-    primary_model = targets[-1][1]
+    primary_model = targets[-1].model_repo_id
 
     logger.info(
         "=== Starting Evaluation Stage for task: %s ===", self.config.task_name
@@ -69,11 +94,16 @@ class EvalStage(BaseStage):
       live_line_callback(
           f"=== Starting Evaluation Stage for task: {self.config.task_name} ==="
       )
-      for label, repo_id in targets:
+      for target in targets:
         # No brackets: the console strips bracketed spans as style tags,
         # which used to swallow the "[sft]" label entirely.
-        live_line_callback(f"  Target {label}: {repo_id}")
+        live_line_callback(
+            f"  Target {target.label}: {target.model_repo_id} "
+            f"at temperature {target.temperature}"
+        )
       live_line_callback(f"  {self.threshold_provenance()}")
+      for line in self.temperature_notes(targets):
+        live_line_callback(f"  {line}")
 
     if self.config.dry_run:
       return self._dry_run_result(targets, primary_model, live_line_callback)
@@ -82,11 +112,11 @@ class EvalStage(BaseStage):
     # call, so an interrupted campaign must not pay for the same model twice.
     metrics: Dict[str, Any] = dict(self.previous_metrics())
 
-    for index, (label, repo_id) in enumerate(targets, start=1):
-      if self.is_target_scored(label, metrics):
+    for index, target in enumerate(targets, start=1):
+      if self.is_target_scored(target.label, metrics):
         message = (
-            f"[RESUME] {label.upper()} ({repo_id}) was already scored; "
-            "keeping the recorded metrics."
+            f"[RESUME] {target.label.upper()} ({target.model_repo_id}) was "
+            "already scored; keeping the recorded metrics."
         )
         logger.info(message)
         if live_line_callback:
@@ -94,8 +124,7 @@ class EvalStage(BaseStage):
         continue
 
       target_metrics = self._evaluate_target(
-          label=label,
-          model_repo_id=repo_id,
+          target=target,
           position=index,
           total=len(targets),
           live_line_callback=live_line_callback,
@@ -115,43 +144,101 @@ class EvalStage(BaseStage):
 
   # --- Target resolution ----------------------------------------------
 
-  def resolve_targets(self) -> List[Tuple[str, str]]:
-    """Lists the (label, repo id) pairs to evaluate, in report order.
+  def target_temperature(self, flavor: Optional[str]) -> float:
+    """Returns the temperature one PE-RL branch should be scored at.
+
+    Args:
+      flavor: The branch's reward-model dataset flavor, or None.
+
+    Returns:
+      The branch's recorded rollout temperature when matching is enabled and
+      the value was recorded; otherwise the configured evaluation
+      temperature.
+    """
+    cfg = self.config.eval
+    if not cfg.match_perl_rollout_temperature:
+      return float(cfg.temperature)
+    recorded = self.context.perl_rollout_temperature_for(flavor)
+    return float(cfg.temperature) if recorded is None else recorded
+
+  def resolve_targets(self) -> List[EvalTarget]:
+    """Lists the passes to run, in report order.
 
     The label doubles as the metric namespace. For a campaign that branched
     over reward-model dataset flavors there is one PE-RL policy per branch,
-    and each is namespaced by its branch id (``perl:synthetic_struct``) so
-    the report can put them side by side against the shared SFT baseline.
+    each namespaced by its branch id (``perl:synthetic_struct``) so the report
+    can put them side by side.
+
+    Each PE-RL branch is scored at its own rollout temperature. Whenever that
+    differs from ``eval.temperature`` the SFT baseline is scheduled a second
+    time at the same temperature, tagged ``sft@t0.6``, so that the branch's
+    delta is measured against a baseline decoded identically and reflects the
+    weights alone. Distinct temperatures are de-duplicated: two branches that
+    happened to win at the same temperature share one extra baseline.
 
     Returns:
-      One entry per available trained policy. The last entry is the primary
-      model (the last PE-RL branch when any exists, otherwise SFT).
+      One entry per (policy, temperature) pass. Baselines come first, so the
+      last entry remains the primary model - the last PE-RL branch when any
+      exists, otherwise SFT.
 
     Raises:
       ValueError: When the campaign produced no policy to evaluate. Falling
         back to the base model would silently report base-model numbers as if
         they were the campaign's results.
     """
-    targets: List[Tuple[str, str]] = []
-    seen = set()
-
+    cfg = self.config.eval
+    base_temperature = float(cfg.temperature)
     sft_repo_id = self.context.sft_model_repo_id
+
+    baselines: List[EvalTarget] = []
     if sft_repo_id:
-      seen.add(sft_repo_id)
-      targets.append(("sft", sft_repo_id))
+      baselines.append(
+          EvalTarget(
+              label=eval_metrics.BASELINE_LABEL,
+              model_repo_id=sft_repo_id,
+              temperature=base_temperature,
+          )
+      )
 
     # Branches come from the flavor list, not from ``config.stages``: a
     # `--stages eval` rerun over a finished campaign has no 'perl' entry
     # there but still has the policies to score.
+    policies: List[EvalTarget] = []
+    seen = {sft_repo_id} if sft_repo_id else set()
     for flavor in flavors.campaign_flavors(self.config):
       repo_id = self.context.perl_model_repo_id_for(flavor)
       if not repo_id or repo_id in seen:
         continue
       seen.add(repo_id)
-      targets.append(
-          (flavors.stage_id_for_flavor(self.config, "perl", flavor), repo_id)
+      policies.append(
+          EvalTarget(
+              label=flavors.stage_id_for_flavor(self.config, "perl", flavor),
+              model_repo_id=repo_id,
+              temperature=self.target_temperature(flavor),
+          )
       )
 
+    # One matched baseline per distinct policy temperature. Keyed on the
+    # formatted token rather than the float so that this agrees exactly with
+    # the pairing `eval_metrics.baseline_label_for` will do later.
+    if sft_repo_id:
+      already = {eval_metrics.format_temperature(base_temperature)}
+      for policy in policies:
+        token = eval_metrics.format_temperature(policy.temperature)
+        if token in already:
+          continue
+        already.add(token)
+        baselines.append(
+            EvalTarget(
+                label=eval_metrics.make_target_label(
+                    eval_metrics.BASELINE_LABEL, policy.temperature
+                ),
+                model_repo_id=sft_repo_id,
+                temperature=policy.temperature,
+            )
+        )
+
+    targets = baselines + policies
     if not targets:
       raise ValueError(
           "Evaluation has no trained policy to score: neither an SFT nor a "
@@ -160,6 +247,55 @@ class EvalStage(BaseStage):
           "checkpoints. The base model is intentionally not evaluated."
       )
     return targets
+
+  def temperature_notes(self, targets: List[EvalTarget]) -> List[str]:
+    """Explains the decoding temperatures in play, for the log.
+
+    Args:
+      targets: The resolved passes.
+
+    Returns:
+      Zero or more lines. Empty when every target shares one temperature,
+      which is the case for a campaign with matching switched off and for one
+      whose policies happened to train at ``eval.temperature``.
+    """
+    cfg = self.config.eval
+    if not cfg.match_perl_rollout_temperature:
+      return [
+          "Temperature matching is off: every target is scored at "
+          f"{cfg.temperature}."
+      ]
+    policies = [t for t in targets if not eval_metrics.is_baseline(t.label)]
+    unmatched = [
+        t.label
+        for t in policies
+        if self.context.perl_rollout_temperature_for(
+            flavors.split_stage_id(t.label)[1]
+        )
+        is None
+    ]
+    notes = []
+    extra = [
+        t
+        for t in targets
+        if eval_metrics.is_baseline(t.label)
+        and t.label != eval_metrics.BASELINE_LABEL
+    ]
+    if extra:
+      notes.append(
+          "Scoring the SFT baseline again at "
+          + ", ".join(str(t.temperature) for t in extra)
+          + " so each PE-RL delta compares like with like."
+      )
+    if unmatched:
+      notes.append(
+          "No rollout temperature was recorded for "
+          + ", ".join(unmatched)
+          + f"; falling back to {cfg.temperature}. The sweep pinned "
+          "temperature outside its parameters block, so it was never logged "
+          "per trial."
+      )
+    return notes
 
   def previous_metrics(self) -> Dict[str, Any]:
     """Returns metrics persisted by an earlier attempt of this stage."""
@@ -183,8 +319,7 @@ class EvalStage(BaseStage):
 
   def _evaluate_target(
       self,
-      label: str,
-      model_repo_id: str,
+      target: EvalTarget,
       position: int,
       total: int,
       live_line_callback: Optional[Callable[[str], None]],
@@ -193,25 +328,28 @@ class EvalStage(BaseStage):
     """Generates and scores completions for a single policy.
 
     Args:
-      label: Short target name ('sft' or 'perl'), used as the metric prefix.
-      model_repo_id: LoRA adapter repo to evaluate.
+      target: The policy and the temperature to sample it at.
       position: 1-based index of this target, for progress messages.
       total: Total number of targets.
       live_line_callback: Log sink.
       stop_requested_callback: Predicate used to cut the evaluation short.
 
     Returns:
-      Metrics for this target, prefixed with ``{label}/``.
+      Metrics for this target, prefixed with ``{target.label}/`` and
+      including the temperature the completions were drawn at.
     """
     cfg = self.config.eval
+    label = target.label
+    model_repo_id = target.model_repo_id
     prefix = f"[{label.upper()} {position}/{total}]"
 
     if live_line_callback:
       live_line_callback(
-          f"{prefix} Step 1/2: generating test completions for {model_repo_id}"
+          f"{prefix} Step 1/2: generating test completions for "
+          f"{model_repo_id} at temperature {target.temperature}"
       )
 
-    gen_cmd = self._generation_command(model_repo_id)
+    gen_cmd = self._generation_command(model_repo_id, target.temperature)
     run_with_retries(
         lambda: self._run_subprocess(
             gen_cmd, live_line_callback, stop_requested_callback
@@ -229,7 +367,7 @@ class EvalStage(BaseStage):
           "+ BertScore + perplexity"
       )
 
-    score_cmd = self._scoring_command(model_repo_id)
+    score_cmd = self._scoring_command(model_repo_id, target.temperature)
     captured = run_with_retries(
         lambda: self._run_subprocess(
             score_cmd, live_line_callback, stop_requested_callback
@@ -241,17 +379,36 @@ class EvalStage(BaseStage):
         stop_requested=stop_requested_callback,
     )
 
-    summary = self._load_summary(model_repo_id)
+    summary = self._load_summary(model_repo_id, target.temperature)
     captured.update(summary)
+    # Recorded per target, not per campaign: with matching on, different rows
+    # of the same table were sampled differently, and the report has to be
+    # able to say so without the config in hand.
+    captured[eval_metrics.DECODING_TEMPERATURE_KEY] = target.temperature
     return {f"{label}/{key}": value for key, value in captured.items()}
 
-  def _summary_path(self, model_repo_id: str) -> Tuple[str, str]:
-    """Returns the (completions repo id, summary json path) for a target."""
+  def _summary_path(
+      self, model_repo_id: str, temperature: Optional[float] = None
+  ) -> Tuple[str, str]:
+    """Returns the (completions repo id, summary json path) for a target.
+
+    Args:
+      model_repo_id: The adapter being evaluated.
+      temperature: The temperature its completions were sampled at. Defaults
+        to ``eval.temperature``. Part of the repo name, so the SFT baseline's
+        greedy and matched runs resolve to different datasets instead of
+        overwriting one another.
+
+    Returns:
+      The completions repo id and the path of the summary JSON.
+    """
     cfg = self.config.eval
+    if temperature is None:
+      temperature = cfg.temperature
     repo = build_eval_dataset_repo_id(
         user=self.config.user,
         writer_model_lora=model_repo_id,
-        temperature=cfg.temperature,
+        temperature=temperature,
         writer_num_fewshot=cfg.writer_num_fewshot,
         task_name=self.config.task_name,
         # Must mirror `_generation_command`: the completions repo name encodes
@@ -281,11 +438,14 @@ class EvalStage(BaseStage):
       return sft_repo
     return None
 
-  def _load_summary(self, model_repo_id: str) -> Dict[str, Any]:
+  def _load_summary(
+      self, model_repo_id: str, temperature: float
+  ) -> Dict[str, Any]:
     """Loads the metrics JSON written by the scoring pipeline.
 
     Args:
       model_repo_id: The evaluated adapter.
+      temperature: The temperature its completions were sampled at.
 
     Returns:
       The parsed metrics dictionary.
@@ -295,7 +455,7 @@ class EvalStage(BaseStage):
         empty metric table as a success is the one outcome an overnight run
         cannot afford.
     """
-    repo, summary_file = self._summary_path(model_repo_id)
+    repo, summary_file = self._summary_path(model_repo_id, temperature)
     if not os.path.isfile(summary_file):
       raise RuntimeError(
           "Scoring finished but no evaluation summary was written to "
@@ -317,9 +477,23 @@ class EvalStage(BaseStage):
 
   # --- Command construction ---------------------------------------------
 
-  def _generation_command(self, model_repo_id: str) -> List[str]:
-    """Builds the ``--mode generate`` invocation for one policy."""
+  def _generation_command(
+      self, model_repo_id: str, temperature: Optional[float] = None
+  ) -> List[str]:
+    """Builds the ``--mode generate`` invocation for one policy.
+
+    Args:
+      model_repo_id: The adapter to serve.
+      temperature: Sampling temperature. Defaults to ``eval.temperature``.
+        Part of the completions repo name, so ``_scoring_command`` and
+        ``_summary_path`` must be given the same value.
+
+    Returns:
+      The argument vector.
+    """
     cfg = self.config.eval
+    if temperature is None:
+      temperature = cfg.temperature
     cmd = [
         "python3",
         "-m",
@@ -354,7 +528,7 @@ class EvalStage(BaseStage):
         "--max_tokens",
         str(cfg.max_tokens),
         "--temperature",
-        str(cfg.temperature),
+        str(temperature),
         "--top_p",
         str(cfg.top_p),
         "--top_k",
@@ -364,9 +538,24 @@ class EvalStage(BaseStage):
     ])
     return cmd
 
-  def _scoring_command(self, model_repo_id: str) -> List[str]:
-    """Builds the ``--mode score`` invocation for one policy."""
+  def _scoring_command(
+      self, model_repo_id: str, temperature: Optional[float] = None
+  ) -> List[str]:
+    """Builds the ``--mode score`` invocation for one policy.
+
+    Args:
+      model_repo_id: The adapter to score.
+      temperature: The temperature its completions were sampled at. Defaults
+        to ``eval.temperature``; it is part of the completions repo name, so
+        it must match what generation used or scoring reads another run's
+        dataset.
+
+    Returns:
+      The argument vector.
+    """
     cfg = self.config.eval
+    if temperature is None:
+      temperature = cfg.temperature
     cmd = [
         "python3",
         "-m",
@@ -406,7 +595,7 @@ class EvalStage(BaseStage):
         "--max_tokens",
         str(cfg.max_tokens),
         "--temperature",
-        str(cfg.temperature),
+        str(temperature),
         "--writer_num_fewshot",
         str(cfg.writer_num_fewshot),
         "--run_autorater",
@@ -477,7 +666,7 @@ class EvalStage(BaseStage):
 
   def _dry_run_result(
       self,
-      targets: List[Tuple[str, str]],
+      targets: List[EvalTarget],
       primary_model: str,
       live_line_callback: Optional[Callable[[str], None]],
   ) -> StageResult:
@@ -498,16 +687,35 @@ class EvalStage(BaseStage):
         },
     }
     metrics: Dict[str, Any] = {}
-    for label, repo_id in targets:
+    for target in targets:
       if live_line_callback:
-        live_line_callback(f"[DRY-RUN] Generating completions for {repo_id}...")
-        live_line_callback(f"[DRY-RUN] Scoring {label} with Gemini autorater...")
+        live_line_callback(
+            f"[DRY-RUN] Generating completions for {target.model_repo_id} "
+            f"at temperature {target.temperature}..."
+        )
+        live_line_callback(
+            f"[DRY-RUN] Scoring {target.label} with Gemini autorater..."
+        )
       time.sleep(0.4)
-      # Branched labels are 'perl:synthetic_struct'; the mock is per *kind*.
-      kind, _ = flavors.split_stage_id(label)
+      # Labels are 'perl:synthetic_struct' or 'sft@t0.6'; the mock is per
+      # *kind*, so both branches and matched baselines resolve to a number.
+      kind = eval_metrics.target_kind(target.label)
       values = dict(mock_per_target.get(kind, mock_per_target["sft"]))
       values["num_samples"] = self.config.eval.max_eval_samples
-      metrics.update({f"{label}/{k}": v for k, v in values.items()})
+      # Sampling costs faithfulness, so a rehearsal that ignored temperature
+      # would show a matched baseline scoring identically to the greedy one
+      # and make the extra pass look pointless.
+      penalty = 0.02 * float(target.temperature)
+      if "hallucination_rate" in values:
+        values["hallucination_rate"] = round(
+            values["hallucination_rate"] + penalty, 4
+        )
+      if "faithfulness_rate" in values:
+        values["faithfulness_rate"] = round(
+            values["faithfulness_rate"] - penalty, 4
+        )
+      values[eval_metrics.DECODING_TEMPERATURE_KEY] = target.temperature
+      metrics.update({f"{target.label}/{k}": v for k, v in values.items()})
     metrics.update(compute_deltas(metrics))
     return StageResult(
         status=StageStatus.COMPLETED,
@@ -588,6 +796,11 @@ def compute_deltas(metrics: Dict[str, Any]) -> Dict[str, Any]:
   ``delta:synthetic_struct/`` - mirroring the ``perl:<flavor>/`` keys it was
   derived from. A single-flavor campaign keeps the plain ``delta/``.
 
+  Each policy is compared against the SFT row sampled at its *own* decoding
+  temperature, so the difference is the weights rather than the decode. With
+  temperature matching off, or on metrics from an older run, that resolves to
+  the one and only ``sft`` row and the behaviour is unchanged.
+
   Args:
     metrics: Metric map with ``sft/`` and ``perl/``-ish prefixed keys.
 
@@ -598,18 +811,21 @@ def compute_deltas(metrics: Dict[str, Any]) -> Dict[str, Any]:
   policies = [
       label
       for label in eval_metrics.target_labels(metrics)
-      if label != eval_metrics.BASELINE_LABEL
+      if not eval_metrics.is_baseline(label)
   ]
   for label in policies:
     prefix = f"{label}/"
     namespace = eval_metrics.delta_label(label)
+    baseline = eval_metrics.baseline_label_for(metrics, label)
+    if baseline is None:
+      continue
     for key, perl_value in metrics.items():
       if not str(key).startswith(prefix):
         continue
       bare = str(key)[len(prefix):]
       if bare in NO_DELTA:
         continue
-      sft_value = metrics.get(f"sft/{bare}")
+      sft_value = metrics.get(f"{baseline}/{bare}")
       if not isinstance(perl_value, (int, float)) or isinstance(
           perl_value, bool
       ):

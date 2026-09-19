@@ -116,13 +116,32 @@ def estimate_runtime(config: CampaignConfig) -> Tuple[float, float]:
   reward-model dataset fan-out is counted: selecting two flavors runs the RM
   and PE-RL sweeps twice, and an estimate that ignored it would understate
   the most expensive campaigns by half.
+
+  Evaluation is priced per *pass*, not per stage: one for the SFT baseline and
+  one per PE-RL branch. With ``match_perl_rollout_temperature`` on there may
+  be up to one further baseline pass per branch, but how many is not knowable
+  until the sweeps have picked their temperatures, so that cost is carried by
+  the upper bound alone.
+
+  Args:
+    config: The campaign to price.
+
+  Returns:
+    A ``(low, high)`` estimate in hours.
   """
   minutes = 0.0
+  # Speculative work that may or may not happen; only widens the upper bound.
+  optimistic_extra = 0.0
   branches = len(flavors.campaign_flavors(config))
   for stage in theme_mod.iter_stage_names(config.stages):
     if stage == "eval":
       samples = getattr(config.eval, "max_eval_samples", 0) or 0
-      minutes += 15.0 + samples / 100.0 * 2.0
+      per_pass = 15.0 + samples / 100.0 * 2.0
+      minutes += per_pass * (1 + branches)
+      if getattr(config.eval, "match_perl_rollout_temperature", False):
+        # Worst case: every branch wins at a different temperature, none of
+        # them the configured one, so each needs its own extra baseline.
+        optimistic_extra += per_pass * branches
       continue
     if stage == "autorater":
       # One judging pass over the labelled set - no generation, no GPU, so
@@ -136,8 +155,7 @@ def estimate_runtime(config: CampaignConfig) -> Tuple[float, float]:
     minutes += repeats * runs * MINUTES_PER_TRIAL.get(stage, 10.0)
   if config.dry_run:
     return (0.02, 0.05)
-  hours = minutes / 60.0
-  return (hours * 0.6, hours * 1.5)
+  return (minutes / 60.0 * 0.6, (minutes + optimistic_extra) / 60.0 * 1.5)
 
 
 def format_estimate(low: float, high: float) -> str:
@@ -190,6 +208,11 @@ def config_summary_lines(config: CampaignConfig, theme: theme_mod.Theme) -> List
     rows.append(("RM dataset", flavors.describe_flavors(campaign_flavors)))
   for stage in stages:
     if stage == "eval":
+      if config.eval.match_perl_rollout_temperature:
+        decoding = "PE-RL at its own rollout temperature, SFT matched"
+      else:
+        decoding = f"every target at temperature {config.eval.temperature}"
+      rows.append(("Decoding", decoding))
       rows.append(
           ("Eval budget", f"{config.eval.max_eval_samples} samples "
                           f"({config.eval.evaluator_model})")
