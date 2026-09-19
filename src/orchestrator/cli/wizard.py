@@ -37,6 +37,11 @@ TASK_DESCRIPTIONS: Dict[str, str] = {
 
 #: Stage catalogue: key, label, one-line description.
 STAGE_CATALOGUE: List[Tuple[str, str, str]] = [
+    (
+        "autorater",
+        "Autorater calibration",
+        "Scores the Gemini judge against human labels, fits its threshold",
+    ),
     ("sft", "SFT sweep", "Supervised fine-tuning of the writer policy"),
     ("rm", "Reward model sweep", "Trains the preference/reward model"),
     ("perl", "PE-RL sweep", "RLOO policy optimization with LoRA adapters"),
@@ -119,6 +124,12 @@ def estimate_runtime(config: CampaignConfig) -> Tuple[float, float]:
       samples = getattr(config.eval, "max_eval_samples", 0) or 0
       minutes += 15.0 + samples / 100.0 * 2.0
       continue
+    if stage == "autorater":
+      # One judging pass over the labelled set - no generation, no GPU, so
+      # cheaper than an evaluation target but not free.
+      samples = getattr(config.eval, "max_eval_samples", 0) or 0
+      minutes += 5.0 + samples / 100.0 * 1.5
+      continue
     stage_cfg = getattr(config, stage, None)
     runs = int(getattr(stage_cfg, "max_runs", 0) or 0)
     repeats = branches if stage in flavors.BRANCHED_KINDS else 1
@@ -140,7 +151,7 @@ def equivalent_command(config: CampaignConfig) -> str:
   """Builds the non-interactive command reproducing this configuration."""
   parts = ["python3 scripts/run_campaign.py run", f"--task {config.task_name}"]
   stages = theme_mod.iter_stage_names(config.stages)
-  if stages != ["sft", "rm", "perl", "eval"]:
+  if stages != list(config_mod.VALID_STAGES):
     parts.append(f"--stages {','.join(stages)}")
   if "sft" in stages and config.sft.max_runs != 30:
     parts.append(f"--sft-runs {config.sft.max_runs}")
@@ -183,6 +194,15 @@ def config_summary_lines(config: CampaignConfig, theme: theme_mod.Theme) -> List
           ("Eval budget", f"{config.eval.max_eval_samples} samples "
                           f"({config.eval.evaluator_model})")
       )
+    elif stage == "autorater":
+      # No budget row: calibration has no sweep and no configuration of its
+      # own, by design - it must use the evaluation's judge settings for
+      # its fitted threshold to transfer.
+      rows.append((
+          "Judge check",
+          f"{config.eval.evaluator_model} vs human labels, warn below "
+          f"ROC-AUC {config.eval.min_autorater_auc:.2f}",
+      ))
     else:
       stage_cfg = getattr(config, stage)
       rows.append(
@@ -223,7 +243,9 @@ class WizardAnswers:
   """Raw answers collected from the user."""
 
   task: str = "npov"
-  stages: List[str] = field(default_factory=lambda: ["sft", "rm", "perl", "eval"])
+  stages: List[str] = field(
+      default_factory=lambda: list(config_mod.VALID_STAGES)
+  )
   preset: str = "standard"
   sft_runs: int = 30
   rm_runs: int = 30

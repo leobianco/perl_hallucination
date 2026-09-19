@@ -19,7 +19,7 @@ from unittest import mock
 from src.orchestrator.cli import app
 from src.orchestrator.cli import console as console_mod
 from src.orchestrator.cli import theme as theme_mod
-from src.orchestrator.config import CampaignConfig
+from src.orchestrator.config import CampaignConfig, VALID_STAGES
 from src.orchestrator.state import CampaignState, StageResult, StageStatus
 
 
@@ -158,7 +158,9 @@ class StateDiscoveryTest(unittest.TestCase):
     state.stages["sft"] = StageResult(status=StageStatus.COMPLETED)
     state.stages["rm"] = StageResult(status=StageStatus.SKIPPED)
     state.stages["perl"] = StageResult(status=StageStatus.RUNNING)
-    self.assertEqual(app.state_progress(state, config), (2, 4))
+    self.assertEqual(
+        app.state_progress(state, config), (2, len(VALID_STAGES))
+    )
 
 
 class DiagnosticsTest(unittest.TestCase):

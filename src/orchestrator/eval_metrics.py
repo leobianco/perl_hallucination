@@ -228,3 +228,68 @@ def format_value(value: Any) -> str:
   if isinstance(value, float):
     return f"{value:.4f}"
   return str(value)
+
+
+# --- Autorater calibration ----------------------------------------------
+
+#: Metric namespace the ``autorater`` stage writes under.
+AUTORATER_PREFIX = "autorater"
+
+#: Calibration values the report shows, in order, with their labels and the
+#: format each is worth reading at. The fitted threshold is deliberately
+#: unrounded: a judge at temperature 0 saturates, so a threshold of
+#: 0.9999887757936129 prints as "1.00000" at five decimals, which is both
+#: wrong and unusable as a configuration value.
+AUTORATER_REPORT_ROWS: Tuple[Tuple[str, str, str], ...] = (
+    ("roc_auc", "ROC-AUC", "{:.4f}"),
+    ("best_threshold", "Fitted threshold", "{!r}"),
+    ("balanced_accuracy", "Balanced accuracy", "{:.4f}"),
+    ("accuracy_at_best_threshold", "Accuracy", "{:.4f}"),
+    ("precision_at_best_threshold", "Precision", "{:.4f}"),
+    ("tpr_at_best_threshold", "TPR (recall)", "{:.4f}"),
+    ("fpr_at_best_threshold", "FPR", "{:.4f}"),
+    ("scored_samples", "Scored samples", "{}"),
+)
+
+
+def autorater_calibration(metrics: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+  """Strips the ``autorater/`` namespace off a calibration metric map.
+
+  Args:
+    metrics: The stage's recorded metrics, or None.
+
+  Returns:
+    The calibration values by bare name, empty when there are none.
+  """
+  prefix = f"{AUTORATER_PREFIX}/"
+  return {
+      str(key)[len(prefix):]: value
+      for key, value in (metrics or {}).items()
+      if str(key).startswith(prefix)
+  }
+
+
+def format_autorater_rows(
+    calibration: Dict[str, Any]
+) -> List[Tuple[str, str]]:
+  """Renders the calibration as (label, formatted value) pairs.
+
+  Args:
+    calibration: Bare-named calibration values, from
+      :func:`autorater_calibration`.
+
+  Returns:
+    One pair per value actually present, in report order. Absent values are
+    skipped rather than shown as a dash: an older state file simply has
+    fewer of them, and a row of dashes reads like a failure.
+  """
+  rows: List[Tuple[str, str]] = []
+  for key, label, fmt in AUTORATER_REPORT_ROWS:
+    if key not in calibration:
+      continue
+    value = calibration[key]
+    try:
+      rows.append((label, fmt.format(value)))
+    except (TypeError, ValueError):
+      rows.append((label, str(value)))
+  return rows

@@ -16,6 +16,7 @@ from src.orchestrator import flavors
 from src.orchestrator import logging_setup
 from src.orchestrator.model_manager import ModelManager
 from src.orchestrator.reporter import CampaignReporter
+from src.orchestrator.stages.autorater_stage import AutoraterStage
 from src.orchestrator.stages.base import BaseStage, CampaignContext
 from src.orchestrator.stages.eval_stage import EvalStage
 from src.orchestrator.stages.perl_stage import PerlStage
@@ -359,6 +360,7 @@ class CampaignEngine:
       ValueError: On an unknown stage kind.
     """
     classes = {
+        "autorater": AutoraterStage,
         "sft": SftStage,
         "rm": RmStage,
         "perl": PerlStage,

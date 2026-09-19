@@ -133,6 +133,7 @@ STATUS_PRESENTATION: Dict[str, Any] = {
 
 #: Human readable stage titles used across every surface of the CLI.
 STAGE_TITLES: Dict[str, str] = {
+    "autorater": "Autorater Calibration",
     "sft": "SFT Sweep",
     "rm": "Reward Model Sweep",
     "perl": "PE-RL Sweep",
@@ -141,6 +142,7 @@ STAGE_TITLES: Dict[str, str] = {
 
 #: Short metric labels shown in compact tables.
 STAGE_METRIC_LABELS: Dict[str, str] = {
+    "autorater": "judge roc_auc",
     "sft": "eval/loss",
     "rm": "eval/roc_auc",
     "perl": "reward/mean",

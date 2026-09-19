@@ -16,7 +16,7 @@ import unittest
 
 from src.orchestrator import eval_metrics
 from src.orchestrator import flavors
-from src.orchestrator.config import CampaignConfig
+from src.orchestrator.config import CampaignConfig, VALID_STAGES
 from src.orchestrator.model_manager import ModelManager
 from src.orchestrator.reporter import CampaignReporter
 from src.orchestrator.stages.base import CampaignContext
@@ -119,16 +119,14 @@ class SingleFlavorIsUnchangedTest(unittest.TestCase):
 
   def test_stage_ids_stay_bare(self):
     plan = flavors.build_plan(_config([flavors.ORGANIC]))
-    self.assertEqual(
-        [p.stage_id for p in plan], ["sft", "rm", "perl", "eval"]
-    )
+    self.assertEqual([p.stage_id for p in plan], list(VALID_STAGES))
 
   def test_a_lone_synthetic_campaign_also_keeps_bare_ids(self):
     # The suffix disambiguates *between branches*. With one branch there is
     # nothing to disambiguate, and a 'rm:synthetic_struct' key would make
     # the campaign unresumable from a state file written by an older build.
     plan = flavors.build_plan(_config([flavors.SYNTHETIC_STRUCT]))
-    self.assertEqual([p.stage_id for p in plan], ["sft", "rm", "perl", "eval"])
+    self.assertEqual([p.stage_id for p in plan], list(VALID_STAGES))
     self.assertFalse(flavors.is_branched(_config([flavors.SYNTHETIC_STRUCT])))
 
   def test_titles_stay_bare(self):
@@ -155,6 +153,7 @@ class BranchedPlanTest(unittest.TestCase):
     self.assertEqual(
         [p.stage_id for p in plan],
         [
+            "autorater",
             "sft",
             "rm:organic",
             "rm:synthetic_struct",

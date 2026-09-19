@@ -91,6 +91,40 @@ python3 scripts/run_campaign.py run --task npov \
 ```
 Omitting a required checkpoint is caught before launch, not three hours in.
 
+### 4b. Calibrating the autorater (and what happens if it is weak)
+
+Every hallucination number this orchestrator reports is a count of verdicts
+from a Gemini judge against a decision threshold. The `autorater` stage runs
+**first**, before any GPU time is spent, and fits that threshold instead of
+inheriting a constant:
+
+```bash
+python3 scripts/run_campaign.py run --task ragtruth --stages autorater
+```
+
+It scores `{user}/{task}_autorater` (test split) with the same judge, the
+same few-shot count and the same seed the final evaluation will use, then
+reports ROC-AUC, the fitted threshold, TPR/FPR, accuracy, precision and how
+saturated the judge's scores are. Section 2.0 of the report shows all of it.
+
+Two consequences worth knowing:
+
+* **The final evaluation scores at the fitted threshold**, not at
+  `eval_stage.threshold`. Campaigns calibrated at different thresholds are
+  not directly comparable with each other, nor with the numbers in
+  `BASELINES_*.md`, which were all scored at the old constant `0.1025`. Drop
+  `autorater` from `stages` to keep that constant.
+* **A weak judge warns, it does not stop.** Below `min_autorater_auc`
+  (default `0.85`) the stage raises a warning that appears in the dashboard
+  and as a `[!CAUTION]` block at the top of the report. The campaign
+  continues: the rates are still computable, they simply carry a wider error
+  bar than the report's decimals suggest.
+
+The only knob worth touching is `evaluator_num_fewshot`, and 2 is the value
+this repository has settled on. Note that calibration deliberately has no
+configuration of its own - it reads `eval_stage`, because a threshold fitted
+against a 4-shot judge does not apply to a 2-shot one.
+
 ### 5. Choosing the reward model's training dataset
 
 The reward model can be trained on human-labelled hallucinations
@@ -564,7 +598,7 @@ campaign:
   project: "new_perl"
   base_model: "google/gemma-4-E4B-it"
 
-stages: [sft, rm, perl, eval]
+stages: [autorater, sft, rm, perl, eval]
 
 # Which dataset(s) the reward model is trained on. Naming two of them runs
 # an RM *and* a PE-RL sweep for each, then scores both policies in one
@@ -613,6 +647,15 @@ eval_stage:
   enabled: true
   evaluator_model: "gemini-2.5-flash"
   max_eval_samples: 1000
+  # Few-shot examples given to the judge. The `autorater` stage is calibrated
+  # with this same value, so the threshold it fits applies to the scoring.
+  evaluator_num_fewshot: 2
+  # Fallback decision threshold, used only when `autorater` is not in stages.
+  # When it is, the campaign scores at the threshold that stage fitted.
+  threshold: 0.1025
+  # ROC-AUC below which the judge is flagged as too weak to trust. Advisory:
+  # it warns in the dashboard and the report, it does not stop the campaign.
+  min_autorater_auc: 0.85
 
 reporting:
   generate_markdown: true

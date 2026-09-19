@@ -8,6 +8,7 @@ including ROC analysis and histogram plotting.
 import argparse
 from dataclasses import dataclass, field
 import hashlib
+import os
 import re
 from typing import Any, Dict, Optional, Sequence, Union
 
@@ -1204,3 +1205,69 @@ def build_eval_dataset_repo_id(
 
   full_name = f"{prefix}{compacted_model}{suffix}"
   return sanitize_hf_repo_id(f"{user}/{full_name}", max_length=max_length)
+
+
+def autorater_eval_run_name(
+    evaluator_model: Optional[str],
+    dataset_labels: Optional[str],
+    evaluator_num_fewshot: Optional[int],
+    seed: int,
+) -> str:
+  """Names the log directory an autorater calibration run writes into.
+
+  Every input that changes the fitted threshold is in the name: the judge,
+  the labelled set it is judged against, how many few-shot examples it was
+  given and the seed that drew them. Two calibrations that differ in any of
+  those are different calibrations and must not overwrite each other.
+
+  Shared by the pipeline that writes the directory and by the orchestrator
+  stage that reads it back. They used to be two copies of one f-string,
+  which is the same arrangement that made the evaluation summary lookup
+  fragile (see ``EvalStage._summary_path``).
+
+  Args:
+      evaluator_model (Optional[str]): Judge model, e.g. 'gemini-2.5-flash'.
+      dataset_labels (Optional[str]): Repo ID of the human-labelled set.
+      evaluator_num_fewshot (Optional[int]): Few-shot examples given to the
+        judge.
+      seed (int): Seed for the subsample and the few-shot draw.
+
+  Returns:
+      str: The directory name, relative to ``logs/``.
+  """
+  eval_model_name = (
+      evaluator_model.split("/")[-1] if evaluator_model else "gemini"
+  )
+  dataset_name = dataset_labels.split("/")[-1] if dataset_labels else "labels"
+  return (
+      f"eval_autorater_{eval_model_name}"
+      f"_autorater_num_fewshot_{evaluator_num_fewshot}"
+      f"_data_{dataset_name}"
+      f"_seed_{seed}"
+  )
+
+
+def autorater_eval_metrics_path(
+    evaluator_model: Optional[str],
+    dataset_labels: Optional[str],
+    evaluator_num_fewshot: Optional[int],
+    seed: int,
+) -> str:
+  """Returns the machine-readable metrics file of an autorater calibration.
+
+  The sibling ``eval_autorater_metrics.txt`` is written for a human; this
+  JSON is what the orchestrator parses to pick up the fitted threshold.
+
+  Args:
+      evaluator_model (Optional[str]): Judge model.
+      dataset_labels (Optional[str]): Repo ID of the human-labelled set.
+      evaluator_num_fewshot (Optional[int]): Few-shot examples given.
+      seed (int): Seed for the subsample and the few-shot draw.
+
+  Returns:
+      str: Path to the JSON metrics file.
+  """
+  name = autorater_eval_run_name(
+      evaluator_model, dataset_labels, evaluator_num_fewshot, seed
+  )
+  return os.path.join("logs", name, "eval_autorater_metrics.json")

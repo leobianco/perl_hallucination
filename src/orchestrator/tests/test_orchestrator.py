@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 
 from src.orchestrator.cli import events as events_mod
-from src.orchestrator.config import CampaignConfig
+from src.orchestrator.config import CampaignConfig, VALID_STAGES
 from src.orchestrator.engine import CampaignEngine
 from src.orchestrator.model_manager import ModelManager
 from src.orchestrator.reporter import CampaignReporter
@@ -32,7 +32,7 @@ class TestOrchestratorConfig(unittest.TestCase):
     self.assertEqual(config.sft.max_runs, 30)
     self.assertEqual(config.rm.max_runs, 30)
     self.assertEqual(config.perl.max_runs, 10)
-    self.assertEqual(config.stages, ["sft", "rm", "perl", "eval"])
+    self.assertEqual(config.stages, list(VALID_STAGES))
 
   def test_task_validation(self):
     valid_cfg = CampaignConfig.create_default(task_name="bosch")
@@ -687,8 +687,8 @@ class TestEngineEvents(unittest.TestCase):
         e.stage for e in seen
         if e.type == events_mod.EventType.STAGE_COMPLETED
     }
-    self.assertEqual(started, {"sft", "rm", "perl", "eval"})
-    self.assertEqual(completed, {"sft", "rm", "perl", "eval"})
+    self.assertEqual(started, set(VALID_STAGES))
+    self.assertEqual(completed, set(VALID_STAGES))
 
   def test_stage_started_carries_sweep_metadata(self):
     _, seen, _ = self.run_engine()
@@ -725,7 +725,7 @@ class TestEngineEvents(unittest.TestCase):
     self.run_engine()
     state = CampaignState.load(self.config.state_file)
     self.assertIsNotNone(state.config_dict)
-    self.assertEqual(state.stages_order, ["sft", "rm", "perl", "eval"])
+    self.assertEqual(state.stages_order, list(VALID_STAGES))
     restored = CampaignConfig.from_dict(state.config_dict)
     self.assertEqual(restored.sft.max_runs, 1)
     self.assertTrue(restored.dry_run)
@@ -749,7 +749,7 @@ class TestEngineEvents(unittest.TestCase):
         e.stage for e in seen
         if e.type == events_mod.EventType.STAGE_SKIPPED
     }
-    self.assertEqual(skipped, {"sft", "rm", "perl", "eval"})
+    self.assertEqual(skipped, set(VALID_STAGES))
     self.assertFalse(
         any(e.type == events_mod.EventType.STAGE_STARTED for e in seen)
     )

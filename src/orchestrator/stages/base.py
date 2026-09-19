@@ -82,6 +82,29 @@ class CampaignContext:
         flavors.stage_id_for_flavor(self.config, "perl", flavor)
     )
 
+  @property
+  def calibrated_threshold(self) -> Optional[float]:
+    """Returns the decision threshold the ``autorater`` stage fitted.
+
+    Read from the state file rather than passed between stages, so that a
+    ``--stages eval`` rerun days later scores at the same operating point as
+    the original campaign instead of silently reverting to the configured
+    constant.
+
+    Returns:
+      The fitted threshold, or None when no calibration has been recorded -
+      the campaign did not run the stage, or it was skipped.
+    """
+    record = self.state.stages.get("autorater")
+    if record is None:
+      return None
+    value = (record.metrics or {}).get("autorater/best_threshold")
+    # An explicit isinstance check, not truthiness: a legitimately fitted
+    # threshold of 0.0 is falsy and must not read as "no calibration".
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+      return None
+    return float(value)
+
 
 
 @dataclass(frozen=True)

@@ -80,6 +80,8 @@ from src.utils import (
     ScopeDataGenArguments,
     ScriptArguments,
     SsfoDataGenArguments,
+    autorater_eval_metrics_path,
+    autorater_eval_run_name,
     build_eval_dataset_repo_id,
     compact_model_name,
     compute_best_roc_threshold,
@@ -4036,21 +4038,11 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
     ground_truth = self.data["label"]
 
     # Save evaluator prompts
-    eval_model_name = (
-        self.args.evaluator_model.split("/")[-1]
-        if self.args.evaluator_model
-        else "gemini"
-    )
-    dataset_name = (
-        self.args.dataset_labels.split("/")[-1]
-        if self.args.dataset_labels
-        else "labels"
-    )
-    name_for_saving = (
-        f"eval_autorater_{eval_model_name}"
-        + f"_autorater_num_fewshot_{self.args.evaluator_num_fewshot}"
-        + f"_data_{dataset_name}"
-        + f"_seed_{self.args.seed}"
+    name_for_saving = autorater_eval_run_name(
+        evaluator_model=self.args.evaluator_model,
+        dataset_labels=self.args.dataset_labels,
+        evaluator_num_fewshot=self.args.evaluator_num_fewshot,
+        seed=self.args.seed,
     )
 
     filepath = f"logs/{name_for_saving}/eval_autorater_evaluator_prompts.txt"
@@ -4185,6 +4177,46 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
       f.write(f"Exactly 0.0 or 1.0: {n_exact_one + n_exact_zero}\n")
       f.write(f"Saturated (within 1e-4 of 0/1): {n_saturated}\n")
     print(f"Metrics saved to {metrics_filepath}")
+
+    # The .txt above is for a human. This is the same content in a form the
+    # orchestrator can read back, which is how the campaign picks up the
+    # fitted threshold and scores the policies at the judge's own operating
+    # point instead of a constant somebody measured months ago.
+    calibration = {
+        "roc_auc": float(auc),
+        "best_threshold": float(threshold),
+        "tpr_at_best_threshold": float(tpr),
+        "fpr_at_best_threshold": float(fpr),
+        "accuracy_at_best_threshold": float(accuracy),
+        "balanced_accuracy": float(balanced_accuracy),
+        "precision_at_best_threshold": float(
+            precision_score(clean_gt, classif_at_threshold)
+        ),
+        "scored_samples": len(valid_indices),
+        "unscored_samples": int(unscored_count),
+        "distinct_scores": n_unique,
+        "saturated_scores": n_saturated,
+        # True when the ROC curve collapsed to a single operating point, in
+        # which case the fitted threshold sits inside the saturated cluster
+        # and a 1e-5 difference flips a label. The warning printed above
+        # says as much; this carries it to whoever reads the JSON.
+        "degenerate_roc": bool(abs(auc - balanced_accuracy) < 1e-5),
+        "evaluator_model": self.args.evaluator_model,
+        "evaluator_num_fewshot": self.args.evaluator_num_fewshot,
+        "autorater_num_samples": self.args.autorater_num_samples,
+        "dataset_labels": self.args.dataset_labels,
+        "seed": self.args.seed,
+    }
+    json_filepath = autorater_eval_metrics_path(
+        evaluator_model=self.args.evaluator_model,
+        dataset_labels=self.args.dataset_labels,
+        evaluator_num_fewshot=self.args.evaluator_num_fewshot,
+        seed=self.args.seed,
+    )
+    os.makedirs(os.path.dirname(json_filepath), exist_ok=True)
+    with open(json_filepath, "w") as f:
+      json.dump(calibration, f, indent=2)
+    print(f"Calibration metrics saved to {json_filepath}")
 
     print("AUC: {:.5f}".format(auc))
     print(f"Threshold: {threshold!r}")

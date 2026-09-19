@@ -73,6 +73,7 @@ class EvalStage(BaseStage):
         # No brackets: the console strips bracketed spans as style tags,
         # which used to swallow the "[sft]" label entirely.
         live_line_callback(f"  Target {label}: {repo_id}")
+      live_line_callback(f"  {self.threshold_provenance()}")
 
     if self.config.dry_run:
       return self._dry_run_result(targets, primary_model, live_line_callback)
@@ -421,7 +422,7 @@ class EvalStage(BaseStage):
         "--evaluate_evaluator",
         "False",
         "--threshold",
-        str(cfg.threshold),
+        str(self.scoring_threshold()),
         "--compute_bertscore",
         str(cfg.compute_bertscore),
         "--bertscore_model",
@@ -442,6 +443,35 @@ class EvalStage(BaseStage):
     if os.environ.get("GEMINI_API_KEY"):
       cmd.extend(["--gemini_api_key", os.environ["GEMINI_API_KEY"]])
     return cmd
+
+  def scoring_threshold(self) -> float:
+    """Returns the score above which a completion counts as hallucinated.
+
+    Prefers the threshold the ``autorater`` stage fitted on the labelled set
+    with this exact judge and few-shot count. ``eval.threshold`` is the
+    fallback for campaigns that do not run calibration, and is a constant
+    measured once, elsewhere, on a configuration nobody recorded.
+
+    Returns:
+      The threshold the scoring pass will use.
+    """
+    fitted = self.context.calibrated_threshold
+    if fitted is None:
+      return self.config.eval.threshold
+    return fitted
+
+  def threshold_provenance(self) -> str:
+    """Returns a one-line account of where the threshold came from."""
+    fitted = self.context.calibrated_threshold
+    if fitted is None:
+      return (
+          f"Decision threshold {self.config.eval.threshold} taken from the "
+          "configuration; no autorater calibration was run."
+      )
+    return (
+        f"Decision threshold {fitted!r} fitted by the autorater "
+        "calibration stage."
+    )
 
   # --- Plumbing ---------------------------------------------------------
 

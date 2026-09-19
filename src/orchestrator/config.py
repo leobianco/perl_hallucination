@@ -21,6 +21,13 @@ VALID_TASKS = [
     "ragtruth-summarization",
 ]
 
+#: Every stage a campaign may run, in the only order they can legally run in:
+#: each one consumes what the previous produced. ``autorater`` is the
+#: exception - it depends on nothing the campaign trains, only on the
+#: human-labelled set - and leads precisely because of that, so a judge that
+#: cannot separate the labels is discovered before the GPUs warm up.
+VALID_STAGES: List[str] = ["autorater", "sft", "rm", "perl", "eval"]
+
 #: Rough per-trial wall-clock estimates (minutes) for each sweep stage. These
 #: feed both the wizard's ETA preview and the sweep timeout budgets, so the two
 #: can never drift apart.
@@ -161,6 +168,13 @@ class EvalStageConfig:
   timeout_minutes: int = 180
 
   evaluator_num_fewshot: int = 2
+  #: ROC-AUC below which the ``autorater`` stage flags the judge as too weak
+  #: to trust. Advisory only: it is logged and reported, and the campaign
+  #: carries on. Stopping would throw away a run over a number the user may
+  #: well have expected, and the hallucination rates are still computable -
+  #: they just have a larger error bar than the report would otherwise
+  #: suggest.
+  min_autorater_auc: float = 0.85
   #: Independent autorater calls per sample. The judge jitters between calls
   #: even at temperature 0, so k > 1 takes the median and reports the spread.
   #: Costs k times the API budget; 1 keeps the historical single call.
@@ -230,8 +244,14 @@ class CampaignConfig:
   project: str = "new_perl"
   wandb_entity: Optional[str] = None
   base_model: str = "google/gemma-4-E4B-it"
+  #: ``autorater`` comes first and is not a training stage: it measures the
+  #: Gemini judge against the human-labelled set and fits the decision
+  #: threshold the final evaluation then scores with. It runs before any GPU
+  #: time is spent precisely because a judge that cannot separate the labels
+  #: invalidates every number downstream of it, and that is worth finding
+  #: out in the first ten minutes rather than the last.
   stages: List[str] = field(
-      default_factory=lambda: ["sft", "rm", "perl", "eval"]
+      default_factory=lambda: ["autorater", "sft", "rm", "perl", "eval"]
   )
   #: Which reward-model training sets this campaign builds branches for; see
   #: :mod:`src.orchestrator.flavors`.
@@ -289,10 +309,10 @@ class CampaignConfig:
           f"Invalid task_name '{self.task_name}'. Must be one of {VALID_TASKS}"
       )
     for stage_name in self.stages:
-      if stage_name not in ["sft", "rm", "perl", "eval"]:
+      if stage_name not in VALID_STAGES:
         raise ValueError(
-            f"Invalid stage '{stage_name}'. Must be one of ['sft', 'rm',"
-            " 'perl', 'eval']"
+            f"Invalid stage '{stage_name}'. Must be one of "
+            f"{list(VALID_STAGES)}"
         )
 
     # Caught here rather than at dataset-load time: a typo'd flavor would

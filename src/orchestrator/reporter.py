@@ -149,6 +149,11 @@ class CampaignReporter:
     #: sweep only ran 3 of its 5 trials is worse than no report at all.
     warning_lines: List[str] = []
 
+    #: Doubts about the *judge* rather than about the search. Kept apart
+    #: because they qualify every number in the report rather than marking
+    #: one stage as incomplete.
+    judge_warning_lines: List[str] = []
+
     for planned in flavors.build_plan(self.config):
       stage_name = planned.stage_id
       stage_title = planned.title or stage_name.upper()
@@ -178,9 +183,19 @@ class CampaignReporter:
           trials_str = f"**{trials_str}**"
 
       for warning in stage_res.warnings or []:
-        warning_lines.append(f"* **{stage_title}**: {warning}")
+        if planned.kind == "autorater":
+          judge_warning_lines.append(f"* {warning}")
+        else:
+          warning_lines.append(f"* **{stage_title}**: {warning}")
 
-      if planned.kind == "sft":
+      if planned.kind == "autorater":
+        metric_str = "judge roc_auc"
+        val_str = (
+            f"{stage_res.best_metric_val:.4f}"
+            if stage_res.best_metric_val is not None
+            else "-"
+        )
+      elif planned.kind == "sft":
         metric_str = "eval/loss"
         val_str = f"{stage_res.best_metric_val:.4f}" if stage_res.best_metric_val is not None else "-"
       elif planned.kind == "rm":
@@ -202,6 +217,16 @@ class CampaignReporter:
           f" **{val_str}** | {trials_str} | {status_icon} |"
       )
 
+    if judge_warning_lines:
+      lines.extend([
+          "",
+          "> [!CAUTION]",
+          "> The autorater that produced every hallucination number below is"
+          " itself of doubtful quality.",
+          "",
+          *judge_warning_lines,
+      ])
+
     if warning_lines:
       lines.extend([
           "",
@@ -221,6 +246,41 @@ class CampaignReporter:
         "## 2. Stage Breakdown & Winning Hyperparameters",
         "",
     ])
+
+    # Autorater calibration. Numbered 2.0 rather than 2.1 so that the SFT,
+    # RM, PE-RL and evaluation sections keep the numbers they have always
+    # had - a report is read against older reports, and renumbering every
+    # section to insert one at the front makes that comparison harder than
+    # the odd number does.
+    cal_res = self.state.stages.get("autorater")
+    if cal_res and cal_res.status == StageStatus.COMPLETED:
+      calibration = eval_metrics.autorater_calibration(cal_res.metrics)
+      rows = eval_metrics.format_autorater_rows(calibration)
+      if rows:
+        eval_cfg = self.config.eval
+        lines.extend([
+            "### 2.0. Autorater Calibration (Judge Quality)",
+            "",
+            "How well the Gemini judge reproduces the human labels, measured"
+            " before any training, on"
+            f" `{self.config.user}/{self.config.task_name}_autorater`"
+            " (test split).",
+            "",
+            f"* **Judge**: `{eval_cfg.evaluator_model}`"
+            f" ({eval_cfg.evaluator_num_fewshot}-shot,"
+            f" k={eval_cfg.autorater_num_samples})",
+            "",
+            "| Calibration metric | Value |",
+            "| :--- | :--- |",
+        ])
+        lines.extend(f"| {label} | `{value}` |" for label, value in rows)
+        lines.extend([
+            "",
+            "The fitted threshold above is the operating point section 2.4"
+            " scored at. Numbers from a campaign calibrated at a different"
+            " threshold are not directly comparable with these.",
+            "",
+        ])
 
     # SFT Details
     sft_res = self.state.stages.get("sft")

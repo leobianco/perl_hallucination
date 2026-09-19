@@ -20,7 +20,7 @@ from src.orchestrator.cli import dashboard as dashboard_mod
 from src.orchestrator.cli import events as events_mod
 from src.orchestrator.cli import renderables
 from src.orchestrator.cli import theme as theme_mod
-from src.orchestrator.config import CampaignConfig
+from src.orchestrator.config import CampaignConfig, VALID_STAGES
 from src.orchestrator.state import CampaignState, StageResult, StageStatus
 
 HAS_RICH = renderables.rich_available()
@@ -615,12 +615,19 @@ class StageViewTest(unittest.TestCase):
         task_name="npov", sft_runs=10, rm_runs=8, perl_runs=4
     )
 
+  def _view(self, views, key):
+    """Returns the row for one stage, by name rather than by position."""
+    for view in views:
+      if view.key == key:
+        return view
+    raise AssertionError(f"no {key!r} row in {[v.key for v in views]}")
+
   def test_pending_campaign(self):
     views = renderables.build_stage_views(self.config, make_state())
-    self.assertEqual([v.key for v in views], ["sft", "rm", "perl", "eval"])
+    self.assertEqual([v.key for v in views], list(VALID_STAGES))
     self.assertTrue(all(v.status == "PENDING" for v in views))
-    self.assertEqual(views[0].trials_total, 10)
-    self.assertEqual(views[0].fraction, 0.0)
+    self.assertEqual(self._view(views, "sft").trials_total, 10)
+    self.assertEqual(self._view(views, "sft").fraction, 0.0)
 
   def test_completed_stage_without_accounting_is_drawn_full(self):
     # State files written before trial accounting existed carry no counters.
@@ -636,7 +643,7 @@ class StageViewTest(unittest.TestCase):
         )
     )
     views = renderables.build_stage_views(self.config, state)
-    sft = views[0]
+    sft = self._view(views, "sft")
     self.assertEqual(sft.status, "COMPLETED")
     self.assertEqual(sft.fraction, 1.0)
     self.assertFalse(sft.is_partial)
@@ -658,7 +665,9 @@ class StageViewTest(unittest.TestCase):
             sweep_outcome="partial",
         )
     )
-    sft = renderables.build_stage_views(self.config, state)[0]
+    sft = self._view(
+        renderables.build_stage_views(self.config, state), "sft"
+    )
     self.assertEqual(sft.trials_done, 6)
     self.assertTrue(sft.is_partial)
     self.assertAlmostEqual(sft.fraction, 0.6)
@@ -679,7 +688,7 @@ class StageViewTest(unittest.TestCase):
         make_state(),
         live={"rm": {"status": "RUNNING", "trials_done": 3, "metric_value": 0.9}},
     )
-    rm = views[1]
+    rm = self._view(views, "rm")
     self.assertTrue(rm.is_active)
     self.assertEqual(rm.trials_done, 3)
     self.assertAlmostEqual(rm.fraction, 3 / 8)
@@ -689,14 +698,14 @@ class StageViewTest(unittest.TestCase):
         perl=StageResult(status=StageStatus.FAILED, error_message="CUDA OOM")
     )
     views = renderables.build_stage_views(self.config, state)
-    self.assertEqual(views[2].error, "CUDA OOM")
+    self.assertEqual(self._view(views, "perl").error, "CUDA OOM")
 
   def test_running_stage_elapsed_uses_now(self):
     state = CampaignState(campaign_id="c", task_name="npov")
     state.mark_stage_running("sft")
     views = renderables.build_stage_views(self.config, state)
-    self.assertIsNotNone(views[0].elapsed_s)
-    self.assertLess(views[0].elapsed_s, 5)
+    self.assertIsNotNone(self._view(views, "sft").elapsed_s)
+    self.assertLess(self._view(views, "sft").elapsed_s, 5)
 
   def test_partial_stage_selection(self):
     self.config.stages = ["perl", "eval"]
@@ -714,9 +723,10 @@ class TextRenderingTest(unittest.TestCase):
   def test_dag_lines_contain_stage_titles(self):
     views = renderables.build_stage_views(self.config, make_state())
     lines = renderables.dag_lines(views, self.theme, width=120)
-    self.assertEqual(len(lines), 4)
-    self.assertIn("SFT Sweep", lines[0])
-    self.assertIn("Final Evaluation", lines[3])
+    self.assertEqual(len(lines), len(VALID_STAGES))
+    self.assertIn("Autorater Calibration", lines[0])
+    self.assertIn("SFT Sweep", lines[1])
+    self.assertIn("Final Evaluation", lines[-1])
 
   def test_dag_lines_have_no_leftover_markup(self):
     views = renderables.build_stage_views(self.config, make_state())
@@ -731,8 +741,9 @@ class TextRenderingTest(unittest.TestCase):
         )
     )
     views = renderables.build_stage_views(self.config, state)
-    narrow = renderables.dag_lines(views, self.theme, width=60)[0]
-    wide = renderables.dag_lines(views, self.theme, width=140)[0]
+    row = [v.key for v in views].index("sft")
+    narrow = renderables.dag_lines(views, self.theme, width=60)[row]
+    wide = renderables.dag_lines(views, self.theme, width=140)[row]
     self.assertLess(len(narrow), len(wide))
     self.assertIn("leobianco/npov_SFT_x", wide)
     self.assertNotIn("leobianco/npov_SFT_x", narrow)
@@ -740,7 +751,8 @@ class TextRenderingTest(unittest.TestCase):
   def test_non_sweep_stage_shows_done(self):
     state = make_state(eval=StageResult(status=StageStatus.COMPLETED))
     views = renderables.build_stage_views(self.config, state)
-    line = renderables.dag_lines(views, self.theme, width=100)[3]
+    row = [v.key for v in views].index("eval")
+    line = renderables.dag_lines(views, self.theme, width=100)[row]
     self.assertIn("done", line)
     self.assertIn(self.theme.glyphs.bar_full, line)
 
@@ -1106,7 +1118,7 @@ class DashboardModelTest(unittest.TestCase):
         )
     )
     summary = self.model.progress_summary()
-    self.assertIn("stages 0/4", summary)
+    self.assertIn(f"stages 0/{len(VALID_STAGES)}", summary)
     self.assertIn("SFT Sweep", summary)
     self.assertIn("1/3", summary)
     self.assertIn("elapsed", summary)
@@ -1116,7 +1128,9 @@ class DashboardModelTest(unittest.TestCase):
         event(events_mod.EventType.STAGE_COMPLETED, stage="sft")
     )
     self.model.on_event(event(events_mod.EventType.STAGE_SKIPPED, stage="rm"))
-    self.assertIn("stages 2/4", self.model.progress_summary())
+    self.assertIn(
+        f"stages 2/{len(VALID_STAGES)}", self.model.progress_summary()
+    )
 
   def test_concurrent_event_ingestion_is_consistent(self):
     def emit(start):
