@@ -674,21 +674,32 @@ class TestStageSelectionDefaults(unittest.TestCase):
     self.assertEqual(self.config.sft.selection_strategy, "best")
     self.assertEqual(self.config.rm.selection_strategy, "best")
 
-  def test_perl_ranks_trials_on_their_final_step(self):
+  def test_perl_ranks_trials_on_the_end_of_training_not_on_a_peak(self):
     # The PE-RL reward is a per-step training signal over 8 sampled
-    # generations: its maximum is a lucky batch, not a better policy.
-    self.assertEqual(self.config.perl.selection_strategy, "final")
+    # generations: its maximum is a lucky batch, not a better policy. But
+    # the single last step is a lucky batch too, so the trials are ranked on
+    # the mean of the tail - the level, which is what the smoothed W&B curve
+    # shows.
+    self.assertEqual(self.config.perl.selection_strategy, "final_window")
+    self.assertGreaterEqual(self.config.perl.selection_window, 2)
 
   def test_the_default_repo_checkpoint_matches_the_ranking(self):
     # Both checkpoints are published either way, but the one the repo serves
     # by default must be the one the trials were ranked on, otherwise the
     # metric quoted in the report describes a model nobody loads.
+    #
+    # Compared by which end of training each refers to rather than by string
+    # equality: "final_window" ranks on the end of the run, so it agrees
+    # with a "final" checkpoint even though the words differ.
+    served_by = {"final": "final", "final_window": "final", "best": "best"}
     for stage in ("sft", "rm", "perl"):
       with self.subTest(stage=stage):
         stage_cfg = getattr(self.config, stage)
         self.assertEqual(
-            stage_cfg.checkpoint_policy, stage_cfg.selection_strategy
+            stage_cfg.checkpoint_policy,
+            served_by[stage_cfg.selection_strategy],
         )
+
 
   def test_perl_serves_the_final_checkpoint_by_default(self):
     self.assertEqual(self.config.perl.checkpoint_policy, "final")

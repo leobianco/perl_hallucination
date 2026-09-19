@@ -622,7 +622,10 @@ class StageViewTest(unittest.TestCase):
     self.assertEqual(views[0].trials_total, 10)
     self.assertEqual(views[0].fraction, 0.0)
 
-  def test_completed_stage_is_full(self):
+  def test_completed_stage_without_accounting_is_drawn_full(self):
+    # State files written before trial accounting existed carry no counters.
+    # Drawing such a stage as 00/10 would be worse than assuming it ran, so
+    # the bar is full - but only when nothing at all was recorded.
     state = make_state(
         sft=StageResult(
             status=StageStatus.COMPLETED,
@@ -636,9 +639,29 @@ class StageViewTest(unittest.TestCase):
     sft = views[0]
     self.assertEqual(sft.status, "COMPLETED")
     self.assertEqual(sft.fraction, 1.0)
-    self.assertEqual(sft.trials_done, 10)
+    self.assertFalse(sft.is_partial)
+    done, total, _ = renderables._bar_values(sft)  # pylint: disable=protected-access
+    self.assertEqual((done, total), (10, 10))
     self.assertAlmostEqual(sft.elapsed_s, 1800.0)
     self.assertEqual(sft.model_repo_id, "leobianco/npov_SFT")
+
+  def test_completed_stage_reports_the_trials_it_actually_ran(self):
+    # The regression this file used to enshrine: a COMPLETED stage had its
+    # counter overwritten with the budget, so a sweep that lost trials to a
+    # crash rendered as a clean full bar.
+    state = make_state(
+        sft=StageResult(
+            status=StageStatus.COMPLETED,
+            best_metric_val=0.31,
+            trials_done=6,
+            trials_total=10,
+            sweep_outcome="partial",
+        )
+    )
+    sft = renderables.build_stage_views(self.config, state)[0]
+    self.assertEqual(sft.trials_done, 6)
+    self.assertTrue(sft.is_partial)
+    self.assertAlmostEqual(sft.fraction, 0.6)
 
   def test_eval_metric_uses_hallucination_rate(self):
     state = make_state(

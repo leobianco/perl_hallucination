@@ -44,18 +44,43 @@ class StageView:
   model_repo_id: Optional[str] = None
   error: Optional[str] = None
   history: List[float] = field(default_factory=list)
+  #: ``complete`` / ``partial`` / ``unknown`` as recorded by the stage, or
+  #: None for a stage that has not finished its sweep (or predates the
+  #: field).
+  sweep_outcome: Optional[str] = None
+  warnings: List[str] = field(default_factory=list)
 
   @property
   def is_active(self) -> bool:
     return str(self.status).upper() == "RUNNING"
 
   @property
+  def is_partial(self) -> bool:
+    """True when the stage completed on fewer trials than it asked for.
+
+    This is the state the dashboard used to be unable to express: a PE-RL
+    stage that lost its 4th of 5 trials to a dead VM published a model, was
+    marked COMPLETED, and was drawn as a full ``05/05`` bar.
+    """
+    if str(self.status).upper() != "COMPLETED":
+      return False
+    if self.sweep_outcome == "partial":
+      return True
+    return bool(self.trials_total) and 0 < self.trials_done < self.trials_total
+
+  @property
   def fraction(self) -> float:
     """Completion ratio in ``[0, 1]``."""
-    if str(self.status).upper() in ("COMPLETED", "SKIPPED"):
+    status = str(self.status).upper()
+    if status == "SKIPPED":
       return 1.0
     if not self.trials_total:
-      return 0.0
+      return 1.0 if status == "COMPLETED" else 0.0
+    if status == "COMPLETED" and not self.trials_done:
+      # Nothing was recorded, which is what every state file written before
+      # trial accounting existed looks like. Claiming 0/N for a stage that
+      # demonstrably finished would be a worse lie than the old one.
+      return 1.0
     return max(0.0, min(1.0, self.trials_done / float(self.trials_total)))
 
 
@@ -159,8 +184,12 @@ def build_stage_views(
       view.trials_done = min(
           int(getattr(result, "trials_done", 0) or 0), view.trials_total or 0
       )
-    if str(view.status).upper() == "COMPLETED" and view.trials_total:
-      view.trials_done = view.trials_total
+      view.sweep_outcome = getattr(result, "sweep_outcome", None)
+      view.warnings = list(getattr(result, "warnings", None) or [])
+    # NOTE: a COMPLETED stage used to have its counter forced to the full
+    # budget here. That is how a PE-RL sweep that crashed during its 4th of
+    # 5 trials still rendered "05/05" and read as a clean run. The stage now
+    # records what W&B says actually finished, and the counter shows it.
 
     overrides = live.get(key) or {}
     for attr, value in overrides.items():
@@ -231,6 +260,10 @@ def dag_lines(
         "FAILED": "error",
         "RUNNING": "running",
     }.get(str(view.status).upper(), "muted")
+    if view.is_partial:
+      # Same status, different story: the stage produced a model, but from a
+      # search that was cut short. Green would say it all went to plan.
+      bar_style = "warning"
     done, total, counter = _bar_values(view)
     bar = theme_mod.progress_bar(done, total, bar_width, theme, bar_style)
     metric = theme_mod.format_metric(view.metric_value)
@@ -243,6 +276,8 @@ def dag_lines(
         bar,
         counter.rjust(7),
     ]
+    if view.is_partial:
+      parts.append(theme.markup("PARTIAL", "warning"))
     if metric_cell:
       parts.append(theme.markup(metric_cell, "metric"))
     if elapsed:
@@ -282,6 +317,12 @@ def summary_lines(
             f"Total stage time: {theme_mod.format_duration(total)}", "muted"
         )
     )
+  # The last thing on screen is the last thing remembered. A campaign that
+  # lost trials has to say so here, not only in the log scrollback that has
+  # long since scrolled away.
+  for view in views:
+    for warning in view.warnings:
+      lines.append(theme.markup(f"! {view.title}: {warning}", "warning"))
   return lines
 
 
@@ -365,7 +406,11 @@ def dag_table(views: Sequence[StageView], theme: Theme, width: int = 100):
         "FAILED": "error",
         "RUNNING": "running",
     }.get(status, "muted")
+    if view.is_partial:
+      bar_style = "warning"
     done, total, counter = _bar_values(view)
+    if view.is_partial:
+      counter = theme.markup(counter, "warning")
     title_style = "heading" if view.is_active else (
         "muted" if status == "PENDING" else "value"
     )
@@ -388,8 +433,16 @@ def dag_table(views: Sequence[StageView], theme: Theme, width: int = 100):
         else "-",
     ]
     if width >= 110:
-      artifact = view.error or view.model_repo_id or ""
-      artifact_style = "error" if view.error else "accent_dim"
+      # A cut-short search outranks the artifact name here: the repo id is
+      # discoverable elsewhere, the fact that it was trained on a partial
+      # sweep is not.
+      if view.error:
+        artifact, artifact_style = view.error, "error"
+      elif view.is_partial:
+        artifact = f"PARTIAL: {done}/{total} trials finished"
+        artifact_style = "warning"
+      else:
+        artifact, artifact_style = view.model_repo_id or "", "accent_dim"
       row.append(
           theme.markup(theme_mod.truncate(artifact, 40), artifact_style)
           if artifact

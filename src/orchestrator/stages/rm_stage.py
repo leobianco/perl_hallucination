@@ -100,22 +100,16 @@ class RmStage(BaseStage):
     if live_line_callback:
       live_line_callback(f"Registered RM Sweep: {sweep_id}{name_str}")
 
-    # 2. Run Sweep Agent for the trials still missing from the budget. On a
-    # resume this is fewer than max_runs; see BaseStage.remaining_runs.
-    remaining = self.remaining_runs(sweep_id, cfg.max_runs, live_line_callback)
-    if remaining:
-      exit_code = self.sweep_controller.run_sweep_agent(
-          sweep_id=sweep_id,
-          max_runs=remaining,
-          timeout_minutes=cfg.timeout_minutes,
-          live_line_callback=live_line_callback,
-          stop_requested_callback=stop_requested_callback,
-      )
-      if exit_code != 0 and live_line_callback:
-        live_line_callback(
-            f"[WARNING] RM sweep agent exited with code {exit_code}; scoring "
-            "the trials that did finish."
-        )
+    # 2. Run the trials still missing from the budget and establish, against
+    # W&B, how many of them actually finished. See
+    # BaseStage.account_for_trials: a sweep that loses trials to a crash
+    # must not report like one that ran clean.
+    execution = self.run_sweep_trials(
+        sweep_id=sweep_id,
+        stage_config=cfg,
+        live_line_callback=live_line_callback,
+        stop_requested_callback=stop_requested_callback,
+    )
 
     # 3. Query Best Run. Under selection_strategy="best" this is the trial
     # with the highest ROC-AUC at *any* eval step. A reward model is a
@@ -155,4 +149,7 @@ class RmStage(BaseStage):
         model_repo_id=rm_repo_id,
         metrics={"eval_roc_auc": winner.value},
         **self.stage_result_selection_fields(winner),
+        **execution.stage_result_fields(
+            extra_warnings=self.selection_warnings(winner)
+        ),
     )

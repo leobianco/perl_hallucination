@@ -38,7 +38,6 @@ DEFAULT_TUNABLE_KEYS: Set[str] = {
     "lora_dropout",
     "beta",
     "temperature",
-    "reward_penalty_alpha",
     "num_generations",
     "max_completion_length",
     "sft_data_fraction",
@@ -53,6 +52,20 @@ DEFAULT_TUNABLE_KEYS: Set[str] = {
 #: constant. See ``_resolve_reward_max_length`` in ``src/pipelines.py`` for why
 #: the previous hardcoded 512 silently zeroed the RLOO advantage on RAGTruth.
 REWARD_MAX_LENGTH: int = 2048
+
+#: Asymmetric multiplier on negative rewards in the PE-RL reward function.
+#:
+#: Pinned, and deliberately NOT tunable, for the same class of reason as
+#: REWARD_MAX_LENGTH: it changes what the metric *means*. ``reward_fn`` scales
+#: negative logit differences by this factor, so it rescales
+#: ``rewards/reward_fn/mean`` - the quantity the PE-RL sweep maximizes.
+#: Searching over it ranked trials on mutually incomparable scales and gave a
+#: Bayesian optimizer a free way to raise the objective by weakening the
+#: hallucination penalty. Both the sweep YAML and the winner's retraining pin
+#: this value, so the two cannot drift apart; a stale ``reward_penalty_alpha``
+#: in an older winner's W&B config is now ignored rather than replayed.
+REWARD_PENALTY_ALPHA: float = 1.0
+
 
 
 @dataclasses.dataclass(frozen=True)
@@ -330,8 +343,13 @@ class ModelManager:
       formatted_beta = (
           f"{beta_val:.2g}" if beta_val >= 0.001 else f"{beta_val:.1e}"
       )
-      alpha_val = float(best_params.get("reward_penalty_alpha", 1.0))
-      alpha_suffix = f"_a{alpha_val}" if alpha_val != 1.0 else ""
+      # From the pinned constant, never from best_params: the retrain below
+      # passes REWARD_PENALTY_ALPHA, so reading a stale alpha out of an old
+      # winner's W&B config here would put a suffix on the repo name that
+      # the model inside does not match.
+      alpha_suffix = (
+          f"_a{REWARD_PENALTY_ALPHA}" if REWARD_PENALTY_ALPHA != 1.0 else ""
+      )
       repo_id = (
           f"{self.user}/{task_name}_PERL_{model_short}_S{seed}_"
           f"epo{formatted_epochs}_lr{formatted_lr}_beta{formatted_beta}_"
@@ -493,6 +511,13 @@ class ModelManager:
           "256",
           "--reward_max_length",
           str(REWARD_MAX_LENGTH),
+          # Must equal the value scripts/sweep_perl.yaml pins for every
+          # trial: it rescales the reward the trials were ranked on, so a
+          # retrain that used a different one would not reproduce the run
+          # that won. No longer replayed from the winner's config - see
+          # REWARD_PENALTY_ALPHA.
+          "--reward_penalty_alpha",
+          str(REWARD_PENALTY_ALPHA),
           "--num_generations",
           "8",
           "--num_iterations",

@@ -17,9 +17,10 @@ def _selection_lines(result: StageResult, metric_label: str) -> List[str]:
   """Explains how a stage's headline number was picked, when that matters.
 
   A score obtained by early stopping is not the same claim as a score the
-  run actually ended on, and the difference decides whether the number is a
-  result or a lucky spike. Silent for ``final`` selection so that reports
-  from stages which do not early stop read exactly as before.
+  run actually ended on, and neither is the same claim as an average over the
+  end of training. The difference decides whether the number is a result or a
+  lucky spike. Silent for plain ``final`` selection so that reports from
+  stages which rank on a single stable evaluation read exactly as before.
 
   Args:
     result: The stage's outcome.
@@ -28,6 +29,22 @@ def _selection_lines(result: StageResult, metric_label: str) -> List[str]:
   Returns:
     Zero, one or two markdown bullet lines.
   """
+  if result.selection_strategy == "final_window":
+    points = result.selection_window
+    span = f"last {points} logged points" if points else "final logged window"
+    lines = [
+        f"* **Selection**: {metric_label} averaged over the {span} of each "
+        "trial (the converged level, not the single step the trial stopped "
+        "on)."
+    ]
+    if result.final_metric_val is not None:
+      lines.append(
+          f"* **Final-step {metric_label}**: "
+          f"`{result.final_metric_val:.5f}` - the gap to the value above is "
+          "step-to-step noise, and is how far a single-point ranking could "
+          "have moved this trial."
+      )
+    return lines
   if result.selection_strategy != "best":
     return []
   if result.selection_step is None:
@@ -47,6 +64,7 @@ def _selection_lines(result: StageResult, metric_label: str) -> List[str]:
         "is optimistically biased by the selection itself."
     )
   return lines
+
 
 
 class CampaignReporter:
@@ -117,22 +135,47 @@ class CampaignReporter:
         "",
         (
             "| Pipeline Stage | Model Identifier | Primary Metric | Best"
-            " Value | Status |"
+            " Value | Trials | Status |"
         ),
         (
             "| :--- | :--- | :--- | :---"
-            " | :--- |"
+            " | :--- | :--- |"
         ),
     ]
+
+    #: Degradations collected while building the table, rendered underneath
+    #: it. A report whose scorecard is a wall of green ticks while the PE-RL
+    #: sweep only ran 3 of its 5 trials is worse than no report at all.
+    warning_lines: List[str] = []
 
     for stage_name in self.config.stages:
       stage_res = self.state.stages.get(stage_name)
       if not stage_res:
-        lines.append(f"| **{stage_name.upper()}** | *Pending* | - | - | ⏳ PENDING |")
+        lines.append(
+            f"| **{stage_name.upper()}** | *Pending* | - | - | - | ⏳ PENDING |"
+        )
         continue
 
       model_str = f"`{stage_res.model_repo_id}`" if stage_res.model_repo_id else "*N/A*"
-      status_icon = "✅ COMPLETED" if stage_res.status == StageStatus.COMPLETED else f"⚠️ {stage_res.status.value}"
+      partial = (
+          stage_res.status == StageStatus.COMPLETED
+          and stage_res.sweep_outcome == "partial"
+      )
+      if stage_res.status != StageStatus.COMPLETED:
+        status_icon = f"⚠️ {stage_res.status.value}"
+      elif partial:
+        status_icon = "⚠️ COMPLETED (PARTIAL)"
+      else:
+        status_icon = "✅ COMPLETED"
+
+      trials_str = "-"
+      if stage_res.trials_total:
+        trials_str = f"{stage_res.trials_done}/{stage_res.trials_total}"
+        if partial:
+          trials_str = f"**{trials_str}**"
+
+      for warning in stage_res.warnings or []:
+        warning_lines.append(f"* **{stage_name.upper()}**: {warning}")
 
       if stage_name == "sft":
         metric_str = "eval/loss"
@@ -151,7 +194,22 @@ class CampaignReporter:
         metric_str = "-"
         val_str = "-"
 
-      lines.append(f"| **{stage_name.upper()}** | {model_str} | `{metric_str}` | **{val_str}** | {status_icon} |")
+      lines.append(
+          f"| **{stage_name.upper()}** | {model_str} | `{metric_str}` |"
+          f" **{val_str}** | {trials_str} | {status_icon} |"
+      )
+
+    if warning_lines:
+      lines.extend([
+          "",
+          "> [!WARNING]",
+          "> This campaign did not run as configured. The results below come"
+          " from a reduced search.",
+          "",
+          "### 1.1. Degradations",
+          "",
+          *warning_lines,
+      ])
 
     lines.extend([
         "",

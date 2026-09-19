@@ -25,6 +25,30 @@ logger = logging.getLogger(__name__)
 #: multi-minute download.
 MAX_HISTORY_ROWS = 20000
 
+#: Run states whose scores are trusted for ranking.
+RANKABLE_STATES = ("finished",)
+
+#: Run states used only when *nothing* finished. A sweep whose every trial
+#: died can still hold a usable metric, and refusing to look would throw away
+#: a recoverable model; but a half-trained run must never outrank a complete
+#: one, so these are consulted only as a last resort.
+FALLBACK_STATES = ("running", "failed")
+
+#: Run states that are never ranked, mapped to the words used in warnings.
+#:
+#: These used to be absent from the state handling altogether, so a trial
+#: killed by an OOM or a dead VM disappeared from the comparison without a
+#: single line of output. Excluding them is right - their last logged value
+#: is an arbitrary point in an unfinished run - but it has to be said out
+#: loud, otherwise a winner picked from 3 candidates reads exactly like one
+#: picked from 5.
+EXCLUDED_STATES = {
+    "crashed": "crashed",
+    "killed": "killed",
+    "preempted": "preempted",
+}
+
+
 
 @dataclasses.dataclass(frozen=True)
 class RunScore:
@@ -38,11 +62,21 @@ class RunScore:
       ``value`` under ``selection="final"``.
     step: The step at which ``value`` was observed, when that is a peak
       strictly better than ``final_value``. None otherwise, including when
-      the trial simply ended at its best point.
-    selection: The strategy that produced ``value`` ('final' or 'best').
+      the trial simply ended at its best point. Always None under
+      ``final_window``, whose score belongs to no single step.
+    selection: The strategy that produced ``value`` ('final', 'final_window'
+      or 'best').
     from_history: True when ``value`` came from the logged history rather
-      than from ``run.summary``. False under ``selection="best"`` means the
-      history was unreadable and the summary was used as a fallback.
+      than from ``run.summary``. False under ``selection="best"`` or
+      ``"final_window"`` means the history was unreadable and the summary was
+      used as a fallback.
+    window_points: How many logged points were averaged under
+      ``final_window``. None for the other strategies, and also None when the
+      window fell back to the summary.
+    pool_total: How many runs the sweep contained when the winner was picked.
+    pool_scored: How many of those were eligible and actually ranked.
+    pool_dropped: Why the rest were excluded, as ``reason -> count``. Empty
+      when every run was ranked.
   """
 
   run_id: str
@@ -52,19 +86,48 @@ class RunScore:
   step: Optional[int] = None
   selection: str = "final"
   from_history: bool = False
+  window_points: Optional[int] = None
+  pool_total: int = 0
+  pool_scored: int = 0
+  pool_dropped: Dict[str, int] = dataclasses.field(default_factory=dict)
 
   def describe_selection(self) -> str:
     """Returns a short human-readable account of how ``value`` was chosen."""
+    tail = ""
+    if self.final_value is not None:
+      tail = f" (final was {self.final_value:.5f})"
+    if self.selection == "final_window":
+      if not self.from_history:
+        return "final logged value; history unavailable for the window"
+      return f"mean of the last {self.window_points} logged points{tail}"
     if self.selection != "best":
       return "final logged value"
     if not self.from_history:
       return "final logged value; history unavailable"
     if self.step is None:
       return "best logged value, which is also the final one"
-    tail = ""
-    if self.final_value is not None:
-      tail = f" (final was {self.final_value:.5f})"
     return f"best logged value, at step {self.step}{tail}"
+
+  def describe_pool(self) -> Optional[str]:
+    """Returns a warning about excluded runs, or None when none were excluded.
+
+    The winner of a sweep is only as meaningful as the field it beat. A
+    campaign that lost trials to a crash ranks fewer configurations than it
+    was asked to, and that has to be visible next to the result rather than
+    inferred from the absence of a run in the W&B UI.
+
+    Returns:
+      A one-line warning, or None when every run in the sweep was ranked.
+    """
+    if not self.pool_dropped:
+      return None
+    detail = ", ".join(
+        f"{count} {reason}" for reason, count in sorted(self.pool_dropped.items())
+    )
+    return (
+        f"The winner was chosen from {self.pool_scored} of {self.pool_total} "
+        f"runs in the sweep; {detail}."
+    )
 
 
 def _metric_key_candidates(target: str) -> List[str]:
@@ -241,6 +304,97 @@ def _scan_metric_history(
   return best_value, best_step
 
 
+def _tail_mean_history(
+    run: Any, key: str, window: int
+) -> Optional[Tuple[float, int]]:
+  """Averages a trial's last ``window`` logged values of ``key``.
+
+  This is the converged-level view of a trial, and the reason it exists is
+  PE-RL: its objective is a training reward logged every optimizer step over
+  a handful of sampled generations, so any single step - the peak *or* the
+  last one - is mostly noise. Ranking on the peak selects the luckiest batch;
+  ranking on the last point selects whichever trial happened to stop on a
+  good one. Neither is the quantity a human reads off the smoothed curve.
+
+  Unlike :func:`_scan_metric_history` this cannot be capped at a prefix of
+  the history: the whole point is the *tail*. The rows are already
+  materialised by :func:`_iter_history_rows`, so taking the last ``window``
+  of them costs nothing extra.
+
+  Args:
+    run: A ``wandb`` run object.
+    key: The exact key to read, as resolved by :func:`_resolve_metric_key`.
+    window: How many trailing points to average. Values below 1 are treated
+      as 1, which degrades to plain final-value scoring rather than raising.
+
+  Returns:
+    ``(mean, points_averaged)``, where ``points_averaged`` is at most
+    ``window`` and can be smaller for a short trial. None when no history
+    could be read or it held no usable value, which the caller must treat as
+    "fall back to the summary".
+  """
+  rows = _iter_history_rows(run, key)
+  if not rows:
+    return None
+
+  values: List[float] = []
+  for row in rows:
+    if not isinstance(row, Mapping):
+      continue
+    value = _coerce_float(row.get(key))
+    if value is not None:
+      values.append(value)
+
+  if not values:
+    return None
+  tail = values[-max(1, window):]
+  return sum(tail) / len(tail), len(tail)
+
+
+
+@dataclasses.dataclass(frozen=True)
+class AgentRun:
+  """How one ``wandb agent`` process ended.
+
+  Attributes:
+    exit_code: The agent's exit code, with a deliberate termination
+      normalised to 0 - a timeout or a user stop is not a campaign failure.
+    timed_out: The agent was killed because the stage's wall-clock budget
+      ran out.
+    interrupted: The agent was killed on a user request (``[a]``/``[s]``).
+    requested_runs: How many trials this agent was asked for. Note this is
+      the *remaining* budget on a resumed stage, not the stage's total.
+    timeout_minutes: The wall-clock budget it was given, for messages.
+  """
+
+  exit_code: int = 0
+  timed_out: bool = False
+  interrupted: bool = False
+  requested_runs: int = 0
+  timeout_minutes: int = 0
+
+  @property
+  def cut_short(self) -> bool:
+    """True when the agent was deliberately terminated."""
+    return self.timed_out or self.interrupted
+
+  @property
+  def clean(self) -> bool:
+    """True when the agent ran its whole budget and exited normally."""
+    return self.exit_code == 0 and not self.cut_short
+
+  def describe(self) -> Optional[str]:
+    """Returns why the agent stopped early, or None when it did not."""
+    if self.timed_out:
+      return (
+          f"the sweep hit its {self.timeout_minutes} minute wall-clock budget"
+      )
+    if self.interrupted:
+      return "the sweep was stopped on request"
+    if self.exit_code != 0:
+      return f"the wandb agent exited with code {self.exit_code}"
+    return None
+
 
 class SweepController:
   """Controls W&B hyperparameter sweep registration, agent execution, and best-run extraction."""
@@ -350,7 +504,10 @@ class SweepController:
       live_line_callback: Optional[Callable[[str], None]] = None,
       stop_requested_callback: Optional[Callable[[], bool]] = None,
   ) -> int:
-    """Executes the W&B sweep agent, bound by max_runs and timeout.
+    """Executes the sweep agent and returns its exit code.
+
+    Thin wrapper over :meth:`run_sweep_agent_detailed` for callers that only
+    care whether the agent came back cleanly.
 
     Args:
         sweep_id: Full path to the sweep (entity/project/id) or short ID.
@@ -365,20 +522,62 @@ class SweepController:
         Exit code of the agent process (0 when the agent was deliberately cut
         short by the timeout or by a user stop request).
     """
+    return self.run_sweep_agent_detailed(
+        sweep_id=sweep_id,
+        max_runs=max_runs,
+        timeout_minutes=timeout_minutes,
+        live_line_callback=live_line_callback,
+        stop_requested_callback=stop_requested_callback,
+    ).exit_code
+
+  def run_sweep_agent_detailed(
+      self,
+      sweep_id: str,
+      max_runs: int = 30,
+      timeout_minutes: int = 240,
+      live_line_callback: Optional[Callable[[str], None]] = None,
+      stop_requested_callback: Optional[Callable[[], bool]] = None,
+  ) -> AgentRun:
+    """Executes the W&B sweep agent, bound by max_runs and timeout.
+
+    The exit code alone cannot be used to judge a sweep: it is deliberately
+    normalised to 0 when the agent is cut short on purpose, because a
+    timeout or a user stop is not a campaign failure. The caller still needs
+    to know it happened - a stage that was asked for 10 trials and got 4 has
+    searched a tenth of the space it reported - so the reason travels back
+    alongside the code.
+
+    Args:
+        sweep_id: Full path to the sweep (entity/project/id) or short ID.
+        max_runs: Strict upper limit of trials to execute before terminating.
+        timeout_minutes: Maximum wall-clock time in minutes allowed for the
+          sweep.
+        live_line_callback: Optional callback receiving live stdout lines.
+        stop_requested_callback: Optional predicate checking if user requested
+          early stop.
+
+    Returns:
+        An :class:`AgentRun` describing how the agent process ended.
+    """
     if self.dry_run:
       logger.info(
           "[DRY-RUN] Simulating sweep agent for %s with max_runs=%d",
           sweep_id,
           max_runs,
       )
-      for i in range(1, min(max_runs + 1, 4)):
+      # Simulate the *whole* budget. Simulating only the first few trials
+      # used to make every dry run look like a sweep that lost trials, which
+      # is now a loud warning rather than a silent one.
+      simulated = max(0, int(max_runs))
+      pause = min(0.3, 3.0 / simulated) if simulated else 0.0
+      for i in range(1, simulated + 1):
         msg = (
             f"[DRY-RUN] Trial {i}/{max_runs} executed successfully (metric simulated)."
         )
         if live_line_callback:
           live_line_callback(msg)
-        time.sleep(0.3)
-      return 0
+        time.sleep(pause)
+      return AgentRun(exit_code=0, requested_runs=max_runs)
 
     # Format full sweep path
     entity = self.resolve_entity()
@@ -422,8 +621,14 @@ class SweepController:
         live_line_callback(f"[WARNING] {msg}")
 
     self.stop_sweep(full_sweep_id)
-    # A deliberate termination is not a failure of the campaign.
-    return 0 if outcome.cut_short else outcome.returncode
+    return AgentRun(
+        # A deliberate termination is not a failure of the campaign.
+        exit_code=0 if outcome.cut_short else outcome.returncode,
+        timed_out=outcome.timed_out,
+        interrupted=outcome.interrupted,
+        requested_runs=max_runs,
+        timeout_minutes=timeout_minutes,
+    )
 
 
   def qualify_sweep_id(self, sweep_id: str) -> str:
@@ -786,6 +991,7 @@ class SweepController:
       goal: str = "minimize",
       live_line_callback: Optional[Callable[[str], None]] = None,
       selection: str = "final",
+      window: int = 1,
   ) -> RunScore:
     """Retrieves the winning run of a sweep together with how it was scored.
 
@@ -795,6 +1001,8 @@ class SweepController:
         goal: 'minimize' or 'maximize'.
         live_line_callback: Optional sink notified about retries.
         selection: See :meth:`fetch_best_run`.
+        window: Trailing points averaged under ``selection="final_window"``;
+          ignored by the other strategies.
 
     Returns:
         The winning :class:`RunScore`.
@@ -822,16 +1030,29 @@ class SweepController:
       )
       # The simulated trial "peaks" slightly above where it ends, so a
       # dry run exercises the same reporting path as a real ``best`` pick.
+      # ``final_window`` gets its own arm for the same reason: a rehearsal
+      # must render the prose the real campaign will render, otherwise the
+      # first time anybody reads it is in a report that matters.
       final_metric = 0.300 if goal == "minimize" else 0.950
       chose_peak = selection == "best"
+      chose_window = selection == "final_window"
+      if chose_window:
+        value = (final_metric + mock_metric) / 2
+      elif chose_peak:
+        value = mock_metric
+      else:
+        value = final_metric
       return RunScore(
           run_id=mock_run_id,
-          value=mock_metric if chose_peak else final_metric,
+          value=value,
           params=mock_params,
           final_value=final_metric,
           step=120 if chose_peak else None,
           selection=selection,
-          from_history=chose_peak,
+          from_history=chose_peak or chose_window,
+          window_points=max(1, window) if chose_window else None,
+          pool_total=1,
+          pool_scored=1,
       )
 
     # This query happens right after hours of sweeping: a transient API error
@@ -839,7 +1060,7 @@ class SweepController:
     # genuinely missing metric raises a message flagged non-retryable.
     return run_with_retries(
         lambda: self._fetch_best_run_once(
-            sweep_id, metric_name, goal, selection, live_line_callback
+            sweep_id, metric_name, goal, selection, live_line_callback, window
         ),
         description="W&B best-run query",
         attempts=self.robustness.api_attempts,
@@ -854,6 +1075,7 @@ class SweepController:
       metric_name: str,
       goal: str,
       selection: str,
+      window: int = 1,
   ) -> Optional[RunScore]:
     """Scores a single trial according to ``selection``.
 
@@ -861,7 +1083,9 @@ class SweepController:
       run: A ``wandb`` run object.
       metric_name: Metric the sweep optimises.
       goal: 'minimize' or 'maximize'.
-      selection: 'final' or 'best'.
+      selection: 'final', 'final_window' or 'best'.
+      window: Trailing points to average under ``final_window``; ignored by
+        the other strategies.
 
     Returns:
       The run's :class:`RunScore`, or None when it never logged the metric.
@@ -881,6 +1105,29 @@ class SweepController:
         final_value=final_value,
         selection=selection,
     )
+    if selection == "final_window":
+      averaged = _tail_mean_history(run, key, window)
+      if averaged is None:
+        # Same bargain as the ``best`` fallback below: the summary value is a
+        # real observation, just a noisier one than we asked for. Scoring on
+        # it keeps the sweep rankable instead of discarding it because a
+        # refinement was unavailable. ``from_history=False`` makes the
+        # downgrade visible in the report rather than silent.
+        logger.warning(
+            "Could not read the logged history of run %s for '%s'; scoring "
+            "it on its final value instead of a %d-point window.",
+            run.id,
+            key,
+            window,
+        )
+        return base
+      window_value, points = averaged
+      return dataclasses.replace(
+          base,
+          value=window_value,
+          window_points=points,
+          from_history=True,
+      )
     if selection != "best":
       return base
 
@@ -918,6 +1165,7 @@ class SweepController:
       goal: str,
       selection: str = "final",
       live_line_callback: Optional[Callable[[str], None]] = None,
+      window: int = 1,
   ) -> RunScore:
     """Single attempt of :meth:`fetch_best_run_details` (see it for the contract)."""
     try:
@@ -934,18 +1182,37 @@ class SweepController:
 
       finished_runs: List[RunScore] = []
       other_runs: List[RunScore] = []
+      # Why each excluded run was excluded. Counted rather than merely
+      # skipped, because the size of the field the winner beat is part of
+      # the result: ranking 3 configurations is not ranking 5.
+      dropped: Dict[str, int] = {}
+
+      def drop(reason: str) -> None:
+        dropped[reason] = dropped.get(reason, 0) + 1
 
       for run in runs:
-        score = self._score_run(run, metric_name, goal, selection)
+        state = str(getattr(run, "state", "") or "unknown")
+        score = self._score_run(run, metric_name, goal, selection, window)
         if score is None:
+          drop(f"logged no '{metric_name}'")
           continue
-        if run.state == "finished":
+        if state in RANKABLE_STATES:
           finished_runs.append(score)
-        elif run.state in ("running", "failed"):
+        elif state in FALLBACK_STATES:
           other_runs.append(score)
+        elif state in EXCLUDED_STATES:
+          drop(EXCLUDED_STATES[state])
+        else:
+          # An unrecognised state is treated as unrankable rather than
+          # assumed good: W&B may add states, and a new one silently
+          # outranking a finished trial is the worse failure.
+          drop(f"in state '{state}'")
 
       # Strictly prioritize finished runs over failed or running ones
       valid_runs = finished_runs if finished_runs else other_runs
+      if finished_runs and other_runs:
+        # Not a defect, but the report should not imply these were compared.
+        dropped["unfinished"] = dropped.get("unfinished", 0) + len(other_runs)
 
       if not valid_runs:
         # Returning a sentinel here used to be silent data corruption: the
@@ -970,22 +1237,34 @@ class SweepController:
       # Sort by metric
       reverse = goal == "maximize"
       valid_runs.sort(key=lambda score: score.value, reverse=reverse)
-      best = valid_runs[0]
+      best = dataclasses.replace(
+          valid_runs[0],
+          pool_total=len(runs),
+          pool_scored=len(valid_runs),
+          pool_dropped=dropped,
+      )
 
       logger.info(
-          "Best run for %s is %s with %s=%.5f (%s)",
+          "Best run for %s is %s with %s=%.5f (%s), chosen from %d of %d runs",
           sweep_id,
           best.run_id,
           metric_name,
           best.value,
           best.describe_selection(),
+          best.pool_scored,
+          best.pool_total,
       )
-      if live_line_callback and selection == "best":
+      if live_line_callback and selection in ("best", "final_window"):
         if not any(score.from_history for score in valid_runs):
+          intent = (
+              "their best evaluation step"
+              if selection == "best"
+              else f"the mean of their last {window} logged points"
+          )
           live_line_callback(
-              "[WARNING] Trials were meant to be ranked on their best "
-              "evaluation step, but no logged history could be read; they "
-              "were ranked on their final value instead."
+              f"[WARNING] Trials were meant to be ranked on {intent}, but no "
+              "logged history could be read; they were ranked on their final "
+              "value instead."
           )
       return best
 

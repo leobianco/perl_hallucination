@@ -3,18 +3,15 @@
 from __future__ import annotations
 
 import abc
-from dataclasses import dataclass
-import glob
-import json
+from dataclasses import dataclass, field
 import logging
-import os
-import re
-from typing import Any, Callable, Dict, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
+from src.orchestrator import naming
 from src.orchestrator.config import CampaignConfig, SweepStageConfig
 from src.orchestrator.model_manager import ModelManager
 from src.orchestrator.state import CampaignState, StageResult, StageStatus
-from src.orchestrator.sweep_controller import RunScore, SweepController
+from src.orchestrator.sweep_controller import AgentRun, RunScore, SweepController
 
 
 logger = logging.getLogger(__name__)
@@ -57,6 +54,66 @@ class CampaignContext:
   def perl_model_repo_id(self) -> Optional[str]:
     """Resolves the final PE-RL model repo ID from state."""
     return self.state.get_model_repo_id("perl")
+
+
+@dataclass(frozen=True)
+class SweepExecution:
+  """What a sweep actually delivered, as opposed to what it was asked for.
+
+  A sweep can end for several reasons that are not failures - the wall-clock
+  budget expires, the user advances with the best run so far, the machine
+  running the agent dies and the agent process with it. In all of those the
+  stage carries on: some trials did finish, so there *is* a best
+  configuration to retrain and publish, and refusing to use it would throw
+  away hours of GPU time.
+
+  What must not happen is the campaign then reporting the result as though
+  the whole search had run. Ranking 3 configurations is not ranking 5, and
+  the difference has to survive into the state file, the dashboard and the
+  report.
+
+  Attributes:
+    trials_done: Trials that finished successfully, as counted by W&B after
+      the agent returned. This is the authoritative number; the live counter
+      is parsed from agent stdout and counts crashed trials too.
+    trials_total: The trial budget the stage was configured with.
+    outcome: ``complete``, ``partial`` or ``unknown``.
+    warnings: Human-readable notes explaining a non-``complete`` outcome.
+  """
+
+  trials_done: int
+  trials_total: int
+  outcome: str = "complete"
+  warnings: List[str] = field(default_factory=list)
+
+  @property
+  def is_partial(self) -> bool:
+    """True when fewer trials finished than the stage asked for."""
+    return self.outcome == "partial"
+
+  def stage_result_fields(
+      self, extra_warnings: Sequence[str] = ()
+  ) -> Dict[str, Any]:
+    """Returns the ``StageResult`` fields recording this accounting.
+
+    Args:
+      extra_warnings: Further degradations discovered after the trials ran,
+        typically from winner selection. They are appended rather than
+        merged by the caller because both sets land in the same
+        ``StageResult.warnings`` list, and a plain ``**`` splat of two dicts
+        would silently drop one of them.
+
+    Returns:
+      The fields to splat into a ``StageResult``.
+    """
+    return {
+        "trials_done": self.trials_done,
+        "trials_total": self.trials_total,
+        "sweep_outcome": self.outcome,
+        "warnings": list(self.warnings) + [w for w in extra_warnings if w],
+    }
+
+
 
 
 class BaseStage(abc.ABC):
@@ -148,6 +205,7 @@ class BaseStage(abc.ABC):
         goal=stage_config.goal,
         live_line_callback=live_line_callback,
         selection=stage_config.selection_strategy,
+        window=stage_config.selection_window,
     )
     label = self.name.upper()
     logger.info(
@@ -173,6 +231,12 @@ class BaseStage(abc.ABC):
             f"the end of the run; the published checkpoint is the step-"
             f"{winner.step} one."
         )
+      # A winner drawn from a shrunken field is still a winner, but it is a
+      # weaker claim, and the operator watching the log is the person best
+      # placed to decide whether to rerun the sweep.
+      pool = winner.describe_pool()
+      if pool:
+        live_line_callback(f"[WARNING] {label}: {pool}")
 
     self.sweep_controller.mark_best_run(
         sweep_id=sweep_id,
@@ -183,6 +247,23 @@ class BaseStage(abc.ABC):
         live_line_callback=live_line_callback,
     )
     return winner
+
+  def selection_warnings(self, winner: RunScore) -> List[str]:
+    """Returns the degradations that winner selection itself discovered.
+
+    Kept separate from the trial-accounting warnings because the two are
+    independent: a sweep can run all of its trials and still rank only some
+    of them (a crashed run is excluded), and a sweep can lose trials and
+    still rank every run that exists.
+
+    Args:
+      winner: The selected trial.
+
+    Returns:
+      Zero or one warning line, ready to append to ``StageResult.warnings``.
+    """
+    pool = winner.describe_pool()
+    return [f"{self.name.upper()}: {pool}"] if pool else []
 
   def materialization_checkpoint_kwargs(
       self, stage_config: SweepStageConfig
@@ -201,6 +282,7 @@ class BaseStage(abc.ABC):
         "best_params": winner.params,
         "selection_strategy": winner.selection,
         "selection_step": winner.step,
+        "selection_window": winner.window_points,
         "final_metric_val": winner.final_value,
     }
 
@@ -249,6 +331,158 @@ class BaseStage(abc.ABC):
         )
     return remaining
 
+  def run_sweep_trials(
+      self,
+      sweep_id: str,
+      stage_config: SweepStageConfig,
+      live_line_callback: Optional[Callable[[str], None]] = None,
+      stop_requested_callback: Optional[Callable[[], bool]] = None,
+  ) -> SweepExecution:
+    """Runs the sweep agent and reports what the sweep actually produced.
+
+    Args:
+      sweep_id: The sweep to execute.
+      stage_config: This stage's configuration (budget and timeout).
+      live_line_callback: Optional sink for agent output and notices.
+      stop_requested_callback: Predicate that cuts the agent short.
+
+    Returns:
+      The accounting for this sweep; see :class:`SweepExecution`.
+    """
+    budget = max(0, int(stage_config.max_runs or 0))
+    remaining = self.remaining_runs(sweep_id, budget, live_line_callback)
+    agent: Optional[AgentRun] = None
+    if remaining:
+      agent = self.sweep_controller.run_sweep_agent_detailed(
+          sweep_id=sweep_id,
+          max_runs=remaining,
+          timeout_minutes=stage_config.timeout_minutes,
+          live_line_callback=live_line_callback,
+          stop_requested_callback=stop_requested_callback,
+      )
+    return self.account_for_trials(
+        sweep_id=sweep_id,
+        budget=budget,
+        agent=agent,
+        live_line_callback=live_line_callback,
+    )
+
+  def account_for_trials(
+      self,
+      sweep_id: str,
+      budget: int,
+      agent: Optional[AgentRun] = None,
+      live_line_callback: Optional[Callable[[str], None]] = None,
+  ) -> SweepExecution:
+    """Establishes how many trials the sweep really finished, and says so.
+
+    The live counter shown while the stage runs is parsed from the agent's
+    stdout, and it counts a trial as "done" the moment the agent stops
+    talking about it - including when the trial crashed, and including
+    trials the agent never got to report on because it died mid-way. It is
+    good enough for a progress bar and worthless as a record.
+
+    So once the agent is back, the count is re-established from W&B, which
+    is the only party that knows how many trials reached ``finished``. That
+    number is what the stage carries into its result, and any shortfall is
+    turned into a warning that follows the campaign all the way to the
+    report. A stage that lost two trials to a dead VM used to be
+    indistinguishable from one that ran perfectly.
+
+    Args:
+      sweep_id: The sweep that was executed.
+      budget: Trials the stage was configured to run.
+      agent: Outcome of the agent process, when one was launched.
+      live_line_callback: Optional sink for the warnings.
+
+    Returns:
+      The accounting for this sweep.
+    """
+    label = self.name.upper()
+    warnings: List[str] = []
+
+    if self.config.dry_run:
+      # No W&B to ask, and the simulated agent runs the whole budget.
+      return SweepExecution(
+          trials_done=budget, trials_total=budget, outcome="complete"
+      )
+
+    finished = self.sweep_controller.count_finished_runs(sweep_id)
+    reason = agent.describe() if agent is not None else None
+
+    if finished is None:
+      # Refuse to invent a number. The previously persisted progress is a
+      # lower bound parsed from stdout, and saying so is better than either
+      # a confident lie or a blank.
+      previous = self.state.stages.get(self.name)
+      trials_done = int(getattr(previous, "trials_done", 0) or 0)
+      outcome = "unknown"
+      warnings.append(
+          f"W&B could not be asked how many {label} trials finished, so the"
+          f" trial count below ({trials_done}/{budget}) is a lower bound"
+          " parsed from the agent's output and may be wrong."
+      )
+    else:
+      trials_done = int(finished)
+      if budget and trials_done < budget:
+        outcome = "partial"
+        because = f" because {reason}" if reason else ""
+        warnings.append(
+            f"{label} sweep is INCOMPLETE: {trials_done} of {budget} trials"
+            f" finished{because}. The winner was chosen from those"
+            f" {trials_done} trials only, so this stage searched less of the"
+            " hyperparameter space than the campaign asked for. Re-run the"
+            " campaign with `resume` to run the missing"
+            f" {budget - trials_done}."
+        )
+      else:
+        outcome = "complete"
+
+    if trials_done == 0 and budget:
+      # Nothing to rank. Left to the winner query to fail on, deliberately:
+      # a sweep whose runs all crashed can still have logged a usable
+      # metric, and failing here would throw that away.
+      warnings.append(
+          f"No {label} trial reached the 'finished' state. Any winner below"
+          " comes from a run W&B does not consider complete."
+      )
+
+    execution = SweepExecution(
+        trials_done=trials_done,
+        trials_total=budget,
+        outcome=outcome,
+        warnings=warnings,
+    )
+    self.record_trial_accounting(execution)
+
+    for warning in warnings:
+      logger.warning("%s", warning)
+      if live_line_callback:
+        live_line_callback(f"[WARNING] {warning}")
+    return execution
+
+  def record_trial_accounting(self, execution: SweepExecution) -> None:
+    """Persists ``execution`` immediately, before materialization starts.
+
+    Materializing the winner retrains it from scratch and can take longer
+    than the sweep did. A crash in there must not lose the record of what
+    the sweep produced.
+
+    Args:
+      execution: The accounting to persist.
+    """
+    result = self.state.stages.get(self.name)
+    if result is None:
+      result = StageResult(status=StageStatus.RUNNING)
+      self.state.stages[self.name] = result
+    for key, value in execution.stage_result_fields().items():
+      setattr(result, key, value)
+    if self.context.state_path:
+      try:
+        self.state.save(self.context.state_path)
+      except OSError as exc:
+        logger.warning("Could not persist trial accounting: %s", exc)
+
   def get_sweep_descriptor(self, sweep_dict: Dict[str, Any]) -> Tuple[str, str]:
     """Returns (model_short_name, stage_type_string) for this stage.
 
@@ -262,76 +496,30 @@ class BaseStage(abc.ABC):
     model_short = self.config.base_model.rstrip("/").split("/")[-1]
     return model_short, self.name.upper()
 
-  def determine_sweep_number(self, prefix: str) -> int:
-    """Calculates the 1-based sweep number for this stage.
+  def campaign_sweep_token(self) -> str:
+    """Returns the hex token shared by every sweep of this campaign.
 
-    Counts prior sweeps matching this prefix from local checkpoint
-    state files and the Weights & Biases API.
-
-    Args:
-      prefix: Prefix string identifying the task, model, and stage.
+    See :mod:`src.orchestrator.naming` for why the old ``#1`` counter had to
+    go.
 
     Returns:
-      Next 1-based sweep number.
+      A short lowercase hex string derived from the campaign's start time.
     """
-    seen_numbers: Set[int] = set()
-    state_file_path = (
-        self.config.state_file
-        or f"./checkpoints/{self.config.task_name}/state.json"
+    return naming.campaign_token(
+        campaign_id=self.state.campaign_id or self.config.name,
+        created_at=getattr(self.state, "created_at", None),
     )
-    checkpoints_dir = os.path.dirname(os.path.abspath(state_file_path))
-
-    if os.path.isdir(checkpoints_dir):
-      for fpath in glob.glob(os.path.join(checkpoints_dir, "*_state.json")):
-        fpath = os.path.abspath(fpath)
-        if fpath == os.path.abspath(state_file_path):
-          continue
-        try:
-          with open(fpath, "r", encoding="utf-8") as f:
-            data = json.load(f)
-          if data.get("campaign_id") == self.state.campaign_id:
-            continue
-          if data.get("task_name") != self.config.task_name:
-            continue
-          stage_data = data.get("stages", {}).get(self.name, {})
-          sw_name = stage_data.get("sweep_name")
-          if sw_name and sw_name.startswith(prefix):
-            m = re.search(r"Sweep #(\d+)", sw_name)
-            if m:
-              seen_numbers.add(int(m.group(1)))
-            else:
-              seen_numbers.add(len(seen_numbers) + 1)
-        except (OSError, json.JSONDecodeError):
-          continue
-
-    if not self.config.dry_run:
-      try:
-        import wandb  # pylint: disable=g-import-not-at-top
-
-        api = wandb.Api()
-        entity = self.sweep_controller.resolve_entity()
-        proj = self.config.project
-        sweeps = api.sweeps(f"{entity}/{proj}")
-        for s in sweeps:
-          s_name = getattr(s, "name", "") or ""
-          if s_name.startswith(prefix):
-            m = re.search(r"Sweep #(\d+)", s_name)
-            if m:
-              seen_numbers.add(int(m.group(1)))
-            else:
-              seen_numbers.add(len(seen_numbers) + 1)
-      except Exception as e:  # pylint: disable=broad-exception-caught
-        logger.debug("Could not query existing sweeps from W&B: %s", e)
-
-    return max(seen_numbers, default=0) + 1
 
   def generate_sweep_name(self, sweep_dict: Dict[str, Any]) -> str:
     """Constructs a descriptive human-readable W&B sweep name.
 
-    Format: [TASK NAME] [MODEL NAME & SIZE] [STAGE / DATA TYPE] [Sweep #X]
-    Example: BOSCH gemma-4-E2B-it SFT Sweep #1
-             BOSCH gemma-3-1b-it RM Organic Sweep #1
-             BOSCH gemma-4-E2B-it PERL Organic Sweep #1
+    Format: [TASK NAME] [MODEL NAME & SIZE] [STAGE / DATA TYPE] [Sweep TOKEN]
+    Example: BOSCH gemma-4-E2B-it SFT Sweep 35d2a7
+             BOSCH gemma-3-1b-it RM Organic Sweep 35d2a7
+             BOSCH gemma-4-E2B-it PERL Organic Sweep 35d2a7
+
+    The trailing token is the same for all three stages of one campaign, so
+    the sweeps that belong together can be found together in the W&B UI.
 
     Args:
       sweep_dict: Sweep configuration dictionary.
@@ -342,8 +530,7 @@ class BaseStage(abc.ABC):
     task_str = self.config.task_name.upper()
     model_short, stage_type_str = self.get_sweep_descriptor(sweep_dict)
     prefix = f"{task_str} {model_short} {stage_type_str}"
-    sweep_num = self.determine_sweep_number(prefix)
-    return f"{prefix} Sweep #{sweep_num}"
+    return f"{prefix} Sweep {self.campaign_sweep_token()}"
 
   def resolve_sweep_id(
       self,

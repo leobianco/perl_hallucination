@@ -56,14 +56,21 @@ def sweep_timeout_minutes(stage: str, max_runs: int) -> int:
 #: How a trial's score is read out of its W&B history.
 #:
 #: ``final``
-#:   The last value the trial logged - what ``run.summary`` holds. Correct
-#:   when the metric is noisy per step and only its *converged* level is
-#:   meaningful (the PE-RL training reward).
+#:   The last value the trial logged - what ``run.summary`` holds. One point,
+#:   so it is only trustworthy for a metric that is itself stable, e.g. an
+#:   evaluation computed over a whole held-out set.
+#: ``final_window``
+#:   The mean of the trial's last ``selection_window`` logged points. This is
+#:   the converged *level*, which is what a human reads off a smoothed W&B
+#:   curve. Correct when the metric is noisy per step: the PE-RL training
+#:   reward is a mean over a handful of sampled generations, so scoring a
+#:   trial on any single step - its peak or its last - ranks configurations
+#:   by which one drew a lucky batch.
 #: ``best``
 #:   The extremum over every logged step, i.e. early-stopping semantics.
 #:   Correct when the deployed checkpoint is itself the best-step one, which
 #:   is what ``--load_best_model_at_end`` gives us for SFT and RM.
-SELECTION_STRATEGIES = ("final", "best")
+SELECTION_STRATEGIES = ("final", "final_window", "best")
 
 #: Which checkpoint of the materialization run becomes the *default* of the
 #: published Hub repository, i.e. the one a bare ``from_pretrained(repo_id)``
@@ -95,6 +102,16 @@ class SweepStageConfig:
   #: keeps the historical behaviour; :meth:`CampaignConfig.create_default`
   #: opts SFT and RM into ``best``.
   selection_strategy: str = "final"
+  #: Trailing logged points averaged under ``selection_strategy`` =
+  #: ``final_window``. Ignored by the other strategies.
+  #:
+  #: It trades noise for lag: too small and the score is still one lucky
+  #: batch, too large and it drags in the early, untrained part of a short
+  #: run. Size it against the trial's step count - a PE-RL trial at
+  #: ``num_train_epochs=0.2`` logs a few dozen steps, so ~10 averages the
+  #: last third without reaching back into the warmup.
+  selection_window: int = 10
+
   #: Which checkpoint the published Hub repo serves by default; see
   #: CHECKPOINT_POLICIES. The other one is always published alongside it
   #: under a subfolder, so this is purely a choice of default - but it should
@@ -250,6 +267,20 @@ class CampaignConfig:
             f"'{stage_cfg.selection_strategy}' for the {stage_name.upper()} "
             f"stage. Must be one of {list(SELECTION_STRATEGIES)}."
         )
+      if (
+          stage_cfg.selection_strategy == "final_window"
+          and stage_cfg.selection_window < 1
+      ):
+        # Caught here rather than clamped at query time: a window of 0 is
+        # not a smaller window, it is a different strategy, and a campaign
+        # that silently ranked on one point while its config said otherwise
+        # would be unreproducible from the config alone.
+        raise ValueError(
+            f"selection_window must be >= 1 for the {stage_name.upper()} "
+            f"stage, got {stage_cfg.selection_window}. Use "
+            "selection_strategy='final' to rank on a single point."
+        )
+
       if stage_cfg.checkpoint_policy not in CHECKPOINT_POLICIES:
         raise ValueError(
             f"Invalid checkpoint_policy '{stage_cfg.checkpoint_policy}' for "
@@ -377,7 +408,19 @@ class CampaignConfig:
             # always lands early, before the policy stabilises, so ranking on
             # it would select the luckiest batch rather than the best
             # configuration. The converged level is the honest signal.
-            selection_strategy="final",
+            #
+            # But plain "final" is only one step of that same noisy signal:
+            # it does not measure the converged level, it measures wherever
+            # the trial happened to stop. Two configurations then swap places
+            # on a single batch of 8 sampled generations, which is how a
+            # winner that maximises nothing visible gets published. The
+            # window averages the tail, which is the level a human reads off
+            # the smoothed curve in the W&B UI.
+            selection_strategy="final_window",
+            # ~10 of the few dozen steps a 0.2-epoch trial logs: the last
+            # third, without reaching back into the warmup.
+            selection_window=10,
+
             # The last checkpoint is the one a bare
             # ``from_pretrained(repo_id)`` returns, for the same reason: a
             # peak-reward adapter is one lucky batch away from being a

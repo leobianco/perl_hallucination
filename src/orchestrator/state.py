@@ -46,7 +46,8 @@ class StageResult:
   #: config is later edited or unavailable.
   trials_total: int = 0
   #: How ``best_metric_val`` was read out of the winning trial: ``final``
-  #: (its last logged value) or ``best`` (its peak over all eval steps).
+  #: (its last logged value), ``final_window`` (the mean of its last
+  #: ``selection_window`` points) or ``best`` (its peak over all eval steps).
   #: Without this, two campaigns of the same task report numbers that are
   #: not comparable and nothing on disk says why.
   selection_strategy: Optional[str] = None
@@ -54,11 +55,31 @@ class StageResult:
   #: better than where the run ended. None under ``final`` selection, and
   #: also None when the run simply ended at its best point.
   selection_step: Optional[int] = None
+  #: How many trailing points were actually averaged under ``final_window``.
+  #: Recorded rather than recomputed from the config because a short trial
+  #: yields fewer points than the window asked for, and the report must
+  #: quote the number the score was really built from.
+  selection_window: Optional[int] = None
+
   #: The winner's *last* logged value of the metric. Under ``best``
   #: selection the gap to ``best_metric_val`` is the honest measure of how
   #: much of the score is early stopping - a large gap on a noisy metric is
   #: a warning sign, not a result.
   final_metric_val: Optional[float] = None
+  #: How the sweep ended, as established against W&B *after* the agent
+  #: returned: ``complete`` (the whole budget finished), ``partial`` (fewer
+  #: trials finished than were asked for - a crash, a timeout, or a user
+  #: stop), or ``unknown`` (W&B could not be reached to find out).
+  #:
+  #: Without this a stage that lost half its trials to a dead VM is
+  #: indistinguishable on disk from one that ran perfectly: both are
+  #: COMPLETED, because a sweep that produced *some* trained models still
+  #: yields a winner and still publishes a checkpoint.
+  sweep_outcome: Optional[str] = None
+  #: Human-readable notes about anything that degraded this stage but did
+  #: not fail it. Surfaced by the dashboard and the campaign report so a
+  #: shortened sweep cannot be mistaken for a clean one.
+  warnings: List[str] = field(default_factory=list)
 
   def to_dict(self) -> Dict[str, Any]:
     res = dataclasses.asdict(self)
@@ -101,8 +122,13 @@ class CampaignState:
     The failure message of the attempt that preceded this one is cleared.
     It describes a run that is over; leaving it in place makes the dashboard
     show a resumed, healthy stage with a red "Materialization ... was
-    interrupted" next to it for the rest of the campaign. Progress, sweep id
-    and best-so-far are deliberately *kept* - those still hold.
+    interrupted" next to it for the rest of the campaign. The degradation
+    notes of that attempt go with it, for the same reason and because this
+    attempt is about to re-establish them from W&B. Progress, sweep id and
+    best-so-far are deliberately *kept* - those still hold.
+
+    Args:
+      stage_name: Stage that is (re)starting.
     """
     self.current_stage = stage_name
     self.updated_at = datetime.datetime.now().isoformat()
@@ -110,6 +136,8 @@ class CampaignState:
       self.stages[stage_name] = StageResult()
     self.stages[stage_name].status = StageStatus.RUNNING
     self.stages[stage_name].error_message = None
+    self.stages[stage_name].warnings = []
+    self.stages[stage_name].sweep_outcome = None
     self.stages[stage_name].start_time = datetime.datetime.now().isoformat()
 
   def update_stage_progress(
@@ -124,6 +152,15 @@ class CampaignState:
     This is what makes ``status``/``status --watch`` usable from a second
     tmux pane: that process has no access to the running campaign's in-memory
     log parser, so anything it is meant to display has to be on disk.
+
+    The trial counters are frozen once ``sweep_outcome`` is set, i.e. once
+    the stage has asked W&B how many trials really finished. Everything
+    after that point is materialization output, which still flows through
+    the same line sink; without the freeze its first line would overwrite
+    the reconciled count with the stdout estimate again - and the estimate
+    counts crashed trials as done, which is the whole reason the
+    reconciliation exists. ``best_metric_val`` is deliberately still
+    accepted: it is not part of the accounting.
 
     Args:
       stage_name: Stage currently running.
@@ -140,11 +177,20 @@ class CampaignState:
       result = StageResult(status=StageStatus.RUNNING)
       self.stages[stage_name] = result
 
+    reconciled = result.sweep_outcome is not None
     changed = False
-    if trials_done is not None and int(trials_done) != result.trials_done:
+    if (
+        not reconciled
+        and trials_done is not None
+        and int(trials_done) != result.trials_done
+    ):
       result.trials_done = int(trials_done)
       changed = True
-    if trials_total and int(trials_total) != result.trials_total:
+    if (
+        not reconciled
+        and trials_total
+        and int(trials_total) != result.trials_total
+    ):
       result.trials_total = int(trials_total)
       changed = True
     if best_metric_val is not None and best_metric_val != result.best_metric_val:
@@ -172,6 +218,16 @@ class CampaignState:
     if result.start_time is None and previous is not None:
       result.start_time = previous.start_time
     if previous is not None:
+      # The human-readable sweep name is recorded by `record_sweep_id` when
+      # the sweep is registered, and stages return a fresh StageResult that
+      # only carries the id. Without this the name is dropped on the last
+      # line of every stage and the report falls back to a bare
+      # `entity/project/ab12cd34`, which is exactly what the descriptive
+      # names exist to avoid.
+      if not result.sweep_name:
+        result.sweep_name = previous.sweep_name
+      if not result.sweep_id:
+        result.sweep_id = previous.sweep_id
       # Stages report their outcome, not their progress; without this the
       # counters tracked during the sweep would be thrown away on the last
       # line of the stage.

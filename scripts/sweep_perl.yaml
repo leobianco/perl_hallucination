@@ -50,6 +50,17 @@ command:
   - --per_device_eval_batch_size=16
   - --auto_find_batch_size=False
   - --gradient_accumulation_steps=8
+  # Pinned, NOT searched. This multiplies the negative part of
+  # rewards/reward_fn/mean - the metric this sweep maximizes - so a trial
+  # that drew a smaller alpha scored higher for free, and every trial was
+  # ranked on a different scale. With method: bayes that is worse than
+  # noise: the optimizer learns that the reliable way to raise the
+  # objective is to weaken the hallucination penalty, i.e. it optimizes
+  # away the thing the penalty exists to punish. Compare alphas across
+  # campaigns using the eval stage's hallucination rate, which does not
+  # depend on alpha, instead of inside one sweep.
+  - --reward_penalty_alpha=1.0
+
   - ${args}
 
 parameters:
@@ -69,9 +80,4 @@ parameters:
       - 0.3
       - 0.6
       - 1.0
-  reward_penalty_alpha:
-    values:
-      - 1.0
-      - 1.5
-      - 2.0
-      - 3.0
+
