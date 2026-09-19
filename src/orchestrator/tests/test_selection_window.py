@@ -350,6 +350,24 @@ class ConfigTest(unittest.TestCase):
     self.assertEqual(config.sft.selection_strategy, "best")
     self.assertEqual(config.rm.selection_strategy, "best")
 
+  def test_stages_that_never_average_advertise_no_window(self):
+    # A dumped config showing `selection_window: 10` under a `best` stage
+    # reads like the stage averages 10 points. It averages none.
+    config = CampaignConfig.create_default(task_name="ragtruth")
+    self.assertIsNone(config.sft.selection_window)
+    self.assertIsNone(config.rm.selection_window)
+    dumped = config.to_dict()
+    self.assertIsNone(dumped["sft"]["selection_window"])
+    self.assertIsNone(dumped["rm"]["selection_window"])
+    self.assertEqual(dumped["perl"]["selection_window"], 10)
+
+  def test_a_window_strategy_without_a_window_is_rejected(self):
+    config = CampaignConfig.create_default(task_name="ragtruth")
+    config.perl.selection_window = None
+    with self.assertRaises(ValueError) as ctx:
+      config.validate()
+    self.assertIn("selection_window", str(ctx.exception))
+
   def test_a_zero_window_is_rejected(self):
     config = CampaignConfig.create_default(task_name="ragtruth")
     config.perl.selection_window = 0

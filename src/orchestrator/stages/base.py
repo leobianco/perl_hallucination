@@ -205,7 +205,9 @@ class BaseStage(abc.ABC):
         goal=stage_config.goal,
         live_line_callback=live_line_callback,
         selection=stage_config.selection_strategy,
-        window=stage_config.selection_window,
+        # None on every stage that does not rank on a window; the query
+        # ignores it there, but it still has to be an int.
+        window=stage_config.selection_window or 1,
     )
     label = self.name.upper()
     logger.info(

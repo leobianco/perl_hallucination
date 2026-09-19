@@ -19,6 +19,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from src.orchestrator import shutdown
 from src.orchestrator.cli import renderables
 from src.orchestrator.cli import theme as theme_mod
 from src.orchestrator.cli.console import UiConsole
@@ -146,6 +147,18 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Skip the pre-launch confirmation.")
   run_parser.add_argument("--interactive", "-i", action="store_true",
                           help="Start from the guided wizard.")
+  # Overrides shutdown_when_done in the YAML, in both directions, so an
+  # overnight launch can arm it without editing a file and a daytime launch
+  # can disarm a YAML that has it on.
+  shutdown_group = run_parser.add_mutually_exclusive_group()
+  shutdown_group.add_argument(
+      "--shutdown", dest="shutdown", action="store_true", default=None,
+      help="Power the VM off when the campaign finishes or fails.",
+  )
+  shutdown_group.add_argument(
+      "--no-shutdown", dest="shutdown", action="store_false", default=None,
+      help="Keep the VM up even if the config asks for a shutdown.",
+  )
   # What to do when a state file for this campaign already exists. Neither
   # answer is safe to guess: resuming silently adopts stale sweep ids and
   # finished stages, starting over silently discards hours of GPU time.
@@ -203,6 +216,15 @@ def build_parser() -> argparse.ArgumentParser:
                              help="Disable the live dashboard.")
   resume_parser.add_argument("--yes", "-y", action="store_true",
                              help="Skip the confirmation prompt.")
+  resume_shutdown = resume_parser.add_mutually_exclusive_group()
+  resume_shutdown.add_argument(
+      "--shutdown", dest="shutdown", action="store_true", default=None,
+      help="Power the VM off when the campaign finishes or fails.",
+  )
+  resume_shutdown.add_argument(
+      "--no-shutdown", dest="shutdown", action="store_false", default=None,
+      help="Keep the VM up even if the config asks for a shutdown.",
+  )
 
   # --- report ---
   report_parser = subparsers.add_parser(
@@ -615,6 +637,9 @@ def cmd_run(args: argparse.Namespace, console: UiConsole) -> int:
     config.dry_run = True
   if args.no_tui or args.plain:
     config.no_tui = True
+  # None means "the flag was not given"; only then does the YAML win.
+  if getattr(args, "shutdown", None) is not None:
+    config.shutdown_when_done = bool(args.shutdown)
 
   try:
     config.validate()
@@ -786,6 +811,10 @@ def cmd_resume(args: argparse.Namespace, console: UiConsole) -> int:
     config.dry_run = True
   if args.no_tui or args.plain:
     config.no_tui = True
+  # The rebuilt config carries whatever the original launch asked for, so an
+  # explicit flag here is the only way to change it for this attempt.
+  if getattr(args, "shutdown", None) is not None:
+    config.shutdown_when_done = bool(args.shutdown)
 
   views = renderables.build_stage_views(config, state)
   completed = [v.title for v in views if str(v.status).upper() == "COMPLETED"]
@@ -1095,21 +1124,47 @@ def _execute_campaign(
     state: Optional[CampaignState] = None,
     plain: bool = False,
 ) -> int:
-  """Runs the campaign with the dashboard or the plain streamer."""
+  """Runs the campaign with the dashboard or the plain streamer.
+
+  Args:
+    config: The campaign to run.
+    console: Output surface; replaced by a plain one when the TUI is off.
+    state: Existing state to resume from, or None for a fresh campaign.
+    plain: Force plain streaming regardless of the config.
+
+  Returns:
+    The process exit code.
+  """
   from src.orchestrator.cli.dashboard import run_campaign_with_dashboard  # pylint: disable=g-import-not-at-top
 
   use_plain = plain or config.no_tui
   if use_plain:
     console = UiConsole(theme=console.theme, force_plain=not console.is_rich)
-  result = run_campaign_with_dashboard(
-      config=config,
-      state=state,
-      console=console,
-      enable_keys=not use_plain and _is_interactive(),
-  )
-  _print_outcome(result, config, console)
-  status = str(result.get("status", "")).upper()
-  return EXIT_OK if status in ("COMPLETED", "STOPPED", "") else EXIT_ERROR
+
+  # A failing campaign does not return a status - the engine re-raises out of
+  # the dashboard - so the outcome is tracked here and the shutdown hook sits
+  # in a `finally`. Otherwise the one case where an idle VM is most expensive
+  # (a crash at hour two of twelve) would be the one case that never powers
+  # off. Assume FAILED until proven otherwise for the same reason.
+  status = "FAILED"
+  try:
+    result = run_campaign_with_dashboard(
+        config=config,
+        state=state,
+        console=console,
+        enable_keys=not use_plain and _is_interactive(),
+    )
+    _print_outcome(result, config, console)
+    status = str(result.get("status", "")).upper()
+    return EXIT_OK if status in ("COMPLETED", "STOPPED", "") else EXIT_ERROR
+  except KeyboardInterrupt:
+    # Somebody is at the keyboard; taking their machine down is never what
+    # Ctrl-C meant.
+    status = "STOPPED"
+    raise
+  finally:
+    shutdown.maybe_shutdown(config, status, console)
+
 
 
 def _print_outcome(

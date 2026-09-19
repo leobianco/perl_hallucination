@@ -103,14 +103,20 @@ class SweepStageConfig:
   #: opts SFT and RM into ``best``.
   selection_strategy: str = "final"
   #: Trailing logged points averaged under ``selection_strategy`` =
-  #: ``final_window``. Ignored by the other strategies.
+  #: ``final_window``. **Read by no other strategy.**
   #:
-  #: It trades noise for lag: too small and the score is still one lucky
-  #: batch, too large and it drags in the early, untrained part of a short
-  #: run. Size it against the trial's step count - a PE-RL trial at
-  #: ``num_train_epochs=0.2`` logs a few dozen steps, so ~10 averages the
-  #: last third without reaching back into the warmup.
-  selection_window: int = 10
+  #: None means "not applicable", which is what a stage ranking on ``best``
+  #: or ``final`` serializes. It deliberately does not default to a number:
+  #: a config dump showing ``selection_window: 10`` next to
+  #: ``selection_strategy: best`` reads like the stage averages 10 points,
+  #: when ``best`` takes a single peak and never averages anything.
+  #:
+  #: Where it *is* used it trades noise for lag: too small and the score is
+  #: still one lucky batch, too large and it drags in the early, untrained
+  #: part of a short run. Size it against the trial's step count - a PE-RL
+  #: trial at ``num_train_epochs=0.2`` logs a few dozen steps, so ~10
+  #: averages the last third without reaching back into the warmup.
+  selection_window: Optional[int] = None
 
   #: Which checkpoint the published Hub repo serves by default; see
   #: CHECKPOINT_POLICIES. The other one is always published alongside it
@@ -233,6 +239,21 @@ class CampaignConfig:
   robustness: RobustnessConfig = field(default_factory=RobustnessConfig)
   dry_run: bool = False
   no_tui: bool = False
+  #: Power the VM off once the campaign has nothing left to do, the way
+  #: ``SHUTDOWN=true`` does in ``scripts/perl.sh``. Off by default: the cost
+  #: of a wrong ``true`` is a machine that disappears under an interactive
+  #: session, while the cost of a wrong ``false`` is only idle GPU time.
+  #:
+  #: It fires on ``COMPLETED`` *and* ``FAILED`` - a campaign that dies at
+  #: hour two is the most expensive one to leave running - but never on a
+  #: stop the user asked for, and never in a dry run. See
+  #: :mod:`src.orchestrator.shutdown`.
+  shutdown_when_done: bool = False
+  #: Cancellable countdown before the machine actually goes down. Long
+  #: enough to read the outcome and hit Ctrl-C, short enough that an
+  #: unattended overnight run is not still billing at breakfast. 0 powers
+  #: off immediately.
+  shutdown_grace_seconds: int = 60
   state_file: Optional[str] = None
 
   def __post_init__(self):
@@ -267,17 +288,18 @@ class CampaignConfig:
             f"'{stage_cfg.selection_strategy}' for the {stage_name.upper()} "
             f"stage. Must be one of {list(SELECTION_STRATEGIES)}."
         )
-      if (
-          stage_cfg.selection_strategy == "final_window"
-          and stage_cfg.selection_window < 1
+      if stage_cfg.selection_strategy == "final_window" and not (
+          isinstance(stage_cfg.selection_window, int)
+          and stage_cfg.selection_window >= 1
       ):
-        # Caught here rather than clamped at query time: a window of 0 is
-        # not a smaller window, it is a different strategy, and a campaign
-        # that silently ranked on one point while its config said otherwise
-        # would be unreproducible from the config alone.
+        # Caught here rather than defaulted at query time: a window of 0 or
+        # None is not a smaller window, it is a different strategy, and a
+        # campaign that silently ranked on one point while its config said
+        # otherwise would be unreproducible from the config alone.
         raise ValueError(
-            f"selection_window must be >= 1 for the {stage_name.upper()} "
-            f"stage, got {stage_cfg.selection_window}. Use "
+            f"selection_window must be an int >= 1 for the "
+            f"{stage_name.upper()} stage when selection_strategy is "
+            f"'final_window', got {stage_cfg.selection_window!r}. Use "
             "selection_strategy='final' to rank on a single point."
         )
 
@@ -291,6 +313,15 @@ class CampaignConfig:
       # run publishes both the best and the final checkpoint (one at the
       # repository root, the other under a named subfolder), so ranking on
       # one criterion can no longer leave the corresponding model unpushed.
+
+    if self.shutdown_when_done and self.shutdown_grace_seconds < 0:
+      # A negative countdown is almost certainly a typo for "no countdown",
+      # but guessing which would silently remove the only chance the user
+      # has to cancel a shutdown they did not mean to arm.
+      raise ValueError(
+          "shutdown_grace_seconds must be >= 0, got "
+          f"{self.shutdown_grace_seconds}. Use 0 to power off immediately."
+      )
 
   def to_dict(self) -> Dict[str, Any]:
     """Converts the config dataclass to a nested dictionary."""

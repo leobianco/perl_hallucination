@@ -545,9 +545,11 @@ perl_stage:
   max_runs: 10
   metric: "rewards/reward_fn/mean"
   goal: "maximize"
-  # Deliberately "final": the training reward is too noisy per step for its
-  # peak to mean anything.
-  selection_strategy: "final"
+  # Never "best": the training reward is far too noisy per step for its peak
+  # to mean anything. "final_window" averages the end of training, which is
+  # the level your eye reads off the W&B curve.
+  selection_strategy: "final_window"
+  selection_window: 10
   checkpoint_policy: "final"   # repo root = last policy; best/ holds the peak
   materialization_eval_steps: 50
   sft_model_path: "auto"
@@ -561,7 +563,33 @@ eval_stage:
 reporting:
   generate_markdown: true
   publish_wandb_report: true
+
+# Power the VM off when there is nothing left to do - the campaign-level
+# equivalent of SHUTDOWN=true in scripts/perl.sh. Off by default.
+#
+# Fires on COMPLETED and on FAILED (a campaign that dies at hour two is the
+# most expensive one to leave running). Never fires on a stop you asked for
+# with the hotkey or Ctrl-C, and never in a --dry-run.
+shutdown_when_done: false
+# Cancellable countdown before the machine goes down; Ctrl-C during it
+# aborts the shutdown. 0 powers off immediately.
+shutdown_grace_seconds: 60
 ```
+
+Arm it for a single overnight launch without touching the YAML:
+
+```bash
+python3 scripts/run_campaign.py run --task ragtruth --shutdown
+python3 scripts/run_campaign.py resume --task ragtruth --shutdown
+
+# ...or disarm a config that has it on:
+python3 scripts/run_campaign.py run --task ragtruth --config my.yaml --no-shutdown
+```
+
+An armed shutdown is echoed in the pre-launch review block as
+`On finish  POWER OFF the VM after a 60s cancellable countdown`, so it is
+never a surprise after the fact.
+
 
 ---
 

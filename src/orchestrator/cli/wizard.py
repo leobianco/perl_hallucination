@@ -179,6 +179,15 @@ def config_summary_lines(config: CampaignConfig, theme: theme_mod.Theme) -> List
   rows.append(("Mode", "DRY-RUN (no GPU work)" if config.dry_run else "LIVE"))
   rows.append(("Estimated time", format_estimate(low, high)))
   rows.append(("State file", config.state_file or "-"))
+  # Only shown when armed. A machine that powers itself off is the single
+  # most surprising thing this tool can do, so it has to appear in the block
+  # the user confirms, not only in the YAML they may have inherited.
+  if getattr(config, "shutdown_when_done", False):
+    grace = getattr(config, "shutdown_grace_seconds", 0)
+    rows.append((
+        "On finish",
+        f"POWER OFF the VM after a {grace}s cancellable countdown",
+    ))
 
   width = max(len(label) for label, _ in rows)
   return [
