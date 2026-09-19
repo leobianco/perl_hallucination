@@ -14,6 +14,7 @@ import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from src.orchestrator import eval_metrics
+from src.orchestrator import flavors
 from src.orchestrator.cli import theme as theme_mod
 from src.orchestrator.cli.theme import Theme
 
@@ -127,28 +128,32 @@ def build_stage_views(
       ``{"sft": {"trials_done": 4, "metric_value": 0.31, "history": [...]}}``.
 
   Returns:
-    One view per configured stage, in execution order.
+    One view per configured stage, in execution order. A campaign that
+    branches over several reward-model dataset flavors gets one row per
+    branch, keyed by the branch id (``rm:synthetic_struct``).
   """
   live = live or {}
   views: List[StageView] = []
-  stages = theme_mod.iter_stage_names(getattr(config, "stages", []) or [])
+  plan = flavors.build_plan(config, theme_mod.STAGE_TITLES)
   state_stages = getattr(state, "stages", {}) or {}
 
-  for key in stages:
+  for planned in plan:
+    key = planned.stage_id
+    kind = planned.kind
     result = state_stages.get(key)
     status = "PENDING"
     if result is not None:
       raw_status = getattr(result, "status", None)
       status = getattr(raw_status, "value", raw_status) or "PENDING"
 
-    metric_name = theme_mod.STAGE_METRIC_LABELS.get(key, "metric")
-    stage_cfg = getattr(config, key, None)
+    metric_name = theme_mod.STAGE_METRIC_LABELS.get(kind, "metric")
+    stage_cfg = getattr(config, kind, None)
     configured_metric = getattr(stage_cfg, "metric", None)
     if configured_metric:
       metric_name = configured_metric
 
     metric_value = getattr(result, "best_metric_val", None) if result else None
-    if key == "eval" and result is not None:
+    if kind == "eval" and result is not None:
       metrics = getattr(result, "metrics", {}) or {}
       # Eval scores several policies; the headline number is the PE-RL one.
       # It is only a *preference*: an eval that recorded something else must
@@ -159,9 +164,9 @@ def build_stage_views(
 
     view = StageView(
         key=key,
-        title=theme_mod.STAGE_TITLES.get(key, key.upper()),
+        title=planned.title or key.upper(),
         status=str(status).upper(),
-        trials_total=stage_budget(config, key),
+        trials_total=stage_budget(config, kind),
         metric_name=metric_name,
         metric_value=metric_value,
         goal=str(getattr(stage_cfg, "goal", "minimize") or "minimize"),

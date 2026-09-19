@@ -10,6 +10,7 @@ import shutil
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
+from src.orchestrator import flavors
 from src.orchestrator.config import RobustnessConfig
 from src.orchestrator.process import stream_subprocess
 from src.orchestrator.retry import run_with_retries
@@ -281,6 +282,7 @@ class ModelManager:
       checkpoint_policy: str = "best",
       eval_steps: Optional[int] = None,
       timestamp: Optional[str] = None,
+      flavor: Optional[str] = None,
   ) -> MaterializationPlan:
     """Builds the retraining command for a sweep's winning configuration.
 
@@ -325,6 +327,16 @@ class ModelManager:
     epochs_val = float(best_params.get("num_train_epochs", 1))
     formatted_epochs = f"{epochs_val:.2g}"
     lora_r = int(best_params.get("lora_r", 8))
+    # Which reward-model dataset this checkpoint belongs to. On an RM repo it
+    # names the data it was trained on; on a PE-RL repo it names the reward
+    # model that scored it. Without it, two branches of the same campaign
+    # differ only by timestamp and become indistinguishable a week later.
+    slug = flavors.flavor_slug(flavor)
+    flavor_tag = f"{slug}_" if slug else ""
+    # An unbranched campaign passes no flavor; the historical default is the
+    # organic dataset, which is what every campaign trained on before the
+    # choice existed.
+    rm_flavor = flavor or flavors.ORGANIC
 
     if stage_name == "sft":
       repo_id = (
@@ -334,7 +346,7 @@ class ModelManager:
       script_path = "src/writer_sft.py"
     elif stage_name == "rm":
       repo_id = (
-          f"{self.user}/{task_name}_RM_{model_short}_S{seed}_"
+          f"{self.user}/{task_name}_RM_{flavor_tag}{model_short}_S{seed}_"
           f"epo{formatted_epochs}_lr{formatted_lr}_r{lora_r}_{timestamp}"
       )
       script_path = "src/reward_model.py"
@@ -351,7 +363,7 @@ class ModelManager:
           f"_a{REWARD_PENALTY_ALPHA}" if REWARD_PENALTY_ALPHA != 1.0 else ""
       )
       repo_id = (
-          f"{self.user}/{task_name}_PERL_{model_short}_S{seed}_"
+          f"{self.user}/{task_name}_PERL_{flavor_tag}{model_short}_S{seed}_"
           f"epo{formatted_epochs}_lr{formatted_lr}_beta{formatted_beta}_"
           f"r{lora_r}{alpha_suffix}_{timestamp}"
       )
@@ -444,8 +456,11 @@ class ModelManager:
       ])
     elif stage_name == "rm":
       cmd.extend([
+          # Must match what RmStage handed the sweep: the winner is retrained
+          # here from scratch, so a mismatch would publish a model trained on
+          # a different dataset than the one the sweep ranked.
           "--dataset_repo_id",
-          f"{self.user}/{task_name}_rm_organic",
+          flavors.dataset_repo_id(self.user, task_name, rm_flavor),
           "--task_type",
           "SEQ_CLS",
           "--peft_type",
@@ -587,6 +602,7 @@ class ModelManager:
       stop_requested_callback: Optional[Callable[[], bool]] = None,
       checkpoint_policy: str = "best",
       eval_steps: Optional[int] = None,
+      flavor: Optional[str] = None,
   ) -> str:
     """Executes a single training run with winning hyperparameters and pushes to HF Hub.
 
@@ -633,6 +649,7 @@ class ModelManager:
         tunable_keys=tunable_keys,
         checkpoint_policy=checkpoint_policy,
         eval_steps=eval_steps,
+        flavor=flavor,
     )
     repo_id = plan.repo_id
     output_dir = plan.output_dir

@@ -21,33 +21,32 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from src.orchestrator.process import stream_subprocess
 from src.orchestrator.retry import run_with_retries
+from src.orchestrator import eval_metrics
+from src.orchestrator import flavors
 from src.orchestrator.stages.base import BaseStage
 from src.orchestrator.state import StageResult, StageStatus
 from src.utils import build_eval_dataset_repo_id
 
 logger = logging.getLogger(__name__)
 
-#: Evaluated policies, in report order. ``sft`` is the RL baseline.
+#: Evaluated policies, in report order. ``sft`` is the RL baseline. A campaign
+#: that branches over reward-model dataset flavors replaces the bare ``perl``
+#: entry with one ``perl:<flavor>`` target per branch.
 TARGET_LABELS: Tuple[str, ...] = ("sft", "perl")
 
 #: Bookkeeping entries that are identical by construction; a delta on them is
 #: pure noise in the report.
-NO_DELTA = frozenset({"num_samples", "num_examples", "seed"})
+NO_DELTA = eval_metrics.NO_DELTA
 
 #: Metrics where a *lower* value is better; used to sign the SFT->PE-RL delta.
-LOWER_IS_BETTER = frozenset({
-    "hallucination_rate",
-    "perplexity",
-    "eval_loss",
-    "loss",
-})
+LOWER_IS_BETTER = eval_metrics.LOWER_IS_BETTER
 
 
 class EvalStage(BaseStage):
   """Orchestrates test completion generation and multi-metric autorating."""
 
   @property
-  def name(self) -> str:
+  def kind(self) -> str:
     return "eval"
 
   def execute(
@@ -71,7 +70,9 @@ class EvalStage(BaseStage):
           f"=== Starting Evaluation Stage for task: {self.config.task_name} ==="
       )
       for label, repo_id in targets:
-        live_line_callback(f"  Target [{label}]: {repo_id}")
+        # No brackets: the console strips bracketed spans as style tags,
+        # which used to swallow the "[sft]" label entirely.
+        live_line_callback(f"  Target {label}: {repo_id}")
 
     if self.config.dry_run:
       return self._dry_run_result(targets, primary_model, live_line_callback)
@@ -116,27 +117,39 @@ class EvalStage(BaseStage):
   def resolve_targets(self) -> List[Tuple[str, str]]:
     """Lists the (label, repo id) pairs to evaluate, in report order.
 
+    The label doubles as the metric namespace. For a campaign that branched
+    over reward-model dataset flavors there is one PE-RL policy per branch,
+    and each is namespaced by its branch id (``perl:synthetic_struct``) so
+    the report can put them side by side against the shared SFT baseline.
+
     Returns:
       One entry per available trained policy. The last entry is the primary
-      model (PE-RL when it exists, otherwise SFT).
+      model (the last PE-RL branch when any exists, otherwise SFT).
 
     Raises:
       ValueError: When the campaign produced no policy to evaluate. Falling
         back to the base model would silently report base-model numbers as if
         they were the campaign's results.
     """
-    candidates = {
-        "sft": self.context.sft_model_repo_id,
-        "perl": self.context.perl_model_repo_id,
-    }
     targets: List[Tuple[str, str]] = []
     seen = set()
-    for label in TARGET_LABELS:
-      repo_id = candidates.get(label)
+
+    sft_repo_id = self.context.sft_model_repo_id
+    if sft_repo_id:
+      seen.add(sft_repo_id)
+      targets.append(("sft", sft_repo_id))
+
+    # Branches come from the flavor list, not from ``config.stages``: a
+    # `--stages eval` rerun over a finished campaign has no 'perl' entry
+    # there but still has the policies to score.
+    for flavor in flavors.campaign_flavors(self.config):
+      repo_id = self.context.perl_model_repo_id_for(flavor)
       if not repo_id or repo_id in seen:
         continue
       seen.add(repo_id)
-      targets.append((label, repo_id))
+      targets.append(
+          (flavors.stage_id_for_flavor(self.config, "perl", flavor), repo_id)
+      )
 
     if not targets:
       raise ValueError(
@@ -460,7 +473,9 @@ class EvalStage(BaseStage):
         live_line_callback(f"[DRY-RUN] Generating completions for {repo_id}...")
         live_line_callback(f"[DRY-RUN] Scoring {label} with Gemini autorater...")
       time.sleep(0.4)
-      values = dict(mock_per_target.get(label, mock_per_target["sft"]))
+      # Branched labels are 'perl:synthetic_struct'; the mock is per *kind*.
+      kind, _ = flavors.split_stage_id(label)
+      values = dict(mock_per_target.get(kind, mock_per_target["sft"]))
       values["num_samples"] = self.config.eval.max_eval_samples
       metrics.update({f"{label}/{k}": v for k, v in values.items()})
     metrics.update(compute_deltas(metrics))
@@ -533,31 +548,48 @@ class EvalStage(BaseStage):
 
 
 def compute_deltas(metrics: Dict[str, Any]) -> Dict[str, Any]:
-  """Adds ``delta/<metric>`` entries comparing PE-RL against SFT.
+  """Adds ``delta/<metric>`` entries comparing each PE-RL policy against SFT.
 
   The delta is signed so that a *positive* value always means PE-RL improved
   on SFT, whatever the direction of the underlying metric.
 
+  A campaign that branched over reward-model dataset flavors has one PE-RL
+  policy per branch. Each gets its own namespace - ``delta:organic/``,
+  ``delta:synthetic_struct/`` - mirroring the ``perl:<flavor>/`` keys it was
+  derived from. A single-flavor campaign keeps the plain ``delta/``.
+
   Args:
-    metrics: Metric map with ``sft/`` and ``perl/`` prefixed keys.
+    metrics: Metric map with ``sft/`` and ``perl/``-ish prefixed keys.
 
   Returns:
     The additional delta entries (empty when either side is missing).
   """
   deltas: Dict[str, Any] = {}
-  for key, perl_value in metrics.items():
-    if not str(key).startswith("perl/"):
-      continue
-    bare = str(key)[len("perl/"):]
-    if bare in NO_DELTA:
-      continue
-    sft_value = metrics.get(f"sft/{bare}")
-    if not isinstance(perl_value, (int, float)) or isinstance(perl_value, bool):
-      continue
-    if not isinstance(sft_value, (int, float)) or isinstance(sft_value, bool):
-      continue
-    improvement = float(perl_value) - float(sft_value)
-    if bare in LOWER_IS_BETTER:
-      improvement = -improvement
-    deltas[f"delta/{bare}"] = improvement
+  policies = [
+      label
+      for label in eval_metrics.target_labels(metrics)
+      if label != eval_metrics.BASELINE_LABEL
+  ]
+  for label in policies:
+    prefix = f"{label}/"
+    namespace = eval_metrics.delta_label(label)
+    for key, perl_value in metrics.items():
+      if not str(key).startswith(prefix):
+        continue
+      bare = str(key)[len(prefix):]
+      if bare in NO_DELTA:
+        continue
+      sft_value = metrics.get(f"sft/{bare}")
+      if not isinstance(perl_value, (int, float)) or isinstance(
+          perl_value, bool
+      ):
+        continue
+      if not isinstance(sft_value, (int, float)) or isinstance(
+          sft_value, bool
+      ):
+        continue
+      improvement = float(perl_value) - float(sft_value)
+      if bare in LOWER_IS_BETTER:
+        improvement = -improvement
+      deltas[f"{namespace}/{bare}"] = improvement
   return deltas

@@ -6,6 +6,7 @@ import logging
 import os
 from typing import Any, Callable, Dict, Optional, Tuple
 import yaml
+from src.orchestrator import flavors
 from src.orchestrator.stages.base import BaseStage
 from src.orchestrator.state import StageResult, StageStatus
 
@@ -16,12 +17,27 @@ class RmStage(BaseStage):
   """Orchestrates the Reward Model hyperparameter sweep and pushes the winning model."""
 
   @property
-  def name(self) -> str:
+  def kind(self) -> str:
     return "rm"
+
+  def dataset_repo_id(self) -> str:
+    """Returns the Hub dataset this branch trains its reward model on.
+
+    This is the single source of truth for the choice, and it is applied to
+    both the sweep trials and the winner's retraining. It used to be the
+    literal ``{user}/{task}_rm_organic`` in two separate places, which is
+    why editing ``--dataset_repo_id`` in ``scripts/sweep_rm.yaml`` had no
+    effect: the stage overwrote it on the way past.
+    """
+    return flavors.dataset_repo_id(
+        user=self.config.user,
+        task_name=self.config.task_name,
+        flavor=self.flavor or flavors.campaign_flavors(self.config)[0],
+    )
 
   def get_sweep_descriptor(self, sweep_dict: Dict[str, Any]) -> Tuple[str, str]:
     rm_model = "google/gemma-4-E4B-it"
-    dataset = f"{self.config.user}/{self.config.task_name}_rm_organic"
+    dataset = self.dataset_repo_id()
     cmd = sweep_dict.get("command", [])
     if isinstance(cmd, list):
       for arg in cmd:
@@ -31,8 +47,15 @@ class RmStage(BaseStage):
           elif arg.startswith("--dataset_repo_id="):
             dataset = arg.split("=", 1)[1]
     model_short = rm_model.rstrip("/").split("/")[-1]
-    is_synth = any(k in dataset.lower() for k in ("synthetic", "llm", "erased"))
-    data_type = "Synthetic" if is_synth else "Organic"
+    # Prefer the flavor this branch was built for: two branches of the same
+    # campaign must not both end up named "RM Synthetic". The keyword sniff
+    # stays as the fallback for a dataset pinned in the YAML by hand.
+    data_type = flavors.flavor_title(self.flavor)
+    if not data_type:
+      is_synth = any(
+          k in dataset.lower() for k in ("synthetic", "llm", "erased")
+      )
+      data_type = "Synthetic" if is_synth else "Organic"
     return model_short, f"RM {data_type}"
 
   def execute(
@@ -61,7 +84,10 @@ class RmStage(BaseStage):
         sweep_dict = yaml.safe_load(f)
 
     # Inject task name, dataset repo, model repo, and seed overrides
-    expected_dataset = f"{self.config.user}/{self.config.task_name}_rm_organic"
+    expected_dataset = self.dataset_repo_id()
+    logger.info("  Reward model dataset: %s", expected_dataset)
+    if live_line_callback:
+      live_line_callback(f"  Reward model dataset: {expected_dataset}")
     if "command" in sweep_dict and isinstance(sweep_dict["command"], list):
       cmd_list = sweep_dict["command"]
       has_dataset = False
@@ -129,6 +155,7 @@ class RmStage(BaseStage):
       live_line_callback("Materializing and pushing best RM to Hugging Face...")
     rm_repo_id = self.model_manager.materialize_and_push(
         stage_name="rm",
+        flavor=self.flavor,
         task_name=self.config.task_name,
         base_model=rm_base_model,
         best_params=winner.params,

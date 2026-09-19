@@ -166,7 +166,8 @@ class TestEvalMetricsView(unittest.TestCase):
     names = [row[0] for row in rows]
     self.assertEqual(names, ["hallucination_rate", "bertscore_f1"])
     self.assertEqual(rows[0][1], [0.11, 0.04])
-    self.assertAlmostEqual(rows[0][2], 0.07)
+    self.assertEqual(len(rows[0][2]), 1)
+    self.assertAlmostEqual(rows[0][2][0], 0.07)
 
 
 class TestReportComparisonTable(unittest.TestCase):

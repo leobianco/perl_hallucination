@@ -19,6 +19,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from src.orchestrator import flavors
 from src.orchestrator import shutdown
 from src.orchestrator.cli import renderables
 from src.orchestrator.cli import theme as theme_mod
@@ -135,6 +136,15 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Existing SFT checkpoint (skips SFT training).")
   run_parser.add_argument("--reward-model", default=None,
                           help="Existing reward model checkpoint.")
+  run_parser.add_argument(
+      "--rm-datasets", default=None,
+      help=(
+          "Comma-separated reward-model training datasets: "
+          + ",".join(flavors.RM_DATASET_FLAVORS)
+          + ". Naming two runs an RM and a PE-RL sweep for each, then "
+          "scores both policies in one evaluation."
+      ),
+  )
   run_parser.add_argument("--dry-run", action="store_true",
                           help="Simulate the DAG without GPU workloads.")
   run_parser.add_argument("--no-tui", action="store_true",
@@ -294,7 +304,14 @@ def config_for_state(state: CampaignState) -> CampaignConfig:
   config = CampaignConfig.create_default(task_name=state.task_name)
   config.name = state.campaign_id
   if getattr(state, "stages_order", None):
-    config.stages = list(state.stages_order)
+    # `stages_order` is the *executed plan*, so it may carry branch ids like
+    # 'rm:organic'. `config.stages` only ever names stage kinds.
+    kinds: List[str] = []
+    for stage_id in state.stages_order:
+      kind, _ = flavors.split_stage_id(stage_id)
+      if kind and kind not in kinds:
+        kinds.append(kind)
+    config.stages = kinds
   return config
 
 
@@ -629,6 +646,10 @@ def cmd_run(args: argparse.Namespace, console: UiConsole) -> int:
     config.perl.sft_model_path = args.sft_model
   if args.reward_model:
     config.perl.reward_model_path = args.reward_model
+  if getattr(args, "rm_datasets", None):
+    config.rm_dataset_flavors = flavors.normalize_flavors(
+        args.rm_datasets.split(",")
+    )
   if getattr(args, "entity", None):
     config.wandb_entity = args.entity
   if getattr(args, "user", None):

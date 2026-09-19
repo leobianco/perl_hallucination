@@ -16,7 +16,7 @@ class SftStage(BaseStage):
   """Orchestrates the SFT hyperparameter sweep and pushes the winning model."""
 
   @property
-  def name(self) -> str:
+  def kind(self) -> str:
     return "sft"
 
   def get_sweep_descriptor(self, sweep_dict: Dict[str, Any]) -> Tuple[str, str]:

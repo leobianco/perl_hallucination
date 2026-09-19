@@ -163,7 +163,7 @@ class _FakeSweepController(SweepController):
 class _ProbeStage(BaseStage):
 
   @property
-  def name(self):
+  def kind(self):
     return "sft"
 
   def execute(self, live_line_callback=None, stop_requested_callback=None):

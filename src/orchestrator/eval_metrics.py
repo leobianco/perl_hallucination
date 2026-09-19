@@ -11,7 +11,30 @@ from __future__ import annotations
 
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
-#: Evaluated policies in report order, with their display names.
+from src.orchestrator import flavors
+
+#: Bookkeeping entries that are identical by construction; a delta on them is
+#: pure noise in the report.
+NO_DELTA: FrozenSet[str] = frozenset({"num_samples", "num_examples", "seed"})
+
+#: Metrics where a *lower* value is better. Used both to sign the SFT->PE-RL
+#: delta and to decide which branch of a fan-out campaign is the headline.
+LOWER_IS_BETTER: FrozenSet[str] = frozenset({
+    "hallucination_rate",
+    "perplexity",
+    "eval_loss",
+    "loss",
+})
+
+#: Baseline policy every campaign produces, and the display names of the two
+#: stage kinds that get evaluated. A branched campaign contributes one
+#: ``perl:<flavor>`` label per reward-model dataset flavor on top of these.
+BASELINE_LABEL: str = "sft"
+KIND_TITLES: Dict[str, str] = {"sft": "SFT", "perl": "PE-RL"}
+
+#: Evaluated policies in report order, with their display names. Retained for
+#: callers that only ever deal with unbranched campaigns; prefer
+#: :func:`present_targets`, which also sees the branches.
 TARGETS: Tuple[Tuple[str, str], ...] = (("sft", "SFT"), ("perl", "PE-RL"))
 
 #: Preferred order for the comparison table; anything else is appended.
@@ -44,14 +67,77 @@ TABULATED_AUDIT_KEYS: FrozenSet[str] = frozenset({
 })
 
 
+def delta_label(target_label: str) -> str:
+  """Returns the namespace holding ``target_label``'s improvement over SFT.
+
+  Args:
+    target_label: ``perl`` or ``perl:synthetic_struct``.
+
+  Returns:
+    ``delta`` or ``delta:synthetic_struct``. The flavor suffix rides along
+    unchanged so that a two-branch campaign gets two independent delta
+    namespaces rather than one that silently holds whichever branch was
+    scored last.
+  """
+  _, flavor = flavors.split_stage_id(target_label)
+  return "delta" if not flavor else f"delta{flavors.SEPARATOR}{flavor}"
+
+
+def target_title(target_label: str) -> str:
+  """Returns the display name of an evaluated policy."""
+  kind, flavor = flavors.split_stage_id(target_label)
+  base = KIND_TITLES.get(kind, kind.upper())
+  return f"{base} ({flavors.flavor_title(flavor)})" if flavor else base
+
+
+def _target_sort_key(target_label: str) -> Tuple[int, int, str]:
+  """Orders policies as SFT first, then PE-RL branches in flavor order."""
+  kind, flavor = flavors.split_stage_id(target_label)
+  kind_rank = 0 if kind == BASELINE_LABEL else 1
+  if flavor in flavors.RM_DATASET_FLAVORS:
+    flavor_rank = flavors.RM_DATASET_FLAVORS.index(flavor)
+  else:
+    flavor_rank = len(flavors.RM_DATASET_FLAVORS)
+  return (kind_rank, flavor_rank, flavor or "")
+
+
+def target_labels(metrics: Dict[str, Any]) -> List[str]:
+  """Lists the policy namespaces present in ``metrics``, in report order.
+
+  Discovered from the keys rather than from a fixed list because the report
+  is often rendered from a state file alone, with no campaign config to say
+  how many branches the run had.
+
+  Args:
+    metrics: The eval stage metric map.
+
+  Returns:
+    Labels such as ``['sft', 'perl']`` or
+    ``['sft', 'perl:organic', 'perl:synthetic_struct']``.
+  """
+  found = set()
+  for key in metrics:
+    text = str(key)
+    if "/" not in text:
+      continue
+    label = text.split("/", 1)[0]
+    kind, _ = flavors.split_stage_id(label)
+    if kind in KIND_TITLES:
+      found.add(label)
+  return sorted(found, key=_target_sort_key)
+
+
 def headline_metric(
     metrics: Dict[str, Any], name: str = "hallucination_rate"
 ) -> Optional[float]:
   """Returns the headline value of ``name`` for the campaign's best policy.
 
   PE-RL is the campaign's product, so it wins when present; SFT is the
-  fallback. Bare and ``eval/``-prefixed keys are still honored so reports from
-  earlier single-model runs keep rendering.
+  fallback. When the campaign branched there is no single PE-RL policy, so
+  the *best* branch is reported - anything else would make the headline
+  depend on which flavor happened to be listed first. Bare and
+  ``eval/``-prefixed keys are still honored so reports from earlier
+  single-model runs keep rendering.
 
   Args:
     metrics: The eval stage metric map.
@@ -60,7 +146,18 @@ def headline_metric(
   Returns:
     The metric value, or None when absent.
   """
-  for key in (f"perl/{name}", f"sft/{name}", name, f"eval/{name}"):
+  policies = [
+      label for label in target_labels(metrics) if label != BASELINE_LABEL
+  ]
+  values = []
+  for label in policies:
+    value = metrics.get(f"{label}/{name}")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+      values.append(float(value))
+  if values:
+    return min(values) if name in LOWER_IS_BETTER else max(values)
+
+  for key in (f"{BASELINE_LABEL}/{name}", name, f"eval/{name}"):
     value = metrics.get(key)
     if isinstance(value, (int, float)) and not isinstance(value, bool):
       return float(value)
@@ -69,19 +166,16 @@ def headline_metric(
 
 def present_targets(metrics: Dict[str, Any]) -> List[Tuple[str, str]]:
   """Lists the (label, display name) pairs that actually have metrics."""
-  return [
-      (label, title)
-      for label, title in TARGETS
-      if any(str(key).startswith(f"{label}/") for key in metrics)
-  ]
+  return [(label, target_title(label)) for label in target_labels(metrics)]
 
 
 def metric_names(metrics: Dict[str, Any]) -> List[str]:
   """Returns the bare metric names present, in a stable display order."""
   bare = set()
+  labels = target_labels(metrics)
   for key in metrics:
     text = str(key)
-    for label, _ in TARGETS:
+    for label in labels:
       if text.startswith(f"{label}/"):
         name = text[len(label) + 1:]
         # `provenance_*` entries record which adapters produced the
@@ -97,25 +191,31 @@ def metric_names(metrics: Dict[str, Any]) -> List[str]:
 
 def comparison_rows(
     metrics: Dict[str, Any],
-) -> List[Tuple[str, List[Optional[Any]], Optional[float]]]:
+) -> List[Tuple[str, List[Optional[Any]], List[Optional[float]]]]:
   """Pivots the namespaced metrics into per-metric comparison rows.
 
   Args:
     metrics: The eval stage metric map.
 
   Returns:
-    One ``(metric_name, [value per present target], delta)`` tuple per metric.
-    ``delta`` is the signed PE-RL improvement over SFT (positive is always
-    better) and is None when the comparison is unavailable.
+    One ``(metric_name, values, deltas)`` tuple per metric. ``values`` is
+    aligned with :func:`present_targets`. ``deltas`` holds one entry per
+    *non-baseline* policy, in the same relative order, each the signed
+    improvement over SFT (positive is always better) or None when the
+    comparison is unavailable.
   """
-  targets = present_targets(metrics)
+  targets = target_labels(metrics)
+  policies = [label for label in targets if label != BASELINE_LABEL]
   rows = []
   for name in metric_names(metrics):
-    values = [metrics.get(f"{label}/{name}") for label, _ in targets]
-    delta = metrics.get(f"delta/{name}")
-    if not isinstance(delta, (int, float)) or isinstance(delta, bool):
-      delta = None
-    rows.append((name, values, delta))
+    values = [metrics.get(f"{label}/{name}") for label in targets]
+    deltas: List[Optional[float]] = []
+    for label in policies:
+      delta = metrics.get(f"{delta_label(label)}/{name}")
+      if not isinstance(delta, (int, float)) or isinstance(delta, bool):
+        delta = None
+      deltas.append(delta)
+    rows.append((name, values, deltas))
   return rows
 
 

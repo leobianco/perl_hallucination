@@ -23,6 +23,7 @@ from src.orchestrator.cli import theme as theme_mod
 from src.orchestrator.cli.console import UiConsole
 from src.orchestrator.cli.renderables import banner
 from src.orchestrator import config as config_mod
+from src.orchestrator import flavors
 from src.orchestrator.config import CampaignConfig, VALID_TASKS
 
 #: Human friendly task descriptions shown in the picker.
@@ -41,6 +42,14 @@ STAGE_CATALOGUE: List[Tuple[str, str, str]] = [
     ("perl", "PE-RL sweep", "RLOO policy optimization with LoRA adapters"),
     ("eval", "Final evaluation", "Gemini autorater + BertScore + perplexity"),
 ]
+
+#: One-line descriptions of the reward-model training datasets, shown in the
+#: picker. Selecting both fans the campaign out into two RM+PE-RL branches.
+RM_FLAVOR_DESCRIPTIONS: Dict[str, str] = {
+    flavors.ORGANIC: "Human-written hallucinations as labelled in the corpus",
+    flavors.SYNTHETIC_STRUCT:
+        "Hallucinations injected by structured perturbation of the answers",
+}
 
 #: Budget presets. Values are (sft_runs, rm_runs, perl_runs, eval_samples).
 PRESETS: Dict[str, Tuple[int, int, int, int]] = {
@@ -98,9 +107,13 @@ def estimate_runtime(config: CampaignConfig) -> Tuple[float, float]:
   """Estimates the campaign wall-clock time in hours as a ``(low, high)`` range.
 
   The numbers are intentionally coarse - their purpose is to stop someone
-  from casually launching a 40 hour job before lunch.
+  from casually launching a 40 hour job before lunch. That is also why the
+  reward-model dataset fan-out is counted: selecting two flavors runs the RM
+  and PE-RL sweeps twice, and an estimate that ignored it would understate
+  the most expensive campaigns by half.
   """
   minutes = 0.0
+  branches = len(flavors.campaign_flavors(config))
   for stage in theme_mod.iter_stage_names(config.stages):
     if stage == "eval":
       samples = getattr(config.eval, "max_eval_samples", 0) or 0
@@ -108,7 +121,8 @@ def estimate_runtime(config: CampaignConfig) -> Tuple[float, float]:
       continue
     stage_cfg = getattr(config, stage, None)
     runs = int(getattr(stage_cfg, "max_runs", 0) or 0)
-    minutes += runs * MINUTES_PER_TRIAL.get(stage, 10.0)
+    repeats = branches if stage in flavors.BRANCHED_KINDS else 1
+    minutes += repeats * runs * MINUTES_PER_TRIAL.get(stage, 10.0)
   if config.dry_run:
     return (0.02, 0.05)
   hours = minutes / 60.0
@@ -138,6 +152,9 @@ def equivalent_command(config: CampaignConfig) -> str:
     parts.append(f'--sft-model "{config.perl.sft_model_path}"')
   if config.perl.reward_model_path and config.perl.reward_model_path != "auto":
     parts.append(f'--reward-model "{config.perl.reward_model_path}"')
+  campaign_flavors = flavors.campaign_flavors(config)
+  if campaign_flavors != [flavors.ORGANIC]:
+    parts.append(f"--rm-datasets {','.join(campaign_flavors)}")
   if config.eval.max_eval_samples != 1000:
     parts.append(f"--eval-samples {config.eval.max_eval_samples}")
   if config.dry_run:
@@ -155,6 +172,11 @@ def config_summary_lines(config: CampaignConfig, theme: theme_mod.Theme) -> List
       ("Campaign id", config.name),
       ("Stages", " " + f" {theme.glyphs.arrow} ".join(s.upper() for s in stages)),
   ]
+  # A two-flavor campaign silently doubles the RM and PE-RL budgets, so the
+  # review block has to say so before the user confirms the estimate.
+  campaign_flavors = flavors.campaign_flavors(config)
+  if "rm" in stages or len(campaign_flavors) > 1:
+    rows.append(("RM dataset", flavors.describe_flavors(campaign_flavors)))
   for stage in stages:
     if stage == "eval":
       rows.append(
@@ -209,6 +231,9 @@ class WizardAnswers:
   eval_samples: int = 1000
   sft_model: str = "auto"
   reward_model: str = "auto"
+  rm_dataset_flavors: List[str] = field(
+      default_factory=lambda: [flavors.ORGANIC]
+  )
   dry_run: bool = False
 
   def to_dict(self) -> Dict[str, Any]:
@@ -223,6 +248,7 @@ def build_config(answers: WizardAnswers) -> CampaignConfig:
       rm_runs=answers.rm_runs,
       perl_runs=answers.perl_runs,
       dry_run=answers.dry_run,
+      rm_dataset_flavors=answers.rm_dataset_flavors,
   )
   config.stages = theme_mod.iter_stage_names(answers.stages)
   config.perl.sft_model_path = answers.sft_model or "auto"
@@ -374,7 +400,13 @@ class PlainPrompter(Prompter):
         for value, _, _ in choices:
           if token.lower() == value.lower():
             picked.append(value)
-    return theme_mod.iter_stage_names(picked)
+    # Deliberately *not* ordered here: this widget also asks non-stage
+    # questions, and the stage caller canonicalises its own answer.
+    deduped: List[str] = []
+    for value in picked:
+      if value not in deduped:
+        deduped.append(value)
+    return deduped
 
   def text(self, message, default="", validate=None):
     hint = theme_mod.escape_markup(f"[{default}]")
@@ -501,6 +533,38 @@ def run_setup_wizard(
     console.error("No stages selected - nothing to run.")
     return None
   answers.stages = stages
+
+  # 2b. Reward-model dataset ------------------------------------------
+  # Only meaningful when this campaign actually trains a reward model. If
+  # PE-RL is reusing an existing RM checkpoint there is no dataset to pick,
+  # and offering two flavors would promise a fan-out we could not deliver
+  # from a single `--reward-model` path.
+  if "rm" in stages:
+    picked = prompter.checkbox(
+        "Which reward-model training dataset(s)?",
+        [
+            (
+                flavor,
+                f"{flavors.flavor_title(flavor):<18} "
+                f"{RM_FLAVOR_DESCRIPTIONS.get(flavor, '')}",
+                flavor == flavors.ORGANIC,
+            )
+            for flavor in flavors.RM_DATASET_FLAVORS
+        ],
+    )
+    if picked is None:
+      return _cancelled(console)
+    picked = flavors.normalize_flavors(picked)
+    if not picked:
+      console.error("No reward-model dataset selected - nothing to train on.")
+      return None
+    answers.rm_dataset_flavors = picked
+    if len(picked) > 1:
+      console.hint(
+          "Two datasets selected: the campaign will run one RM sweep and "
+          "one PE-RL sweep per dataset, then score both policies in a "
+          "single evaluation."
+      )
 
   # 3. Budget ----------------------------------------------------------
   preset = prompter.select(

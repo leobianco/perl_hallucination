@@ -27,6 +27,7 @@ import time
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from src.orchestrator.cli import renderables
+from src.orchestrator import flavors
 from src.orchestrator.cli import theme as theme_mod
 from src.orchestrator.cli.console import UiConsole
 from src.orchestrator.cli.events import (
@@ -584,7 +585,7 @@ class LiveDashboard:
   ) -> str:
     """Formats one log line with a clock and a colored stage tag."""
     clock = datetime.datetime.fromtimestamp(timestamp).strftime("%H:%M:%S")
-    tag = (stage or "run").upper()[:4].ljust(4)
+    tag = flavors.log_tag(stage)
     style = "error" if any(
         hint in message.lower() for hint in ("error", "failed", "traceback")
     ) else "value"

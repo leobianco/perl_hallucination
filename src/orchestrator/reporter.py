@@ -7,6 +7,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 from src.orchestrator import eval_metrics
+from src.orchestrator import flavors
 from src.orchestrator.config import CampaignConfig
 from src.orchestrator.state import CampaignState, StageResult, StageStatus
 
@@ -148,11 +149,13 @@ class CampaignReporter:
     #: sweep only ran 3 of its 5 trials is worse than no report at all.
     warning_lines: List[str] = []
 
-    for stage_name in self.config.stages:
+    for planned in flavors.build_plan(self.config):
+      stage_name = planned.stage_id
+      stage_title = planned.title or stage_name.upper()
       stage_res = self.state.stages.get(stage_name)
       if not stage_res:
         lines.append(
-            f"| **{stage_name.upper()}** | *Pending* | - | - | - | ⏳ PENDING |"
+            f"| **{stage_title}** | *Pending* | - | - | - | ⏳ PENDING |"
         )
         continue
 
@@ -175,18 +178,18 @@ class CampaignReporter:
           trials_str = f"**{trials_str}**"
 
       for warning in stage_res.warnings or []:
-        warning_lines.append(f"* **{stage_name.upper()}**: {warning}")
+        warning_lines.append(f"* **{stage_title}**: {warning}")
 
-      if stage_name == "sft":
+      if planned.kind == "sft":
         metric_str = "eval/loss"
         val_str = f"{stage_res.best_metric_val:.4f}" if stage_res.best_metric_val is not None else "-"
-      elif stage_name == "rm":
+      elif planned.kind == "rm":
         metric_str = "eval/roc_auc"
         val_str = f"{stage_res.best_metric_val:.4f}" if stage_res.best_metric_val is not None else "-"
-      elif stage_name == "perl":
+      elif planned.kind == "perl":
         metric_str = "rewards/mean"
         val_str = f"{stage_res.best_metric_val:.4f}" if stage_res.best_metric_val is not None else "-"
-      elif stage_name == "eval":
+      elif planned.kind == "eval":
         metric_str = "autorater_hallucination"
         h_rate = eval_metrics.headline_metric(stage_res.metrics)
         val_str = f"{h_rate:.4f}" if h_rate is not None else "Done"
@@ -195,7 +198,7 @@ class CampaignReporter:
         val_str = "-"
 
       lines.append(
-          f"| **{stage_name.upper()}** | {model_str} | `{metric_str}` |"
+          f"| **{stage_title}** | {model_str} | `{metric_str}` |"
           f" **{val_str}** | {trials_str} | {status_icon} |"
       )
 
@@ -242,16 +245,27 @@ class CampaignReporter:
           lines.append(f"  {k}: {v}")
       lines.extend(["```", ""])
 
-    # RM Details
-    rm_res = self.state.stages.get("rm")
-    if rm_res and rm_res.status == StageStatus.COMPLETED:
+    # RM Details - one block per dataset-flavor branch. An unbranched
+    # campaign keeps the flat "2.2." heading it has always had.
+    branched = flavors.is_branched(self.config)
+    for index, rm_stage_id in enumerate(
+        flavors.branch_stage_ids(self.config, "rm"), start=1
+    ):
+      rm_res = self.state.stages.get(rm_stage_id)
+      if not rm_res or rm_res.status != StageStatus.COMPLETED:
+        continue
+      _, rm_flavor = flavors.split_stage_id(rm_stage_id)
+      rm_suffix = (
+          f" - {flavors.flavor_title(rm_flavor)} dataset" if rm_flavor else ""
+      )
       rm_sw = (
           f"`{rm_res.sweep_name}` (`{rm_res.sweep_id}`)"
           if rm_res.sweep_name
           else f"`{rm_res.sweep_id}`"
       )
       lines.extend([
-          "### 2.2. Reward Model (RM)",
+          f"### 2.2{f'.{index}' if branched else ''}."
+          f" Reward Model (RM){rm_suffix}",
           f"* **Sweep**: {rm_sw}",
           f"* **Winning Run ID**: `{rm_res.best_run_id}`",
           f"* **Best ROC-AUC**: `{rm_res.best_metric_val:.5f}`",
@@ -265,16 +279,27 @@ class CampaignReporter:
           lines.append(f"  {k}: {v}")
       lines.extend(["```", ""])
 
-    # PE-RL Details
-    perl_res = self.state.stages.get("perl")
-    if perl_res and perl_res.status == StageStatus.COMPLETED:
+    # PE-RL Details - one block per branch, each against its own reward model.
+    for index, perl_stage_id in enumerate(
+        flavors.branch_stage_ids(self.config, "perl"), start=1
+    ):
+      perl_res = self.state.stages.get(perl_stage_id)
+      if not perl_res or perl_res.status != StageStatus.COMPLETED:
+        continue
+      _, perl_flavor = flavors.split_stage_id(perl_stage_id)
+      perl_suffix = (
+          f" - {flavors.flavor_title(perl_flavor)} reward model"
+          if perl_flavor
+          else ""
+      )
       perl_sw = (
           f"`{perl_res.sweep_name}` (`{perl_res.sweep_id}`)"
           if perl_res.sweep_name
           else f"`{perl_res.sweep_id}`"
       )
       lines.extend([
-          "### 2.3. Parameter-Efficient Reinforcement Learning (PE-RL)",
+          f"### 2.3{f'.{index}' if branched else ''}."
+          f" Parameter-Efficient Reinforcement Learning (PE-RL){perl_suffix}",
           f"* **Sweep**: {perl_sw}",
           f"* **Winning Run ID**: `{perl_res.best_run_id}`",
           f"* **Best Mean Reward**: `{perl_res.best_metric_val:.5f}`",
@@ -303,25 +328,46 @@ class CampaignReporter:
 
       if targets:
         # Δ is signed so that positive always means PE-RL improved on SFT,
-        # regardless of whether the metric is minimized or maximized.
-        header = "| Metric | " + " | ".join(t for _, t in targets) + " | Δ |"
-        divider = "| :--- | " + " | ".join("---:" for _ in targets) + " | ---: |"
+        # regardless of whether the metric is minimized or maximized. One Δ
+        # column per PE-RL branch; they all share the same SFT baseline.
+        policies = [
+            (label, title)
+            for label, title in targets
+            if label != eval_metrics.BASELINE_LABEL
+        ]
+        delta_heads = [
+            "Δ" if len(policies) == 1 else f"Δ {title}"
+            for _, title in policies
+        ]
+        header = (
+            "| Metric | "
+            + " | ".join(t for _, t in targets)
+            + "".join(f" | {head}" for head in delta_heads)
+            + " |"
+        )
+        divider = (
+            "| :--- | "
+            + " | ".join("---:" for _ in targets)
+            + "".join(" | ---:" for _ in delta_heads)
+            + " |"
+        )
         lines.extend([
             "* **Per-policy results** (Δ = PE-RL improvement over SFT):",
             "",
             header,
             divider,
         ])
-        for name, values, delta in eval_metrics.comparison_rows(
+        for name, values, deltas in eval_metrics.comparison_rows(
             eval_res.metrics
         ):
           cells = " | ".join(
               f"**{eval_metrics.format_value(v)}**" for v in values
           )
-          delta_str = (
-              f"{delta:+.4f}" if isinstance(delta, float) else "-"
+          delta_cells = "".join(
+              f" | {d:+.4f}" if isinstance(d, float) else " | -"
+              for d in deltas
           )
-          lines.append(f"| `{name}` | {cells} | {delta_str} |")
+          lines.append(f"| `{name}` | {cells}{delta_cells} |")
         lines.append("")
       else:
         lines.extend([

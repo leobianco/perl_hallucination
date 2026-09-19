@@ -91,12 +91,61 @@ python3 scripts/run_campaign.py run --task npov \
 ```
 Omitting a required checkpoint is caught before launch, not three hours in.
 
-### 5. Pre-flight Dry-Run (Verify wiring without GPU allocation)
+### 5. Choosing the reward model's training dataset
+
+The reward model can be trained on human-labelled hallucinations
+(`organic`) or on hallucinations injected by structured perturbation
+(`synthetic_struct`). The orchestrator picks the dataset itself - editing
+`--dataset_repo_id` in `scripts/sweep_rm.yaml` has no effect, because the RM
+stage rewrites that flag on the way past. Choose it here instead:
+
+```bash
+python3 scripts/run_campaign.py run --task ragtruth --rm-datasets synthetic_struct
+```
+
+The wizard asks the same question whenever the `rm` stage is selected.
+
+**Naming two datasets fans the campaign out.** The reward model *is* the
+experiment, so two datasets are two independent branches, not one sweep with
+two options:
+
+```bash
+python3 scripts/run_campaign.py run --task ragtruth --rm-datasets organic,synthetic_struct
+```
+
+| | Single dataset | Two datasets |
+| :--- | :--- | :--- |
+| Stage ids | `sft`, `rm`, `perl`, `eval` | `sft`, `rm:organic`, `rm:synthetic_struct`, `perl:organic`, `perl:synthetic_struct`, `eval` |
+| SFT | once | once (shared by both branches) |
+| Evaluation | once | once, scoring **both** policies against the shared SFT baseline |
+| Report | `2.2.`, `2.3.` | `2.2.1/2.2.2`, `2.3.1/2.3.2`, one Δ column per branch |
+
+Both reward models are trained before either policy: an RM sweep is far
+cheaper than a PE-RL sweep, so a failure in the cheap half surfaces before
+the expensive half has begun, and both ROC-AUCs are visible before any
+policy training starts.
+
+Every published checkpoint carries its dataset in the repo id
+(`..._RM_synstruct_...`, `..._PERL_synstruct_...`), so a reward model and
+the policy it shaped stay identifiable a month later.
+
+> [!NOTE]
+> `synthetic_llm` is deliberately not selectable. Its training split is
+> assembled at load time from two other datasets via
+> `--num_organic_hallus_to_keep` / `--num_struct_hallus_to_keep`; exposing it
+> as a plain flavor would hide those knobs and silently train on a mixture
+> nobody asked for. Use `scripts/reward_model.sh` directly for that case.
+
+Two datasets require the `rm` stage: without it both branches would fall
+back to the single `--reward-model` override and produce two identical
+policies reported as a comparison. That is rejected before launch.
+
+### 6. Pre-flight Dry-Run (Verify wiring without GPU allocation)
 ```bash
 python3 scripts/run_campaign.py run --task npov --preset smoke --dry-run
 ```
 
-### 6. Resuming vs. Restarting a Campaign
+### 7. Resuming vs. Restarting a Campaign
 
 A campaign is identified by its **name**, and its name determines its **state
 file**:
@@ -213,7 +262,7 @@ If the launching pane and `status --watch` ever disagree about the trial
 count, that is a bug worth reporting - they are no longer allowed to.
 
 
-### 7. Monitoring from a second tmux pane
+### 8. Monitoring from a second tmux pane
 ```bash
 python3 scripts/run_campaign.py status --task npov --watch
 python3 scripts/run_campaign.py status --task npov --json | jq .stages_completed
@@ -424,7 +473,7 @@ artifact.
 
 
 
-### 8. Headless Mode (for `nohup` or logging to file)
+### 9. Headless Mode (for `nohup` or logging to file)
 ```bash
 python3 scripts/run_campaign.py run --task npov --no-tui > campaign.log 2>&1 &
 ```
@@ -516,6 +565,11 @@ campaign:
   base_model: "google/gemma-4-E4B-it"
 
 stages: [sft, rm, perl, eval]
+
+# Which dataset(s) the reward model is trained on. Naming two of them runs
+# an RM *and* a PE-RL sweep for each, then scores both policies in one
+# evaluation. See "Choosing the reward model's training dataset" above.
+rm_dataset_flavors: [organic]
 
 sft_stage:
   enabled: true

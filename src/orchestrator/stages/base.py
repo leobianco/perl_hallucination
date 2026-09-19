@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 import logging
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
+from src.orchestrator import flavors
 from src.orchestrator import naming
 from src.orchestrator.config import CampaignConfig, SweepStageConfig
 from src.orchestrator.model_manager import ModelManager
@@ -42,18 +43,45 @@ class CampaignContext:
 
   @property
   def reward_model_repo_id(self) -> Optional[str]:
-    """Resolves the Reward Model repo ID from state or configuration overrides."""
-    if (
-        self.config.perl.reward_model_path
-        and self.config.perl.reward_model_path != "auto"
-    ):
-      return self.config.perl.reward_model_path
-    return self.state.get_model_repo_id("rm")
+    """Resolves the Reward Model repo ID for a single-branch campaign.
+
+    Kept for callers that predate branching. A branched campaign must use
+    :meth:`reward_model_repo_id_for`, because "the" reward model is not
+    well defined once there are two of them; this property answers for the
+    first flavor.
+    """
+    return self.reward_model_repo_id_for(
+        flavors.campaign_flavors(self.config)[0]
+    )
+
+  def reward_model_repo_id_for(self, flavor: Optional[str]) -> Optional[str]:
+    """Resolves the Reward Model repo ID for one branch.
+
+    Args:
+      flavor: The branch's dataset flavor, or None for an unbranched run.
+
+    Returns:
+      The configured override when one is set, otherwise the checkpoint the
+      matching RM branch published.
+    """
+    override = self.config.perl.reward_model_path
+    if override and override != "auto":
+      return override
+    return self.state.get_model_repo_id(
+        flavors.stage_id_for_flavor(self.config, "rm", flavor)
+    )
 
   @property
   def perl_model_repo_id(self) -> Optional[str]:
     """Resolves the final PE-RL model repo ID from state."""
     return self.state.get_model_repo_id("perl")
+
+  def perl_model_repo_id_for(self, flavor: Optional[str]) -> Optional[str]:
+    """Resolves the PE-RL checkpoint published by one branch."""
+    return self.state.get_model_repo_id(
+        flavors.stage_id_for_flavor(self.config, "perl", flavor)
+    )
+
 
 
 @dataclass(frozen=True)
@@ -119,17 +147,58 @@ class SweepExecution:
 class BaseStage(abc.ABC):
   """Abstract interface for a campaign execution stage."""
 
-  def __init__(self, context: CampaignContext):
+  def __init__(
+      self,
+      context: CampaignContext,
+      flavor: Optional[str] = None,
+      stage_id: Optional[str] = None,
+  ):
+    """Binds a stage implementation to one branch of the campaign.
+
+    Args:
+      context: Shared runtime context.
+      flavor: The reward-model dataset flavor this branch trains on, for the
+        kinds that branch. None for SFT and evaluation, which are shared.
+      stage_id: The key this branch is known by in the state file and the
+        dashboard. Defaults to the bare kind, which is what a single-flavor
+        campaign uses and what every state file written before branches
+        existed contains.
+    """
     self.context = context
     self.config = context.config
     self.state = context.state
     self.sweep_controller = context.sweep_controller
     self.model_manager = context.model_manager
+    self.flavor = flavor
+    self._stage_id = stage_id or self.kind
 
   @property
   @abc.abstractmethod
+  def kind(self) -> str:
+    """Which implementation this is: 'sft', 'rm', 'perl' or 'eval'.
+
+    Also the attribute name of this stage's configuration on
+    ``CampaignConfig``. Constant per subclass; it does not vary by branch.
+    """
+
+  @property
   def name(self) -> str:
-    """Stage identifier (e.g. 'sft', 'rm', 'perl', 'eval')."""
+    """This branch's identity: 'rm', or 'rm:synthetic_struct' when branched.
+
+    Used as the state-file key, so every branch accumulates its own sweep
+    id, winner and trial accounting. Equal to :attr:`kind` whenever the
+    campaign runs a single flavor, which is what keeps older state files
+    resumable.
+    """
+    return self._stage_id
+
+  @property
+  def label(self) -> str:
+    """Upper-case display label, e.g. ``RM`` or ``RM SYNTHETIC STRUCT``."""
+    if not self.flavor or self._stage_id == self.kind:
+      return self.kind.upper()
+    return f"{self.kind.upper()} {flavors.flavor_title(self.flavor).upper()}"
+
 
   @abc.abstractmethod
   def execute(
@@ -209,7 +278,7 @@ class BaseStage(abc.ABC):
         # ignores it there, but it still has to be an int.
         window=stage_config.selection_window or 1,
     )
-    label = self.name.upper()
+    label = self.label
     logger.info(
         "Best %s Run: %s (%s=%.5f, %s)",
         label,
@@ -243,7 +312,7 @@ class BaseStage(abc.ABC):
     self.sweep_controller.mark_best_run(
         sweep_id=sweep_id,
         run_id=winner.run_id,
-        stage_name=self.name,
+        stage_name=self.kind,
         metric_name=metric_name,
         metric_value=winner.value,
         live_line_callback=live_line_callback,
@@ -265,7 +334,7 @@ class BaseStage(abc.ABC):
       Zero or one warning line, ready to append to ``StageResult.warnings``.
     """
     pool = winner.describe_pool()
-    return [f"{self.name.upper()}: {pool}"] if pool else []
+    return [f"{self.label}: {pool}"] if pool else []
 
   def materialization_checkpoint_kwargs(
       self, stage_config: SweepStageConfig
@@ -400,7 +469,7 @@ class BaseStage(abc.ABC):
     Returns:
       The accounting for this sweep.
     """
-    label = self.name.upper()
+    label = self.label
     warnings: List[str] = []
 
     if self.config.dry_run:
@@ -496,7 +565,7 @@ class BaseStage(abc.ABC):
     """
     del sweep_dict  # Default implementation does not inspect command args.
     model_short = self.config.base_model.rstrip("/").split("/")[-1]
-    return model_short, self.name.upper()
+    return model_short, self.label
 
   def campaign_sweep_token(self) -> str:
     """Returns the hex token shared by every sweep of this campaign.
@@ -572,7 +641,7 @@ class BaseStage(abc.ABC):
       still_exists = self.sweep_controller.sweep_exists(previous.sweep_id)
       if still_exists is False:
         message = (
-            f"Recorded {self.name.upper()} sweep {previous.sweep_id}"
+            f"Recorded {self.label} sweep {previous.sweep_id}"
             f"{name_hint} no longer exists on W&B (deleted?). "
             "Registering a new sweep."
         )
@@ -602,7 +671,7 @@ class BaseStage(abc.ABC):
         if self.sweep_controller.sweep_is_running(previous.sweep_id) is False:
           reactivated = self.sweep_controller.resume_sweep(previous.sweep_id)
           notice = (
-              f"{self.name.upper()} sweep {previous.sweep_id} was stopped; "
+              f"{self.label} sweep {previous.sweep_id} was stopped; "
               + (
                   "reactivated it."
                   if reactivated
@@ -617,7 +686,7 @@ class BaseStage(abc.ABC):
                 notice if reactivated else f"[WARNING] {notice}"
             )
         message = (
-            f"Resuming existing {self.name.upper()} sweep "
+            f"Resuming existing {self.label} sweep "
             f"{previous.sweep_id}{name_hint} instead of starting a new one."
         )
         logger.info(message)

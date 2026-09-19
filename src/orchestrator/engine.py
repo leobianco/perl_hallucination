@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, Optional
 from src.orchestrator.cli.events import ControlSignals, EventBus, EventType
 from src.orchestrator.cli.events import SweepProgressParser
 from src.orchestrator.config import CampaignConfig
+from src.orchestrator import flavors
 from src.orchestrator import logging_setup
 from src.orchestrator.model_manager import ModelManager
 from src.orchestrator.reporter import CampaignReporter
@@ -344,20 +345,33 @@ class CampaignEngine:
       return True
     return self.controls.abort_requested
 
-  def _instantiate_stage(self, stage_name: str) -> BaseStage:
-    """Instantiates the concrete stage implementation by name."""
-    if stage_name == "sft":
-      return SftStage(self.context)
-    elif stage_name == "rm":
-      return RmStage(self.context)
-    elif stage_name == "perl":
-      return PerlStage(self.context)
-    elif stage_name == "eval":
-      return EvalStage(self.context)
-    else:
-      raise ValueError(f"Unknown stage name: {stage_name}")
+  def _instantiate_stage(self, planned: flavors.PlannedStage) -> BaseStage:
+    """Instantiates the concrete stage implementation for one planned branch.
 
-  def _stage_payload(self, stage_name: str) -> Dict[str, Any]:
+    Args:
+      planned: The branch to run. ``kind`` picks the implementation;
+        ``flavor`` and ``stage_id`` tell it which branch it is.
+
+    Returns:
+      The stage instance.
+
+    Raises:
+      ValueError: On an unknown stage kind.
+    """
+    classes = {
+        "sft": SftStage,
+        "rm": RmStage,
+        "perl": PerlStage,
+        "eval": EvalStage,
+    }
+    stage_class = classes.get(planned.kind)
+    if stage_class is None:
+      raise ValueError(f"Unknown stage name: {planned.kind}")
+    return stage_class(
+        self.context, flavor=planned.flavor, stage_id=planned.stage_id
+    )
+
+  def _stage_payload(self, stage_id: str) -> Dict[str, Any]:
     """Metadata describing a stage, published with ``STAGE_STARTED``.
 
     ``trials_baseline`` travels with the event because the dashboard builds
@@ -372,12 +386,13 @@ class CampaignEngine:
     Returns:
       Payload dictionary for the event bus.
     """
-    stage_cfg = getattr(self.config, stage_name, None)
+    kind, _ = flavors.split_stage_id(stage_id)
+    stage_cfg = getattr(self.config, kind, None)
     return {
         "metric": getattr(stage_cfg, "metric", None),
         "goal": getattr(stage_cfg, "goal", None),
         "max_runs": getattr(stage_cfg, "max_runs", 0),
-        "trials_baseline": self._resume_baseline(stage_name),
+        "trials_baseline": self._resume_baseline(stage_id),
     }
 
   def run(self) -> Dict[str, Any]:
@@ -405,19 +420,26 @@ class CampaignEngine:
     # Persisting the config makes ``resume`` reproduce the original campaign
     # (budgets, stage selection, checkpoint overrides) instead of guessing.
     self.state.config_dict = self.config.to_dict()
-    self.state.stages_order = list(self.config.stages)
+    plan = flavors.build_plan(self.config)
+    self.state.stages_order = [planned.stage_id for planned in plan]
     self.state.save(self.state_path)
 
     interrupted = False
     try:
-      for stage_name in self.config.stages:
+      for planned in plan:
+        stage_name = planned.stage_id
+        # The plan's title already carries the flavor when the campaign
+        # branches, so every operator-facing line says *which* branch it is.
+        stage_label = planned.title or stage_name.upper()
         # Check if already finished in previous run (resumption)
         if self.state.is_stage_completed(stage_name):
           logger.info("Stage '%s' is already completed. Skipping.", stage_name)
           self.bus.publish(
               EventType.STAGE_SKIPPED,
               stage=stage_name,
-              message=f"[RESUME] Skipping already completed stage: {stage_name}",
+              message=(
+                  f"[RESUME] Skipping already completed stage: {stage_label}"
+              ),
               model_repo_id=self.state.get_model_repo_id(stage_name),
               metric=getattr(self.state.stages.get(stage_name), "best_metric_val", None),
           )
@@ -427,7 +449,7 @@ class CampaignEngine:
         if self.controls.is_paused:
           self.bus.publish(
               EventType.NOTICE,
-              message=f"Paused before stage '{stage_name}'. Press [p] to resume.",
+              message=f"Paused before stage '{stage_label}'. Press [p] to resume.",
           )
           self.state.status = "PAUSED"
           self.state.save(self.state_path)
@@ -446,7 +468,7 @@ class CampaignEngine:
           self.state.save(self.state_path)
           self.bus.publish(
               EventType.NOTICE,
-              message=f"Campaign stopped by user before stage '{stage_name}'.",
+              message=f"Campaign stopped by user before stage '{stage_label}'.",
           )
           break
 
@@ -461,11 +483,11 @@ class CampaignEngine:
         self.bus.publish(
             EventType.STAGE_STARTED,
             stage=stage_name,
-            message=f"=== Starting {stage_name.upper()} stage ===",
+            message=f"=== Starting {stage_label} stage ===",
             **self._stage_payload(stage_name),
         )
 
-        stage_instance = self._instantiate_stage(stage_name)
+        stage_instance = self._instantiate_stage(planned)
         try:
           result: StageResult = stage_instance.execute(
               live_line_callback=self._stage_line_callback(stage_name),
@@ -483,7 +505,7 @@ class CampaignEngine:
               EventType.STAGE_COMPLETED,
               stage=stage_name,
               message=(
-                  f"{stage_name.upper()} finished in "
+                  f"{stage_label} finished in "
                   f"{time.time() - started:.0f}s"
                   + (
                       f" (best={result.best_metric_val:.5f})"

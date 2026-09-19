@@ -16,6 +16,7 @@ from unittest import mock
 
 from src.orchestrator.cli import console as console_mod
 from src.orchestrator.cli import theme as theme_mod
+from src.orchestrator import flavors
 from src.orchestrator.cli import wizard
 from src.orchestrator.config import CampaignConfig
 
@@ -232,13 +233,16 @@ class PlainPrompterTest(unittest.TestCase):
     )
     self.assertEqual(picked, ["sft"])
 
-  def test_checkbox_parses_comma_list_and_sorts(self):
+  def test_checkbox_parses_comma_list_in_click_order(self):
+    # The widget is generic - it also asks non-stage questions like the
+    # reward-model dataset - so it returns what was clicked. Canonical
+    # pipeline ordering is the stage caller's job.
     p = self.prompter(["3, 1"])
     picked = p.checkbox(
         "stages",
         [("sft", "SFT", True), ("rm", "RM", True), ("perl", "PERL", True)],
     )
-    self.assertEqual(picked, ["sft", "perl"])
+    self.assertEqual(picked, ["perl", "sft"])
 
   def test_text_validates_and_reprompts(self):
     p = self.prompter(["zero", "12"])
@@ -325,7 +329,14 @@ class WizardFlowTest(unittest.TestCase):
   def test_happy_path_with_preset(self):
     # task, stages, preset, dry-run, launch
     config, prompter = self.run_wizard(
-        ["npov", ["sft", "rm", "perl", "eval"], "quick", True, True]
+        [
+            "npov",
+            ["sft", "rm", "perl", "eval"],
+            ["organic"],
+            "quick",
+            True,
+            True,
+        ]
     )
     self.assertIsNotNone(config)
     self.assertEqual(config.task_name, "npov")
@@ -347,6 +358,7 @@ class WizardFlowTest(unittest.TestCase):
         [
             "bosch",
             ["sft", "rm", "perl", "eval"],
+            ["organic"],
             "custom",
             "3",
             "4",
@@ -390,7 +402,7 @@ class WizardFlowTest(unittest.TestCase):
 
   def test_checkpoint_is_not_asked_when_stage_is_present(self):
     _, prompter = self.run_wizard(
-        ["npov", ["sft", "rm", "perl"], "smoke", True, True]
+        ["npov", ["sft", "rm", "perl"], ["organic"], "smoke", True, True]
     )
     self.assertNotIn(
         "Existing SFT checkpoint", " ".join(prompter.asked)
@@ -437,13 +449,117 @@ class WizardFlowTest(unittest.TestCase):
 
   def test_long_campaign_emits_a_warning(self):
     self.run_wizard(
-        ["npov", ["sft", "rm", "perl", "eval"], "thorough", False, False]
+        [
+            "npov",
+            ["sft", "rm", "perl", "eval"],
+            ["organic"],
+            "thorough",
+            False,
+            False,
+        ]
     )
     self.assertIn("may run for", self.console.file.getvalue())
 
   def test_short_campaign_has_no_warning(self):
     self.run_wizard(["npov", ["sft"], "smoke", True, False])
     self.assertNotIn("may run for", self.console.file.getvalue())
+
+  def test_dataset_question_is_skipped_without_an_rm_sweep(self):
+    # With no reward model to train there is no dataset to choose, and
+    # offering a fan-out would promise branches we cannot produce from the
+    # single --reward-model path.
+    _, prompter = self.run_wizard(
+        [
+            "npov",
+            ["perl", "eval"],
+            "smoke",
+            "leobianco/npov_SFT_x",
+            "leobianco/npov_RM_x",
+            True,
+            True,
+        ]
+    )
+    self.assertNotIn("reward-model training dataset", " ".join(prompter.asked))
+
+  def test_dataset_question_is_asked_when_the_rm_sweep_runs(self):
+    _, prompter = self.run_wizard(
+        ["npov", ["sft", "rm"], ["organic"], "smoke", True, True]
+    )
+    self.assertIn("reward-model training dataset", " ".join(prompter.asked))
+
+  def test_choosing_synthetic_only_reaches_the_config(self):
+    config, _ = self.run_wizard(
+        ["npov", ["sft", "rm"], ["synthetic_struct"], "smoke", True, True]
+    )
+    self.assertEqual(config.rm_dataset_flavors, ["synthetic_struct"])
+
+  def test_choosing_both_datasets_fans_the_campaign_out(self):
+    config, _ = self.run_wizard(
+        [
+            "npov",
+            ["sft", "rm", "perl", "eval"],
+            ["synthetic_struct", "organic"],
+            "smoke",
+            True,
+            True,
+        ]
+    )
+    # Normalised into execution order regardless of click order.
+    self.assertEqual(
+        config.rm_dataset_flavors, ["organic", "synthetic_struct"]
+    )
+    self.assertEqual(
+        [p.stage_id for p in flavors.build_plan(config)],
+        [
+            "sft",
+            "rm:organic",
+            "rm:synthetic_struct",
+            "perl:organic",
+            "perl:synthetic_struct",
+            "eval",
+        ],
+    )
+
+  def test_empty_dataset_selection_aborts(self):
+    config, _ = self.run_wizard(["npov", ["sft", "rm"], []])
+    self.assertIsNone(config)
+    self.assertIn(
+        "No reward-model dataset selected", self.console.file.getvalue()
+    )
+
+  def test_review_block_names_the_datasets(self):
+    self.run_wizard(
+        [
+            "npov",
+            ["sft", "rm", "perl", "eval"],
+            ["organic", "synthetic_struct"],
+            "smoke",
+            True,
+            True,
+        ]
+    )
+    self.assertIn("Organic + Synthetic Struct", self.console.file.getvalue())
+
+  def test_estimate_counts_every_branch(self):
+    single = wizard.build_config(
+        wizard.WizardAnswers(
+            task="npov", rm_dataset_flavors=["organic"], preset="thorough",
+            sft_runs=60, rm_runs=60, perl_runs=20, eval_samples=2000,
+        )
+    )
+    both = wizard.build_config(
+        wizard.WizardAnswers(
+            task="npov",
+            rm_dataset_flavors=["organic", "synthetic_struct"],
+            preset="thorough",
+            sft_runs=60, rm_runs=60, perl_runs=20, eval_samples=2000,
+        )
+    )
+    # SFT and eval are shared, so the fan-out is more than 1x but less
+    # than 2x. An estimate that ignored it would be plain wrong.
+    self.assertGreater(
+        wizard.estimate_runtime(both)[1], wizard.estimate_runtime(single)[1]
+    )
 
   def test_yaml_export_writes_a_loadable_file(self):
     with tempfile.TemporaryDirectory() as tmp:

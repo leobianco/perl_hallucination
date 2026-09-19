@@ -6,6 +6,7 @@ import logging
 import os
 from typing import Any, Callable, Dict, Optional, Tuple
 import yaml
+from src.orchestrator import flavors
 from src.orchestrator.stages.base import BaseStage
 from src.orchestrator.state import StageResult, StageStatus
 
@@ -16,13 +17,13 @@ class PerlStage(BaseStage):
   """Orchestrates the PE-RL (RLOO) hyperparameter sweep and pushes the winning model."""
 
   @property
-  def name(self) -> str:
+  def kind(self) -> str:
     return "perl"
 
   def get_sweep_descriptor(self, sweep_dict: Dict[str, Any]) -> Tuple[str, str]:
     model = self.config.base_model
     rm_model = (
-        self.context.reward_model_repo_id
+        self.context.reward_model_repo_id_for(self.flavor)
         or getattr(self.config.perl, "reward_model_path", None)
         or ""
     )
@@ -35,8 +36,14 @@ class PerlStage(BaseStage):
           elif arg.startswith("--reward_model_path="):
             rm_model = arg.split("=", 1)[1]
     model_short = model.rstrip("/").split("/")[-1]
-    is_synth = any(k in str(rm_model).lower() for k in ("synthetic", "llm", "erased"))
-    data_type = "Synthetic" if is_synth else "Organic"
+    # See RmStage.get_sweep_descriptor: the branch's own flavor beats a
+    # keyword sniff of the reward model's repo id.
+    data_type = flavors.flavor_title(self.flavor)
+    if not data_type:
+      is_synth = any(
+          k in str(rm_model).lower() for k in ("synthetic", "llm", "erased")
+      )
+      data_type = "Synthetic" if is_synth else "Organic"
     return model_short, f"PERL {data_type}"
 
   def execute(
@@ -55,7 +62,10 @@ class PerlStage(BaseStage):
 
     # Resolve SFT and RM model checkpoints
     sft_model = self.context.sft_model_repo_id
-    rm_model = self.context.reward_model_repo_id
+    # This branch's own reward model, not "the" reward model: a two-flavor
+    # campaign has one per branch and crossing them would silently compare
+    # the wrong pair.
+    rm_model = self.context.reward_model_repo_id_for(self.flavor)
 
     if not self.config.dry_run:
       if not sft_model:
@@ -169,6 +179,7 @@ class PerlStage(BaseStage):
       live_line_callback("Materializing and pushing best PE-RL policy to Hugging Face...")
     perl_repo_id = self.model_manager.materialize_and_push(
         stage_name="perl",
+        flavor=self.flavor,
         task_name=self.config.task_name,
         base_model=self.config.base_model,
         best_params=winner.params,

@@ -10,6 +10,8 @@ import os
 from typing import Any, Dict, List, Optional
 import yaml
 
+from src.orchestrator import flavors
+
 
 VALID_TASKS = [
     "npov",
@@ -231,6 +233,18 @@ class CampaignConfig:
   stages: List[str] = field(
       default_factory=lambda: ["sft", "rm", "perl", "eval"]
   )
+  #: Which reward-model training sets this campaign builds branches for; see
+  #: :mod:`src.orchestrator.flavors`.
+  #:
+  #: Lives here rather than on ``rm`` because it reshapes the whole DAG: one
+  #: entry per flavor means one RM sweep *and* one PE-RL sweep per flavor,
+  #: with SFT shared upstream and evaluation scoring every branch in one
+  #: pass. Putting it under ``rm`` would have made a campaign-topology knob
+  #: look like a per-sweep detail.
+  #:
+  #: ``["organic"]`` reproduces the behaviour of every campaign that ran
+  #: before flavors were selectable, down to the stage ids in the state file.
+  rm_dataset_flavors: List[str] = field(default_factory=lambda: [flavors.ORGANIC])
   sft: SweepStageConfig = field(default_factory=SweepStageConfig)
   rm: SweepStageConfig = field(default_factory=SweepStageConfig)
   perl: SweepStageConfig = field(default_factory=SweepStageConfig)
@@ -280,6 +294,36 @@ class CampaignConfig:
             f"Invalid stage '{stage_name}'. Must be one of ['sft', 'rm',"
             " 'perl', 'eval']"
         )
+
+    # Caught here rather than at dataset-load time: a typo'd flavor would
+    # otherwise surface as a 404 from the Hub an hour into the campaign,
+    # after SFT had already been paid for.
+    selected_flavors = flavors.normalize_flavors(self.rm_dataset_flavors)
+    if not selected_flavors:
+      raise ValueError(
+          "rm_dataset_flavors must name at least one reward-model dataset; "
+          f"valid values are {list(flavors.RM_DATASET_FLAVORS)}."
+      )
+    unknown = [f for f in selected_flavors if f not in flavors.RM_DATASET_FLAVORS]
+    if unknown:
+      raise ValueError(
+          f"Unknown rm_dataset_flavors {unknown}. Must be chosen from "
+          f"{list(flavors.RM_DATASET_FLAVORS)}. Note that 'synthetic_llm' is "
+          "deliberately not selectable: its training split is assembled from "
+          "two other datasets and needs the num_*_hallus_to_keep knobs."
+      )
+    # A fan-out is defined by its reward models. Without an RM sweep every
+    # branch would fall back to the single `perl.reward_model_path`
+    # override, so the campaign would train N identical policies and report
+    # them as a comparison between datasets.
+    if len(selected_flavors) > 1 and "rm" not in self.stages:
+      raise ValueError(
+          f"rm_dataset_flavors names {len(selected_flavors)} datasets "
+          f"({', '.join(selected_flavors)}) but the campaign does not run "
+          "the 'rm' stage, so there is nothing to train on them. Add 'rm' "
+          "to stages, or select a single dataset and point "
+          "perl.reward_model_path at an existing reward model."
+      )
     for stage_name in ("sft", "rm", "perl"):
       stage_cfg: SweepStageConfig = getattr(self, stage_name)
       if stage_cfg.selection_strategy not in SELECTION_STRATEGIES:
@@ -386,6 +430,7 @@ class CampaignConfig:
       rm_runs: int = 30,
       perl_runs: int = 10,
       dry_run: bool = False,
+      rm_dataset_flavors: Optional[List[str]] = None,
   ) -> CampaignConfig:
     """Creates a standard production-ready CampaignConfig for the given task."""
     return cls(
@@ -394,6 +439,8 @@ class CampaignConfig:
         wandb_entity=wandb_entity,
         seed=seed,
         dry_run=dry_run,
+        rm_dataset_flavors=flavors.normalize_flavors(rm_dataset_flavors)
+        or [flavors.ORGANIC],
         sft=SweepStageConfig(
             enabled=True,
             sweep_config_path="scripts/sweep_sft.yaml",
