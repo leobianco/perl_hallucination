@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
 from src.orchestrator import flavors
+from src.orchestrator import naming
 from src.orchestrator.config import RobustnessConfig
 from src.orchestrator.process import stream_subprocess
 from src.orchestrator.retry import run_with_retries
@@ -339,16 +340,16 @@ class ModelManager:
     rm_flavor = flavor or flavors.ORGANIC
 
     if stage_name == "sft":
-      repo_id = (
-          f"{self.user}/{task_name}_SFT_{model_short}_S{seed}_"
-          f"epo{formatted_epochs}_lr{formatted_lr}_r{lora_r}_{timestamp}"
+      details = (
+          f"S{seed}_epo{formatted_epochs}_lr{formatted_lr}_r{lora_r}"
       )
+      stage_tag = "SFT"
       script_path = "src/writer_sft.py"
     elif stage_name == "rm":
-      repo_id = (
-          f"{self.user}/{task_name}_RM_{flavor_tag}{model_short}_S{seed}_"
-          f"epo{formatted_epochs}_lr{formatted_lr}_r{lora_r}_{timestamp}"
+      details = (
+          f"S{seed}_epo{formatted_epochs}_lr{formatted_lr}_r{lora_r}"
       )
+      stage_tag = "RM"
       script_path = "src/reward_model.py"
     elif stage_name == "perl":
       beta_val = float(best_params.get("beta", 0.05))
@@ -362,16 +363,36 @@ class ModelManager:
       alpha_suffix = (
           f"_a{REWARD_PENALTY_ALPHA}" if REWARD_PENALTY_ALPHA != 1.0 else ""
       )
-      repo_id = (
-          f"{self.user}/{task_name}_PERL_{flavor_tag}{model_short}_S{seed}_"
-          f"epo{formatted_epochs}_lr{formatted_lr}_beta{formatted_beta}_"
-          f"r{lora_r}{alpha_suffix}_{timestamp}"
+      details = (
+          f"S{seed}_epo{formatted_epochs}_lr{formatted_lr}_"
+          f"beta{formatted_beta}_r{lora_r}{alpha_suffix}"
       )
+      stage_tag = "PERL"
       script_path = "src/perl.py"
     else:
       raise ValueError(f"Unknown stage for materialization: {stage_name}")
 
-    # Enforce Hugging Face Hub constraints (length <= 96, no dots, valid characters)
+    # SFT is shared by every branch of a campaign, so its checkpoint carries
+    # no flavor: tagging it would claim a provenance it does not have.
+    repo_id, shortened = naming.fit_model_repo_id(
+        user=self.user,
+        task=task_name,
+        stage=stage_tag,
+        model=model_short,
+        details=details,
+        timestamp=timestamp,
+        flavor_slug="" if stage_name == "sft" else flavor_tag.rstrip("_"),
+    )
+    if shortened:
+      logger.info(
+          "Repo id for %s shortened to fit Hugging Face's 96-character "
+          "limit: %s",
+          stage_name,
+          repo_id,
+      )
+
+    # Belt and braces: the fitter bounds the length, this bounds the alphabet
+    # (periods, stray punctuation) and is a no-op on a well-formed name.
     repo_id = sanitize_hf_repo_id(repo_id)
 
     if self.dry_run:
