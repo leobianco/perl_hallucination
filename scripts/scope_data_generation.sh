@@ -3,7 +3,9 @@
 # Core Parameters
 USER="leobianco"
 SEED=130104
-MODEL_REPO_ID="google/gemma-4-E4B"
+# Overridable from the environment so that swapping the base model does
+# not require editing this script:  MODEL_REPO_ID=Qwen/Qwen3-4B-Instruct-2507 ./scope_data_generation.sh
+MODEL_REPO_ID="${MODEL_REPO_ID:-google/gemma-4-E4B}"
 SFT_MODEL_PATH="${USER}/"
 
 # SCOPE Generation Parameters (Algorithm 1 in https://arxiv.org/pdf/2502.13674#page=4.69)

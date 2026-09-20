@@ -77,6 +77,10 @@ except ImportError:
   get_peft_model = None
   LoraConfig = None
 
+from src.model_compat import (
+    resolve_turn_end_token,
+    strip_terminal_tokens,
+)
 from src.models import (
     Gemma4ForSequenceClassification,
     register_gemma4_for_sequence_classification,
@@ -103,7 +107,23 @@ def resolve_terminal_token_string(
     token_spec: Optional[str],
     tokenizer: Any = None,
 ) -> Optional[str]:
-  """Resolves token specification ('eos', 'end_of_turn', 'none', or custom string) into a concrete token string."""
+  """Resolves a token spec ('eos', 'end_of_turn', 'none', custom) to a string.
+
+  ``end_of_turn`` names a *role*, not a literal. Returning the Gemma spelling
+  unconditionally meant that on any other family the string
+  ``"<end_of_turn>"`` was appended as ordinary text, shattered into unknown
+  sub-words by the tokenizer, and scored as content - which silently inverts
+  the result of the very experiment this module exists to run. It is now
+  looked up on the tokenizer (``<|im_end|>`` for ChatML models, ``</s>`` for
+  Mistral, ``<end_of_turn>`` for Gemma).
+
+  Args:
+    token_spec: 'eos', 'end_of_turn'/'eot', 'none', or a literal token.
+    tokenizer: Tokenizer used to resolve the symbolic specs.
+
+  Returns:
+    The concrete token string, or None for "leave the text as generated".
+  """
   if token_spec is None:
     return None
   normalized = str(token_spec).strip()
@@ -113,7 +133,8 @@ def resolve_terminal_token_string(
     eos_tok = getattr(tokenizer, "eos_token", None)
     return eos_tok if eos_tok else "<eos>"
   if normalized.lower() in ("end_of_turn", "<end_of_turn>", "eot"):
-    return "<end_of_turn>"
+    resolved = resolve_turn_end_token(tokenizer) if tokenizer else None
+    return resolved if resolved else "<end_of_turn>"
   return normalized
 
 
@@ -121,20 +142,32 @@ def apply_terminal_token_formatting(
     text: str,
     target_token: Optional[str],
     strip_existing_terminal_tokens: bool = True,
+    tokenizer: Any = None,
 ) -> str:
   """Applies terminal token formatting to a text prompt/completion.
 
-  Strips trailing whitespace and any known terminal delimiters (<eos>, <end_of_turn>, </s>, etc.)
-  if requested, then appends target_token if specified.
+  Strips trailing whitespace and any known terminal delimiter if requested,
+  then appends ``target_token``. Stripping is delegated to
+  :func:`src.model_compat.strip_terminal_tokens` so that the list of
+  delimiters is maintained in one place and can be extended from the
+  tokenizer for families it does not hardcode.
+
+  Args:
+    text: The text to format.
+    target_token: Token to append, or None to append nothing.
+    strip_existing_terminal_tokens: Whether to remove an existing terminator
+      first.
+    tokenizer: Optional tokenizer, used to recognise terminators belonging to
+      families not in the static list.
+
+  Returns:
+    The formatted text.
   """
   if text is None:
     return ""
   cleaned = str(text).rstrip()
   if strip_existing_terminal_tokens:
-    for tok in ("<end_of_turn>", "<eos>", "</s>", "<|endoftext|>", "<|im_end|>"):
-      if cleaned.endswith(tok):
-        cleaned = cleaned[: -len(tok)].rstrip()
-        break
+    cleaned = strip_terminal_tokens(cleaned, tokenizer)
   if target_token:
     cleaned = f"{cleaned}{target_token}"
   return cleaned
@@ -239,6 +272,7 @@ class TokenMismatchRewardModelPipeline(RewardModelPipeline):
           example["prompt"],
           target_token=resolved_tok,
           strip_existing_terminal_tokens=True,
+          tokenizer=self.tokenizer,
       )
       return {"prompt": formatted_prompt}
 
@@ -365,6 +399,7 @@ class TokenMismatchPERLPipeline(PERLPipeline):
               c,
               target_token=resolved_tok,
               strip_existing_terminal_tokens=force_swap or (scoring_token.lower() != "as_generated"),
+              tokenizer=reward_tokenizer,
           )
         formatted_texts.append(p + formatted_c)
 

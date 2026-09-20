@@ -494,7 +494,14 @@ def compute_conditional_perplexity(
   perplexities = []
 
   if getattr(tokenizer, "pad_token_id", None) is None:
-    tokenizer.pad_token_id = getattr(tokenizer, "eos_token_id", 0)
+    # Never invent an id: token 0 is `<unk>` on Llama/Mistral but a real
+    # vocabulary entry on other tokenizers. Prefer unk, then eos, else leave
+    # it unset (this loop is per-sample and never actually pads).
+    for attr in ("unk_token_id", "eos_token_id"):
+      candidate = getattr(tokenizer, attr, None)
+      if candidate is not None:
+        tokenizer.pad_token_id = candidate
+        break
 
   for i in range(0, len(prompts), batch_size):
     batch_prompts = prompts[i : i + batch_size]

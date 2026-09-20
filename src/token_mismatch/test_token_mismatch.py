@@ -98,30 +98,64 @@ from src.token_mismatch.pipelines import (
 )
 
 
+class FakeTokenizer:
+  """Tokenizer double whose turn terminator is discoverable.
+
+  ``end_of_turn`` names a *role*, and it is now resolved from the tokenizer
+  rather than spelled out as Gemma's literal. A ``MagicMock`` cannot stand in
+  for that: it answers every attribute, so the resolution would appear to
+  succeed against a tokenizer that declares nothing.
+  """
+
+  def __init__(self, eos_token, turn_end_token=None):
+    self.eos_token = eos_token
+    if turn_end_token is not None:
+      self.additional_special_tokens = [turn_end_token]
+
+
 class TestTokenMismatchFormatting(unittest.TestCase):
   """Tests for terminal token resolution and string formatting helpers."""
 
   def test_resolve_terminal_token_string(self):
-    mock_tok = MagicMock()
-    mock_tok.eos_token = "<eos>"
+    tok = FakeTokenizer(eos_token="<eos>", turn_end_token="<end_of_turn>")
 
-    self.assertEqual(resolve_terminal_token_string("eos", mock_tok), "<eos>")
-    self.assertEqual(resolve_terminal_token_string("<eos>", mock_tok), "<eos>")
+    self.assertEqual(resolve_terminal_token_string("eos", tok), "<eos>")
+    self.assertEqual(resolve_terminal_token_string("<eos>", tok), "<eos>")
     self.assertEqual(
-        resolve_terminal_token_string("end_of_turn", mock_tok), "<end_of_turn>"
+        resolve_terminal_token_string("end_of_turn", tok), "<end_of_turn>"
     )
     self.assertEqual(
-        resolve_terminal_token_string("<end_of_turn>", mock_tok), "<end_of_turn>"
+        resolve_terminal_token_string("<end_of_turn>", tok), "<end_of_turn>"
+    )
+    self.assertEqual(resolve_terminal_token_string("eot", tok), "<end_of_turn>")
+    self.assertIsNone(resolve_terminal_token_string("none", tok))
+    self.assertIsNone(resolve_terminal_token_string("as_generated", tok))
+    self.assertIsNone(resolve_terminal_token_string("raw", tok))
+    self.assertIsNone(resolve_terminal_token_string(None, tok))
+    self.assertEqual(
+        resolve_terminal_token_string("<custom_stop>", tok), "<custom_stop>"
+    )
+
+  def test_end_of_turn_follows_the_tokenizer_not_gemma(self):
+    """The regression this module exists to measure depends on this.
+
+    Appending the literal ``"<end_of_turn>"`` to a ChatML model's completion
+    puts an unknown string into the text, which the tokenizer shatters into
+    ordinary sub-words and the reward model scores as content - inverting the
+    result of the experiment.
+    """
+    chatml = FakeTokenizer(
+        eos_token="<|endoftext|>", turn_end_token="<|im_end|>"
     )
     self.assertEqual(
-        resolve_terminal_token_string("eot", mock_tok), "<end_of_turn>"
+        resolve_terminal_token_string("end_of_turn", chatml), "<|im_end|>"
     )
-    self.assertIsNone(resolve_terminal_token_string("none", mock_tok))
-    self.assertIsNone(resolve_terminal_token_string("as_generated", mock_tok))
-    self.assertIsNone(resolve_terminal_token_string("raw", mock_tok))
-    self.assertIsNone(resolve_terminal_token_string(None, mock_tok))
+
+    # Mistral draws no distinction between "end of turn" and "end of
+    # document", so its EOS is the right answer rather than a compromise.
+    mistral = FakeTokenizer(eos_token="</s>")
     self.assertEqual(
-        resolve_terminal_token_string("<custom_stop>", mock_tok), "<custom_stop>"
+        resolve_terminal_token_string("end_of_turn", mistral), "</s>"
     )
 
   def test_apply_terminal_token_formatting_stripping_and_appending(self):

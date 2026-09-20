@@ -69,6 +69,15 @@ from sklearn.metrics import (
 )
 from src import checkpoint_publication
 from src.metrics import GenerationMetricsEvaluator
+from src.model_compat import (
+    chat_wrap_user,
+    configure_tokenizer_padding,
+    parse_target_modules,
+    resolve_yes_no_token_ids,
+    safe_get_peft_model,
+    strip_terminal_tokens,
+    warn_on_pad_eos_collision,
+)
 from src.models import (
     Gemma4ForSequenceClassification,
     register_gemma4_for_sequence_classification,
@@ -183,6 +192,110 @@ def _resolve_reward_max_length(args: Any) -> int:
   if value <= 0:
     return _DEFAULT_REWARD_MAX_LENGTH
   return value
+
+
+def _load_sequence_classifier(
+    model_ref: str,
+    torch_dtype: Any,
+    num_labels: int = 2,
+) -> Any:
+  """Loads a 2-class sequence classifier for any supported model family.
+
+  ``AutoModelForSequenceClassification`` is the path for every family that
+  Transformers ships a classification head for - which is all of them except
+  Gemma 4, whose head this repository has to supply itself (see
+  :mod:`src.models.gemma4_sequence_classification`).
+
+  The Gemma 4 fallback used to be selected by sniffing for "gemma" in the
+  repo-id string, which meant a reward model published under a name that did
+  not mention its base model would take the wrong branch. Registration is now
+  attempted first and the fallback keys only on the *error*, so the decision
+  no longer depends on how a checkpoint happens to be named.
+
+  Args:
+    model_ref: Hub repo id or local path.
+    torch_dtype: dtype to load the weights in.
+    num_labels: Number of classification labels.
+
+  Returns:
+    The loaded model.
+
+  Raises:
+    ValueError: Propagated from Transformers when the architecture genuinely
+      has no classification head available.
+  """
+  id2label = {0: "Yes", 1: "No"}
+  label2id = {"Yes": 0, "No": 1}
+  kwargs = dict(
+      num_labels=num_labels,
+      id2label=id2label,
+      label2id=label2id,
+      torch_dtype=torch_dtype,
+  )
+
+  # No-op for every family other than Gemma 4; see the registration helper.
+  register_gemma4_for_sequence_classification(model_ref)
+  try:
+    return AutoModelForSequenceClassification.from_pretrained(
+        model_ref, **kwargs
+    )
+  except (ValueError, KeyError) as e:
+    if Gemma4ForSequenceClassification is None:
+      raise
+    try:
+      return Gemma4ForSequenceClassification.from_pretrained(
+          model_ref, **kwargs
+      )
+    except Exception:  # pylint: disable=broad-except
+      # The Gemma 4 head could not load it either, so the original
+      # Transformers error is the informative one.
+      raise e  # pylint: disable=raise-missing-from
+
+
+_CHAT_TOKENIZER_UNSET = object()
+
+
+def _resolve_chat_tokenizer(pipeline: Any) -> Any:
+  """Returns a tokenizer for chat wrapping, loading one lazily if needed.
+
+  The SCOPE and SSFO data-generation pipelines need the policy's *native*
+  conversational framing for their "no context" ablation. SCOPE already builds
+  a tokenizer for its logits processor, but SSFO generates purely through vLLM
+  and has a no-op ``setup_tokenizer``, so one is loaded on first use and
+  cached on the instance.
+
+  A failure to load is not fatal: :func:`~src.model_compat.chat_wrap_user`
+  degrades to the raw question, which is the correct prompt for a base model
+  anyway.
+
+  Args:
+    pipeline: The data-generation pipeline instance.
+
+  Returns:
+    A tokenizer, or None if none could be obtained.
+  """
+  tokenizer = getattr(pipeline, "tokenizer", None)
+  if tokenizer is not None:
+    return tokenizer
+
+  cached = getattr(pipeline, "_chat_tokenizer", _CHAT_TOKENIZER_UNSET)
+  if cached is not _CHAT_TOKENIZER_UNSET:
+    return cached
+
+  tokenizer = None
+  repo_id = getattr(getattr(pipeline, "args", None), "model_repo_id", None)
+  if repo_id:
+    try:
+      tokenizer = AutoTokenizer.from_pretrained(repo_id)
+    except Exception as e:  # pylint: disable=broad-except
+      print(
+          f"Warning: could not load a tokenizer from '{repo_id}' to apply the"
+          f" chat template ({e}). Context-free prompts will be sent as raw"
+          " text."
+      )
+      tokenizer = None
+  pipeline._chat_tokenizer = tokenizer  # pylint: disable=protected-access
+  return tokenizer
 
 
 def parse_hf_repo_reference(
@@ -507,6 +620,36 @@ class Pipeline(abc.ABC):
     self.vllm_model: Optional[str] = None
     self.use_vllm: bool = False
     self._best_archiver: Optional[BestCheckpointArchiver] = None
+    #: Set by `setup_tokenizer`; see `src.model_compat.PaddingReport`. None
+    #: for the pipelines that need no tokenizer at all (generation).
+    self.padding_report: Optional[Any] = None
+
+  def _attach_lora(self, model: Any, lora_config: Any) -> Any:
+    """Wraps ``model`` in a LoRA adapter, model-family independently.
+
+    `peft.get_peft_model` looks the architecture up in a static table to
+    decide which modules to adapt, so a model family newer than the pinned
+    PEFT release fails with "Please specify target_modules". Routing every
+    call site through here means that failure mode is handled once, and that
+    `--lora_target_modules` works everywhere rather than in whichever
+    pipeline remembered to read it.
+
+    Args:
+      model: The base model to adapt.
+      lora_config: The `peft.LoraConfig` to apply.
+
+    Returns:
+      The PEFT-wrapped model.
+    """
+    explicit = parse_target_modules(
+        getattr(getattr(self, "_lora_args", None), "lora_target_modules", None)
+    )
+    return safe_get_peft_model(
+        model,
+        lora_config,
+        get_peft_model_fn=get_peft_model,
+        explicit_target_modules=explicit,
+    )
 
   def _training_callbacks(self) -> list[Any]:
     """Builds the callback list shared by every training pipeline.
@@ -1182,12 +1325,10 @@ class Pipeline(abc.ABC):
         padding_side="left",
     )
 
-    # Set pad token if not present
-    if self.tokenizer.pad_token_id is None:
-      if self.tokenizer.eos_token_id is not None:
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-      elif self.tokenizer.unk_token_id is not None:
-        self.tokenizer.pad_token = self.tokenizer.unk_token
+    # Pad-token selection is model-family dependent (Gemma ships one, Qwen
+    # reuses <|endoftext|>, Mistral ships none) and the choice has
+    # consequences beyond padding, so it lives in one place.
+    self.padding_report = configure_tokenizer_padding(self.tokenizer)
 
   @abc.abstractmethod
   def load_data(self) -> None:
@@ -1343,7 +1484,7 @@ class SFTPipeline(Pipeline):
     if self.tokenizer.pad_token_id is not None:
       model.config.pad_token_id = self.tokenizer.pad_token_id
 
-    self.model = get_peft_model(model, self._lora_config)
+    self.model = self._attach_lora(model, self._lora_config)
     self.model.to(torch.bfloat16)
 
   def setup_trainer(self) -> None:
@@ -1483,45 +1624,39 @@ class RewardModelPipeline(Pipeline):
       )
 
   def setup_model(self) -> None:
-    register_gemma4_for_sequence_classification(self.args.model_repo_id)
-    id2label = {0: "Yes", 1: "No"}
-    label2id = {"Yes": 0, "No": 1}
-
-    try:
-      self.model = AutoModelForSequenceClassification.from_pretrained(
-          self.args.model_repo_id,
-          num_labels=2,
-          id2label=id2label,
-          label2id=label2id,
-          torch_dtype=self.torch_dtype,
-      )
-    except ValueError as e:
-      if (
-          "Gemma4Config" in str(e)
-          or "gemma-4" in str(self.args.model_repo_id).lower()
-          or "gemma4" in str(self.args.model_repo_id).lower()
-      ):
-        self.model = Gemma4ForSequenceClassification.from_pretrained(
-            self.args.model_repo_id,
-            num_labels=2,
-            id2label=id2label,
-            label2id=label2id,
-            torch_dtype=self.torch_dtype,
-        )
-      else:
-        raise
+    self.model = _load_sequence_classifier(
+        self.args.model_repo_id, self.torch_dtype
+    )
 
     if self.tokenizer.pad_token_id is not None:
       self.model.config.pad_token_id = self.tokenizer.pad_token_id
+    # The classification head pools at the last non-pad position, so a pad
+    # token that equals the EOS token quietly shifts that position. Say so
+    # here rather than in the tokenizer helper: this is the pipeline where it
+    # changes the numbers.
+    if self.padding_report is not None:
+      warn_on_pad_eos_collision(self.padding_report, "reward model training")
 
-    self.model = get_peft_model(self.model, self._lora_config)
+    self.model = self._attach_lora(self.model, self._lora_config)
     self.model.to(self.torch_dtype)
 
     # Adjust score parameters and ensure all modules_to_save heads
-    # match torch_dtype
-    score_head = getattr(self.model, "score", None)
-    if score_head is None and hasattr(self.model, "base_model"):
-      score_head = getattr(self.model.base_model, "score", None)
+    # match torch_dtype.
+    # Transformers spells the classification head `score` on causal-LM
+    # backbones and `classifier` on encoder ones. Looking for both costs
+    # nothing and stops this block from silently doing nothing - which would
+    # leave the head in fp32, frozen, and at its default initialisation
+    # scale.
+    score_head = None
+    for owner in (self.model, getattr(self.model, "base_model", None)):
+      if owner is None:
+        continue
+      for attr in ("score", "classifier"):
+        score_head = getattr(owner, attr, None)
+        if score_head is not None:
+          break
+      if score_head is not None:
+        break
     if score_head is not None:
       score_head.to(self.torch_dtype)
       if hasattr(score_head, "modules_to_save"):
@@ -1739,9 +1874,6 @@ class PERLPipeline(Pipeline):
                 )
 
   def setup_model(self) -> None:
-    id2label = {0: "Yes", 1: "No"}
-    label2id = {"Yes": 0, "No": 1}
-
     reward_model_path = self.args.reward_model_path or getattr(
         self.training_args, "reward_model_path", None
     )
@@ -1749,32 +1881,9 @@ class PERLPipeline(Pipeline):
         self.training_args, "sft_model_path", None
     )
 
-    register_gemma4_for_sequence_classification(reward_model_path)
-    try:
-      self.reward_model = AutoModelForSequenceClassification.from_pretrained(
-          reward_model_path,
-          num_labels=2,
-          id2label=id2label,
-          label2id=label2id,
-          torch_dtype=torch.bfloat16,
-      )
-    except ValueError as e:
-      if "Gemma4Config" in str(e) or (
-          reward_model_path
-          and (
-              "gemma-4" in str(reward_model_path).lower()
-              or "gemma4" in str(reward_model_path).lower()
-          )
-      ):
-        self.reward_model = Gemma4ForSequenceClassification.from_pretrained(
-            reward_model_path,
-            num_labels=2,
-            id2label=id2label,
-            label2id=label2id,
-            torch_dtype=torch.bfloat16,
-        )
-      else:
-        raise
+    self.reward_model = _load_sequence_classifier(
+        reward_model_path, torch.bfloat16
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     self.reward_model.to(torch.bfloat16)
     self.reward_model.to(device)
@@ -1784,8 +1893,12 @@ class PERLPipeline(Pipeline):
         reward_model_path,
         padding_side="right",
     )
-    if self.reward_tokenizer.pad_token is None:
-      self.reward_tokenizer.pad_token = self.reward_tokenizer.eos_token
+    # Must follow the *same* rule the reward model was trained under
+    # (`RewardModelPipeline.setup_tokenizer`), otherwise the pooled position
+    # differs between training and scoring and the reward becomes a different
+    # function of the text.
+    reward_padding = configure_tokenizer_padding(self.reward_tokenizer)
+    warn_on_pad_eos_collision(reward_padding, "PE-RL reward scoring")
     if self.reward_tokenizer.pad_token_id is not None:
       self.reward_model.config.pad_token_id = self.reward_tokenizer.pad_token_id
 
@@ -1882,14 +1995,14 @@ class PERLPipeline(Pipeline):
       )
       sft_peft = PeftModel.from_pretrained(policy_base, resolved_adapter_path)
       merged_base = sft_peft.merge_and_unload()
-      self.policy = get_peft_model(merged_base, self._lora_config)
+      self.policy = self._attach_lora(merged_base, self._lora_config)
     else:
       print(
           f"Initializing fresh LoRA adapter (r={self._lora_config.r},"
           f" alpha={self._lora_config.lora_alpha}) directly on model"
           f" '{self.args.model_repo_id}'..."
       )
-      self.policy = get_peft_model(policy_base, self._lora_config)
+      self.policy = self._attach_lora(policy_base, self._lora_config)
 
     self.policy.to(torch.bfloat16)
 
@@ -2100,9 +2213,9 @@ class DPOPipeline(Pipeline):
       # evaluates the exact SFT reference model without extra memory overhead.
       sft_peft = PeftModel.from_pretrained(base_model, resolved_adapter_path)
       merged_base = sft_peft.merge_and_unload()
-      self.model = get_peft_model(merged_base, self._lora_config)
+      self.model = self._attach_lora(merged_base, self._lora_config)
     else:
-      self.model = get_peft_model(base_model, self._lora_config)
+      self.model = self._attach_lora(base_model, self._lora_config)
 
     self.model.to(torch.bfloat16)
     self.ref_model = None
@@ -2250,11 +2363,12 @@ class ScopeDataGenerationPipeline(Pipeline):
         self.args.model_repo_id,
         padding_side="left",
     )
-    if self.tokenizer.pad_token_id is None:
-      if self.tokenizer.eos_token_id is not None:
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-      elif self.tokenizer.unk_token_id is not None:
-        self.tokenizer.pad_token = self.tokenizer.unk_token
+    # Use the shared resolver so every stage agrees on which token pads. A
+    # local eos-before-unk fallback here would give Mistral `</s>` for SCOPE
+    # and `<unk>` everywhere else, silently changing what the model sees.
+    self.padding_report = configure_tokenizer_padding(
+        self.tokenizer, padding_side="left"
+    )
 
   def load_data(self) -> None:
     dataset = load_dataset(self.args.dataset_repo_id)
@@ -2300,8 +2414,8 @@ class ScopeDataGenerationPipeline(Pipeline):
         prompt_with_context = str(entry)
         user_query = entry.get("user_query", "")
 
-      prompt_without_context = (
-          f"<start_of_turn>user\n{user_query}<end_of_turn>\n<start_of_turn>model\n"
+      prompt_without_context = chat_wrap_user(
+          _resolve_chat_tokenizer(self), user_query
       )
       return prompt_with_context, prompt_without_context, gt
 
@@ -2331,8 +2445,8 @@ class ScopeDataGenerationPipeline(Pipeline):
             f" question:\n{question}\nManual information:\n{context}\nAnswer to"
             " user's question:\n"
         )
-      prompt_without_context = (
-          f"<start_of_turn>user\n{question}<end_of_turn>\n<start_of_turn>model\n"
+      prompt_without_context = chat_wrap_user(
+          _resolve_chat_tokenizer(self), question
       )
       return prompt_with_context, prompt_without_context, gt
 
@@ -2365,8 +2479,8 @@ class ScopeDataGenerationPipeline(Pipeline):
           )
         else:
           prompt_with_context = f"Question: {user_query}\nAnswer:\n"
-      prompt_without_context = (
-          f"<start_of_turn>user\n{user_query}<end_of_turn>\n<start_of_turn>model\n"
+      prompt_without_context = chat_wrap_user(
+          _resolve_chat_tokenizer(self), user_query
       )
       return prompt_with_context, prompt_without_context, gt
 
@@ -2385,8 +2499,8 @@ class ScopeDataGenerationPipeline(Pipeline):
               ),
           ),
       )
-      prompt_without_context = (
-          f"<start_of_turn>user\n{raw_query}<end_of_turn>\n<start_of_turn>model\n"
+      prompt_without_context = chat_wrap_user(
+          _resolve_chat_tokenizer(self), raw_query
       )
       return prompt_with_context, prompt_without_context, gt
 
@@ -2418,14 +2532,7 @@ class ScopeDataGenerationPipeline(Pipeline):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     self.device = device
 
-    if self.tokenizer.pad_token_id is None:
-      if self.tokenizer.eos_token_id is not None:
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-      elif self.tokenizer.unk_token_id is not None:
-        self.tokenizer.pad_token = self.tokenizer.unk_token
-        self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
-    self.tokenizer.padding_side = "left"
+    configure_tokenizer_padding(self.tokenizer, padding_side="left")
 
     print(f"Loading base pre-trained model: {self.args.model_repo_id}...")
     self.base_model = AutoModelForCausalLM.from_pretrained(
@@ -2484,14 +2591,7 @@ class ScopeDataGenerationPipeline(Pipeline):
       prompts_without_ctx = prompts_with_ctx
 
     tokenizer = self.tokenizer
-    tokenizer.padding_side = "left"
-    if tokenizer.pad_token_id is None:
-      if tokenizer.eos_token_id is not None:
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-      elif tokenizer.unk_token_id is not None:
-        tokenizer.pad_token = tokenizer.unk_token
-        tokenizer.pad_token_id = tokenizer.unk_token_id
+    configure_tokenizer_padding(tokenizer, padding_side="left")
 
     device = self.device
     alpha = self.args.alpha
@@ -2579,7 +2679,7 @@ class ScopeDataGenerationPipeline(Pipeline):
       ]
 
     clean_completions = [
-        d.replace("<end_of_turn>", "").replace("<eos>", "").strip()
+        strip_terminal_tokens(d, _resolve_chat_tokenizer(self)).strip()
         for d in decoded
     ]
     return clean_completions
@@ -2728,8 +2828,8 @@ class SSFODataGenerationPipeline(Pipeline):
         prompt_with_context = str(entry)
         user_query = entry.get("user_query", "")
 
-      prompt_without_context = (
-          f"<start_of_turn>user\n{user_query}<end_of_turn>\n<start_of_turn>model\n"
+      prompt_without_context = chat_wrap_user(
+          _resolve_chat_tokenizer(self), user_query
       )
       return prompt_with_context, prompt_without_context, gt
 
@@ -2759,8 +2859,8 @@ class SSFODataGenerationPipeline(Pipeline):
             f" question:\n{question}\nManual information:\n{context}\nAnswer to"
             " user's question:\n"
         )
-      prompt_without_context = (
-          f"<start_of_turn>user\n{question}<end_of_turn>\n<start_of_turn>model\n"
+      prompt_without_context = chat_wrap_user(
+          _resolve_chat_tokenizer(self), question
       )
       return prompt_with_context, prompt_without_context, gt
 
@@ -2793,8 +2893,8 @@ class SSFODataGenerationPipeline(Pipeline):
           )
         else:
           prompt_with_context = f"Question: {user_query}\nAnswer:\n"
-      prompt_without_context = (
-          f"<start_of_turn>user\n{user_query}<end_of_turn>\n<start_of_turn>model\n"
+      prompt_without_context = chat_wrap_user(
+          _resolve_chat_tokenizer(self), user_query
       )
       return prompt_with_context, prompt_without_context, gt
 
@@ -2813,8 +2913,8 @@ class SSFODataGenerationPipeline(Pipeline):
               ),
           ),
       )
-      prompt_without_context = (
-          f"<start_of_turn>user\n{raw_query}<end_of_turn>\n<start_of_turn>model\n"
+      prompt_without_context = chat_wrap_user(
+          _resolve_chat_tokenizer(self), raw_query
       )
       return prompt_with_context, prompt_without_context, gt
 
@@ -3029,12 +3129,26 @@ class SSFODataGenerationPipeline(Pipeline):
           "dtype": "bfloat16",
           "hf_overrides": {"allow_global_per_layer_attribute_access": True},
       }
+      # Only set when asked: vLLM otherwise sizes the KV cache for the model's
+      # declared context, which some checkpoints advertise as 262144.
+      max_model_len = getattr(self.args, "max_model_len", None)
+      if max_model_len:
+        llm_kwargs["max_model_len"] = max_model_len
       if hasattr(self, "llm") and self.llm is not None:
         llm = self.llm
       else:
         try:
           llm = LLM(**llm_kwargs)
-        except TypeError:
+        except (TypeError, ValueError, KeyError, AttributeError) as e:
+          # See `EvaluationGenerationPipeline.run_and_save`: `hf_overrides`
+          # holds a family-specific knob that must never be the reason the
+          # engine refuses to start.
+          if "hf_overrides" not in llm_kwargs:
+            raise
+          print(
+              f"vLLM rejected the engine arguments ({e}); retrying without"
+              " hf_overrides."
+          )
           llm_kwargs.pop("hf_overrides", None)
           llm = LLM(**llm_kwargs)
 
@@ -3971,6 +4085,10 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
       self.tokenizer = AutoTokenizer.from_pretrained(
           self.args.evaluator_model, padding_side="left"
       )
+      # Models such as Mistral ship no pad token; batched autorater scoring
+      # would raise "Asking to pad but the tokenizer does not have a padding
+      # token" without this.
+      configure_tokenizer_padding(self.tokenizer, padding_side="left")
 
   def load_data(self) -> None:
     # Load dataset with hallucination labels
@@ -4022,9 +4140,10 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
       scores = self.gemini_score_dataset(client, self.data, self.args)
     else:
       # Tokenize in batches and compute scores using tokenizer token ids
-      # for Yes/No
-      yes_token_id = self.tokenizer.convert_tokens_to_ids("Yes")
-      no_token_id = self.tokenizer.convert_tokens_to_ids("No")
+      # for Yes/No. Resolved through the helper rather than a bare
+      # convert_tokens_to_ids: on a SentencePiece vocabulary that returns the
+      # unk id for both words, which scores every sample at exactly 0.5.
+      yes_token_id, no_token_id = resolve_yes_no_token_ids(self.tokenizer)
       scores = self.evaluator_score(
           self.data,
           self.args,
@@ -4672,6 +4791,12 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
         "dtype": "bfloat16",
         "hf_overrides": {"allow_global_per_layer_attribute_access": True},
     }
+    # Only set when asked: vLLM otherwise sizes the KV cache for the model's
+    # declared context. Qwen/Qwen3-4B-Instruct-2507 declares 262144, which
+    # needs roughly 38 GB of KV cache and will not start on a 48 GB card.
+    max_model_len = getattr(self.args, "max_model_len", None)
+    if max_model_len:
+      llm_kwargs["max_model_len"] = max_model_len
     print(
         f"Initializing vLLM engine with base model '{self.vllm_model}' "
         f"(enable_lora={self.enable_lora}, max_lora_rank={llm_kwargs['max_lora_rank']}, "
@@ -4680,7 +4805,17 @@ class EvaluationGenerationPipeline(EvaluationPipeline):
     )
     try:
       llm = LLM(**llm_kwargs)
-    except TypeError:
+    except (TypeError, ValueError, KeyError, AttributeError) as e:
+      # `hf_overrides` carries a knob that only one model family understands.
+      # It is inert elsewhere on today's vLLM, but a version or a family that
+      # validates config keys would reject it, and the engine failing to start
+      # is not an acceptable price for an optional flag.
+      if "hf_overrides" not in llm_kwargs:
+        raise
+      print(
+          f"vLLM rejected the engine arguments ({e}); retrying without"
+          " hf_overrides."
+      )
       llm_kwargs.pop("hf_overrides", None)
       llm = LLM(**llm_kwargs)
 
@@ -4728,6 +4863,7 @@ class EvaluationScoringPipeline(EvaluationPipeline):
       self.tokenizer = AutoTokenizer.from_pretrained(
           self.args.evaluator_model, padding_side="left"
       )
+      configure_tokenizer_padding(self.tokenizer, padding_side="left")
     if getattr(self.args, "compute_perplexity", False):
       fluency_model_name = getattr(
           self.args, "fluency_model", None
@@ -4736,6 +4872,9 @@ class EvaluationScoringPipeline(EvaluationPipeline):
         print(f"Loading fluency tokenizer: {fluency_model_name}...")
         self.fluency_tokenizer = AutoTokenizer.from_pretrained(
             fluency_model_name, padding_side="left"
+        )
+        configure_tokenizer_padding(
+            self.fluency_tokenizer, padding_side="left"
         )
       else:
         self.fluency_tokenizer = None
@@ -4898,8 +5037,7 @@ class EvaluationScoringPipeline(EvaluationPipeline):
         client = self.create_gemini_client()
         scores = self.gemini_score_dataset(client, self.val_data, self.args)
       else:
-        yes_token_id = self.tokenizer.convert_tokens_to_ids("Yes")
-        no_token_id = self.tokenizer.convert_tokens_to_ids("No")
+        yes_token_id, no_token_id = resolve_yes_no_token_ids(self.tokenizer)
         scores = self.evaluator_score(
             self.val_data,
             self.args,

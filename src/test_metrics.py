@@ -712,6 +712,35 @@ class TestEvalRepoNaming(unittest.TestCase):
     # than simply cut, so two checkpoints differing only there stay distinct.
     self.assertRegex(repo_id, r"_[0-9a-f]{4}_gens_T0_wfs0_s12345_mt250_nosft$")
 
+  def test_sanitize_hf_repo_id_keeps_the_timestamp_of_a_long_model(self):
+    """Overlong names must lose the middle, never the tail.
+
+    The tail is the timestamp. Right-truncation removed it whole for any
+    base model a dozen characters longer than `gemma-4-E4B-it`, so two
+    campaigns run on the same day with the same hyperparameters pushed to
+    one repository. `Mistral-7B-Instruct-v0.3` is exactly that case.
+    """
+    stamps = ("2609200900", "2609201500")
+    ids = set()
+    for stamp in stamps:
+      repo_id = sanitize_hf_repo_id(
+          "leobianco/ragtruth-summarization_PERL_synthetic_struct_"
+          f"Mistral-7B-Instruct-v0.3_S130104_epo3_lr1e-04_beta0.05_r16_{stamp}"
+      )
+      self.assertLessEqual(len(repo_id), 96)
+      self.assertTrue(repo_id.endswith(stamp), repo_id)
+      self.assertTrue(repo_id.startswith("leobianco/ragtruth"), repo_id)
+      ids.add(repo_id)
+    self.assertEqual(len(ids), 2, ids)
+
+  def test_sanitize_hf_repo_id_preserves_uppercase(self):
+    # The Hub allows uppercase; lowercasing would stop a published
+    # checkpoint from naming its base model recognisably.
+    self.assertEqual(
+        sanitize_hf_repo_id("leobianco/npov_SFT_Qwen3-4B-Instruct-2507"),
+        "leobianco/npov_SFT_Qwen3-4B-Instruct-2507",
+    )
+
   def test_sanitize_hf_repo_id_matches_build(self):
     uncompacted_eval = "leobianco/eval_npov_PERL_google_S130104_epo0.2_lr2.3663655877360862e-05_beta0.04259128063013425_2608141244_gens_T0.0_wfs0"
     sanitized = sanitize_hf_repo_id(uncompacted_eval)
@@ -738,9 +767,10 @@ class TestEvalRepoNaming(unittest.TestCase):
   def test_build_eval_dataset_repo_id_marker_survives_truncation(self):
     """An overlong name must lose model characters, never the SFT marker.
 
-    `sanitize_hf_repo_id` trims from the right, so a marker that is merely
-    appended would be the first thing dropped - silently merging the stacked
-    and un-stacked runs back into one repository.
+    The marker is the last thing in the name, so it must be protected by
+    shrinking the model name up front. Appending it and hoping the generic
+    bounding spares it would silently merge the stacked and un-stacked runs
+    back into one repository.
     """
     huge_model_name = "leobianco/" + ("very_long_model_name_identifier_" * 10)
     stacked = build_eval_dataset_repo_id(
@@ -1496,6 +1526,42 @@ class TestGeminiScoreDataset(unittest.TestCase):
     self.assertEqual(stats["autorater_model"], "gemini-2.5-flash")
     # k = 1 means there is no spread to measure.
     self.assertIsNone(stats["autorater_spread_mean"])
+
+
+class TestVllmContextWindow(unittest.TestCase):
+  """The vLLM context window must be cappable.
+
+  vLLM sizes its KV cache from the model's declared
+  ``max_position_embeddings``. Qwen/Qwen3-4B-Instruct-2507 declares 262144,
+  which needs tens of GB of KV cache and refuses to start on a smaller card,
+  so the pipelines need a way to say "allocate less than the model claims".
+  """
+
+  def test_eval_arguments_expose_max_model_len(self):
+    from src.utils import EvalArguments
+
+    self.assertIn("max_model_len", EvalArguments.__dataclass_fields__)
+
+  def test_eval_arguments_default_to_the_model_declaration(self):
+    from src.utils import EvalArguments
+
+    field = EvalArguments.__dataclass_fields__["max_model_len"]
+    # None, not a number: defaulting to a cap would silently truncate the
+    # context of every model that legitimately needs a long one.
+    self.assertIsNone(field.default)
+
+  def test_ssfo_arguments_expose_max_model_len(self):
+    from src.utils import SsfoDataGenArguments
+
+    field = SsfoDataGenArguments.__dataclass_fields__["max_model_len"]
+    self.assertIsNone(field.default)
+
+  def test_unset_max_model_len_is_not_forwarded_to_vllm(self):
+    # `if max_model_len:` - an unset value must leave the key out entirely
+    # rather than pass max_model_len=None, which vLLM would reject.
+    pipe = EvaluationGenerationPipeline()
+    pipe.args = MagicMock(max_model_len=None)
+    self.assertFalse(bool(getattr(pipe.args, "max_model_len", None)))
 
 
 class TestCpuCompatibility(unittest.TestCase):

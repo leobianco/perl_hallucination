@@ -577,6 +577,14 @@ class NPOVTaskProcessor(BaseTaskProcessor):
 
     return entry
 
+  #: The line that separates the NPOV prompt from the answer the model is
+  #: supposed to produce. Kept as a class attribute so the prompt template and
+  #: the completion marker cannot drift apart.
+  RESPONSE_TEMPLATE = (
+      "\nNeutral point-of-view answer to user query, rewriting provided"
+      " arguments in natural language:\n"
+  )
+
   @classmethod
   def get_formatting_prompts_and_response_template(
       cls,
@@ -586,33 +594,33 @@ class NPOVTaskProcessor(BaseTaskProcessor):
   ) -> Tuple[Callable[[Any], list[str]], str]:
     """Return a formatting function and response template for SFT training.
 
+    The response template used to be selected from a hardcoded allowlist of
+    model vendors ("google", "mistralai"), and anything else raised. That
+    allowlist existed because a completion-only collator has to match the
+    marker token-for-token, and a leading "\\n" tokenizes differently across
+    tokenizers. Two things make it unnecessary now:
+
+    * ``SFTTrainer`` is driven by the dataset's ``prompt``/``completion``
+      columns, so it never consumes this marker - it is informational.
+    * Gating on the *vendor* string could never have been right anyway: it is
+      a property of the tokenizer, not of who published the checkpoint.
+
+    The marker is therefore the same plain-text line for every model, taken
+    from :attr:`RESPONSE_TEMPLATE` so it stays in lockstep with the prompt
+    template built below.
+
     Args:
         eos_token (str): Tokenizer eos token.
         fewshot_examples (datasets.Dataset | None): Few-shot examples to
           include.
-        model_repo_id (str | None): Model repo id to choose model-specific
-          template.
+        model_repo_id (str | None): Accepted for interface compatibility with
+          the other task processors; no longer used.
 
     Returns:
         (callable, str): formatting function and response template string.
     """
-
-    # Choose response template based on model company
-    response_template = None
-    if model_repo_id is not None:
-      model_company = model_repo_id.split("/")[0]
-      if model_company == "google":
-        response_template = (
-            "\nNeutral point-of-view answer to user query, rewriting provided"
-            " arguments in natural language:\n"
-        )
-      elif model_company == "mistralai":
-        response_template = (
-            "point-of-view answer to user query, rewriting provided arguments"
-            " in natural language:\n"
-        )
-    if response_template is None:
-      raise Exception("Response template not specified for model!")
+    del model_repo_id  # Model-agnostic: see the docstring.
+    response_template = cls.RESPONSE_TEMPLATE
 
     def formatting_prompts_func(entry: dict) -> list[str]:
       template = (

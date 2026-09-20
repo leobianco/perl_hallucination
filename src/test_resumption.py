@@ -1231,6 +1231,11 @@ class TestRewardMaxLength(unittest.TestCase):
 
     class _Split:
 
+      # `process_data` drops a stale `labels` column before tokenizing, so
+      # the double has to answer this even though the test is about the
+      # tokenization budget.
+      column_names = ["prompt", "label"]
+
       def map(self, fn, batched=False):
         del batched
         fn({"prompt": ["text"]})
@@ -1238,6 +1243,10 @@ class TestRewardMaxLength(unittest.TestCase):
 
       def set_format(self, _):
         return self
+
+      # `process_data` fails loudly on an empty training split.
+      def __len__(self):
+        return 1
 
       @property
       def features(self):

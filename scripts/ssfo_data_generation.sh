@@ -3,7 +3,9 @@
 # Core Parameters
 USER="leobianco"
 SEED=130104
-MODEL_REPO_ID="google/gemma-4-E4B-it"
+# Overridable from the environment so that swapping the base model does
+# not require editing this script:  MODEL_REPO_ID=Qwen/Qwen3-4B-Instruct-2507 ./ssfo_data_generation.sh
+MODEL_REPO_ID="${MODEL_REPO_ID:-google/gemma-4-E4B-it}"
 SFT_MODEL_PATH="${USER}/"
 
 # SSFO Generation Parameters (matching evaluator.sh)

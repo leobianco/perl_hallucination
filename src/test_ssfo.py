@@ -164,6 +164,38 @@ from src.pipelines import SSFODataGenerationPipeline
 from src.utils import SsfoDataGenArguments
 
 
+class _FakeChatTokenizer:
+  """Tokenizer double that renders a chat template.
+
+  ``_extract_prompts`` no longer hardcodes Gemma's turn markers; it asks the
+  tokenizer for the model's own conversational framing. The tests therefore
+  have to supply a tokenizer for the expected strings to mean anything, and
+  the ``style`` switch lets the same tests prove the behaviour is not
+  Gemma-specific.
+  """
+
+  def __init__(self, style="gemma"):
+    self.style = style
+    self.chat_template = "<present>"
+    self.bos_token = "<bos>" if style == "gemma" else None
+
+  def apply_chat_template(
+      self, messages, tokenize=False, add_generation_prompt=False
+  ):
+    del tokenize
+    content = messages[-1]["content"]
+    if self.style == "chatml":
+      out = f"<|im_start|>user\n{content}<|im_end|>\n"
+      if add_generation_prompt:
+        out += "<|im_start|>assistant\n"
+      return out
+    # Gemma renders a leading BOS, which `chat_wrap_user` must strip.
+    out = f"{self.bos_token}<start_of_turn>user\n{content}<end_of_turn>\n"
+    if add_generation_prompt:
+      out += "<start_of_turn>model\n"
+    return out
+
+
 class TestSSFODataGeneration(unittest.TestCase):
   """Test suite for SSFO synthetic preference data generation."""
 
@@ -184,6 +216,7 @@ class TestSSFODataGeneration(unittest.TestCase):
         push_to_hub=False,
     )
     self.pipeline.device = torch.device("cpu")
+    self.pipeline.tokenizer = _FakeChatTokenizer()
     self.pipeline.enable_lora = False
     self.pipeline.lora_path = None
     self.pipeline.vllm_model = self.pipeline.args.model_repo_id
@@ -486,6 +519,52 @@ class TestSSFODataGeneration(unittest.TestCase):
       self.assertEqual(
           splits_dict["train"].column_names, ["prompt", "chosen", "rejected"]
       )
+
+
+class TestSSFOChatTemplateAgnosticism(unittest.TestCase):
+  """The "no context" prompt must follow the policy's own chat template."""
+
+  def _pipeline(self, tokenizer):
+    pipeline = SSFODataGenerationPipeline()
+    pipeline.args = SsfoDataGenArguments(
+        task_name="npov",
+        dataset_repo_id="test_user/test_sft",
+        model_repo_id="acme/some-model",
+        sft_model_path="test_user/test_sft_model",
+    )
+    pipeline.tokenizer = tokenizer
+    return pipeline
+
+  def test_chatml_family_gets_chatml_markers(self):
+    pipeline = self._pipeline(_FakeChatTokenizer(style="chatml"))
+    _, prompt_no_ctx, _ = pipeline._extract_prompts(
+        {"user_query": "Is coffee healthy?", "npov_response": "Maybe."}
+    )
+    self.assertEqual(
+        prompt_no_ctx,
+        "<|im_start|>user\nIs coffee healthy?<|im_end|>\n"
+        "<|im_start|>assistant\n",
+    )
+    self.assertNotIn("<start_of_turn>", prompt_no_ctx)
+
+  def test_gemma_template_bos_is_not_duplicated(self):
+    pipeline = self._pipeline(_FakeChatTokenizer(style="gemma"))
+    _, prompt_no_ctx, _ = pipeline._extract_prompts(
+        {"user_query": "Is coffee healthy?", "npov_response": "Maybe."}
+    )
+    # The template emits a BOS; it must be dropped, because the prompt is
+    # re-tokenized downstream with add_special_tokens=True.
+    self.assertFalse(prompt_no_ctx.startswith("<bos>"))
+    self.assertTrue(prompt_no_ctx.startswith("<start_of_turn>user"))
+
+  def test_base_model_without_chat_template_gets_raw_text(self):
+    tokenizer = _FakeChatTokenizer()
+    tokenizer.chat_template = None
+    pipeline = self._pipeline(tokenizer)
+    _, prompt_no_ctx, _ = pipeline._extract_prompts(
+        {"user_query": "Is coffee healthy?", "npov_response": "Maybe."}
+    )
+    self.assertEqual(prompt_no_ctx, "Is coffee healthy?")
 
 
 if __name__ == "__main__":

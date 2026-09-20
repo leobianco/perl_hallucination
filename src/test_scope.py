@@ -166,6 +166,38 @@ from src.pipelines import (
 from src.utils import ScopeDataGenArguments
 
 
+class _FakeChatTokenizer:
+  """Tokenizer double that renders a chat template.
+
+  ``_extract_prompts`` no longer hardcodes Gemma's turn markers; it asks the
+  tokenizer for the model's own conversational framing. The tests therefore
+  have to supply a tokenizer for the expected strings to mean anything, and
+  the ``style`` switch lets the same tests prove the behaviour is not
+  Gemma-specific.
+  """
+
+  def __init__(self, style="gemma"):
+    self.style = style
+    self.chat_template = "<present>"
+    self.bos_token = "<bos>" if style == "gemma" else None
+
+  def apply_chat_template(
+      self, messages, tokenize=False, add_generation_prompt=False
+  ):
+    del tokenize
+    content = messages[-1]["content"]
+    if self.style == "chatml":
+      out = f"<|im_start|>user\n{content}<|im_end|>\n"
+      if add_generation_prompt:
+        out += "<|im_start|>assistant\n"
+      return out
+    # Gemma renders a leading BOS, which `chat_wrap_user` must strip.
+    out = f"{self.bos_token}<start_of_turn>user\n{content}<end_of_turn>\n"
+    if add_generation_prompt:
+      out += "<start_of_turn>model\n"
+    return out
+
+
 class TestScopeDataGeneration(unittest.TestCase):
   """Test suite for SCOPE noisy decoding and data generation."""
 
@@ -188,6 +220,7 @@ class TestScopeDataGeneration(unittest.TestCase):
         push_to_hub=False,
     )
     self.pipeline.device = torch.device("cpu")
+    self.pipeline.tokenizer = _FakeChatTokenizer()
 
   def test_scope_sft_splits(self):
     """Test splitting SFT data into D1 and D2 in ScopeDataGenerationPipeline."""

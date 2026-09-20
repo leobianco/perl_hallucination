@@ -163,6 +163,10 @@ class SsfoDataGenArguments:
         Hub. Default: True.
       output_dir (Optional[str]): Optional local directory to save the generated
         dataset. Default: None.
+      max_model_len (Optional[int]): Context window vLLM allocates a KV cache
+        for. None uses the model's declared `max_position_embeddings`, which
+        can be 262144 on recent Qwen checkpoints and will OOM at engine
+        startup on smaller GPUs. Default: None.
   """
 
   task_name: str
@@ -182,6 +186,7 @@ class SsfoDataGenArguments:
   use_base_model_for_rejected: bool = True
   push_to_hub: bool = True
   output_dir: Optional[str] = None
+  max_model_len: Optional[int] = None
 
 
 @dataclass
@@ -209,6 +214,8 @@ class LoraArguments:
       lora_r (int): LoRA attention dimension (rank).
       lora_alpha (int): LoRA alpha parameter for scaling.
       lora_dropout (float): LoRA dropout probability.
+      lora_target_modules (Optional[str]): Comma-separated module names to
+        adapt, or None to let PEFT infer them from the architecture.
   """
 
   task_type: str = field(
@@ -235,6 +242,18 @@ class LoraArguments:
   lora_dropout: float = field(
       default=0.0,
       metadata={"help": "LoRA dropout probability. Default: 0.0"},
+  )
+  lora_target_modules: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Comma-separated module names to attach LoRA to, e.g."
+              " 'q_proj,k_proj,v_proj,o_proj'. Leave unset to let PEFT infer"
+              " them from the architecture, which is what every Gemma run has"
+              " done. Only needed when PEFT does not recognise the model"
+              " family."
+          )
+      },
   )
 
 
@@ -295,6 +314,17 @@ def create_lora_argument_parser() -> argparse.ArgumentParser:
       type=float,
       default=0.0,
       help="LoRA dropout probability. Default: 0.0",
+  )
+  parser.add_argument(
+      "--lora_target_modules",
+      type=str,
+      default=None,
+      help=(
+          "Comma-separated module names to attach LoRA to, e.g."
+          " 'q_proj,k_proj,v_proj,o_proj'. Default: unset, meaning PEFT infers"
+          " them from the architecture. Only needed when PEFT does not"
+          " recognise the model family."
+      ),
   )
 
   return parser
@@ -451,6 +481,20 @@ class EvalArguments:
   )
 
   max_tokens: int = field(default=128)
+
+  max_model_len: Optional[int] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Context window vLLM should allocate a KV cache for. Leave unset"
+              " to use the model's declared `max_position_embeddings`. Models"
+              " advertising very long contexts (e.g."
+              " Qwen/Qwen3-4B-Instruct-2507 declares 262144) will OOM at"
+              " engine startup on smaller GPUs; cap this to something the"
+              " prompts actually need (e.g. 8192)."
+          )
+      },
+  )
 
   temperature: float = field(default=0.0)
 
@@ -908,6 +952,49 @@ def compact_model_name(model_name: str) -> str:
   return name
 
 
+def _bound_repo_name(repo_name: str, max_length: int) -> str:
+  """Shortens ``repo_name`` to ``max_length`` without losing its tail.
+
+  Repo names are built as ``{task}_{stage}_{model}_{flavor}_{hparams}_
+  {timestamp}``, so the *most* disambiguating part - the timestamp - sits at
+  the end. Plain right-truncation therefore removes exactly the characters
+  that make the name unique: with a model name a dozen characters longer than
+  ``gemma-4-E4B-it`` the whole timestamp disappears, and two campaigns run on
+  the same day with the same hyperparameters silently push to one repository.
+
+  Shortening from the middle keeps both the human-readable prefix and the
+  timestamp, and the interposed hash of the full name restores the uniqueness
+  the elided characters carried.
+
+  Args:
+      repo_name: The unbounded repository name.
+      max_length: Maximum number of characters allowed.
+
+  Returns:
+      ``repo_name`` if it already fits, otherwise a middle-elided form of it.
+  """
+  if max_length <= 0:
+    return ""
+  if len(repo_name) <= max_length:
+    return repo_name
+
+  digest = hashlib.sha1(repo_name.encode("utf-8")).hexdigest()[:6]
+  marker = f"_{digest}_"
+  # Too tight to keep both ends legible: fall back to the old behaviour but
+  # keep the hash, so the name is still unique.
+  if max_length <= len(marker) + 8:
+    return (digest + repo_name)[:max_length].rstrip(".-_")
+
+  remaining = max_length - len(marker)
+  # Bias towards the tail: the timestamp and the hyperparameters that differ
+  # between sibling runs both live there.
+  tail_len = min(len(repo_name), remaining * 2 // 3)
+  head_len = remaining - tail_len
+  head = repo_name[:head_len].rstrip(".-_")
+  tail = repo_name[len(repo_name) - tail_len:].lstrip(".-_")
+  return f"{head}{marker}{tail}"
+
+
 def sanitize_hf_repo_id(repo_id: str, max_length: int = 96) -> str:
   """Sanitizes and bounds a Hugging Face repository ID to comply with Hugging Face Hub constraints.
 
@@ -916,6 +1003,10 @@ def sanitize_hf_repo_id(repo_id: str, max_length: int = 96) -> str:
   - Allowed characters: alphanumeric, '-', '_'
   - Replaces all '.' with '_' to eliminate period-related validation issues.
   - Cannot start or end with '-' or '.'
+
+  Note that uppercase characters are *allowed* by the Hub (``Qwen/Qwen3-4B``,
+  ``mistralai/Mistral-7B-Instruct-v0.3``) and are deliberately preserved, so
+  that a published checkpoint still names its base model recognisably.
 
   Args:
       repo_id (str): The repository identifier (e.g. 'user/dataset_name').
@@ -948,14 +1039,10 @@ def sanitize_hf_repo_id(repo_id: str, max_length: int = 96) -> str:
   if namespace:
     namespace = namespace.replace(".", "_")
     namespace = re.sub(r"[^a-zA-Z0-9_\-]", "_", namespace).strip(".-_")
-    max_repo_name_len = max_length - len(namespace) - 1
-    if len(repo_name) > max_repo_name_len:
-      repo_name = repo_name[:max_repo_name_len].rstrip(".-_")
+    repo_name = _bound_repo_name(repo_name, max_length - len(namespace) - 1)
     return f"{namespace}/{repo_name}"
   else:
-    if len(repo_name) > max_length:
-      repo_name = repo_name[:max_length].rstrip(".-_")
-    return repo_name
+    return _bound_repo_name(repo_name, max_length)
 
 
 #: String spellings of "no model here" that shells and configs keep producing.
@@ -1194,9 +1281,11 @@ def build_eval_dataset_repo_id(
   else:
     prefix = "eval_"
 
-  # The model name absorbs the whole overflow: `sanitize_hf_repo_id` trims from
-  # the right, which would otherwise eat the SFT marker and merge two distinct
-  # configurations back into one repository.
+  # The model name absorbs the whole overflow here, before
+  # `sanitize_hf_repo_id` ever sees the name. That keeps the SFT marker and
+  # the generation settings intact and, crucially, keeps the overflow
+  # attributable: shortening the model deliberately is more legible than
+  # letting the generic bounding elide an arbitrary middle span.
   allowed_model_len = max_length - len(user) - 1 - len(prefix) - len(suffix)
   if allowed_model_len <= 0:
     compacted_model = ""

@@ -3,7 +3,9 @@
 # Core Parameters
 USER="leobianco"
 SEED=130104
-MODEL_REPO_ID="google/gemma-4-E4B-it"
+# Overridable from the environment so that swapping the base model does
+# not require editing this script:  MODEL_REPO_ID=Qwen/Qwen3-4B-Instruct-2507 ./writer_sft.sh
+MODEL_REPO_ID="${MODEL_REPO_ID:-google/gemma-4-E4B-it}"
 
 # Training Parameters
 BATCH_SIZE=16
@@ -26,7 +28,10 @@ DEEPSPEED_CONFIG="scripts/deepspeed_config.yaml"
 
 # Parameters derived from above
 TASK_NAME="$1"
-MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
+# $NF, not $1: awk -F'/' '{print $1}' returns the *vendor* namespace, so every
+# run identifier said "google" instead of naming the model. Harmless while one
+# model was ever used; with two it makes runs of different models collide.
+MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $NF}')
 TIMESTAMP=$(date '+%y%m%d%H%M')
 FORMATTED_LR=$(python3 -c "import sys; lr=float('${LEARNING_RATE}'); print(f'{lr:.1e}')" 2>/dev/null || echo "$LEARNING_RATE")
 FORMATTED_EPOCHS=$(python3 -c "import sys; e=float('${NUM_TRAIN_EPOCHS}'); print(f'{e:.2g}')" 2>/dev/null || echo "$NUM_TRAIN_EPOCHS")
