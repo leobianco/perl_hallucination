@@ -79,6 +79,29 @@ MINUTES_PER_TRIAL: Dict[str, float] = config_mod.MINUTES_PER_TRIAL
 
 _REPO_ID_RE = re.compile(r"^[\w.\-]+/[\w.\-]+$")
 
+#: The base model a campaign uses when the user does not say otherwise.
+#: Read off the dataclass rather than re-typed, so the wizard can never
+#: disagree with :class:`~src.orchestrator.config.CampaignConfig`.
+DEFAULT_BASE_MODEL: str = config_mod.CampaignConfig.base_model
+
+#: Base models we have actually exercised end-to-end, offered as a shortlist.
+#: This is a convenience, not a whitelist - "custom" accepts any HF repo id,
+#: and nothing downstream branches on the vendor.
+BASE_MODEL_CATALOGUE: List[Tuple[str, str]] = [
+    (
+        DEFAULT_BASE_MODEL,
+        "project default, gated (accept the licence on the Hub first)",
+    ),
+    (
+        "Qwen/Qwen3-4B-Instruct-2507",
+        "Apache-2.0, ungated, closest scale - non-thinking variant",
+    ),
+    (
+        "mistralai/Mistral-7B-Instruct-v0.3",
+        "Apache-2.0, 7B - needs more VRAM than the 4B models",
+    ),
+]
+
 
 # --------------------------------------------------------------------------
 # Pure helpers
@@ -168,6 +191,12 @@ def format_estimate(low: float, high: float) -> str:
 def equivalent_command(config: CampaignConfig) -> str:
   """Builds the non-interactive command reproducing this configuration."""
   parts = ["python3 scripts/run_campaign.py run", f"--task {config.task_name}"]
+  # The printed command is meant to be copy-pasteable. Omitting the model
+  # would silently reproduce a Gemma campaign from a Qwen one.
+  if config.base_model != DEFAULT_BASE_MODEL:
+    parts.append(f'--base-model "{config.base_model}"')
+  if config.reward_base_model and config.reward_base_model != config.base_model:
+    parts.append(f'--reward-base-model "{config.reward_base_model}"')
   stages = theme_mod.iter_stage_names(config.stages)
   if stages != list(config_mod.VALID_STAGES):
     parts.append(f"--stages {','.join(stages)}")
@@ -201,6 +230,11 @@ def config_summary_lines(config: CampaignConfig, theme: theme_mod.Theme) -> List
       ("Campaign id", config.name),
       ("Stages", " " + f" {theme.glyphs.arrow} ".join(s.upper() for s in stages)),
   ]
+  # Only shown when it diverges: a reward model built on a different family
+  # from the policy is a deliberate choice, and an accidental one is very
+  # expensive to discover after the fact.
+  if config.reward_base_model and config.reward_base_model != config.base_model:
+    rows.append(("Reward base model", config.reward_base_model))
   # A two-flavor campaign silently doubles the RM and PE-RL budgets, so the
   # review block has to say so before the user confirms the estimate.
   campaign_flavors = flavors.campaign_flavors(config)
@@ -266,6 +300,12 @@ class WizardAnswers:
   """Raw answers collected from the user."""
 
   task: str = "npov"
+  #: Empty means "whatever :class:`CampaignConfig` defaults to". Storing the
+  #: empty string rather than the literal keeps the wizard from pinning a
+  #: model the day the project default changes.
+  base_model: str = ""
+  #: Empty means "same as ``base_model``". Only ever set deliberately.
+  reward_base_model: str = ""
   stages: List[str] = field(
       default_factory=lambda: list(config_mod.VALID_STAGES)
   )
@@ -296,6 +336,13 @@ def build_config(answers: WizardAnswers) -> CampaignConfig:
       rm_dataset_flavors=answers.rm_dataset_flavors,
   )
   config.stages = theme_mod.iter_stage_names(answers.stages)
+  # Applied after create_default rather than threaded through it: an empty
+  # answer must leave the dataclass default untouched, not overwrite it with
+  # an empty string.
+  if answers.base_model:
+    config.base_model = answers.base_model
+  if answers.reward_base_model:
+    config.reward_base_model = answers.reward_base_model
   config.perl.sft_model_path = answers.sft_model or "auto"
   config.perl.reward_model_path = answers.reward_model or "auto"
   config.eval.max_eval_samples = int(answers.eval_samples)
@@ -562,6 +609,37 @@ def run_setup_wizard(
   if not task:
     return _cancelled(console)
   answers.task = task
+
+  # 1b. Base model -----------------------------------------------------
+  # The review block has always shown the base model; until now there was no
+  # way to change it here, which made the wizard a Gemma-only entry point.
+  model = prompter.select(
+      "Which base model should every stage start from?",
+      [
+          (repo_id, f"{repo_id:<36} {description}")
+          for repo_id, description in BASE_MODEL_CATALOGUE
+      ]
+      + [("custom", f"{'custom':<36} enter any Hugging Face repo id")],
+      default=DEFAULT_BASE_MODEL,
+  )
+  if not model:
+    return _cancelled(console)
+  if model == "custom":
+    model = prompter.text(
+        "Base model repo id",
+        default=DEFAULT_BASE_MODEL,
+        validate=validate_repo_id,
+    )
+    if not model:
+      return _cancelled(console)
+  answers.base_model = model.strip()
+  if answers.base_model != DEFAULT_BASE_MODEL:
+    # Said once, here, rather than discovered three hours into a campaign.
+    console.hint(
+        "The reward model will be built on the same base unless you say "
+        "otherwise; pass --reward-base-model to diverge. Long-context "
+        "checkpoints may also need --max_model_len on the eval stage."
+    )
 
   # 2. Stages ----------------------------------------------------------
   stages = prompter.checkbox(

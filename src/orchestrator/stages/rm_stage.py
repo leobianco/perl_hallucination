@@ -36,7 +36,11 @@ class RmStage(BaseStage):
     )
 
   def get_sweep_descriptor(self, sweep_dict: Dict[str, Any]) -> Tuple[str, str]:
-    rm_model = "google/gemma-4-E4B-it"
+    # The campaign's reward base model is the default, so a sweep YAML that
+    # does not pin --model_repo_id is named after the model the stage will
+    # actually train. An explicit pin in the YAML still wins, because
+    # `execute` honours it too.
+    rm_model = self.config.resolved_reward_base_model()
     dataset = self.dataset_repo_id()
     cmd = sweep_dict.get("command", [])
     if isinstance(cmd, list):
@@ -78,7 +82,12 @@ class RmStage(BaseStage):
 
     # Load and adjust sweep configuration
     sweep_dict = {}
-    rm_base_model = "google/gemma-4-E4B-it"
+    # The campaign is the source of truth for the base model, exactly as it is
+    # in the SFT and PE-RL stages. The YAML's own `--model_repo_id` is the
+    # default for running the sweep standalone; letting it win here would mean
+    # `reward_base_model` never took effect, because scripts/sweep_rm.yaml
+    # ships with a pin.
+    rm_base_model = self.config.resolved_reward_base_model()
     if os.path.exists(yaml_path):
       with open(yaml_path, "r", encoding="utf-8") as f:
         sweep_dict = yaml.safe_load(f)
@@ -86,11 +95,14 @@ class RmStage(BaseStage):
     # Inject task name, dataset repo, model repo, and seed overrides
     expected_dataset = self.dataset_repo_id()
     logger.info("  Reward model dataset: %s", expected_dataset)
+    logger.info("  Reward model base:    %s", rm_base_model)
     if live_line_callback:
       live_line_callback(f"  Reward model dataset: {expected_dataset}")
+      live_line_callback(f"  Reward model base:    {rm_base_model}")
     if "command" in sweep_dict and isinstance(sweep_dict["command"], list):
       cmd_list = sweep_dict["command"]
       has_dataset = False
+      has_model = False
       for idx, arg in enumerate(cmd_list):
         if isinstance(arg, str):
           if arg.startswith("--task_name="):
@@ -101,10 +113,13 @@ class RmStage(BaseStage):
             cmd_list[idx] = f"--dataset_repo_id={expected_dataset}"
             has_dataset = True
           elif arg.startswith("--model_repo_id="):
-            rm_base_model = arg.split("=", 1)[1]
+            cmd_list[idx] = f"--model_repo_id={rm_base_model}"
+            has_model = True
 
       if not has_dataset:
         cmd_list.append(f"--dataset_repo_id={expected_dataset}")
+      if not has_model:
+        cmd_list.append(f"--model_repo_id={rm_base_model}")
 
     # Apply parameter search overrides if specified
     if cfg.parameter_overrides and "parameters" in sweep_dict:

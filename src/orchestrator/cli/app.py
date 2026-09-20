@@ -132,10 +132,34 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Max trials for the PE-RL sweep.")
   run_parser.add_argument("--eval-samples", type=int, default=None,
                           help="Number of evaluation samples.")
+  run_parser.add_argument(
+      "--max-model-len", type=int, default=None,
+      help=(
+          "Context window vLLM allocates a KV cache for during evaluation"
+          " generation. Needed for checkpoints that declare a very large"
+          " context (Qwen3-*-2507 declares 262144); leave unset to keep"
+          " vLLM's default."
+      ),
+  )
   run_parser.add_argument("--sft-model", default=None,
                           help="Existing SFT checkpoint (skips SFT training).")
   run_parser.add_argument("--reward-model", default=None,
                           help="Existing reward model checkpoint.")
+  run_parser.add_argument(
+      "--base-model", default=None,
+      help=(
+          "Hugging Face repo id of the base policy, e.g."
+          " 'Qwen/Qwen3-4B-Instruct-2507'. Overrides the campaign config and"
+          " the --model_repo_id pinned in every sweep YAML."
+      ),
+  )
+  run_parser.add_argument(
+      "--reward-base-model", default=None,
+      help=(
+          "Base model for the reward model, when it should differ from"
+          " --base-model. Defaults to --base-model."
+      ),
+  )
   run_parser.add_argument(
       "--rm-datasets", default=None,
       help=(
@@ -642,6 +666,10 @@ def cmd_run(args: argparse.Namespace, console: UiConsole) -> int:
 
   if args.stages:
     config.stages = theme_mod.iter_stage_names(args.stages.split(","))
+  if getattr(args, "base_model", None):
+    config.base_model = args.base_model
+  if getattr(args, "reward_base_model", None):
+    config.reward_base_model = args.reward_base_model
   if args.sft_model:
     config.perl.sft_model_path = args.sft_model
   if args.reward_model:
@@ -650,6 +678,11 @@ def cmd_run(args: argparse.Namespace, console: UiConsole) -> int:
     config.rm_dataset_flavors = flavors.normalize_flavors(
         args.rm_datasets.split(",")
     )
+  # Applied outside the `--config` branch on purpose: the cap depends on the
+  # GPU the campaign lands on, not on the experiment, so it has to be
+  # overridable on a YAML that was written for a different machine.
+  if getattr(args, "max_model_len", None):
+    config.eval.max_model_len = args.max_model_len
   if getattr(args, "entity", None):
     config.wandb_entity = args.entity
   if getattr(args, "user", None):

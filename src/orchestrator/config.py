@@ -207,10 +207,28 @@ class EvalStageConfig:
   match_perl_rollout_temperature: bool = True
   top_p: float = 1.0
   top_k: int = 0
+  #: Context window vLLM sizes its KV cache for during generation. None keeps
+  #: vLLM's own default, which is whatever the checkpoint *declares* - and a
+  #: declaration is not a promise that the cache fits: ``Qwen3-4B-Instruct-2507``
+  #: advertises 262144 tokens, roughly 38 GB of KV cache for a single sequence,
+  #: so the engine either refuses to start or serves one request at a time.
+  #:
+  #: Set it to something the evaluation actually needs (longest prompt plus
+  #: ``max_tokens``). Too small is not a quiet truncation - vLLM rejects a
+  #: prompt that does not fit - so the failure stays visible.
+  max_model_len: Optional[int] = None
   compute_bertscore: bool = True
   bertscore_model: str = "sentence-transformers/all-MiniLM-L6-v2"
   compute_perplexity: bool = True
-  fluency_model: str = "google/gemma-4-E4B-it"
+  #: Language model used to score the fluency (conditional perplexity) of a
+  #: completion. None means "the campaign's ``base_model``", which is what
+  #: ``scripts/evaluator.sh`` has always done (``FLUENCY_MODEL=${BASE_MODEL}``)
+  #: and the only default that stays correct when the policy changes family.
+  #: Pinning a literal here made ``--base-model Qwen/...`` still pull the
+  #: gated Gemma repo and report a Qwen policy's fluency under a Gemma LM.
+  #: Set it explicitly only to hold the fluency reference fixed across a
+  #: cross-family comparison.
+  fluency_model: Optional[str] = None
   wandb_project: str = "new_perl_eval"
   log_to_wandb: bool = True
   overwrite_scores: bool = False
@@ -267,6 +285,19 @@ class CampaignConfig:
   project: str = "new_perl"
   wandb_entity: Optional[str] = None
   base_model: str = "google/gemma-4-E4B-it"
+  #: Base model for the *reward* model, when it should differ from the policy.
+  #:
+  #: None means "use ``base_model``", which is what almost every campaign
+  #: wants and, crucially, what makes changing ``base_model`` sufficient. The
+  #: reward model used to be pinned only in ``scripts/sweep_rm.yaml``, so a
+  #: campaign retargeted at a new policy silently kept scoring its rollouts
+  #: with a reward model built on the old one - a mismatch that produces
+  #: plausible-looking reward curves and no error at all.
+  #:
+  #: Set it explicitly to run the deliberately-asymmetric configurations, e.g.
+  #: a small reward model against a larger policy.
+  reward_base_model: Optional[str] = None
+
   #: ``autorater`` comes first and is not a training stage: it measures the
   #: Gemini judge against the human-labelled set and fits the decision
   #: threshold the final evaluation then scores with. It runs before any GPU
@@ -319,6 +350,30 @@ class CampaignConfig:
       self.name = f"{self.task_name}_campaign_{timestamp}"
     if not self.state_file:
       self.state_file = f"./checkpoints/{self.task_name}/{self.name}_state.json"
+
+  def resolved_reward_base_model(self) -> str:
+    """The base model the reward model is trained on.
+
+    Single source of truth for the RM stage and for anything that reports on
+    it, so that the default ("same as the policy") cannot be re-derived
+    differently in two places.
+
+    Returns:
+      ``reward_base_model`` when set, otherwise ``base_model``.
+    """
+    return self.reward_base_model or self.base_model
+
+  def resolved_fluency_model(self) -> str:
+    """The language model that scores completion fluency.
+
+    Same contract as :meth:`resolved_reward_base_model`: an unset value
+    follows the policy, so moving a campaign to another model family is one
+    edit rather than three.
+
+    Returns:
+      ``eval.fluency_model`` when set, otherwise ``base_model``.
+    """
+    return self.eval.fluency_model or self.base_model
 
   def validate(self) -> None:
     """Validates the campaign configuration values.

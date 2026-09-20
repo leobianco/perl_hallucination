@@ -68,6 +68,61 @@ REWARD_MAX_LENGTH: int = 2048
 #: in an older winner's W&B config is now ignored rather than replayed.
 REWARD_PENALTY_ALPHA: float = 1.0
 
+#: Batch geometry for PE-RL winner retraining.
+#:
+#: These are NOT part of the PE-RL search space, so they are not replayed from
+#: the winner's run config and have to be pinned to whatever every trial of
+#: ``scripts/sweep_perl.yaml`` used. The defaults below are the ones a ~4B
+#: policy was tuned with.
+#:
+#: They are overridable because they are the only thing in this command that
+#: depends on the *size* of the model rather than on the experiment: a 7B
+#: policy does not fit this geometry, and ``auto_find_batch_size=False``
+#: removes the runtime escape hatch. Changing them changes the effective
+#: batch size and therefore the optimisation problem, which is why this is a
+#: deliberate, explicit override and not an automatic fallback.
+#:
+#: Override with ``PERL_<UPPERCASED_KEY>``, e.g.
+#: ``PERL_PER_DEVICE_TRAIN_BATCH_SIZE=2 PERL_GRADIENT_ACCUMULATION_STEPS=16``.
+#:
+#: Note for RLOO/GRPO: the number of prompts in a generation batch must stay
+#: divisible by ``num_generations``. Halve ``per_device_train_batch_size`` and
+#: double ``gradient_accumulation_steps`` together rather than one of the two.
+PERL_BATCH_GEOMETRY: Dict[str, str] = {
+    "num_generations": "8",
+    "num_iterations": "1",
+    "steps_per_generation": "16",
+    "per_device_train_batch_size": "4",
+    "per_device_eval_batch_size": "16",
+    "gradient_accumulation_steps": "8",
+    "auto_find_batch_size": "False",
+}
+
+
+def perl_batch_geometry(
+    env: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+  """Returns the PE-RL batch geometry with any environment overrides applied.
+
+  Args:
+    env: Environment mapping to read overrides from. Defaults to ``os.environ``.
+
+  Returns:
+    A copy of :data:`PERL_BATCH_GEOMETRY` with ``PERL_<UPPERCASED_KEY>``
+    entries substituted. Values are passed through verbatim so that
+    ``HfArgumentParser`` - not this function - owns their validation.
+  """
+  source = os.environ if env is None else env
+  geometry = dict(PERL_BATCH_GEOMETRY)
+  for key in geometry:
+    override = source.get(f"PERL_{key.upper()}")
+    if override is not None and str(override).strip():
+      geometry[key] = str(override).strip()
+      logger.info(
+          "PE-RL batch geometry: --%s overridden to %s", key, geometry[key]
+      )
+  return geometry
+
 
 
 @dataclasses.dataclass(frozen=True)
@@ -554,20 +609,11 @@ class ModelManager:
           # REWARD_PENALTY_ALPHA.
           "--reward_penalty_alpha",
           str(REWARD_PENALTY_ALPHA),
-          "--num_generations",
-          "8",
-          "--num_iterations",
-          "1",
-          "--steps_per_generation",
-          "16",
-          "--per_device_train_batch_size",
-          "4",
-          "--per_device_eval_batch_size",
-          "16",
-          "--gradient_accumulation_steps",
-          "8",
-          "--auto_find_batch_size",
-          "False",
+      ])
+      # Size-dependent, not experiment-dependent: see PERL_BATCH_GEOMETRY.
+      for flag, value in perl_batch_geometry().items():
+        cmd.extend([f"--{flag}", value])
+      cmd.extend([
           "--logging_steps",
           "1",
           "--log_completions",

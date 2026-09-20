@@ -319,7 +319,17 @@ class WizardFlowTest(unittest.TestCase):
     super().setUp()
     self.console = make_console()
 
-  def run_wizard(self, answers, save_yaml=False):
+  def run_wizard(self, answers, save_yaml=False, raw=False):
+    """Drives the wizard with ``answers``.
+
+    The base-model question sits between "task" and "stages". Every existing
+    flow predates it and does not care about the model, so unless ``raw`` is
+    set the default answer is spliced in for them; that keeps this helper the
+    single place that knows the question order.
+    """
+    if not raw:
+      answers = list(answers)
+      answers.insert(1, wizard.DEFAULT_BASE_MODEL)
     prompter = wizard.ScriptedPrompter(answers)
     config = wizard.run_setup_wizard(
         console=self.console, prompter=prompter, save_yaml=save_yaml
@@ -589,6 +599,114 @@ class WizardFlowTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join("configs")))
       finally:
         os.chdir(cwd)
+
+
+class BaseModelQuestionTest(unittest.TestCase):
+  """The wizard must be able to choose a base model, not only show one."""
+
+  def setUp(self):
+    super().setUp()
+    self.console = make_console()
+
+  def run_wizard(self, answers):
+    prompter = wizard.ScriptedPrompter(answers)
+    config = wizard.run_setup_wizard(
+        console=self.console, prompter=prompter, save_yaml=False
+    )
+    return config, prompter
+
+  def test_the_question_is_asked(self):
+    _, prompter = self.run_wizard(
+        ["npov", wizard.DEFAULT_BASE_MODEL, ["sft"], "smoke", True, True]
+    )
+    self.assertIn("base model", " ".join(prompter.asked).lower())
+
+  def test_default_answer_leaves_the_project_default(self):
+    config, _ = self.run_wizard(
+        ["npov", wizard.DEFAULT_BASE_MODEL, ["sft"], "smoke", True, True]
+    )
+    self.assertEqual(config.base_model, wizard.DEFAULT_BASE_MODEL)
+
+  def test_catalogue_choice_reaches_the_config(self):
+    config, _ = self.run_wizard(
+        [
+            "npov",
+            "Qwen/Qwen3-4B-Instruct-2507",
+            ["sft"],
+            "smoke",
+            True,
+            True,
+        ]
+    )
+    self.assertEqual(config.base_model, "Qwen/Qwen3-4B-Instruct-2507")
+
+  def test_custom_opens_a_free_text_prompt(self):
+    config, prompter = self.run_wizard(
+        [
+            "npov",
+            "custom",
+            "some-org/some-model-v9",
+            ["sft"],
+            "smoke",
+            True,
+            True,
+        ]
+    )
+    self.assertEqual(config.base_model, "some-org/some-model-v9")
+    self.assertIn("Base model repo id", prompter.asked)
+
+  def test_custom_answer_is_validated(self):
+    with self.assertRaises(AssertionError):
+      self.run_wizard(
+          ["npov", "custom", "not-a-repo-id", ["sft"], "smoke", True, True]
+      )
+
+  def test_cancelling_the_model_question_aborts(self):
+    config, _ = self.run_wizard(["npov", None])
+    self.assertIsNone(config)
+    self.assertIn("cancelled", self.console.file.getvalue())
+
+  def test_a_non_default_model_is_announced_in_the_review_block(self):
+    self.run_wizard(
+        [
+            "npov",
+            "Qwen/Qwen3-4B-Instruct-2507",
+            ["sft"],
+            "smoke",
+            True,
+            True,
+        ]
+    )
+    self.assertIn("Qwen/Qwen3-4B-Instruct-2507", self.console.file.getvalue())
+
+  def test_the_equivalent_command_round_trips_the_model(self):
+    # Regression: the printed command used to omit the model entirely, so
+    # copy-pasting it from a Qwen campaign silently reran it on Gemma.
+    config = CampaignConfig.create_default(task_name="npov")
+    self.assertNotIn("--base-model", wizard.equivalent_command(config))
+    config.base_model = "Qwen/Qwen3-4B-Instruct-2507"
+    command = wizard.equivalent_command(config)
+    self.assertIn('--base-model "Qwen/Qwen3-4B-Instruct-2507"', command)
+    self.assertNotIn("--reward-base-model", command)
+    config.reward_base_model = "mistralai/Mistral-7B-Instruct-v0.3"
+    self.assertIn(
+        '--reward-base-model "mistralai/Mistral-7B-Instruct-v0.3"',
+        wizard.equivalent_command(config),
+    )
+
+  def test_build_config_ignores_blank_answers(self):
+    answers = wizard.WizardAnswers(task="npov")
+    self.assertEqual(answers.base_model, "")
+    config = wizard.build_config(answers)
+    self.assertEqual(config.base_model, wizard.DEFAULT_BASE_MODEL)
+    self.assertIsNone(config.reward_base_model)
+
+  def test_default_base_model_tracks_the_dataclass(self):
+    self.assertEqual(
+        wizard.DEFAULT_BASE_MODEL,
+        CampaignConfig.create_default(task_name="npov").base_model,
+    )
+
 
 
 if __name__ == "__main__":

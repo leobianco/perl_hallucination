@@ -536,6 +536,12 @@ class EvalStage(BaseStage):
         "--writer_num_fewshot",
         str(cfg.writer_num_fewshot),
     ])
+    # Generation is the only evaluation phase that starts a vLLM engine, and
+    # the engine sizes its KV cache from the checkpoint's declared context
+    # unless told otherwise. Omitted entirely when unset so that campaigns
+    # which never needed it keep vLLM's own default.
+    if cfg.max_model_len:
+      cmd.extend(["--max_model_len", str(cfg.max_model_len)])
     return cmd
 
   def _scoring_command(
@@ -619,7 +625,7 @@ class EvalStage(BaseStage):
         "--compute_perplexity",
         str(cfg.compute_perplexity),
         "--fluency_model",
-        cfg.fluency_model,
+        self.config.resolved_fluency_model(),
         "--log_to_wandb",
         str(cfg.log_to_wandb),
         "--wandb_project",

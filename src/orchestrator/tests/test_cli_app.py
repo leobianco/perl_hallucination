@@ -597,6 +597,55 @@ class RunCommandTest(CommandTestBase):
     )
     self.assertEqual(self.executed["config"].sft.max_runs, 9)
 
+  def test_base_model_flag_overrides_the_default(self):
+    self.run_cli(
+        [
+            "run",
+            "--base-model",
+            "Qwen/Qwen3-4B-Instruct-2507",
+            "--dry-run",
+            "--yes",
+        ]
+    )
+    config = self.executed["config"]
+    self.assertEqual(config.base_model, "Qwen/Qwen3-4B-Instruct-2507")
+    # Unset, the reward model follows the policy - so changing one flag is
+    # enough to move an entire campaign to another family.
+    self.assertEqual(
+        config.resolved_reward_base_model(), "Qwen/Qwen3-4B-Instruct-2507"
+    )
+
+  def test_reward_base_model_flag_is_independent(self):
+    self.run_cli(
+        [
+            "run",
+            "--base-model",
+            "Qwen/Qwen3-4B-Instruct-2507",
+            "--reward-base-model",
+            "mistralai/Mistral-7B-Instruct-v0.3",
+            "--dry-run",
+            "--yes",
+        ]
+    )
+    config = self.executed["config"]
+    self.assertEqual(config.base_model, "Qwen/Qwen3-4B-Instruct-2507")
+    self.assertEqual(
+        config.resolved_reward_base_model(),
+        "mistralai/Mistral-7B-Instruct-v0.3",
+    )
+
+  def test_max_model_len_flag_reaches_the_eval_config(self):
+    """The cap depends on the GPU, so it must be settable without a YAML."""
+    self.run_cli(
+        ["run", "--max-model-len", "8192", "--dry-run", "--yes"]
+    )
+    self.assertEqual(self.executed["config"].eval.max_model_len, 8192)
+
+  def test_max_model_len_defaults_to_unset(self):
+    """Omitting the flag must not invent a cap for existing campaigns."""
+    self.run_cli(["run", "--dry-run", "--yes"])
+    self.assertIsNone(self.executed["config"].eval.max_model_len)
+
   def test_stage_subset_is_normalized(self):
     self.run_cli(
         [
