@@ -57,6 +57,13 @@ MILESTONE_HINTS = (
     "dry-run",
 )
 
+#: Floor for the pinned block on a very short pane: below this the dashboard
+#: would be cropped down to nothing and stop being useful.
+MIN_PINNED_ROWS = 8
+
+#: Row budget used when there is no terminal to overflow (plain mode, tests).
+MAX_ROWS_UNBOUNDED = 10_000
+
 
 class DashboardModel:
   """UI state derived from the campaign event stream.
@@ -172,7 +179,13 @@ class DashboardModel:
       best = parser.best_trial(self._goal(stage))
       if best is not None and best.metric is not None:
         self._record_metric(stage or "", best.metric, replace=True)
-    entry = (event.timestamp, stage, event.message)
+    # The parser still sees the raw line (it strips its own prefixes), but
+    # anything that reaches the terminal has to be escape-free: a progress
+    # bar's cursor moves would otherwise repaint the pinned block itself.
+    message = theme_mod.sanitize_line(event.message)
+    if not message:
+      return
+    entry = (event.timestamp, stage, message)
     self._logs.append(entry)
     if self._should_display(event):
       self._pending.append(entry)
@@ -493,11 +506,21 @@ class LiveDashboard:
 
   # --- Rendering ------------------------------------------------------
   def render(self):
-    """Builds the pinned renderable (rich) for the current model state."""
+    """Builds the pinned renderable (rich) for the current model state.
+
+    The block is fitted to the pane: the hotkey footer is always the last
+    row, and whatever does not fit above it is dropped or cropped. A pinned
+    block taller than the terminal cannot be erased on the next refresh, and
+    ``rich`` then redraws it below the leftovers - which is how the footer
+    used to appear half a dozen times in a row.
+    """
     from rich.console import Group  # pylint: disable=g-import-not-at-top
 
     width = self.console.width
     views = self.model.stage_views()
+    footer = self._footer(width)
+    budget = self._row_budget() - self._measure(footer)
+
     blocks: List[Any] = [
         renderables.header_panel(
             self.model.config,
@@ -509,58 +532,156 @@ class LiveDashboard:
         ),
         renderables.dag_table(views, self.theme, width=width),
     ]
+    used = sum(self._measure(block) for block in blocks)
 
     parser = self.model.active_parser()
     if parser is not None and parser.trials:
-      from rich.panel import Panel  # pylint: disable=g-import-not-at-top
-      from rich import box  # pylint: disable=g-import-not-at-top
-
-      stage = self.model.current_stage or ""
-      stage_cfg = getattr(self.model.config, stage, None)
-      limit = max(3, min(8, 4 + self.model.log_window))
-      blocks.append(
-          Panel(
-              renderables.leaderboard_table(
-                  parser.leaderboard(
-                      goal=str(getattr(stage_cfg, "goal", "minimize")), limit=limit
-                  ),
-                  self.theme,
-                  metric_name=parser.metric_name
-                  or theme_mod.STAGE_METRIC_LABELS.get(stage, "metric"),
-                  goal=str(getattr(stage_cfg, "goal", "minimize")),
-                  limit=limit,
-              ),
-              title=self.theme.markup(
-                  f"Live leaderboard {self.theme.glyphs.bullet} "
-                  f"{theme_mod.STAGE_TITLES.get(stage, stage.upper())}",
-                  "heading",
-              ),
-              border_style=self.theme.style("border") or "none",
-              box=box.ROUNDED if self.theme.use_unicode else box.ASCII,
-              padding=(0, 1),
-          )
-      )
+      panel = self._leaderboard_panel(parser, spare=budget - used)
+      if panel is not None:
+        blocks.append(panel)
+        used += self._measure(panel)
 
     if self.model.show_help:
-      blocks.append(renderables.help_panel(self.theme))
+      panel = renderables.help_panel(self.theme)
+      if used + self._measure(panel) <= budget:
+        blocks.append(panel)
+        used += self._measure(panel)
 
-    blocks.append(self._footer(width))
+    if used > budget:
+      blocks = self._crop_blocks(blocks, budget)
+    blocks.append(footer)
     return Group(*blocks)
 
+  def _leaderboard_panel(self, parser: Any, spare: int):
+    """Builds the live leaderboard, shrunk to ``spare`` rows (None if it can't).
+
+    Args:
+      parser: Parser of the running stage, holding the trial records.
+      spare: Rows still available above the footer.
+
+    Returns:
+      A ``rich`` panel, or None when there is no room for a useful one.
+    """
+    from rich.panel import Panel  # pylint: disable=g-import-not-at-top
+    from rich import box  # pylint: disable=g-import-not-at-top
+
+    stage = self.model.current_stage or ""
+    stage_cfg = getattr(self.model.config, stage, None)
+    goal = str(getattr(stage_cfg, "goal", "minimize"))
+    desired = max(3, min(8, 4 + self.model.log_window))
+    for limit in range(desired, 2, -1):
+      panel = Panel(
+          renderables.leaderboard_table(
+              parser.leaderboard(goal=goal, limit=limit),
+              self.theme,
+              metric_name=parser.metric_name
+              or theme_mod.STAGE_METRIC_LABELS.get(stage, "metric"),
+              goal=goal,
+              limit=limit,
+          ),
+          title=self.theme.markup(
+              f"Live leaderboard {self.theme.glyphs.bullet} "
+              f"{theme_mod.STAGE_TITLES.get(stage, stage.upper())}",
+              "heading",
+          ),
+          border_style=self.theme.style("border") or "none",
+          box=box.ROUNDED if self.theme.use_unicode else box.ASCII,
+          padding=(0, 1),
+      )
+      if self._measure(panel) <= spare:
+        return panel
+    return None
+
+  # --- Pane fitting ---------------------------------------------------
+  def _row_budget(self) -> int:
+    """Rows the pinned block may occupy, leaving one for the log stream."""
+    if self.console.rich is None:
+      # Plain mode never pins anything, so nothing needs to be cropped.
+      return MAX_ROWS_UNBOUNDED
+    return max(MIN_PINNED_ROWS, self.console.height - 1)
+
+  def _measure(self, renderable: Any) -> int:
+    """Returns the number of terminal rows ``renderable`` will occupy."""
+    console = self.console.rich
+    if console is None or renderable is None:
+      return 0
+    try:
+      options = console.options.update(height=None)
+      return len(console.render_lines(renderable, options, pad=False))
+    except Exception:  # pylint: disable=broad-except
+      # Measuring must never be the thing that kills a campaign; an
+      # unmeasurable block is simply not cropped.
+      return 0
+
+  def _crop_blocks(self, blocks: List[Any], budget: int) -> List[Any]:
+    """Keeps the leading blocks that fit in ``budget`` rows, cropping the last."""
+    kept: List[Any] = []
+    used = 0
+    for block in blocks:
+      height = self._measure(block)
+      if used + height <= budget:
+        kept.append(block)
+        used += height
+        continue
+      cropped = self._crop_to_height(block, budget - used)
+      if cropped is not None:
+        kept.append(cropped)
+      break
+    return kept
+
+  def _crop_to_height(self, renderable: Any, height: int):
+    """Returns ``renderable`` truncated to its first ``height`` rows."""
+    console = self.console.rich
+    if console is None or height <= 0:
+      return None
+    from rich.segment import Segment  # pylint: disable=g-import-not-at-top
+    from rich.segment import Segments  # pylint: disable=g-import-not-at-top
+
+    try:
+      options = console.options.update(height=None)
+      lines = console.render_lines(renderable, options, pad=False)
+    except Exception:  # pylint: disable=broad-except
+      return None
+    segments: List[Any] = []
+    for line in lines[:height]:
+      segments.extend(line)
+      segments.append(Segment("\n"))
+    return Segments(segments)
+
   def _footer(self, width: int):
+    """Builds the single-row footer: hotkeys left, last activity right.
+
+    Both columns are ``no_wrap``. A legend that wraps would make the footer
+    two rows tall, and every row the pinned block gains beyond what ``rich``
+    expects is a row it can no longer erase.
+
+    Args:
+      width: Full width of the pane.
+
+    Returns:
+      A one-row ``rich`` grid.
+    """
     from rich.table import Table  # pylint: disable=g-import-not-at-top
 
     grid = Table.grid(expand=True)
-    grid.add_column(justify="left", ratio=3)
-    grid.add_column(justify="right", ratio=2)
+    hotkey_width = max(20, width * 3 // 5)
+    grid.add_column(justify="left", ratio=3, no_wrap=True, overflow="crop")
+    grid.add_column(
+        justify="right", ratio=2, no_wrap=True, overflow="ellipsis"
+    )
     logs = self.model.recent_logs(1)
     activity = logs[-1][2] if logs else "waiting for output…"
     grid.add_row(
         renderables.hotkey_hint(
-            self.theme, paused=self.model.controls.is_paused, width=width
+            self.theme,
+            paused=self.model.controls.is_paused,
+            width=hotkey_width,
         ),
         self.theme.markup(
-            theme_mod.truncate(activity, max(20, width // 3)), "muted"
+            theme_mod.truncate(
+                theme_mod.sanitize_line(activity), max(20, width // 3)
+            ),
+            "muted",
         ),
     )
     return grid
@@ -586,6 +707,9 @@ class LiveDashboard:
     """Formats one log line with a clock and a colored stage tag."""
     clock = datetime.datetime.fromtimestamp(timestamp).strftime("%H:%M:%S")
     tag = flavors.log_tag(stage)
+    # Idempotent: the model already sanitizes, but this method is also the
+    # entry point for callers that never went through the event bus.
+    message = theme_mod.sanitize_line(message)
     style = "error" if any(
         hint in message.lower() for hint in ("error", "failed", "traceback")
     ) else "value"
@@ -609,7 +733,11 @@ class LiveDashboard:
         refresh_per_second=self.refresh_per_second,
         transient=False,
         screen=False,
-        vertical_overflow="visible",
+        # ``visible`` lets a block taller than the pane scroll off the top,
+        # and rich can only erase what is still on screen: the leftovers
+        # stayed, and the next refresh stacked another copy under them.
+        # ``render`` already fits the block, this is the belt to that braces.
+        vertical_overflow="crop",
     ) as live:
       while not is_done():
         self.flush_logs(printer=lambda text: live.console.print(text, markup=True))
@@ -772,6 +900,7 @@ def _stream_plain_until_done(
       text = event.message
     else:
       text = f"[{event.type.value}] {event.stage or ''} {event.message}".strip()
+    text = theme_mod.sanitize_line(text)
     if text:
       console.info(f"{event.clock} {text}")
 

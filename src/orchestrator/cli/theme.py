@@ -19,6 +19,7 @@ import dataclasses
 from dataclasses import dataclass
 import math
 import os
+import re
 import sys
 from typing import Any, Dict, Iterable, List, Optional, Sequence, TextIO
 
@@ -492,6 +493,47 @@ def plain(text: str, theme: Optional[Theme] = None) -> str:
   if theme is not None and theme.use_color:
     return text
   return strip_markup(text)
+
+
+#: Every escape sequence shape a child process can emit: OSC (window title,
+#: hyperlinks), CSI (colors, cursor moves, line erase) and the two-byte Fe
+#: escapes. Matching only CSI would let ``ESC]0;title BEL`` through.
+_ANSI_SEQUENCE_RE = re.compile(
+    r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
+    r"|\x1b\[[0-?]*[ -/]*[@-~]"
+    r"|\x1b[@-Z\\-_]"
+)
+
+#: Control bytes that would move the cursor or ring the bell. ``\n`` and
+#: ``\r`` are handled separately, above.
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def sanitize_line(text: str) -> str:
+  r"""Flattens raw process output into one printable, cursor-safe line.
+
+  Progress bars (``tqdm`` in vLLM, the Hugging Face uploader) repaint a
+  single line with ``\r`` and move the cursor with ANSI escapes. Forwarded
+  verbatim into the live dashboard those bytes repaint *the dashboard*: the
+  terminal cursor jumps while ``rich`` keeps counting the rows it thinks it
+  printed, so the pinned block can no longer be erased and stale copies of
+  the hotkey footer pile up at the bottom of the pane.
+
+  Args:
+    text: A raw line of child-process output.
+
+  Returns:
+    The text a terminal would ultimately have displayed, with escape
+    sequences, control bytes and line breaks removed.
+  """
+  cleaned = _ANSI_SEQUENCE_RE.sub("", str(text))
+  if "\r" in cleaned:
+    # Only the last repaint of a progress bar is what the user would see.
+    painted = [segment for segment in cleaned.split("\r") if segment.strip()]
+    cleaned = painted[-1] if painted else ""
+  # A multi-line message would silently grow the single-row footer.
+  cleaned = cleaned.replace("\n", " ").replace("\t", "    ")
+  return _CONTROL_CHAR_RE.sub("", cleaned).rstrip()
 
 
 #: The only order in which the stages can legally execute: each sweep

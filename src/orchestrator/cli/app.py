@@ -972,6 +972,8 @@ def cmd_list(args: argparse.Namespace, console: UiConsole) -> int:
           "COMPLETED": "success",
           "FAILED": "error",
           "IN_PROGRESS": "running",
+          "STOPPED": "warning",
+          "ABORTED": "warning",
       }.get(entry["status"], "muted")
       table.add_row(
           entry["campaign_id"],
@@ -1134,6 +1136,7 @@ def _render_status(
       "IN_PROGRESS": "running",
       "PAUSED": "warning",
       "STOPPED": "warning",
+      "ABORTED": "warning",
   }.get(str(state.status).upper(), "muted")
 
   console.blank()
@@ -1210,7 +1213,14 @@ def _execute_campaign(
     )
     _print_outcome(result, config, console)
     status = str(result.get("status", "")).upper()
-    return EXIT_OK if status in ("COMPLETED", "STOPPED", "") else EXIT_ERROR
+    # ABORTED is a deliberate keystroke, not a defect, so it exits clean -
+    # and, being an attended status, it also stops the `finally` below from
+    # powering the machine off under whoever pressed the key.
+    return (
+        EXIT_OK
+        if status in ("COMPLETED", "STOPPED", "ABORTED", "")
+        else EXIT_ERROR
+    )
   except KeyboardInterrupt:
     # Somebody is at the keyboard; taking their machine down is never what
     # Ctrl-C meant.
@@ -1232,6 +1242,11 @@ def _print_outcome(
     console.success("Campaign completed.")
   elif status == "STOPPED":
     console.warn("Campaign stopped early; progress was saved.")
+  elif status == "ABORTED":
+    console.warn(
+        "Campaign aborted; work in flight was killed. The interrupted stage"
+        " kept its sweep, so `resume` will run only the trials it still owes."
+    )
   else:
     console.info(f"Campaign finished with status {status}.")
 

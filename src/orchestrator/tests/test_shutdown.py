@@ -37,6 +37,41 @@ class _Config:
     self.shutdown_grace_seconds = grace
 
 
+class _FakeClock:
+  """A monotonic clock that only advances when something sleeps.
+
+  Lets a five-minute countdown be tested in microseconds, and - the point
+  here - lets the test measure *when* each notice was emitted rather than
+  merely that it was.
+  """
+
+  def __init__(self):
+    self.now = 0.0
+
+  def __call__(self) -> float:
+    return self.now
+
+  def sleep(self, seconds: float) -> None:
+    self.now += seconds
+
+
+class _TimedConsole:
+  """Console double that records the time of every notice."""
+
+  def __init__(self, clock: _FakeClock):
+    self._clock = clock
+    self.said = []
+
+  def blank(self) -> None:
+    pass
+
+  def info(self, message: str) -> None:
+    self.said.append((self._clock.now, message))
+
+  def warn(self, message: str) -> None:
+    self.said.append((self._clock.now, message))
+
+
 class PolicyTest(unittest.TestCase):
   """Which outcomes justify powering the machine off."""
 
@@ -59,6 +94,15 @@ class PolicyTest(unittest.TestCase):
     # Reaching STOPPED requires the stop hotkey or Ctrl-C, so a human is
     # present and pulling the machine from under them is never the intent.
     wanted, reason = shutdown.should_shutdown(_Config(), "STOPPED")
+    self.assertFalse(wanted)
+    self.assertIn("by hand", reason)
+
+  def test_an_aborted_campaign_does_not_either(self):
+    # `[x]` kills the work in flight, so the stage it interrupted raises on
+    # its way down and the campaign used to land here as FAILED - i.e. as a
+    # crash, which powers the machine off under the person who pressed the
+    # key. ABORTED is the status that keeps those two apart.
+    wanted, reason = shutdown.should_shutdown(_Config(), "ABORTED")
     self.assertFalse(wanted)
     self.assertIn("by hand", reason)
 
@@ -130,6 +174,53 @@ class GracePeriodTest(unittest.TestCase):
     self.assertIn("Ctrl-C to cancel", text)
     self.assertIn("3s", text)
 
+  def test_a_long_countdown_is_never_silent(self):
+    """Regression: ``--grace 300`` printed nothing for its first four minutes.
+
+    The announcement schedule stopped at 60s and the loop only announces a
+    mark still ahead of it, so nothing was ahead of 300s. An operator
+    watching a program whose sole job is to halt the machine saw four
+    minutes of nothing, concluded it had hung, and killed it two minutes
+    before it would have fired.
+    """
+    clock = _FakeClock()
+    watcher = _TimedConsole(clock)
+    self.assertTrue(
+        shutdown._wait_out_grace_period(
+            300, watcher, sleeper=clock.sleep, clock=clock
+        )
+    )
+
+    spoken_at = [when for when, _ in watcher.said]
+    self.assertTrue(spoken_at, "the countdown said nothing at all")
+    # It opens immediately, stating the full period...
+    self.assertEqual(spoken_at[0], 0.0)
+    self.assertIn("5 min", watcher.said[0][1])
+    # ...never goes quiet for longer than one announcement interval...
+    gaps = [b - a for a, b in zip(spoken_at, spoken_at[1:])]
+    self.assertTrue(
+        all(gap <= shutdown._COARSE_INTERVAL for gap in gaps),
+        f"silent for {max(gaps):.0f}s between announcements",
+    )
+    # ...and is still talking on the way out.
+    self.assertLessEqual(300 - spoken_at[-1], shutdown._COARSE_INTERVAL)
+
+  def test_a_short_countdown_keeps_counting_in_seconds(self):
+    # Minutes would be a silly unit for the 60s default; the tail stays in
+    # seconds so the last ten of them are still readable.
+    self.assertEqual(shutdown._format_countdown(45), "45s")
+    self.assertEqual(shutdown._format_countdown(60), "60s")
+    self.assertEqual(shutdown._format_countdown(300), "5 min")
+
+  def test_the_schedule_never_outruns_the_period(self):
+    # A mark the countdown can never reach would be announced immediately
+    # and then never again, which is the bug this test brackets.
+    for period in (1, 5, 59, 60, 61, 130, 300, 3600):
+      marks = shutdown._announcement_marks(period)
+      self.assertTrue(marks, f"no marks for a {period}s period")
+      self.assertLessEqual(max(marks), period)
+      self.assertEqual(max(marks), period, "the period itself is a mark")
+
 
 
 class ExecutionTest(unittest.TestCase):
@@ -142,7 +233,33 @@ class ExecutionTest(unittest.TestCase):
             _Config(), "COMPLETED", runner=runner, waiter=lambda *a: True
         )
     )
-    runner.assert_called_once_with(["sudo", "shutdown", "-h", "now"])
+    runner.assert_called_once_with(list(shutdown.SHUTDOWN_COMMAND))
+
+  def test_it_never_waits_for_a_sudo_password(self):
+    # Without -n, a sudoers entry that wants a password turns the last act of
+    # a twelve-hour campaign into an invisible prompt on an inherited stdin,
+    # and the watcher hangs there until somebody notices the VM is still up.
+    self.assertIn("-n", shutdown.SHUTDOWN_COMMAND)
+
+  def test_a_nonzero_exit_is_not_reported_as_success(self):
+    # Only exceptions used to be caught, so `sudo` exiting 1 still logged
+    # "Shutdown command issued." while the machine happily stayed up.
+    class _Result:
+      returncode = 1
+
+    console = make_console()
+    self.assertFalse(
+        shutdown.maybe_shutdown(
+            _Config(),
+            "COMPLETED",
+            console=console,
+            runner=lambda _cmd: _Result(),
+            waiter=lambda *a: True,
+        )
+    )
+    text = console.file.getvalue()
+    self.assertIn("exited 1", text)
+    self.assertIn("sudo -n true", text)
 
   def test_it_does_nothing_when_disarmed(self):
     runner = mock.Mock()

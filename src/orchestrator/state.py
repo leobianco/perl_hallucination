@@ -104,7 +104,11 @@ class CampaignState:
 
   campaign_id: str
   task_name: str
-  status: str = "IN_PROGRESS"  # "IN_PROGRESS", "COMPLETED", "FAILED", "PAUSED"
+  #: One of ``IN_PROGRESS``, ``COMPLETED``, ``FAILED``, ``PAUSED``,
+  #: ``STOPPED`` (``[s]`` or Ctrl-C) or ``ABORTED`` (``[x]``). The last three
+  #: mean a human was at the keyboard, which is how
+  #: :mod:`src.orchestrator.shutdown` decides not to power the machine off.
+  status: str = "IN_PROGRESS"
   current_stage: Optional[str] = None
   stages: Dict[str, StageResult] = field(default_factory=dict)
   stages_order: List[str] = field(default_factory=list)

@@ -165,6 +165,30 @@ class FormattingTest(unittest.TestCase):
     self.assertEqual(theme_mod.strip_markup("[RESUME] skipping"), "[RESUME] skipping")
     self.assertEqual(theme_mod.strip_markup("a [1, 2] b"), "a [1, 2] b")
 
+  def test_sanitize_line_strips_escape_sequences(self):
+    self.assertEqual(
+        theme_mod.sanitize_line("\x1b[1;32mtraining\x1b[0m done"),
+        "training done",
+    )
+    self.assertEqual(
+        theme_mod.sanitize_line("\x1b]0;window title\x07uploading"), "uploading"
+    )
+
+  def test_sanitize_line_keeps_the_last_repaint_of_a_progress_bar(self):
+    bar = "Uploading:  10%|#   |\rUploading:  90%|#########|\r"
+    self.assertEqual(theme_mod.sanitize_line(bar), "Uploading:  90%|#########|")
+
+  def test_sanitize_line_flattens_multiline_and_control_bytes(self):
+    self.assertEqual(
+        theme_mod.sanitize_line("first\nsecond\x07\x08"), "first second"
+    )
+
+  def test_sanitize_line_is_idempotent_on_clean_text(self):
+    clean = "[SFT@T1.0 2/5] Step 2/2: scoring"
+    once = theme_mod.sanitize_line(clean)
+    self.assertEqual(once, clean)
+    self.assertEqual(theme_mod.sanitize_line(once), once)
+
   def test_iter_stage_names_normalizes(self):
     self.assertEqual(
         theme_mod.iter_stage_names([" SFT ", "rm", "sft", "", None]),
@@ -1084,6 +1108,24 @@ class DashboardModelTest(unittest.TestCase):
     self.model.on_event(event(events_mod.EventType.LOG, message="noise"))
     self.assertEqual(self.model.recent_logs()[-1][2], "noise")
 
+  def test_ingested_logs_are_terminal_safe(self):
+    self.model.on_event(
+        event(
+            events_mod.EventType.LOG,
+            message="\x1b[2KUpload:  10%\rUpload: 100%",
+        )
+    )
+    stored = self.model.recent_logs()[-1][2]
+    self.assertEqual(stored, "Upload: 100%")
+    self.assertNotIn("\x1b", stored)
+    self.assertNotIn("\r", stored)
+
+  def test_escape_only_lines_are_dropped(self):
+    before = len(self.model.recent_logs(99))
+    self.model.on_event(event(events_mod.EventType.LOG, message="\x1b[2K\r"))
+    self.assertEqual(len(self.model.recent_logs(99)), before)
+    self.assertEqual(self.model.drain_pending_logs(), [])
+
   def test_log_buffer_is_capacity_bounded(self):
     model = dashboard_mod.DashboardModel(
         self.config, self.state, log_capacity=3
@@ -1506,6 +1548,70 @@ class LiveDashboardTest(unittest.TestCase):
       Console(file=out, width=width, no_color=True).print(dash.render())
       for line in out.getvalue().splitlines():
         self.assertLessEqual(len(line), width)
+
+  @requires_rich
+  def test_render_fits_the_pane_and_pins_the_hotkeys_last(self):
+    """The pinned block must never be taller than the terminal.
+
+    A block that outgrows the pane cannot be erased by ``rich`` on the next
+    refresh, which is what left stale copies of the hotkey row stacked at
+    the bottom of the tmux pane.
+    """
+    from rich.console import Console  # pylint: disable=g-import-not-at-top
+
+    self.model.on_event(
+        event(
+            events_mod.EventType.STAGE_STARTED,
+            stage="sft",
+            metric="eval/loss",
+            max_runs=2,
+        )
+    )
+    for line in SweepProgressParserTest.AGENT_OUTPUT:
+      self.model.on_event(
+          event(events_mod.EventType.LOG, stage="sft", message=line)
+      )
+    self.model.show_help = True
+    rich_console = console_mod.UiConsole(
+        theme=theme_mod.detect_theme(force_color=False),
+        file=io.StringIO(),
+        width=100,
+    )
+    dash = dashboard_mod.LiveDashboard(self.model, console=rich_console)
+    for height in (10, 16, 24, 60):
+      with mock.patch.object(
+          console_mod.UiConsole,
+          "height",
+          new_callable=mock.PropertyMock,
+          return_value=height,
+      ):
+        out = io.StringIO()
+        Console(file=out, width=100, no_color=True).print(dash.render())
+        lines = [line for line in out.getvalue().splitlines()]
+        self.assertLessEqual(len(lines), height - 1, f"height={height}")
+        self.assertIn("[q]", lines[-1], f"height={height}")
+
+  @requires_rich
+  def test_footer_activity_stays_on_one_row(self):
+    from rich.console import Console  # pylint: disable=g-import-not-at-top
+
+    self.model.on_event(
+        event(
+            events_mod.EventType.LOG,
+            message="upload\x1b[1G 10%\rupload 99%\nsecond line",
+        )
+    )
+    rich_console = console_mod.UiConsole(
+        theme=theme_mod.detect_theme(force_color=False),
+        file=io.StringIO(),
+        width=100,
+    )
+    dash = dashboard_mod.LiveDashboard(self.model, console=rich_console)
+    out = io.StringIO()
+    Console(file=out, width=100, no_color=True).print(dash._footer(100))  # pylint: disable=protected-access
+    rendered = out.getvalue()
+    self.assertEqual(len(rendered.splitlines()), 1)
+    self.assertNotIn("\x1b", rendered)
 
 
 if __name__ == "__main__":

@@ -4,9 +4,11 @@ import os
 import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
+from src.orchestrator import shutdown as shutdown_mod
 from src.orchestrator.cli import events as events_mod
 from src.orchestrator.config import CampaignConfig, VALID_STAGES
 from src.orchestrator.engine import CampaignEngine
@@ -778,12 +780,50 @@ class TestEngineControls(unittest.TestCase):
     state = CampaignState.load(self.config.state_file)
     self.assertEqual(state.status, "STOPPED")
 
-  def test_abort_skips_reporting(self):
+  def test_abort_skips_reporting_and_says_it_was_an_abort(self):
     controls = events_mod.ControlSignals()
     controls.request_abort()
     result = CampaignEngine(config=self.config, controls=controls).run()
-    self.assertEqual(result["status"], "STOPPED")
+    # Not STOPPED: `[s]` and `[x]` differ in what they kill, so they must
+    # differ in what they record. Not FAILED either - see below.
+    self.assertEqual(result["status"], "ABORTED")
     self.assertNotIn("artifacts", result)
+    state = CampaignState.load(self.config.state_file)
+    self.assertEqual(state.status, "ABORTED")
+
+  def test_an_abort_that_kills_a_stage_is_not_a_crash(self):
+    """The regression that powered off an attended VM.
+
+    Aborting *inside* a stage kills the materialization, so the stage raises
+    on its way down and the campaign used to record FAILED - a terminal
+    status, which the shutdown policy happily acts on while the operator who
+    pressed the key is still sitting there.
+    """
+    controls = events_mod.ControlSignals()
+    engine = CampaignEngine(config=self.config, controls=controls)
+
+    def explode(*_args, **_kwargs):
+      # Abort first, exactly as the hotkey would, then fail the way a
+      # terminated materialization subprocess does.
+      controls.request_abort()
+      raise RuntimeError("Materialization of the best perl model was interrupted")
+
+    with mock.patch.object(CampaignEngine, "_instantiate_stage") as factory:
+      factory.return_value.execute.side_effect = explode
+      result = engine.run()
+
+    self.assertEqual(result["status"], "ABORTED")
+    state = CampaignState.load(self.config.state_file)
+    self.assertEqual(state.status, "ABORTED")
+    # The *stage* still failed, and still holds what a resume needs.
+    self.assertEqual(
+        state.stages[state.current_stage].status, StageStatus.FAILED
+    )
+    # And the policy leaves the machine alone.
+    armed = types.SimpleNamespace(shutdown_when_done=True, dry_run=False)
+    wanted, reason = shutdown_mod.should_shutdown(armed, state.status)
+    self.assertFalse(wanted)
+    self.assertIn("by hand", reason)
 
   def test_pause_does_not_end_the_campaign(self):
     controls = events_mod.ControlSignals()

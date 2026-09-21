@@ -23,9 +23,14 @@ logger = logging.getLogger(__name__)
 
 #: How the VM is halted. ``shutdown -h now`` rather than ``poweroff`` to match
 #: ``scripts/perl.sh``, and via ``sudo`` because the campaign does not run as
-#: root. On a GCP VM the invoking user is normally a passwordless sudoer; when
-#: they are not, the command fails and we say so instead of hanging.
-SHUTDOWN_COMMAND: Tuple[str, ...] = ("sudo", "shutdown", "-h", "now")
+#: root.
+#:
+#: ``-n`` is what keeps the promise made below about never hanging. Without it
+#: a machine whose sudoers entry wants a password turns the last line of a
+#: twelve-hour campaign into an invisible ``[sudo] password for ...`` prompt on
+#: an inherited stdin that nobody is watching - the process sits there forever
+#: and the VM stays up anyway. With it, sudo fails immediately and we say so.
+SHUTDOWN_COMMAND: Tuple[str, ...] = ("sudo", "-n", "shutdown", "-h", "now")
 
 #: Campaign outcomes after which the machine genuinely has no work left.
 #:
@@ -36,14 +41,33 @@ SHUTDOWN_COMMAND: Tuple[str, ...] = ("sudo", "shutdown", "-h", "now")
 TERMINAL_STATUSES = frozenset({"COMPLETED", "FAILED"})
 
 #: Outcomes that mean a human intervened. ``STOPPED`` is reached by the stop
-#: hotkey or Ctrl-C, both of which require somebody at the keyboard, and
-#: pulling the machine out from under that person is never what they meant.
-ATTENDED_STATUSES = frozenset({"STOPPED", "PAUSED"})
+#: hotkey or Ctrl-C and ``ABORTED`` by ``[x]``; both require somebody at the
+#: keyboard, and pulling the machine out from under that person is never what
+#: they meant.
+#:
+#: ``ABORTED`` exists precisely for this set. An abort kills the work in
+#: flight, so the stage it interrupted raises on its way down; recording that
+#: as ``FAILED`` made a deliberate keystroke indistinguishable from an OOM,
+#: and this policy would then power off a machine whose user had pressed a key
+#: three seconds earlier.
+ATTENDED_STATUSES = frozenset({"STOPPED", "PAUSED", "ABORTED"})
 
-#: Seconds at which the countdown announces itself. Sparse on purpose: the
-#: notice has to survive in a log file that nobody reads live, without
-#: producing sixty lines of noise.
+#: Seconds at which a countdown of a minute or less announces itself. Sparse
+#: on purpose: the notice has to survive in a log file that nobody reads live,
+#: without producing sixty lines of noise.
 _ANNOUNCE_AT = (60, 30, 15, 10, 5, 3, 2, 1)
+
+#: Spacing of the announcements above a minute.
+#:
+#: Without these the schedule above was the *whole* schedule, so a
+#: ``--grace 300`` printed nothing at all for its first four minutes: the loop
+#: only announces a mark that is still ahead of it, and nothing in
+#: ``_ANNOUNCE_AT`` is ahead of 300s. Four minutes of silence from a program
+#: whose only job is to halt the machine reads exactly like a hang, and the
+#: one operator who saw it (correctly) killed it. Every grace period now opens
+#: with an announcement and never goes quiet for longer than this.
+_COARSE_INTERVAL = 60
+
 
 
 def should_shutdown(config: Any, status: str) -> Tuple[bool, str]:
@@ -82,6 +106,35 @@ def should_shutdown(config: Any, status: str) -> Tuple[bool, str]:
   return True, f"the campaign finished with status {normalized}"
 
 
+def _announcement_marks(seconds: float) -> Tuple[int, ...]:
+  """Builds the countdown schedule for a grace period of ``seconds``.
+
+  The full period is always a mark, so the countdown opens by stating how
+  long it is going to be; the rest is one mark a minute down to the last
+  minute, then the fine-grained tail. See ``_COARSE_INTERVAL`` for the
+  incident this shape exists to prevent.
+
+  Args:
+    seconds: Length of the grace period.
+
+  Returns:
+    The marks, ascending. Only marks the period is long enough to reach are
+    included, so a short countdown behaves exactly as it always did.
+  """
+  total = int(seconds)
+  marks = {mark for mark in _ANNOUNCE_AT if mark <= total}
+  marks.update(range(_COARSE_INTERVAL, total + 1, _COARSE_INTERVAL))
+  marks.add(total)
+  return tuple(sorted(marks))
+
+
+def _format_countdown(mark: int) -> str:
+  """Renders a mark the way an operator reads it: minutes once it is minutes."""
+  if mark >= 120 and mark % 60 == 0:
+    return f"{mark // 60} min"
+  return f"{mark}s"
+
+
 def _wait_out_grace_period(
     seconds: float,
     console: Optional[Any] = None,
@@ -102,22 +155,27 @@ def _wait_out_grace_period(
   if seconds <= 0:
     return True
   deadline = clock() + seconds
+  marks = _announcement_marks(seconds)
   announced = set()
   try:
     while True:
       remaining = deadline - clock()
       if remaining <= 0:
         return True
-      mark = min((s for s in _ANNOUNCE_AT if s >= remaining), default=None)
+      mark = min((s for s in marks if s >= remaining), default=None)
       if mark is not None and mark not in announced:
         announced.add(mark)
-        message = f"Powering off in {mark}s - press Ctrl-C to cancel."
+        message = (
+            f"Powering off in {_format_countdown(mark)} - press Ctrl-C to"
+            " cancel."
+        )
         logger.warning(message)
         if console is not None:
           console.warn(message)
       sleeper(min(1.0, remaining))
   except KeyboardInterrupt:
     return False
+
 
 
 def maybe_shutdown(
@@ -173,13 +231,33 @@ def maybe_shutdown(
 
   run = runner or subprocess.run
   try:
-    run(list(SHUTDOWN_COMMAND))
+    outcome = run(list(SHUTDOWN_COMMAND))
   except Exception as error:  # pylint: disable=broad-except
     failed = f"Could not power off the VM ({type(error).__name__}: {error})."
     logger.error(failed)
     if console is not None:
       console.error(failed)
       console.hint("Shut it down by hand: " + " ".join(SHUTDOWN_COMMAND))
+    return False
+
+  # Only exceptions used to be caught, so a `sudo` that exited 1 - not a
+  # sudoer, or a sudoers entry that wants a password - was still reported as
+  # "Shutdown command issued." and the VM quietly stayed up. An injected
+  # runner that reports no code at all is taken at its word; that is the test
+  # doubles' contract, not a real runner's.
+  code = getattr(outcome, "returncode", 0)
+  if isinstance(code, int) and code != 0:
+    failed = (
+        f"Could not power off the VM: {' '.join(SHUTDOWN_COMMAND)} exited"
+        f" {code}."
+    )
+    logger.error(failed)
+    if console is not None:
+      console.error(failed)
+      console.hint(
+          "This needs passwordless sudo; `sudo -n true` says whether you"
+          " have it."
+      )
     return False
   logger.warning("Shutdown command issued.")
   return True

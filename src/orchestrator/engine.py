@@ -346,6 +346,21 @@ class CampaignEngine:
       return True
     return self.controls.abort_requested
 
+  def _interrupted_status(self) -> str:
+    """Names the interruption that ended the campaign.
+
+    ``[s]`` and ``[x]`` both end the run, so both used to record ``STOPPED``
+    at a stage boundary - and, when the abort landed *inside* a stage and the
+    materialization raised on its way down, ``FAILED``. That second case is
+    the damaging one: ``FAILED`` is a terminal status, so the shutdown policy
+    powered off a machine whose operator had pressed a key three seconds
+    earlier, and the report could not tell a deliberate abort from an OOM.
+
+    Returns:
+      ``ABORTED`` when the user asked for a hard abort, ``STOPPED`` otherwise.
+    """
+    return "ABORTED" if self.controls.abort_requested else "STOPPED"
+
   def _instantiate_stage(self, planned: flavors.PlannedStage) -> BaseStage:
     """Instantiates the concrete stage implementation for one planned branch.
 
@@ -464,13 +479,21 @@ class CampaignEngine:
         if self.controls.stop_requested or (
             self._external_stop is not None and self._external_stop()
         ):
-          logger.info("Campaign stopped by user before starting %s", stage_name)
+          interrupted_status = self._interrupted_status()
+          logger.info(
+              "Campaign %s by user before starting %s",
+              interrupted_status.lower(),
+              stage_name,
+          )
           interrupted = True
-          self.state.status = "STOPPED"
+          self.state.status = interrupted_status
           self.state.save(self.state_path)
           self.bus.publish(
               EventType.NOTICE,
-              message=f"Campaign stopped by user before stage '{stage_label}'.",
+              message=(
+                  f"Campaign {interrupted_status.lower()} by user before stage"
+                  f" '{stage_label}'."
+              ),
           )
           break
 
@@ -536,19 +559,23 @@ class CampaignEngine:
           raise
 
       if interrupted:
+        # Whatever was written to the state file is what everything
+        # downstream must agree on - the CLI's exit code, the report, and the
+        # shutdown policy that is about to read that very file.
+        final_status = str(self.state.status or "STOPPED").upper()
         self.bus.publish(
             EventType.CAMPAIGN_FINISHED,
-            message="Campaign stopped before completion.",
-            status="STOPPED",
+            message=f"Campaign {final_status.lower()} before completion.",
+            status=final_status,
         )
         if self.controls.abort_requested:
-          return {"status": "STOPPED", "state_file": self.state_path}
+          return {"status": final_status, "state_file": self.state_path}
         artifacts = self.reporter.generate_all()
         return {
-            "status": "STOPPED",
+            "status": final_status,
             "artifacts": artifacts,
             "state_file": self.state_path,
-          "log_file": self.log_path,
+            "log_file": self.log_path,
         }
 
       # All stages completed
@@ -573,6 +600,29 @@ class CampaignEngine:
       }
 
     except Exception as e:
+      # An abort kills the work in flight on purpose, so whatever the stage
+      # raised on its way down ("Materialization ... was interrupted", a
+      # terminated subprocess) is the *consequence* of a keystroke, not a
+      # defect. Recording FAILED made a deliberate `[x]` indistinguishable
+      # from an OOM - including to the shutdown watcher, which treats FAILED
+      # as terminal and powered off a machine somebody was sitting at.
+      if self._should_abort_stage():
+        logger.warning("Campaign aborted by user: %s", e)
+        self.state.status = "ABORTED"
+        self.state.save(self.state_path)
+        self.bus.publish(
+            EventType.CAMPAIGN_FINISHED,
+            message="Campaign aborted by user; work in flight was killed.",
+            status="ABORTED",
+        )
+        # The stage itself stays FAILED, with its sweep id intact: that is
+        # what lets `resume` re-enter it and run only the trials it still
+        # owes. Only the *campaign's* verdict changes here.
+        return {
+            "status": "ABORTED",
+            "state_file": self.state_path,
+            "log_file": self.log_path,
+        }
       logger.error("Campaign failed: %s", e)
       self.state.status = "FAILED"
       self.state.save(self.state_path)

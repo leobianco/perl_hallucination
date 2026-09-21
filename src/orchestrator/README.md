@@ -574,16 +574,55 @@ always restored on exit.
 
 | Hotkey | Action | Description |
 | :---: | :--- | :--- |
-| **`[a]`** | **Advance with Best** | Seals the active sweep, selects the current top run, and promotes it to the next stage. |
-| **`[p]`** | **Pause / Resume** | Parks the campaign before the next stage. The campaign stays alive — it does **not** stop. |
-| **`[s]`** | **Stop** | Finishes the current stage, then ends the campaign gracefully and writes the report. |
-| **`[x]`** | **Abort** | Same as stop, but skips report generation. |
+| **`[a]`** | **Advance with Best** | Seals the active sweep *now*, promotes its current leader, and continues with the next stage. |
+| **`[p]`** | **Pause / Resume** | Parks the campaign *before the next stage*. The current stage runs to completion first. The campaign stays alive — it does **not** stop. |
+| **`[s]`** | **Stop** | Seals the active sweep *now*, publishes its leader, then ends the campaign and writes the report. |
+| **`[x]`** | **Abort** | Kills everything in flight, including the materialization. No report. |
 | **`[l]`** | **Log verbosity** | Cycles all → milestones → off. |
 | **`[+]` / `[-]`** | **Resize** | Grows/shrinks the live leaderboard. |
 | **`[?]`** | **Help** | Toggles the in-place hotkey cheat-sheet. |
 | **`[q]`** | **Detach** | Detaches the dashboard; the campaign keeps running headless. |
 
 `Ctrl-C` once requests a graceful stop; twice aborts.
+
+### What each interruption actually costs
+
+"Finishes the current stage" means the *stage*, not the trial you are watching.
+`[a]` and `[s]` terminate the sweep agent on the next poll, so the trial in
+flight dies and is recorded `killed` by W&B. Only `[p]` lets it finish.
+
+| | `[p]` | `[a]` | `[s]` | `[x]` |
+| :--- | :---: | :---: | :---: | :---: |
+| Trial in flight | finishes | **killed** | **killed** | **killed** |
+| Rest of the `max_runs` budget | runs | forfeited | forfeited | recoverable |
+| Winner materialized + pushed | yes | yes | yes | **no** |
+| Remaining stages | held | run | skipped | skipped |
+| Final report | later | later | yes | no |
+| Campaign status | `PAUSED` | — | `STOPPED` | `ABORTED` |
+| Stage status | — | `COMPLETED` | `COMPLETED` | `FAILED` |
+| `shutdown_when_done` fires | no | — | no | no |
+
+The last rows are the ones that bite. `resume` skips stages recorded
+`COMPLETED`, so **`[s]` retires the sweep permanently** — the trials it never
+ran are gone. `[x]` records the stage `FAILED` while keeping its `sweep_id`, so
+`resume` reactivates the same sweep and runs only the missing trials.
+
+`PAUSED`, `STOPPED` and `ABORTED` are the *attended* statuses: all three mean
+somebody was at the keyboard, so none of them powers the VM off. Only
+`COMPLETED` and `FAILED` do that. (`ABORTED` exists for exactly this reason:
+an abort kills the materialization, the stage raises on its way down, and the
+campaign used to be recorded as `FAILED` — i.e. as a crash, which powered the
+machine off under the person who had just pressed the key.)
+
+> [!TIP]
+> To park a sweep overnight and finish its remaining trials tomorrow: wait for
+> the trial in flight to finish (a killed trial is `killed`, not `finished`, so
+> it would be re-run), press `[x]`, then `run_campaign.py resume --task <task>`.
+> Press `[s]` only when you accept the sweep is over at the trials it has.
+
+A `[p]`-paused campaign blocks in-process and never exits, so an armed
+`shutdown_when_done` watcher will sit there until its 48 h ceiling and then
+leave the VM up. That is intended: `PAUSED` means somebody is coming back.
 
 ---
 
@@ -719,11 +758,15 @@ reporting:
 # equivalent of SHUTDOWN=true in scripts/perl.sh. Off by default.
 #
 # Fires on COMPLETED and on FAILED (a campaign that dies at hour two is the
-# most expensive one to leave running). Never fires on a stop you asked for
-# with the hotkey or Ctrl-C, and never in a --dry-run.
+# most expensive one to leave running). Never fires on PAUSED, STOPPED or
+# ABORTED - those all mean somebody was at the keyboard - and never in a
+# --dry-run. Needs passwordless sudo: the halt runs `sudo -n shutdown -h now`,
+# which fails loudly rather than waiting at a password prompt nobody can see.
 shutdown_when_done: false
 # Cancellable countdown before the machine goes down; Ctrl-C during it
-# aborts the shutdown. 0 powers off immediately.
+# aborts the shutdown. 0 powers off immediately. The countdown announces
+# itself at the full period, then once a minute, then every few seconds over
+# the last minute - so a long grace period is never mistaken for a hang.
 shutdown_grace_seconds: 60
 ```
 

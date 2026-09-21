@@ -334,44 +334,55 @@ def summary_lines(
 def hotkey_hint(theme: Theme, paused: bool = False, width: int = 100) -> str:
   """Renders the footer hotkey legend.
 
+  The widest variant that actually fits is used: the caller measures the
+  space the legend gets, and a legend that does not fit would wrap the
+  footer onto a second row.
+
   Args:
     theme: Active theme.
     paused: Whether the campaign is currently paused.
-    width: Available width; narrow terminals get abbreviated labels.
+    width: Width available *to the legend itself*, not to the terminal.
 
   Returns:
     A markup string.
   """
   pause_label = "resume" if paused else "pause"
-  if width < 88:
-    keys: List[Tuple[str, str]] = [
-        ("a", "adv"),
-        ("p", pause_label[:3]),
-        ("s", "stop"),
-        ("?", "help"),
-        ("q", "quit"),
-    ]
-  else:
-    keys = [
-        ("a", "advance w/ best"),
-        ("p", pause_label),
-        ("s", "stop sweep"),
-        ("l", "logs"),
-        ("?", "help"),
-        ("q", "detach"),
-    ]
-  rendered = [
-      f"{theme.markup(f'[{key}]', 'accent')} {theme.markup(label, 'muted')}"
-      for key, label in keys
+  full: List[Tuple[str, str]] = [
+      ("a", "advance w/ best"),
+      ("p", pause_label),
+      ("s", "stop sweep"),
+      ("l", "logs"),
+      ("?", "help"),
+      ("q", "detach"),
   ]
-  return "  ".join(rendered)
+  # Abbreviated, but still complete: a key that is not advertised here is a
+  # key nobody presses.
+  compact: List[Tuple[str, str]] = [
+      ("a", "adv"),
+      ("p", pause_label[:3]),
+      ("s", "stop"),
+      ("l", "logs"),
+      ("?", "help"),
+      ("q", "quit"),
+  ]
+
+  def _render(keys: List[Tuple[str, str]]) -> str:
+    return "  ".join(
+        f"{theme.markup(f'[{key}]', 'accent')} {theme.markup(label, 'muted')}"
+        for key, label in keys
+    )
+
+  rendered = _render(full)
+  if len(theme_mod.strip_markup(rendered)) > max(0, int(width)):
+    rendered = _render(compact)
+  return rendered
 
 
 HELP_TEXT: List[Tuple[str, str]] = [
     ("a", "Seal the running sweep, promote its current best run, advance."),
     ("p", "Pause before the next stage (current trial finishes cleanly)."),
-    ("s", "Stop the campaign gracefully after the current stage."),
-    ("x", "Abort now, skipping report generation."),
+    ("s", "Stop: seal the sweep now (trial in flight dies), publish, report."),
+    ("x", "Abort now: no materialization, no report; resumable with `resume`."),
     ("l", "Cycle log verbosity: all -> milestones -> off."),
     ("+/-", "Grow or shrink the live log window."),
     ("?", "Toggle this help overlay."),
@@ -590,7 +601,12 @@ def header_panel(
     badges.append(theme.markup(" PAUSED ", "warning"))
   status = str(getattr(state, "status", "")).upper()
   if status:
-    style = {"COMPLETED": "success", "FAILED": "error"}.get(status, "accent")
+    style = {
+        "COMPLETED": "success",
+        "FAILED": "error",
+        "STOPPED": "warning",
+        "ABORTED": "warning",
+    }.get(status, "accent")
     badges.append(theme.markup(f" {status} ", style))
 
   grid.add_row(

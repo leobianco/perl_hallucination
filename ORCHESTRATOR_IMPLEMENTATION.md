@@ -475,17 +475,35 @@ Logs stream normally; the block below stays pinned at the bottom of the pane:
 The previous prototype conflated pause/stop/advance into one flag, so pressing
 `[P]` silently killed the campaign. They are now four independent intents:
 
-* **`[p]` Pause / Resume** — parks the engine *before the next stage*. The
-  campaign stays alive; the header shows a `PAUSED` badge.
+* **`[p]` Pause / Resume** — parks the engine *before the next stage*; the
+  current stage, including every trial still owed by its budget, runs to
+  completion first. The campaign stays alive; the header shows a `PAUSED` badge.
 * **`[a]` Advance with Best** — seals the running sweep, promotes its current
   leader, and continues. The request is cleared once the stage consumes it, so
   it never leaks into the following stage.
-* **`[s]` Stop** — finishes the current stage, then ends the campaign
-  gracefully *and still writes the report*.
-* **`[x]` Abort** — same, minus reporting.
+* **`[s]` Stop** — seals the running sweep, publishes its leader, then ends the
+  campaign gracefully *and still writes the report*.
+* **`[x]` Abort** — same, minus reporting *and* minus the materialization.
+
 * **`[l]`** cycles log verbosity (all → milestones → off); **`[+]`/`[-]`**
   resize the leaderboard; **`[?]`** toggles help; **`[q]`** detaches the
   dashboard while the campaign keeps running.
+
+`[a]` and `[s]` both flip `should_interrupt_stage()`, which terminates the
+`wandb agent` subprocess on its next poll: the trial in flight is killed, and
+the trials still owed by `max_runs` are forfeited. The winner's retraining is
+deliberately governed by a *separate* predicate (`abort_requested`), so
+`[s]` publishes a model instead of dying with *"Materialization ... was
+interrupted"*. Consequence for recovery: `[s]` records the stage `COMPLETED`
+and `resume` will skip it, while `[x]` records it `FAILED` with its `sweep_id`
+intact, which is the only interruption whose remaining trials can be resumed.
+
+At campaign level the three interruptions record `PAUSED`, `STOPPED` and
+`ABORTED` respectively, and `shutdown.ATTENDED_STATUSES` holds all three.
+`ABORTED` is not cosmetic: an abort kills the materialization, so the stage
+raises on its way out and the campaign used to land in the generic `FAILED`
+handler - a *terminal* status, on which the shutdown watcher powers the
+machine off under the operator who just pressed the key.
 
 `Ctrl-C` once = graceful stop, twice = abort. The key reader is a no-op when
 stdin is not a TTY and always restores termios, including on exceptions.
