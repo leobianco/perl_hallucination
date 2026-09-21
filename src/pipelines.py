@@ -674,16 +674,16 @@ class Pipeline(abc.ABC):
       enable = getattr(peft_model, "enable_input_require_grads", None)
       if callable(enable):
         enable()
-        logger.info(
-            "Gradient checkpointing is on: enabled input gradients so the "
-            "LoRA adapter still receives one."
+        print(
+            "[LoRA] Gradient checkpointing is on: enabled input gradients so "
+            "the adapter still receives one."
         )
       else:
-        logger.warning(
-            "Gradient checkpointing is on but %s has no "
-            "enable_input_require_grads; if the backward pass raises "
-            "'element 0 of tensors does not require grad', that is why.",
-            type(peft_model).__name__,
+        print(
+            "[LoRA] Warning: gradient checkpointing is on but "
+            f"{type(peft_model).__name__} has no enable_input_require_grads; "
+            "if the backward pass raises 'element 0 of tensors does not "
+            "require grad', that is why."
         )
     return peft_model
 
