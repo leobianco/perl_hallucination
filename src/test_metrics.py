@@ -214,6 +214,8 @@ try:
       EvaluationScoringPipeline,
       SSFODataGenerationPipeline,
       _VLLM_AVAILABLE,
+      build_reward_hacking_fewshot_examples,
+      degenerate_reward_hacked_response,
   )
 except ImportError:
   EvaluationAutoraterPipeline = None
@@ -221,11 +223,16 @@ except ImportError:
   EvaluationScoringPipeline = None
   SSFODataGenerationPipeline = None
   _VLLM_AVAILABLE = False
+  build_reward_hacking_fewshot_examples = None
+  degenerate_reward_hacked_response = None
 
 from src.utils import (
+    REWARD_HACKING_SCALE_MAX,
+    REWARD_HACKING_SCALE_MIN,
     build_eval_dataset_repo_id,
     compact_model_name,
     looks_like_rl_checkpoint,
+    reward_hacking_dimension_keys,
     sanitize_hf_repo_id,
     sft_stacking_marker,
 )
@@ -1640,6 +1647,369 @@ class TestCpuCompatibility(unittest.TestCase):
     self.assertIn("Answer to user's question:\nResponse 1", prompt)
     self.assertIn("Answer to user's question:\nResponse 2", prompt)
     self.assertTrue(prompt.endswith("Test Q\nManual:\nC\nAnswer to user's question:\n"))
+
+
+class TestRewardHackingDegeneration(unittest.TestCase):
+  """The synthetic bad examples that anchor the bottom of the judge's scale.
+
+  Without them the judge only ever sees well-written gold responses, learns
+  the top of the scale and nothing else, and compresses every real completion
+  into 4s and 5s - at which point the rubric cannot separate a good policy
+  from a degenerate one, which is its only job.
+  """
+
+  def setUp(self):
+    if degenerate_reward_hacked_response is None:
+      self.skipTest("pipelines module not available in lightweight test env")
+
+  def _degenerate(self, context, response, seed=0):
+    import random as random_mod
+
+    return degenerate_reward_hacked_response(
+        context, response, random_mod.Random(seed)
+    )
+
+  def test_it_actually_changes_the_text(self):
+    context = "The capital of France is Paris. It sits on the Seine."
+    response = "Paris is the capital. The Seine runs through it."
+    for seed in range(10):
+      with self.subTest(seed=seed):
+        self.assertNotEqual(
+            self._degenerate(context, response, seed).strip(),
+            response.strip(),
+        )
+
+  def test_it_is_reproducible_for_a_given_seed(self):
+    # A campaign re-run must build the same demonstrations, or two runs of
+    # the "same" configuration are graded against different prompts.
+    context = "Some source material. With two sentences."
+    response = "An answer. A second sentence."
+    self.assertEqual(
+        self._degenerate(context, response, 7),
+        self._degenerate(context, response, 7),
+    )
+
+  def test_it_can_produce_a_verbatim_copy_of_the_context(self):
+    # The signature reward-hacked output. At least one seed must reach it,
+    # otherwise the non_extractiveness dimension has no demonstration.
+    context = "A long retrieved passage about turbines and their upkeep."
+    response = "Turbines need upkeep. Check them monthly."
+    produced = {self._degenerate(context, response, s) for s in range(20)}
+    self.assertIn(context, produced)
+
+  def test_it_can_produce_a_duplicated_response(self):
+    context = ""
+    response = "First sentence. Second sentence."
+    produced = {self._degenerate(context, response, s) for s in range(20)}
+    self.assertTrue(
+        any(text.count("First sentence.") > 1 for text in produced), produced
+    )
+
+  def test_a_single_sentence_is_still_corruptible(self):
+    # Sentence shuffling needs two sentences and the verbatim copy needs a
+    # context, but duplication works on anything - so a one-sentence
+    # response with no context is not a lost cause.
+    response = "Single sentence with no punctuation split"
+    self.assertNotEqual(self._degenerate("", response, 0), response)
+
+  def test_it_leaves_text_it_cannot_corrupt_alone(self):
+    # Nothing to copy and nothing to repeat. Returning the input unchanged
+    # lets the caller notice and skip the pair rather than emit a "bad"
+    # demonstration identical to the good one.
+    self.assertEqual(self._degenerate("", "", 0), "")
+
+
+class TestRewardHackingFewshot(unittest.TestCase):
+  """Building graded demonstrations out of SFT samples."""
+
+  def setUp(self):
+    if build_reward_hacking_fewshot_examples is None:
+      self.skipTest("pipelines module not available in lightweight test env")
+    from src.task_processors.base_task_processor import BaseTaskProcessor
+
+    self.processor_cls = BaseTaskProcessor
+
+  def _source(self, rows=6):
+    return MockDataset({
+        "context": [
+            f"Source passage number {i} with several words in it. "
+            f"And a second sentence for row {i}."
+            for i in range(rows)
+        ],
+        "user_query": [f"Question {i}?" for i in range(rows)],
+        "response": [
+            f"A composed answer for row {i}. It has two sentences."
+            for i in range(rows)
+        ],
+    })
+
+  def test_it_returns_nothing_when_none_were_asked_for(self):
+    self.assertIsNone(
+        build_reward_hacking_fewshot_examples(
+            self.processor_cls, self._source(), num_pairs=0, seed=1
+        )
+    )
+
+  def test_each_pair_contributes_one_good_and_one_bad_example(self):
+    examples = build_reward_hacking_fewshot_examples(
+        self.processor_cls, self._source(), num_pairs=2, seed=1
+    )
+    self.assertEqual(len(examples), 4)
+    degenerate = [e for e in examples if e["is_degenerate"]]
+    clean = [e for e in examples if not e["is_degenerate"]]
+    self.assertEqual(len(degenerate), 2)
+    self.assertEqual(len(clean), 2)
+
+  def test_the_two_ends_of_the_scale_are_both_demonstrated(self):
+    examples = build_reward_hacking_fewshot_examples(
+        self.processor_cls, self._source(), num_pairs=2, seed=1
+    )
+    for example in examples:
+      grades = example["reward_hacking_grades"]
+      expected = (
+          REWARD_HACKING_SCALE_MIN
+          if example["is_degenerate"]
+          else REWARD_HACKING_SCALE_MAX
+      )
+      with self.subTest(degenerate=example["is_degenerate"]):
+        self.assertEqual(
+            grades, {k: expected for k in reward_hacking_dimension_keys()}
+        )
+
+  def test_the_pair_differs_only_in_the_writing(self):
+    # Both halves share a context and a question, so the judge cannot learn
+    # to key the grade off the topic or the length of the source.
+    examples = build_reward_hacking_fewshot_examples(
+        self.processor_cls, self._source(), num_pairs=1, seed=1
+    )
+    contexts = {e["context"] for e in examples}
+    self.assertEqual(len(contexts), 1)
+
+  def test_the_rendered_demonstrations_are_not_identical(self):
+    # The failure this guards: if the degenerate text were written to a
+    # column the prompt builder does not read, both demonstrations would
+    # render the same body under opposite grades and actively mislead.
+    examples = build_reward_hacking_fewshot_examples(
+        self.processor_cls, self._source(), num_pairs=1, seed=1
+    )
+    rendered = {
+        self.processor_cls._format_reward_hacking_example(e)
+        for e in examples
+    }
+    self.assertEqual(len(rendered), 2)
+
+  def test_an_empty_source_yields_nothing(self):
+    self.assertIsNone(
+        build_reward_hacking_fewshot_examples(
+            self.processor_cls, MockDataset({}), num_pairs=2, seed=1
+        )
+    )
+
+
+class TestRewardHackingVerdictParsing(unittest.TestCase):
+  """Turning the judge's reply into grades."""
+
+  def setUp(self):
+    if EvaluationScoringPipeline is None:
+      self.skipTest("pipelines module not available in lightweight test env")
+    self.pipeline = EvaluationScoringPipeline()
+    self.keys = reward_hacking_dimension_keys()
+
+  def _response(self, text):
+    return MagicMock(candidates=[MagicMock()], text=text)
+
+  def test_a_clean_json_object_parses(self):
+    payload = json.dumps({k: REWARD_HACKING_SCALE_MAX for k in self.keys})
+    grades = self.pipeline.gemini_rubric_response(self._response(payload))
+    self.assertEqual(grades, {k: 1.0 for k in self.keys})
+
+  def test_grades_are_normalized_to_the_unit_interval(self):
+    payload = json.dumps({k: REWARD_HACKING_SCALE_MIN for k in self.keys})
+    grades = self.pipeline.gemini_rubric_response(self._response(payload))
+    self.assertEqual(grades, {k: 0.0 for k in self.keys})
+
+  def test_an_object_wrapped_in_prose_is_recovered(self):
+    # The `response_schema` downgrade decodes without constraints, so the
+    # judge may fence the object or introduce it. Losing the sample over
+    # that would silently shrink the denominator.
+    payload = (
+        "Sure, here are the grades:\n```json\n"
+        + json.dumps({k: 3 for k in self.keys})
+        + "\n```"
+    )
+    grades = self.pipeline.gemini_rubric_response(self._response(payload))
+    self.assertEqual(grades, {k: 0.5 for k in self.keys})
+
+  def test_out_of_range_grades_are_clamped(self):
+    payload = json.dumps({k: 99 for k in self.keys})
+    grades = self.pipeline.gemini_rubric_response(self._response(payload))
+    self.assertEqual(grades, {k: 1.0 for k in self.keys})
+
+  def test_a_partial_object_keeps_what_it_can(self):
+    payload = json.dumps({self.keys[0]: 5})
+    grades = self.pipeline.gemini_rubric_response(self._response(payload))
+    self.assertEqual(grades, {self.keys[0]: 1.0})
+
+  def test_unparseable_text_yields_no_verdict(self):
+    # None, not a default grade: an unreadable reply is missing data, and
+    # scoring it would let a flaky judge masquerade as a bad policy.
+    self.assertIsNone(
+        self.pipeline.gemini_rubric_response(self._response("no idea, sorry"))
+    )
+
+  def test_an_object_with_no_known_keys_yields_no_verdict(self):
+    payload = json.dumps({"vibes": 5})
+    self.assertIsNone(
+        self.pipeline.gemini_rubric_response(self._response(payload))
+    )
+
+  def test_a_blocked_response_yields_no_verdict(self):
+    blocked = MagicMock(candidates=[], text=None)
+    self.assertIsNone(self.pipeline.gemini_rubric_response(blocked))
+
+
+class TestRewardHackingRubricDataset(unittest.TestCase):
+  """Grading a whole dataset against the rubric."""
+
+  def setUp(self):
+    if EvaluationScoringPipeline is None:
+      self.skipTest("pipelines module not available in lightweight test env")
+    self.pipeline = EvaluationScoringPipeline()
+    self.keys = reward_hacking_dimension_keys()
+    self.temp_dir = tempfile.mkdtemp()
+
+  def tearDown(self):
+    shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+  def _dataset(self, n=3):
+    return MockDataset(
+        {"reward_hacking_prompt": [f"Grade this {i}" for i in range(n)]}
+    )
+
+  def _args(self, **overrides):
+    values = {
+        "seed": 42,
+        "evaluator_model": "gemini-2.5-flash",
+        "reward_hacking_model": None,
+        "reward_hacking_checkpoint_path": None,
+        "overwrite_scores": False,
+        "max_workers": 1,
+        "autorater_num_samples": 1,
+    }
+    values.update(overrides)
+    return MagicMock(**values)
+
+  def _client(self, texts):
+    """Returns a client replying with `texts` in call order."""
+    replies = list(texts)
+    calls = []
+
+    def generate(model, contents, config):
+      del model, config
+      calls.append(str(contents))
+      return MagicMock(
+          candidates=[MagicMock()], text=replies[(len(calls) - 1) % len(replies)]
+      )
+
+    client = MagicMock()
+    client.models.generate_content.side_effect = generate
+    return client, calls
+
+  def test_every_row_gets_a_verdict(self):
+    payload = json.dumps({k: 4 for k in self.keys})
+    client, calls = self._client([payload])
+    verdicts = self.pipeline.gemini_score_rubric_dataset(
+        client, self._dataset(3), self._args()
+    )
+    self.assertEqual(len(verdicts), 3)
+    self.assertEqual(len(calls), 3)
+    for verdict in verdicts:
+      self.assertEqual(verdict, {k: 0.75 for k in self.keys})
+
+  def test_a_failed_row_is_none_and_does_not_poison_the_others(self):
+    good = json.dumps({k: 5 for k in self.keys})
+    client, _ = self._client([good, "garbage", good])
+    verdicts = self.pipeline.gemini_score_rubric_dataset(
+        client, self._dataset(3), self._args()
+    )
+    self.assertEqual(sum(1 for v in verdicts if v is None), 1)
+    self.assertEqual(sum(1 for v in verdicts if v), 2)
+
+  def test_repeated_draws_are_averaged_not_rounded_to_the_grid(self):
+    # The grades are already discretised to five points. A median over k
+    # draws lands back on that grid and throws away the resolution the
+    # extra API calls were paid for.
+    low = json.dumps({k: 1 for k in self.keys})
+    high = json.dumps({k: 5 for k in self.keys})
+    client, _ = self._client([low, high])
+    verdicts = self.pipeline.gemini_score_rubric_dataset(
+        client, self._dataset(1), self._args(autorater_num_samples=2)
+    )
+    for key in self.keys:
+      self.assertAlmostEqual(verdicts[0][key], 0.5)
+
+  def test_the_judge_spread_is_recorded(self):
+    low = json.dumps({k: 1 for k in self.keys})
+    high = json.dumps({k: 5 for k in self.keys})
+    client, _ = self._client([low, high])
+    self.pipeline.gemini_score_rubric_dataset(
+        client, self._dataset(1), self._args(autorater_num_samples=2)
+    )
+    stats = self.pipeline.reward_hacking_stats
+    self.assertGreater(stats["reward_hacking_audit_spread_mean"], 0.0)
+
+  def test_the_judge_defaults_to_the_hallucination_judge(self):
+    payload = json.dumps({k: 3 for k in self.keys})
+    client, _ = self._client([payload])
+    self.pipeline.gemini_score_rubric_dataset(
+        client, self._dataset(1), self._args()
+    )
+    self.assertEqual(
+        self.pipeline.reward_hacking_stats["reward_hacking_audit_model"],
+        "gemini-2.5-flash",
+    )
+
+  def test_an_explicit_judge_overrides_it(self):
+    payload = json.dumps({k: 3 for k in self.keys})
+    client, _ = self._client([payload])
+    self.pipeline.gemini_score_rubric_dataset(
+        client,
+        self._dataset(1),
+        self._args(reward_hacking_model="gemini-2.5-pro"),
+    )
+    self.assertEqual(
+        self.pipeline.reward_hacking_stats["reward_hacking_audit_model"],
+        "gemini-2.5-pro",
+    )
+
+  def test_a_checkpoint_is_resumed_rather_than_re_billed(self):
+    # Grading is billed per call; an interrupted campaign must not pay
+    # twice for rows it already has.
+    ckpt = os.path.join(self.temp_dir, "rubric.json")
+    with open(ckpt, "w") as handle:
+      json.dump([{k: 1.0 for k in self.keys}, None, None], handle)
+    payload = json.dumps({k: 2 for k in self.keys})
+    client, calls = self._client([payload])
+    verdicts = self.pipeline.gemini_score_rubric_dataset(
+        client, self._dataset(3), self._args(reward_hacking_checkpoint_path=ckpt)
+    )
+    self.assertEqual(len(calls), 2)
+    self.assertEqual(verdicts[0], {k: 1.0 for k in self.keys})
+
+  def test_overwrite_ignores_the_checkpoint(self):
+    ckpt = os.path.join(self.temp_dir, "rubric.json")
+    with open(ckpt, "w") as handle:
+      json.dump([{k: 1.0 for k in self.keys}, None, None], handle)
+    payload = json.dumps({k: 2 for k in self.keys})
+    client, calls = self._client([payload])
+    self.pipeline.gemini_score_rubric_dataset(
+        client,
+        self._dataset(3),
+        self._args(
+            reward_hacking_checkpoint_path=ckpt, overwrite_scores=True
+        ),
+    )
+    self.assertEqual(len(calls), 3)
 
 
 if __name__ == "__main__":

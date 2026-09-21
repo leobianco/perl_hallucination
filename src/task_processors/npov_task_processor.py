@@ -472,6 +472,49 @@ class NPOVTaskProcessor(BaseTaskProcessor):
 
     return npov_evaluator_prompt
 
+  @classmethod
+  def reward_hacking_context(cls, entry: dict) -> str:
+    """Returns the two perspectives as the source material to grade against.
+
+    NPOV has no single ``context`` column: the material the answer must be
+    built from is the pair of argument lists. The generic base-class lookup
+    would find nothing and hand the judge an empty context, which makes every
+    response look maximally non-extractive and silently disables the one
+    dimension this rubric exists for.
+
+    Args:
+        entry (dict): An NPOV row.
+
+    Returns:
+        str: Both perspectives, labelled.
+    """
+    first_name = entry.get("perspective_1_name", "Perspective 1")
+    second_name = entry.get("perspective_2_name", "Perspective 2")
+    return (
+        f"{first_name} arguments provided:\n{entry.get('perspective_1', '')}"
+        f"\n\n{second_name} arguments provided:"
+        f"\n{entry.get('perspective_2', '')}"
+    )
+
+  @classmethod
+  def reward_hacking_response(
+      cls, entry: dict, use_true_label: bool = False
+  ) -> str:
+    """Returns the NPOV rewriting to grade.
+
+    Args:
+        entry (dict): An NPOV row.
+        use_true_label (bool): Grade the gold ``npov_response`` instead of the
+          model's ``completion``.
+
+    Returns:
+        str: The response text.
+    """
+    if use_true_label:
+      return str(entry.get("npov_response") or entry.get("completion") or "")
+    return str(entry.get("completion") or entry.get("npov_response") or "")
+
+
   @staticmethod
   def _rm_prompt(entry: dict) -> dict:
     """Format a reward model prompt for an NPOV entry.

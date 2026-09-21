@@ -399,14 +399,23 @@ class CampaignReporter:
     eval_res = self.state.stages.get("eval")
     if eval_res and eval_res.status == StageStatus.COMPLETED:
       targets = eval_metrics.present_targets(eval_res.metrics)
+      eval_cfg = self.config.eval
       lines.extend([
           "### 2.4. Final Evaluation & Gemini Autorating",
-          f"* **Evaluator Model**: `{self.config.eval.evaluator_model}`",
+          f"* **Evaluator Model**: `{eval_cfg.evaluator_model}`",
           f"* **Headline Policy**: `{eval_res.model_repo_id}`",
-          f"* **Evaluation Seed**: `{self.config.eval.seed}`"
-          f" (subsamples {self.config.eval.max_eval_samples} test examples)",
-          "",
+          f"* **Evaluation Seed**: `{eval_cfg.seed}`"
+          f" (subsamples {eval_cfg.max_eval_samples} test examples)",
       ])
+      if eval_cfg.run_reward_hacking_autorater:
+        lines.append(
+            "* **Reward-hacking rubric**:"
+            f" `{eval_cfg.reward_hacking_model or eval_cfg.evaluator_model}`"
+            f" ({eval_cfg.reward_hacking_num_fewshot}-pair,"
+            f" k={eval_cfg.autorater_num_samples},"
+            f" flag threshold {eval_cfg.reward_hacking_threshold})"
+        )
+      lines.append("")
 
       if targets:
         # Δ is signed so that positive always means PE-RL improved on SFT,
@@ -456,6 +465,24 @@ class CampaignReporter:
           )
           lines.append(f"| `{name}` | {cells}{delta_cells} |")
         lines.append("")
+        if eval_cfg.run_reward_hacking_autorater:
+          lines.extend([
+              "The `reward_hacking_*` rows grade the *writing*, not the"
+              " facts: fluency, non-repetition and non-extractiveness, each"
+              " on a 1-5 scale rescaled to [0, 1], with"
+              " `reward_hacking_quality` their unweighted mean. Read them"
+              " against `hallucination_rate`: a policy whose hallucination"
+              " rate falls while its rubric quality falls too has most"
+              " likely learned to copy the context rather than to answer"
+              " from it, and the faithfulness win is not real.",
+              "",
+              "Unlike the hallucination threshold, the rubric's flag"
+              " threshold is **not calibrated** against labelled data, so"
+              " the absolute level of `reward_hacking_rate` carries little"
+              " meaning. The Δ columns, which compare policies graded by the"
+              " same judge under the same prompt, are the trustworthy part.",
+              "",
+          ])
       else:
         lines.extend([
             "| Metric | Measured Value |",

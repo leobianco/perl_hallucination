@@ -12,6 +12,10 @@ from __future__ import annotations
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 from src.orchestrator import flavors
+from src.utils import REWARD_HACKING_AUDIT_PREFIX
+from src.utils import reward_hacking_dimension_keys
+from src.utils import REWARD_HACKING_QUALITY_KEY
+from src.utils import REWARD_HACKING_RATE_KEY
 
 #: Bookkeeping entries that are identical by construction; a delta on them is
 #: pure noise in the report.
@@ -28,6 +32,10 @@ NO_DELTA: FrozenSet[str] = frozenset({
 #: delta and to decide which branch of a fan-out campaign is the headline.
 LOWER_IS_BETTER: FrozenSet[str] = frozenset({
     "hallucination_rate",
+    # Fraction of completions the rubric judge graded below the quality
+    # threshold. The rubric's other outputs - the aggregate quality score and
+    # the per-dimension means - are higher-is-better and so need no entry.
+    REWARD_HACKING_RATE_KEY,
     "perplexity",
     "eval_loss",
     "loss",
@@ -60,10 +68,18 @@ DECODING_TEMPERATURE_KEY: str = "decoding_temperature"
 TARGETS: Tuple[Tuple[str, str], ...] = (("sft", "SFT"), ("perl", "PE-RL"))
 
 #: Preferred order for the comparison table; anything else is appended.
+#:
+#: The rubric block sits directly under the hallucination block because the
+#: two are read together: a hallucination rate that improves while
+#: `reward_hacking_quality` falls is the signature of a policy that learned to
+#: copy the context rather than to answer from it.
 METRIC_ORDER: Tuple[str, ...] = (
     "hallucination_rate",
     "faithfulness_rate",
     "autorater_accuracy",
+    REWARD_HACKING_QUALITY_KEY,
+    REWARD_HACKING_RATE_KEY,
+    *(f"reward_hacking_{key}" for key in reward_hacking_dimension_keys()),
     "bertscore_f1",
     "perplexity",
     "num_samples",
@@ -78,15 +94,23 @@ PROVENANCE_PREFIX: str = "provenance_"
 #: Prefixes of summary keys that audit *how the evaluation ran* rather than
 #: how the model performed. Tabulating all of them would bury the four numbers
 #: the campaign is actually about.
-AUDIT_PREFIXES: Tuple[str, ...] = (PROVENANCE_PREFIX, "autorater_")
+AUDIT_PREFIXES: Tuple[str, ...] = (
+    PROVENANCE_PREFIX,
+    "autorater_",
+    REWARD_HACKING_AUDIT_PREFIX,
+)
 
 #: Audit keys that earn a row anyway: `autorater_accuracy` is a real metric,
 #: and the dropped count and judge spread are needed to know whether a delta
-#: between two policies means anything.
+#: between two policies means anything. The rubric's dropped count is here for
+#: the same reason: its verdicts come from a JSON parse that can fail per
+#: sample, so a quality score is only as trustworthy as the number of samples
+#: that actually produced one.
 TABULATED_AUDIT_KEYS: FrozenSet[str] = frozenset({
     "autorater_accuracy",
     "autorater_n_dropped",
     "autorater_spread_mean",
+    f"{REWARD_HACKING_AUDIT_PREFIX}n_dropped",
 })
 
 

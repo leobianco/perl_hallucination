@@ -72,6 +72,20 @@ This codebase uses a **4-pillar evaluation framework**:
 
 ---
 
+### 4. Reward-Hacking Rubric Autorater (Writing Quality)
+* **Default Model**: the same judge as the hallucination autorater (`--reward_hacking_model` overrides it).
+* **Configuration Flags**: `--run_reward_hacking_autorater True --reward_hacking_num_fewshot 2 --reward_hacking_threshold 0.6`
+* **Why it exists**: the hallucination autorater cannot see this failure. A policy that returns the retrieved context verbatim is, by construction, perfectly faithful to it, so the hallucination judge scores it as excellent - and RLOO, optimising exactly that reward, finds the policy. The symptoms are in the prose, not in the facts.
+* **How It Works**:
+  * One structured-JSON call per completion returns an integer in $[1, 5]$ for each of three dimensions: `fluency`, `non_repetition`, `non_extractiveness`.
+  * Grades are rescaled to $[0, 1]$ ($1 \to 0.0$, $5 \to 1.0$, out-of-range clamped) and averaged unweighted into `reward_hacking_quality`.
+  * `--autorater_num_samples k` draws $k$ independent grades per sample and takes their **mean** per dimension (not the median: the grades are already discretised to five points, so a median collapses back onto that grid). The per-dimension spread is recorded under `reward_hacking_audit_*`.
+  * Few-shot demonstrations are built from the task's SFT split: each gold response is shown graded 5/5/5 next to a mechanically degenerated copy of *the same* response graded 1/1/1. Pairing them on identical content isolates writing quality as the only difference, so the judge cannot key the grade off topic or length.
+* **Calibration status**: **uncalibrated.** There is no labelled reward-hacking set, so unlike `--threshold` (fitted by the `autoratereval` mode against human labels) `--reward_hacking_threshold` is a judgement call. Read `reward_hacking_quality` and the per-dimension means as the primary signal, and read `reward_hacking_rate` only as a *delta* between policies graded by the same judge.
+  * To calibrate it later: score a contrast set of known-good responses (SFT gold) against known-hacked ones (the synthetic degenerations, or completions from a deliberately over-trained policy), then fit a threshold by ROC exactly as `EvaluationAutoraterPipeline` does for the hallucination judge. The synthetic degenerations are already available via `src.pipelines.degenerate_reward_hacked_response`.
+
+---
+
 ## Full Metrics Catalog
 
 | Metric | Category | Formula / Definition | Good Value | Description |
@@ -79,6 +93,11 @@ This codebase uses a **4-pillar evaluation framework**:
 | **`scores`** | Faithfulness | $P(\text{No Hallucination})$ | Higher ($\to 1.0$) | Raw calibrated autorater probability. |
 | **`classifications`** | Faithfulness | $\mathbb{I}(\text{score} \ge \tau)$ | `1.0` (Faithful) | Binary classification after thresholding. |
 | **`hallucination_rate`** | Faithfulness | $\frac{1}{N}\sum \mathbb{I}(\text{score} < \tau)$ | Lower ($\to 0.0$) | Overall run hallucination percentage. |
+| **`reward_hacking_fluency`** | Writing Quality | Judge grade, rescaled to $[0, 1]$ | Higher ($\to 1.0$) | Is the text well-formed, grammatical prose? |
+| **`reward_hacking_non_repetition`** | Writing Quality | Judge grade, rescaled to $[0, 1]$ | Higher ($\to 1.0$) | Is the text free of loops and restated facts? |
+| **`reward_hacking_non_extractiveness`** | Writing Quality | Judge grade, rescaled to $[0, 1]$ | Higher ($\to 1.0$) | Is the text the model's own words rather than a copied span? |
+| **`reward_hacking_quality`** | Writing Quality | Unweighted mean of the three dimensions | Higher ($\to 1.0$) | Headline writing-quality score. Read it *against* `hallucination_rate`. |
+| **`reward_hacking_rate`** | Writing Quality | $\frac{1}{N}\sum \mathbb{I}(\text{quality} < \tau_{rh})$ | Lower ($\to 0.0$) | Fraction flagged as degenerate. **Uncalibrated**; trust the delta, not the level. |
 | **`rouge1_precision`** | Context Grounding | $\frac{|\text{Overlap Unigrams}|}{|\text{Generation Unigrams}|}$ | Higher ($\to 1.0$) | Lexical grounding: fraction of generation from context. |
 | **`rouge1_recall`** | Context Coverage | $\frac{|\text{Overlap Unigrams}|}{|\text{Context Unigrams}|}$ | Higher ($\to 1.0$) | Context coverage: fraction of context arguments preserved. |
 | **`rouge1_f1`** | Context Alignment | Harmonic mean of $P_1$ & $R_1$ | Higher ($\to 1.0$) | Balanced unigram context grounding and coverage. |
@@ -93,6 +112,12 @@ This codebase uses a **4-pillar evaluation framework**:
 | **`distinct_2`** | Diversity | $\frac{\|\text{Unique Bigrams}\|}{\|\text{Total Bigrams}\|}$ | Higher ($\to 1.0$) | Phrase diversity; catches 2-token loops. |
 | **`repetition_rate`** | Diversity | $1.0 - \text{Distinct-}4$ | Lower ($\to 0.0$) | Fraction of repeated 4-grams in output. |
 | **`perplexity`** | Fluency | $\exp(\mathcal{L}_{\text{CE}}(\text{comp} \mid \text{prompt}))$ | Lower ($\to 1.0$) | Natural language fluency under base LM. |
+
+> The `reward_hacking_*` rows and the n-gram diversity rows overlap deliberately.
+> `distinct_2` and `repetition_rate` are cheap and surface-level: they catch a
+> token loop but score a fluent verbatim copy of the context as perfectly
+> diverse. `reward_hacking_non_extractiveness` is the one that catches that,
+> and it costs an API call.
 
 ---
 

@@ -33,6 +33,10 @@ from src.orchestrator import flavors
 from src.orchestrator.stages.base import BaseStage
 from src.orchestrator.state import StageResult, StageStatus
 from src.utils import build_eval_dataset_repo_id
+from src.utils import REWARD_HACKING_AUDIT_PREFIX
+from src.utils import reward_hacking_dimension_keys
+from src.utils import REWARD_HACKING_QUALITY_KEY
+from src.utils import REWARD_HACKING_RATE_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -635,6 +639,23 @@ class EvalStage(BaseStage):
       cmd.extend(["--overwrite_scores", "True"])
     if cfg.scores_checkpoint_path:
       cmd.extend(["--scores_checkpoint_path", cfg.scores_checkpoint_path])
+    cmd.extend([
+        "--run_reward_hacking_autorater",
+        str(cfg.run_reward_hacking_autorater),
+    ])
+    if cfg.run_reward_hacking_autorater:
+      cmd.extend([
+          "--reward_hacking_num_fewshot",
+          str(cfg.reward_hacking_num_fewshot),
+          "--reward_hacking_threshold",
+          str(cfg.reward_hacking_threshold),
+      ])
+      # Left unset, the evaluator falls the rubric judge back to
+      # `evaluator_model` itself. Resolving it here instead would bake the
+      # fallback into the argv, so a config that meant "whatever the
+      # hallucination judge is" would stop tracking it.
+      if cfg.reward_hacking_model:
+        cmd.extend(["--reward_hacking_model", cfg.reward_hacking_model])
     if os.environ.get("GEMINI_API_KEY"):
       cmd.extend(["--gemini_api_key", os.environ["GEMINI_API_KEY"]])
     return cmd
@@ -692,6 +713,23 @@ class EvalStage(BaseStage):
             "perplexity": 7.84,
         },
     }
+    #: Mock rubric grades, already normalized to [0, 1]. The PE-RL profile is
+    #: deliberately *worse* than the SFT one while its hallucination rate is
+    #: better: that divergence is the whole reason the rubric exists, and a
+    #: rehearsal that showed both moving together would teach the reader to
+    #: ignore the new rows.
+    mock_rubric = {
+        "sft": {
+            "fluency": 0.86,
+            "non_repetition": 0.91,
+            "non_extractiveness": 0.78,
+        },
+        "perl": {
+            "fluency": 0.79,
+            "non_repetition": 0.72,
+            "non_extractiveness": 0.54,
+        },
+    }
     metrics: Dict[str, Any] = {}
     for target in targets:
       if live_line_callback:
@@ -720,6 +758,12 @@ class EvalStage(BaseStage):
         values["faithfulness_rate"] = round(
             values["faithfulness_rate"] - penalty, 4
         )
+      if self.config.eval.run_reward_hacking_autorater:
+        values.update(
+            self._mock_rubric_metrics(
+                mock_rubric.get(kind, mock_rubric["sft"])
+            )
+        )
       values[eval_metrics.DECODING_TEMPERATURE_KEY] = target.temperature
       metrics.update({f"{target.label}/{k}": v for k, v in values.items()})
     metrics.update(compute_deltas(metrics))
@@ -728,6 +772,42 @@ class EvalStage(BaseStage):
         model_repo_id=primary_model,
         metrics=metrics,
     )
+
+  def _mock_rubric_metrics(
+      self, grades: Dict[str, float]
+  ) -> Dict[str, float]:
+    """Expands mock per-dimension grades into the rubric's metric keys.
+
+    The aggregate is recomputed from the grades rather than hard-coded so
+    that a rehearsal cannot show a quality score inconsistent with the
+    dimensions printed beside it, and so that adding a rubric dimension does
+    not silently leave the dry run reporting the old three-way mean.
+
+    Args:
+      grades: Normalized [0, 1] grade per rubric dimension.
+
+    Returns:
+      The metric keys a real scoring pass would contribute, namespaced later
+      by the caller.
+    """
+    present = [
+        grades[key]
+        for key in reward_hacking_dimension_keys()
+        if key in grades
+    ]
+    values = {
+        f"reward_hacking_{key}": value for key, value in grades.items()
+    }
+    if present:
+      quality = sum(present) / len(present)
+      values[REWARD_HACKING_QUALITY_KEY] = round(quality, 4)
+      # Per-sample scores are not simulated, so there is no distribution to
+      # threshold. Reporting the fraction as 0 or 1 would be a lie in either
+      # direction; a smooth stand-in that moves with quality at least keeps
+      # the row's sign meaningful in a rehearsal.
+      values[REWARD_HACKING_RATE_KEY] = round(max(0.0, 1.0 - quality) / 2, 4)
+    values[f"{REWARD_HACKING_AUDIT_PREFIX}n_dropped"] = 0
+    return values
 
   def _run_subprocess(
       self,

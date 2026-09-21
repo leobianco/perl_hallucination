@@ -13,6 +13,18 @@ RUN_AUTORATER="True"
 AUTORATER_NUM_SAMPLES="${AUTORATER_NUM_SAMPLES:-1}"
 THRESHOLD=0.1025
 EVALUATOR_NUM_FEWSHOT=2
+# Reward-hacking rubric: a second judge that grades the writing (fluency,
+# non-repetition, non-extractiveness) rather than the facts. It catches the
+# degenerate policy that scores perfectly on the hallucination judge by
+# copying the context verbatim. Overridable so a quick manual scoring run can
+# skip the extra Gemini pass.
+RUN_REWARD_HACKING_AUTORATER="${RUN_REWARD_HACKING_AUTORATER:-True}"
+# Empty reuses EVALUATOR_MODEL.
+REWARD_HACKING_MODEL="${REWARD_HACKING_MODEL:-}"
+# Demonstration *pairs* (one clean SFT response, one degenerated copy of it).
+REWARD_HACKING_NUM_FEWSHOT="${REWARD_HACKING_NUM_FEWSHOT:-2}"
+# UNCALIBRATED - see EvalArguments. Read the per-dimension means, not this.
+REWARD_HACKING_THRESHOLD="${REWARD_HACKING_THRESHOLD:-0.6}"
 WRITER_NUM_FEWSHOT=0
 MAX_TOKENS=250
 MAX_EVAL_SAMPLES=1000
@@ -113,6 +125,10 @@ elif [ "$2" == "score" ]; then
         --compute_perplexity "$COMPUTE_PERPLEXITY" \
         --fluency_model "$FLUENCY_MODEL" \
         --log_to_wandb "${LOG_TO_WANDB:-False}" \
+        --run_reward_hacking_autorater "$RUN_REWARD_HACKING_AUTORATER" \
+        ${REWARD_HACKING_MODEL:+--reward_hacking_model "$REWARD_HACKING_MODEL"} \
+        --reward_hacking_num_fewshot "$REWARD_HACKING_NUM_FEWSHOT" \
+        --reward_hacking_threshold "$REWARD_HACKING_THRESHOLD" \
         --wandb_project "${WANDB_PROJECT:-new_perl_eval}"
 elif [ "$2" == "autoratereval" ]; then
     echo "Running in autoratereval mode (max_eval_samples=$MAX_EVAL_SAMPLES)..."

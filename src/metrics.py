@@ -988,6 +988,18 @@ class GenerationMetricsEvaluator:
           table_cols.append("scores")
         if "classifications" in dataset.column_names:
           table_cols.append("classifications")
+        # Per-sample rubric grades. The aggregate quality score answers
+        # "did the policy degenerate?"; only the per-row grades answer
+        # "on which completions?", which is what the table is for. The
+        # rubric *prompt* column is deliberately excluded - it embeds the
+        # context and few-shot demos, and would dwarf every other cell.
+        for rubric_col in sorted(dataset.column_names):
+          if (
+              rubric_col.startswith("reward_hacking_")
+              and rubric_col != "reward_hacking_prompt"
+              and rubric_col not in table_cols
+          ):
+            table_cols.append(rubric_col)
 
         for ctx_col in [
             "perspective_1",
