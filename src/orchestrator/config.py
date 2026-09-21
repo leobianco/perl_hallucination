@@ -455,7 +455,7 @@ class CampaignConfig:
 
     Returns:
       A mapping without the leading ``--``; empty below
-      :data:`src.orchestrator.accel.ZERO3_THRESHOLD_B`.
+      :data:`src.orchestrator.accel.CHECKPOINT_THRESHOLD_B`.
     """
     return accel.memory_flags(stage, self.base_model, self.reward_base_model)
 

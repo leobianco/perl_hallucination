@@ -644,7 +644,7 @@ class Pipeline(abc.ABC):
 
     It is also where gradient checkpointing is made safe under LoRA. The
     orchestrator turns `--gradient_checkpointing` on for any base model at or
-    above `src.orchestrator.accel.ZERO3_THRESHOLD_B`, and the two features do
+    above `src.orchestrator.accel.CHECKPOINT_THRESHOLD_B`, and the two do
     not compose on their own: reentrant checkpointing only recomputes a
     segment whose *inputs* require grad, and with a frozen base model nothing
     upstream of the first adapter does. The backward pass then fails with

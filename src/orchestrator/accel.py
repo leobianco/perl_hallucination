@@ -61,16 +61,36 @@ NUM_PROCESSES = 2
 # --------------------------------------------------------------------------
 # Thresholds
 # --------------------------------------------------------------------------
-#: Billions of parameters at or above which a model counts as "large", i.e.
-#: gets gradient checkpointing everywhere and ZeRO Stage 3 in the PE-RL stage.
+#: Billions of parameters at or above which a model counts as "large" and
+#: gets the cheap memory savings: gradient checkpointing in every stage, and
+#: the halved PE-RL micro-batch (with doubled accumulation, so the effective
+#: batch is unchanged). Both are local, well-understood trades of compute for
+#: memory, and neither changes the distributed execution model.
 #:
 #: 6 sits between the 4B models the campaigns were tuned on and the 7B ones
-#: they are being retargeted at. Under Stage 2 a 7B policy and a 7B reward
-#: model are ~29 GB of bf16 weights resident on the same GPU during PE-RL,
-#: before activations and before the rollout KV cache; on an 80 GB card that
-#: is survivable but not comfortable, and it is the configuration that
-#: actually OOMs first.
-ZERO3_THRESHOLD_B = 6.0
+#: they are being retargeted at, so nothing below 6B changes behaviour.
+CHECKPOINT_THRESHOLD_B = 6.0
+
+#: Billions of parameters at or above which the PE-RL stage moves to ZeRO
+#: Stage 3.
+#:
+#: This was 6.0, which put Mistral-7B on Stage 3 and was a mistake worth
+#: recording. The arithmetic on a 2x80 GB box: a 7B policy and a 7B reward
+#: model are ~29 GB of bf16 weights, and with LoRA the gradients and optimiser
+#: state are a rounding error, so Stage 2 lands around 35-38 GB of 80 - some
+#: 42 GB spare. Stage 3 would cut that to ~27 GB while costing 20-30% in
+#: all-gather latency. Worse, the saving is partly fictional: the reward model
+#: is never passed to `deepspeed.initialize`, so it is not sharded at all, and
+#: `reward_fn` in src/pipelines.py all-gathers it in full for every scored
+#: batch regardless. Buying 8 GB of a 42 GB surplus for a quarter of the
+#: throughput is a bad trade, and Stage 3 is where this codebase's sharp edges
+#: live (the SFT adapter merge, the reward gather, generation gathering).
+#:
+#: 12 is where two resident models stop fitting comfortably: 4 GB per billion
+#: parameters for the pair, so ~48 GB of weights, leaving roughly 30 GB for
+#: activations and the rollout KV cache. It is an engineering estimate, not a
+#: measurement - watch `nvidia-smi` on the first campaign that crosses it.
+ZERO3_THRESHOLD_B = 12.0
 
 #: Above this, parameters do not fit even sharded across the box, so the only
 #: remaining move is to page them to host RAM. Deliberately far from anything
@@ -146,9 +166,11 @@ def resident_parameters_b(
   The PE-RL stage keeps the policy and the reward model resident at the same
   time, so it is sized on the *larger* of the two rather than on the policy
   alone. It is deliberately not their sum: the sum would have flipped the
-  existing 4B campaigns (4 + 4 = 8) onto Stage 3 and changed the behaviour of
-  runs that are known to work. The two-models-at-once cost is absorbed by
-  setting :data:`ZERO3_THRESHOLD_B` low instead.
+  existing 4B campaigns (4 + 4 = 8) onto a launcher they were never measured
+  under, changing the behaviour of runs that are known to work. The
+  two-models-at-once cost is accounted for in the thresholds themselves -
+  see :data:`ZERO3_THRESHOLD_B`, which is set from the arithmetic for a
+  *pair* of resident models, not a single one.
   """
   if stage == "rm":
     candidates = [reward_model or policy_model]
@@ -168,9 +190,17 @@ def is_large(
     stage: str,
     policy_model: str,
     reward_model: Optional[str] = None,
-    threshold: float = ZERO3_THRESHOLD_B,
+    threshold: float = CHECKPOINT_THRESHOLD_B,
 ) -> bool:
-  """Whether ``stage`` needs the memory-saving settings.
+  """Whether ``stage`` needs the cheap memory-saving settings.
+
+  This governs gradient checkpointing and the PE-RL batch geometry, which is
+  why it defaults to :data:`CHECKPOINT_THRESHOLD_B` and not to
+  :data:`ZERO3_THRESHOLD_B`. The two used to be one constant; they were split
+  because the point at which trading compute for activation memory starts to
+  pay (~6B) is far below the point at which it is worth changing the
+  distributed execution model (~12B). Profile selection is
+  :func:`select_profile`'s business, not this function's.
 
   Args:
     stage: 'sft', 'rm' or 'perl'.

@@ -110,10 +110,10 @@ def perl_batch_geometry(
   Args:
     env: Environment mapping to read overrides from. Defaults to ``os.environ``.
     policy_model: Base model of the policy. When given, a model at or above
-      :data:`src.orchestrator.accel.ZERO3_THRESHOLD_B` halves the micro-batch
-      and doubles the accumulation, exactly as the sweep stage does - the
-      retraining has to reproduce the trial that won, so the two scalings are
-      the same function applied to the same baseline.
+      :data:`src.orchestrator.accel.CHECKPOINT_THRESHOLD_B` halves the
+      micro-batch and doubles the accumulation, exactly as the sweep stage
+      does - the retraining has to reproduce the trial that won, so the two
+      scalings are the same function applied to the same baseline.
     reward_model: Base model of the reward model, when it differs.
 
   Returns:

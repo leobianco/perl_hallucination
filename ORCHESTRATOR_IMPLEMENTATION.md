@@ -188,26 +188,43 @@ which every caller reads as "keep the historical behaviour".
 | Estimated size | SFT / RM | PE-RL |
 |---|---|---|
 | < 6B | ZeRO-2 | ZeRO-2 |
-| 6B - 30B | ZeRO-2 + gradient checkpointing | ZeRO-3 + gradient checkpointing + halved micro-batch |
+| 6B - 12B | ZeRO-2 + gradient checkpointing | ZeRO-2 + gradient checkpointing + halved micro-batch |
+| 12B - 30B | ZeRO-2 + gradient checkpointing | ZeRO-3 + gradient checkpointing + halved micro-batch |
 | >= 30B | ZeRO-3 + CPU offload | ZeRO-3 + CPU offload |
 
-Three decisions worth keeping:
+Five decisions worth keeping:
 
 1. **PE-RL is sized on `max(policy, reward_model)`, not their sum.** Summing
    would push the existing 4B campaigns (4 + 4 = 8) onto a launcher they have
    never run under, invalidating every comparison against `BASELINES_*.md`.
-   The two-models-resident cost is absorbed by putting the threshold at 6
-   instead.
-2. **Stage 3 is applied to PE-RL only.** SFT and RM hold one model and train a
+   The two-models-resident cost is instead built into the thresholds, which
+   are derived from the arithmetic for a *pair* of models.
+2. **Two thresholds, not one.** `CHECKPOINT_THRESHOLD_B` (6) governs gradient
+   checkpointing and the batch geometry; `ZERO3_THRESHOLD_B` (12) governs the
+   launcher. They started as one constant at 6, which put Mistral-7B on Stage
+   3 - and Stage 3 broke the PE-RL adapter merge outright (see decision 4)
+   while buying ~8 GB of a ~42 GB surplus for 20-30% of throughput. Trading
+   compute for activation memory pays far earlier than changing the
+   distributed execution model does.
+3. **Stage 3 is applied to PE-RL only.** SFT and RM hold one model and train a
    LoRA adapter on it; at 7B that is ~14.5 GB of bf16 weights, which Stage 2
    handles comfortably, and sharding would buy nothing but all-gather latency.
-3. **Halving the micro-batch doubles accumulation.** The effective batch, and
+   Note also that the reward model is never passed to `deepspeed.initialize`,
+   so Stage 3 does not shard it, and `reward_fn` all-gathers it in full per
+   scored batch - the stage's headline saving is smaller than it looks.
+4. **Stage 3 profiles must set `zero3_init_flag: false`.** `PERLPipeline`
+   merges the SFT adapter with `merge_and_unload()` before the trainer exists.
+   Under `deepspeed.zero.Init` every parameter is a 0-element placeholder, so
+   PEFT's in-place merge raises "The size of tensor a (0) must match the size
+   of tensor b (4096)". `deepspeed.initialize` still partitions the policy
+   afterwards, so nothing is lost but a startup memory spike.
+5. **Halving the micro-batch doubles accumulation.** The effective batch, and
    therefore the optimisation problem the sweep searches, is invariant - only
    the peak activation memory of one micro-step falls. The scaling is applied
    by the same function on both sides (`BaseStage.apply_launcher_settings` for
    the trials, `model_manager.perl_batch_geometry` for the winner's
-   retraining), because a winner selected under Stage 3 that is retrained
-   under Stage 2 fails at the most expensive possible moment.
+   retraining), because a winner selected under one geometry that is retrained
+   under another fails at the most expensive possible moment.
 
 Escape hatches, in increasing order of bluntness: `--deepspeed-profile
 {auto,zero2,zero3,zero3_offload}` or a literal path; `PERL_<KEY>` environment

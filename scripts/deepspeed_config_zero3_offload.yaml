@@ -23,6 +23,12 @@
 # Host RAM is now a hard requirement: budget at least 2 bytes per parameter
 # per *process*, so ~30 GB of free RAM for a 7B model on two GPUs, more if
 # pin_memory keeps it resident.
+#
+# zero3_init_flag is false for the same reason as in
+# scripts/deepspeed_config_zero3.yaml: PE-RL merges the SFT adapter with
+# `merge_and_unload()` before the trainer runs, and `deepspeed.zero.Init`
+# leaves every parameter a 0-element placeholder that the merge cannot write
+# to. See that file for the full account.
 # ==============================================================================
 compute_environment: LOCAL_MACHINE
 debug: false
@@ -30,7 +36,7 @@ deepspeed_config:
   gradient_accumulation_steps: auto
   offload_optimizer_device: cpu
   offload_param_device: cpu
-  zero3_init_flag: true
+  zero3_init_flag: false
   zero3_save_16bit_model: true
   zero_stage: 3
 distributed_type: DEEPSPEED

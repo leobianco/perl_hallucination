@@ -3,8 +3,11 @@
 #
 # Selected automatically by src/orchestrator/accel.py for the PE-RL stage of a
 # campaign whose policy or reward model is "large" (>= accel.ZERO3_THRESHOLD_B
-# parameters, currently 6B). Everything else keeps ZeRO Stage 2, which is both
-# faster and sufficient below that size.
+# parameters, currently 12B). Everything else keeps ZeRO Stage 2, which is both
+# faster and sufficient below that size - including 7B models on a 2x80 GB box,
+# which Stage 2 fits with roughly 42 GB to spare. Reach for this file only when
+# the arithmetic in accel.ZERO3_THRESHOLD_B says two resident models no longer
+# fit, or pass --deepspeed-profile zero3 to force it.
 #
 # WHY STAGE 3 HERE AND NOWHERE ELSE
 # PE-RL is the only stage that holds two full models resident at once: the
@@ -19,13 +22,25 @@
 # `reward_fn` in src/pipelines.py must gather the *whole* reward model for
 # each scored batch (see the `deepspeed.zero.GatheredParameters` block there:
 # TRL's `ds3_gather_for_generation` only covers the policy). Expect the PE-RL
-# stage to run roughly 20-30% slower than it does under Stage 2.
+# stage to run roughly 20-30% slower than it does under Stage 2, and note that
+# the reward model is briefly resident in full during every scoring call, so
+# Stage 3 saves far less on it than the arithmetic above suggests.
 #
-# zero3_init_flag: true is load-bearing, not cosmetic. With it false,
-# `from_pretrained` materialises the full checkpoint on every rank before the
-# trainer partitions it, which both spikes memory at startup and leaves the
-# auxiliary reward model unpartitioned - i.e. it gives up exactly the saving
-# this file exists for.
+# WHY zero3_init_flag IS false
+# An earlier version of this file set it true, on the reasoning that letting
+# `from_pretrained` build the model inside `deepspeed.zero.Init()` avoids a
+# full-checkpoint spike on each rank. That is true, and it also breaks PE-RL
+# outright. `PERLPipeline.setup_model` merges the SFT adapter into the base
+# weights with `merge_and_unload()` before the trainer ever runs, and under
+# `zero.Init` every parameter is a 0-element placeholder whose real shard
+# lives in `ds_tensor`. PEFT's `base_layer.weight.data += delta_weight` then
+# dies with "The size of tensor a (0) must match the size of tensor b (4096)".
+# With the flag false the checkpoint is materialised whole, the merge sees
+# real weights, and `deepspeed.initialize` partitions the policy afterwards -
+# so training-time sharding is unaffected. The cost is a startup spike of one
+# full model per rank (~14.5 GB at 7B), which is affordable on an 80 GB card.
+# The auxiliary reward model then stays unpartitioned, which `reward_fn`
+# handles: it gathers only when it finds `ds_id` on the parameters.
 # ==============================================================================
 compute_environment: LOCAL_MACHINE
 debug: false
@@ -33,7 +48,7 @@ deepspeed_config:
   gradient_accumulation_steps: auto
   offload_optimizer_device: none
   offload_param_device: none
-  zero3_init_flag: true
+  zero3_init_flag: false
   # LoRA adapters are saved through the trainer, but the consolidated 16-bit
   # state dict is what makes a crashed run recoverable and what
   # `--load_best_model_at_end` needs to reload a partitioned checkpoint.

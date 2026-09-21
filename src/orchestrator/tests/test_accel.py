@@ -32,6 +32,9 @@ from src.orchestrator.sweep_controller import SweepController
 
 GEMMA = "google/gemma-4-E4B-it"
 MISTRAL = "mistralai/Mistral-7B-Instruct-v0.3"
+#: Above :data:`accel.ZERO3_THRESHOLD_B`, unlike MISTRAL. Stage 3 assertions
+#: need a model that genuinely crosses the threshold; 7B deliberately does not.
+LLAMA_13B = "meta-llama/Llama-2-13b-hf"
 
 
 class _Captured(Exception):
@@ -95,20 +98,36 @@ class SelectProfileTest(unittest.TestCase):
             "scripts/deepspeed_config.yaml",
         )
 
-  def test_a_7b_campaign_gets_stage_3_in_perl_only(self):
-    self.assertEqual(accel.select_profile("sft", MISTRAL), accel.ZERO2)
-    self.assertEqual(accel.select_profile("rm", MISTRAL), accel.ZERO2)
-    self.assertEqual(accel.select_profile("perl", MISTRAL), accel.ZERO3)
+  def test_a_7b_campaign_stays_on_stage_2_in_every_stage(self):
+    """7B is large enough for checkpointing but not for Stage 3.
+
+    On the 2x80 GB box these campaigns run on, a 7B policy and a 7B reward
+    model are ~29 GB of bf16 weights, which Stage 2 holds with roughly 42 GB
+    to spare. Stage 3 would cost 20-30% in all-gather latency to reclaim
+    memory that is not scarce - and `reward_fn` gathers the reward model in
+    full for every scored batch anyway, so much of the saving is fictional.
+    An earlier threshold of 6.0 put Mistral-7B on Stage 3 and broke the PE-RL
+    adapter merge; see ZERO3_THRESHOLD_B.
+    """
+    for stage in ("sft", "rm", "perl"):
+      with self.subTest(stage=stage):
+        self.assertEqual(accel.select_profile(stage, MISTRAL), accel.ZERO2)
+
+  def test_a_13b_campaign_gets_stage_3_in_perl_only(self):
+    self.assertEqual(accel.select_profile("sft", LLAMA_13B), accel.ZERO2)
+    self.assertEqual(accel.select_profile("rm", LLAMA_13B), accel.ZERO2)
+    self.assertEqual(accel.select_profile("perl", LLAMA_13B), accel.ZERO3)
 
   def test_perl_is_sized_on_the_larger_of_policy_and_reward_model(self):
     # The stage holds both. A small policy with a large reward model is just
     # as tight as the other way round.
     self.assertEqual(
-        accel.select_profile("perl", GEMMA, reward_model=MISTRAL), accel.ZERO3
+        accel.select_profile("perl", GEMMA, reward_model=LLAMA_13B),
+        accel.ZERO3,
     )
     # ...but the RM sweep itself only ever holds the reward model.
     self.assertEqual(
-        accel.select_profile("rm", MISTRAL, reward_model=GEMMA), accel.ZERO2
+        accel.select_profile("rm", LLAMA_13B, reward_model=GEMMA), accel.ZERO2
     )
 
   def test_two_4b_models_do_not_add_up_into_stage_3(self):
@@ -168,6 +187,36 @@ class SelectProfileTest(unittest.TestCase):
         # Every profile launches the same box; a mismatch here would start
         # one process per GPU on one profile and not the other.
         self.assertEqual(parsed["num_processes"], accel.NUM_PROCESSES)
+
+  def test_stage_3_profiles_do_not_enable_zero_init(self):
+    """Stage 3 must not build models inside ``deepspeed.zero.Init``.
+
+    ``PERLPipeline.setup_model`` merges the SFT adapter into the base weights
+    with ``merge_and_unload()`` before the trainer is constructed. Under
+    ``zero.Init`` each parameter is a 0-element placeholder whose real shard
+    lives in ``ds_tensor``, so PEFT's ``base_layer.weight.data +=
+    delta_weight`` raises "The size of tensor a (0) must match the size of
+    tensor b (4096)" and the stage dies on the VM after the checkpoint has
+    already been downloaded.
+
+    Turning the flag on saves a startup memory spike, which is a poor trade
+    against not running at all. ``deepspeed.initialize`` still partitions the
+    policy afterwards, so training-time sharding is unaffected.
+    """
+    repo_root = os.path.join(os.path.dirname(__file__), "..", "..", "..")
+    for name in (accel.ZERO3, accel.ZERO3_OFFLOAD):
+      with self.subTest(profile=name):
+        with open(
+            os.path.join(repo_root, accel.PROFILE_CONFIGS[name]),
+            "r",
+            encoding="utf-8",
+        ) as handle:
+          parsed = yaml.safe_load(handle)
+        self.assertIs(
+            parsed["deepspeed_config"]["zero3_init_flag"],
+            False,
+            f"{name} enables zero.Init, which breaks the PE-RL adapter merge.",
+        )
 
 
 class MemoryFlagsTest(unittest.TestCase):
@@ -399,8 +448,16 @@ class SweepCommandTest(unittest.TestCase):
         "A 4B campaign must not silently acquire gradient checkpointing.",
     )
 
-  def test_a_7b_perl_sweep_moves_to_stage_3(self):
+  def test_a_7b_perl_sweep_stays_on_stage_2(self):
+    # The memory flags below still apply at 7B - only the launcher does not.
     command = self._perl_command(MISTRAL)
+    self.assertEqual(
+        self._flag(command, "config_file"),
+        "scripts/deepspeed_config.yaml",
+    )
+
+  def test_a_13b_perl_sweep_moves_to_stage_3(self):
+    command = self._perl_command(LLAMA_13B)
     self.assertEqual(
         self._flag(command, "config_file"),
         "scripts/deepspeed_config_zero3.yaml",
@@ -488,12 +545,20 @@ class SweepMaterializationAgreementTest(unittest.TestCase):
     return None
 
   def test_the_retrain_uses_the_profile_the_sweep_selected(self):
+    # 13B, not 7B: the point of this test is that a *non-default* profile
+    # survives into the retrain, so it needs a model that selects one.
     config = CampaignConfig.create_default(task_name="npov", dry_run=True)
-    config.base_model = MISTRAL
-    command = self._plan_command(MISTRAL, config)
+    config.base_model = LLAMA_13B
+    command = self._plan_command(LLAMA_13B, config)
     self.assertIn(
         "--config_file=scripts/deepspeed_config_zero3.yaml", command
     )
+
+  def test_a_7b_retrain_stays_on_the_default_profile(self):
+    config = CampaignConfig.create_default(task_name="npov", dry_run=True)
+    config.base_model = MISTRAL
+    command = self._plan_command(MISTRAL, config)
+    self.assertIn("--config_file=scripts/deepspeed_config.yaml", command)
 
   def test_the_retrain_uses_the_batch_the_sweep_searched(self):
     config = CampaignConfig.create_default(task_name="npov", dry_run=True)

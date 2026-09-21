@@ -167,12 +167,12 @@ def build_parser() -> argparse.ArgumentParser:
           "DeepSpeed launcher profile: "
           + ", ".join(accel.VALID_PROFILES)
           + ", or a path to an accelerate config. Default 'auto' reads the"
-          " size off the base model's name: ZeRO Stage 2 throughout below"
-          f" {accel.ZERO3_THRESHOLD_B:g}B, Stage 3 for the PE-RL stage at or"
+          " size off the base model's name. ZeRO Stage 2 throughout below"
+          f" {accel.ZERO3_THRESHOLD_B:g}B; Stage 3 for the PE-RL stage at or"
           " above it (that stage holds the policy and the reward model at"
-          " once). A large model also gets gradient checkpointing and half"
-          " the PE-RL micro-batch, with accumulation doubled to keep the"
-          " effective batch."
+          f" once). Separately, from {accel.CHECKPOINT_THRESHOLD_B:g}B a model"
+          " gets gradient checkpointing and half the PE-RL micro-batch, with"
+          " accumulation doubled to keep the effective batch."
       ),
   )
   run_parser.add_argument(
