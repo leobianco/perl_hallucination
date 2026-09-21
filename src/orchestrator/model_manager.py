@@ -10,6 +10,7 @@ import shutil
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
+from src.orchestrator import accel
 from src.orchestrator import flavors
 from src.orchestrator import naming
 from src.orchestrator.config import RobustnessConfig
@@ -101,19 +102,33 @@ PERL_BATCH_GEOMETRY: Dict[str, str] = {
 
 def perl_batch_geometry(
     env: Optional[Dict[str, str]] = None,
+    policy_model: Optional[str] = None,
+    reward_model: Optional[str] = None,
 ) -> Dict[str, str]:
-  """Returns the PE-RL batch geometry with any environment overrides applied.
+  """Returns the PE-RL batch geometry for a given policy.
 
   Args:
     env: Environment mapping to read overrides from. Defaults to ``os.environ``.
+    policy_model: Base model of the policy. When given, a model at or above
+      :data:`src.orchestrator.accel.ZERO3_THRESHOLD_B` halves the micro-batch
+      and doubles the accumulation, exactly as the sweep stage does - the
+      retraining has to reproduce the trial that won, so the two scalings are
+      the same function applied to the same baseline.
+    reward_model: Base model of the reward model, when it differs.
 
   Returns:
-    A copy of :data:`PERL_BATCH_GEOMETRY` with ``PERL_<UPPERCASED_KEY>``
-    entries substituted. Values are passed through verbatim so that
-    ``HfArgumentParser`` - not this function - owns their validation.
+    A copy of :data:`PERL_BATCH_GEOMETRY` with the size scaling and then any
+    ``PERL_<UPPERCASED_KEY>`` entries substituted. Values are passed through
+    verbatim so that ``HfArgumentParser`` - not this function - owns their
+    validation.
+
+  The environment override is applied *last*, so an operator who pins
+  ``PERL_PER_DEVICE_TRAIN_BATCH_SIZE`` still wins over the automatic choice.
   """
   source = os.environ if env is None else env
   geometry = dict(PERL_BATCH_GEOMETRY)
+  if policy_model:
+    geometry = accel.scale_perl_geometry(geometry, policy_model, reward_model)
   for key in geometry:
     override = source.get(f"PERL_{key.upper()}")
     if override is not None and str(override).strip():
@@ -339,6 +354,8 @@ class ModelManager:
       eval_steps: Optional[int] = None,
       timestamp: Optional[str] = None,
       flavor: Optional[str] = None,
+      deepspeed_config: Optional[str] = None,
+      memory_flags: Optional[Dict[str, str]] = None,
   ) -> MaterializationPlan:
     """Builds the retraining command for a sweep's winning configuration.
 
@@ -364,6 +381,13 @@ class ModelManager:
         eval_steps: See :meth:`materialize_and_push`.
         timestamp: Overrides the ``%y%m%d%H%M`` stamp of the repo id; only
           meant for tests that need a stable name.
+        deepspeed_config: ``accelerate launch --config_file`` argument. None
+          keeps the manager's default. It must be the same profile the sweep
+          ran under - see ``CampaignConfig.deepspeed_config_for`` - because a
+          winner selected under ZeRO Stage 3 may simply not fit under Stage 2.
+        memory_flags: Extra ``flag -> value`` training arguments the base
+          model's size calls for (gradient checkpointing, today). The sweep
+          passes the same ones; see ``BaseStage.apply_launcher_settings``.
 
     Returns:
         The :class:`MaterializationPlan` describing the run.
@@ -463,7 +487,7 @@ class ModelManager:
     cmd = [
         "accelerate",
         "launch",
-        f"--config_file={self.deepspeed_config}",
+        f"--config_file={deepspeed_config or self.deepspeed_config}",
         script_path,
         "--task_name",
         task_name,
@@ -611,7 +635,9 @@ class ModelManager:
           str(REWARD_PENALTY_ALPHA),
       ])
       # Size-dependent, not experiment-dependent: see PERL_BATCH_GEOMETRY.
-      for flag, value in perl_batch_geometry().items():
+      # Passing the policy makes a large model shrink the micro-batch here
+      # exactly as it did in the sweep, so the retrain reproduces the trial.
+      for flag, value in perl_batch_geometry(policy_model=base_model).items():
         cmd.extend([f"--{flag}", value])
       cmd.extend([
           "--logging_steps",
@@ -621,6 +647,14 @@ class ModelManager:
           "--eval_on_start",
           "True",
       ])
+
+    # Memory settings the base model's size calls for. Appended rather than
+    # folded into the per-stage blocks above because they are a property of
+    # the checkpoint being trained, not of the stage training it - and skipped
+    # when the stage already pins them, so an explicit value always wins.
+    for flag, value in (memory_flags or {}).items():
+      if f"--{flag}" not in cmd:
+        cmd.extend([f"--{flag}", str(value)])
 
     # Inject the winning hyperparameters (scalars only, allowlisted).
     #
@@ -670,6 +704,8 @@ class ModelManager:
       checkpoint_policy: str = "best",
       eval_steps: Optional[int] = None,
       flavor: Optional[str] = None,
+      deepspeed_config: Optional[str] = None,
+      memory_flags: Optional[Dict[str, str]] = None,
   ) -> str:
     """Executes a single training run with winning hyperparameters and pushes to HF Hub.
 
@@ -696,6 +732,9 @@ class ModelManager:
           ``checkpoint_policy="best"``, where it bounds how finely the best
           checkpoint can be located; it should mirror the sweep YAML's
           ``--eval_steps``. None keeps the stage's historical cadence.
+        deepspeed_config: The launcher the sweep ran under. None keeps the
+          manager's default; see :meth:`build_materialization_command`.
+        memory_flags: Size-derived training flags the sweep also passed.
 
     Returns:
         The uploaded Hugging Face model repository ID.
@@ -717,6 +756,8 @@ class ModelManager:
         checkpoint_policy=checkpoint_policy,
         eval_steps=eval_steps,
         flavor=flavor,
+        deepspeed_config=deepspeed_config,
+        memory_flags=memory_flags,
     )
     repo_id = plan.repo_id
     output_dir = plan.output_dir

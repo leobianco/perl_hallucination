@@ -22,6 +22,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from src.orchestrator.cli import theme as theme_mod
 from src.orchestrator.cli.console import UiConsole
 from src.orchestrator.cli.renderables import banner
+from src.orchestrator import accel
 from src.orchestrator import config as config_mod
 from src.orchestrator import flavors
 from src.orchestrator.config import CampaignConfig, VALID_TASKS
@@ -197,6 +198,8 @@ def equivalent_command(config: CampaignConfig) -> str:
     parts.append(f'--base-model "{config.base_model}"')
   if config.reward_base_model and config.reward_base_model != config.base_model:
     parts.append(f'--reward-base-model "{config.reward_base_model}"')
+  if config.deepspeed_profile != accel.AUTO:
+    parts.append(f"--deepspeed-profile {config.deepspeed_profile}")
   stages = theme_mod.iter_stage_names(config.stages)
   if stages != list(config_mod.VALID_STAGES):
     parts.append(f"--stages {','.join(stages)}")
@@ -220,6 +223,32 @@ def equivalent_command(config: CampaignConfig) -> str:
   return " ".join(parts)
 
 
+def launcher_summary(config: CampaignConfig) -> str:
+  """Describes the DeepSpeed profile each training stage will launch under.
+
+  Args:
+    config: The campaign being reviewed.
+
+  Returns:
+    Something like ``zero2 (auto, ~4B)`` when every stage agrees, or
+    ``sft/rm zero2, perl zero3 (auto, ~7B)`` when they do not.
+  """
+  size = accel.resident_parameters_b("perl", config.base_model,
+                                     config.reward_base_model)
+  origin = "auto" if config.deepspeed_profile == accel.AUTO else "forced"
+  scale = f"{origin}, ~{size:g}B" if size is not None else f"{origin}, size unknown"
+  names = []
+  for stage in ("sft", "rm", "perl"):
+    path = config.deepspeed_config_for(stage)
+    names.append(
+        next((key for key, value in accel.PROFILE_CONFIGS.items()
+              if value == path), path)
+    )
+  if len(set(names)) == 1:
+    return f"{names[0]} ({scale})"
+  return f"sft {names[0]}, rm {names[1]}, perl {names[2]} ({scale})"
+
+
 def config_summary_lines(config: CampaignConfig, theme: theme_mod.Theme) -> List[str]:
   """Renders the human-readable review block shown before launching."""
   stages = theme_mod.iter_stage_names(config.stages)
@@ -235,6 +264,11 @@ def config_summary_lines(config: CampaignConfig, theme: theme_mod.Theme) -> List
   # expensive to discover after the fact.
   if config.reward_base_model and config.reward_base_model != config.base_model:
     rows.append(("Reward base model", config.reward_base_model))
+  # Always shown, because it is derived rather than chosen: the operator is
+  # picking a model, and this is the consequence they did not type. Anything
+  # other than plain ZeRO Stage 2 means the campaign will be slower than the
+  # runtime estimate below, and that is worth reading before confirming.
+  rows.append(("Launcher", launcher_summary(config)))
   # A two-flavor campaign silently doubles the RM and PE-RL budgets, so the
   # review block has to say so before the user confirms the estimate.
   campaign_flavors = flavors.campaign_flavors(config)

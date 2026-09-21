@@ -70,7 +70,11 @@ EVAL_STEPS=50
 EVAL_ON_START=True
 
 # Infrastructure Parameters
-DEEPSPEED_CONFIG="scripts/deepspeed_config.yaml"
+# Override for a large policy, e.g.
+#   DEEPSPEED_CONFIG=scripts/deepspeed_config_zero3.yaml ./perl.sh
+# The orchestrator picks this automatically from the model size (see
+# src/orchestrator/accel.py); a hand-run script has to be told.
+DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-scripts/deepspeed_config.yaml}"
 SHUTDOWN=false
 
 # Parameters derived from above

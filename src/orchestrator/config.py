@@ -10,6 +10,7 @@ import os
 from typing import Any, Dict, List, Optional
 import yaml
 
+from src.orchestrator import accel
 from src.orchestrator import flavors
 
 
@@ -332,6 +333,21 @@ class CampaignConfig:
   #: a small reward model against a larger policy.
   reward_base_model: Optional[str] = None
 
+  #: Which ``accelerate``/DeepSpeed launcher profile the training stages use.
+  #:
+  #: ``auto`` (the default) derives it from the size the base model's name
+  #: advertises: see :mod:`src.orchestrator.accel`. In practice that means
+  #: ZeRO Stage 2 everywhere for the 4B models this project was built on -
+  #: byte-identical commands to the ones that ran before the knob existed -
+  #: and Stage 3 for the PE-RL stage only once the policy reaches 6B, which
+  #: is the stage and the size at which two resident models stop fitting
+  #: comfortably on an 80 GB card.
+  #:
+  #: Set it to a profile name (``zero2``, ``zero3``, ``zero3_offload``) to
+  #: force one, or to a literal path to an accelerate config file to use
+  #: something this project does not have a name for.
+  deepspeed_profile: str = accel.AUTO
+
   #: ``autorater`` comes first and is not a training stage: it measures the
   #: Gemini judge against the human-labelled set and fits the decision
   #: threshold the final evaluation then scores with. It runs before any GPU
@@ -409,6 +425,56 @@ class CampaignConfig:
     """
     return self.eval.fluency_model or self.base_model
 
+  def deepspeed_config_for(self, stage: str) -> str:
+    """The ``accelerate launch --config_file`` argument for one stage.
+
+    Same contract as :meth:`resolved_reward_base_model`: one place decides,
+    so the sweep and the winner's retraining cannot end up on different
+    launchers. They must agree - a trial that fitted under Stage 3 and a
+    retrain that does not fit under Stage 2 is a campaign that dies after the
+    expensive part is already paid for.
+
+    Args:
+      stage: 'sft', 'rm' or 'perl'.
+
+    Returns:
+      A path to an accelerate config file.
+    """
+    return accel.deepspeed_config_path(
+        stage,
+        self.base_model,
+        self.reward_base_model,
+        profile=self.deepspeed_profile,
+    )
+
+  def memory_flags_for(self, stage: str) -> Dict[str, str]:
+    """Extra training flags a large base model needs, as ``flag -> value``.
+
+    Args:
+      stage: 'sft', 'rm' or 'perl'.
+
+    Returns:
+      A mapping without the leading ``--``; empty below
+      :data:`src.orchestrator.accel.ZERO3_THRESHOLD_B`.
+    """
+    return accel.memory_flags(stage, self.base_model, self.reward_base_model)
+
+  def describe_launcher(self, stage: str) -> str:
+    """One line naming the launcher choice and why, for the campaign log.
+
+    Args:
+      stage: 'sft', 'rm' or 'perl'.
+
+    Returns:
+      Human-readable summary; see :func:`src.orchestrator.accel.describe`.
+    """
+    return accel.describe(
+        stage,
+        self.base_model,
+        self.reward_base_model,
+        profile=self.deepspeed_profile,
+    )
+
   def validate(self) -> None:
     """Validates the campaign configuration values.
 
@@ -426,6 +492,26 @@ class CampaignConfig:
             f"Invalid stage '{stage_name}'. Must be one of "
             f"{list(VALID_STAGES)}"
         )
+
+    # A profile name is checked, a path is not: the path is only read by
+    # `accelerate launch`, minutes later, and a typo there is reported
+    # clearly. A typo in a *name* would instead fall through
+    # `deepspeed_config_path` as if it were a path, and the campaign would
+    # die on "config file not found" with no hint that 'zero_3' was meant to
+    # be 'zero3'.
+    profile = (self.deepspeed_profile or "").strip()
+    if not profile:
+      raise ValueError(
+          "deepspeed_profile must not be empty; use 'auto' to let the base "
+          f"model's size decide, or one of {list(accel.PROFILE_CONFIGS)}."
+      )
+    looks_like_path = "/" in profile or profile.endswith((".yaml", ".yml"))
+    if profile not in accel.VALID_PROFILES and not looks_like_path:
+      raise ValueError(
+          f"Unknown deepspeed_profile '{profile}'. Must be one of "
+          f"{list(accel.VALID_PROFILES)}, or a path to an accelerate "
+          "config file."
+      )
 
     # Caught here rather than at dataset-load time: a typo'd flavor would
     # otherwise surface as a 404 from the Hub an hour into the campaign,

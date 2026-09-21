@@ -100,7 +100,66 @@ DATASET_WITH_COMPLETIONS="leobianco/npov_eval_last_ckpt_220" \
 ./scripts/evaluator.sh npov score
 ```
 
-We perform our experiments in a multi-GPU setting. More precisely, we use 8 x L4 GPUs. For an efficient use of GPU memory, we employ pipeline parallelism, specifically ZeRO Phase-3 [(link to paper)](https://arxiv.org/abs/1910.02054). To do so, we use Hugging Face's Accelerate library integration of Microsoft's DeepSpeed. The configuration used for our experiments is stored in `scripts/deepspeed_config.yaml` (you should run `accelerate config` to set up your own environment, see [Accelerate's documentation](https://huggingface.co/docs/transformers/en/deepspeed) for more details).
+## Base models, GPUs and DeepSpeed
+
+The original experiments ran on 8 x L4 GPUs. For an efficient use of GPU
+memory we employ ZeRO
+[(link to paper)](https://arxiv.org/abs/1910.02054) through Hugging Face's
+Accelerate integration of Microsoft's DeepSpeed. The configurations live in
+`scripts/` (run `accelerate config` to set up your own environment, see
+[Accelerate's documentation](https://huggingface.co/docs/transformers/en/deepspeed)).
+All three ship with `num_processes: 2`, matching the 2 x A100-80GB box the
+campaigns currently run on.
+
+| Profile | File | Used for |
+|---|---|---|
+| `zero2` | `scripts/deepspeed_config.yaml` | everything below 6B, and SFT/RM at any size below 30B |
+| `zero3` | `scripts/deepspeed_config_zero3.yaml` | the PE-RL stage from 6B up |
+| `zero3_offload` | `scripts/deepspeed_config_zero3_offload.yaml` | from 30B up, or forced by hand |
+
+### Running a campaign on another base model
+
+```bash
+python3 scripts/run_campaign.py run --task npov \
+    --base-model "mistralai/Mistral-7B-Instruct-v0.3"
+```
+
+`--base-model` reaches the SFT, RM and PE-RL sweeps, the winners' retraining
+and the evaluation, overriding the `--model_repo_id` pinned in every
+`scripts/sweep_*.yaml`. The wizard (`run_campaign.py wizard`) asks for it too
+and shows the resulting launcher in its review block. Nothing else needs
+editing; `src/model_compat.py` handles the family differences (chat template,
+turn terminator, missing pad token).
+
+**What a large model changes automatically.** `src/orchestrator/accel.py`
+reads the parameter count off the checkpoint's name and, at or above 6B:
+
+* the PE-RL stage moves to ZeRO Stage 3, because it is the only stage holding
+  two models at once - the policy and the reward model, ~29 GB of bf16 weights
+  at 7B - before activations and the rollout KV cache;
+* every training stage gets `--gradient_checkpointing True`;
+* the PE-RL micro-batch is halved and gradient accumulation doubled, so the
+  effective batch, and therefore the optimisation problem the sweep searches,
+  is unchanged.
+
+Below 6B nothing changes at all, so the existing 4B results stay comparable.
+Override the profile with `--deepspeed-profile {auto,zero2,zero3,zero3_offload}`
+or a path; override the batch geometry with
+`PERL_PER_DEVICE_TRAIN_BATCH_SIZE` / `PERL_GRADIENT_ACCUMULATION_STEPS` (an
+explicit environment value always beats the automatic one). Hand-run scripts
+do not consult the orchestrator, so tell them directly:
+
+```bash
+DEEPSPEED_CONFIG=scripts/deepspeed_config_zero3.yaml \
+MODEL_REPO_ID=mistralai/Mistral-7B-Instruct-v0.3 ./scripts/perl.sh npov
+```
+
+> **Cost of Stage 3.** Parameters are all-gathered on every forward, and the
+> reward model is gathered once per scored batch (TRL's
+> `ds3_gather_for_generation` only covers the policy, so `reward_fn` in
+> `src/pipelines.py` does it explicitly). Budget 20-30% more wall clock for
+> the PE-RL stage than the estimate the wizard prints.
+
 
 ## Other notes
 

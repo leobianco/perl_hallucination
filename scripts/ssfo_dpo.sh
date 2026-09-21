@@ -27,7 +27,11 @@ EVAL_STRATEGY="epoch"
 SAVE_STRATEGY="epoch"
 
 # Infrastructure Parameters
-DEEPSPEED_CONFIG="scripts/deepspeed_config.yaml"
+# Override for a large policy, e.g.
+#   DEEPSPEED_CONFIG=scripts/deepspeed_config_zero3.yaml ./ssfo_dpo.sh
+# The orchestrator picks this automatically from the model size (see
+# src/orchestrator/accel.py); a hand-run script has to be told.
+DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-scripts/deepspeed_config.yaml}"
 
 # Parameters derived from above
 TASK_NAME="$1"

@@ -39,7 +39,11 @@ REWARD_MAX_LENGTH="${REWARD_MAX_LENGTH:-2048}"
 # Infrastructure Parameters
 PRECISION="BF16"
 EVAL_STEPS=25
-DEEPSPEED_CONFIG="scripts/deepspeed_config.yaml"
+# Override for a large policy, e.g.
+#   DEEPSPEED_CONFIG=scripts/deepspeed_config_zero3.yaml ./reward_model.sh
+# The orchestrator picks this automatically from the model size (see
+# src/orchestrator/accel.py); a hand-run script has to be told.
+DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-scripts/deepspeed_config.yaml}"
 
 # Parameters derived from above
 TASK_NAME="$1"

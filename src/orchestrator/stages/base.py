@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 import logging
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
+from src.orchestrator import accel
 from src.orchestrator import flavors
 from src.orchestrator import naming
 from src.orchestrator.config import CampaignConfig, SweepStageConfig
@@ -263,6 +264,106 @@ class BaseStage(abc.ABC):
     """Executes the stage logic and returns the resulting StageResult."""
 
   # --- Shared helpers -------------------------------------------------
+  def apply_launcher_settings(
+      self,
+      sweep_dict: Dict[str, Any],
+      live_line_callback: Optional[Callable[[str], None]] = None,
+  ) -> None:
+    """Rewrites a sweep's launcher config and memory flags for the base model.
+
+    The sweep YAMLs pin ``--config_file=scripts/deepspeed_config.yaml`` and a
+    batch geometry that were both tuned for a ~4B policy. ``--base-model``
+    made the size a free variable without making these follow it, so a 7B
+    campaign launched under the 4B settings and, with
+    ``auto_find_batch_size=False`` in the PE-RL sweep, had no runtime escape
+    hatch from the resulting OOM.
+
+    Mutates ``sweep_dict`` in place, because that is what the caller then
+    registers with W&B. A small model produces no change at all, so the
+    campaigns this project already ran keep emitting identical commands.
+
+    Args:
+      sweep_dict: The parsed sweep YAML; its ``command`` list is patched.
+      live_line_callback: Optional sink for the one-line explanation, so the
+        choice is visible in the TUI as well as in the log.
+    """
+    command = sweep_dict.get("command")
+    if not isinstance(command, list):
+      return
+
+    config_path = self.config.deepspeed_config_for(self.kind)
+    desired = f"--config_file={config_path}"
+    for idx, arg in enumerate(command):
+      if isinstance(arg, str) and arg.startswith("--config_file="):
+        changed = command[idx] != desired
+        command[idx] = desired
+        break
+    else:
+      # No launcher argument at all: this sweep does not go through
+      # `accelerate launch`, so there is nothing to point at a profile.
+      return
+
+    # Applied by name, never appended blindly: a sweep that already pins one
+    # of these has done so deliberately and is left alone.
+    for flag, value in self.config.memory_flags_for(self.kind).items():
+      token = f"--{flag}="
+      if any(isinstance(arg, str) and arg.startswith(token) for arg in command):
+        continue
+      # Before ``${args}``, which W&B expands into the trial's sampled
+      # hyperparameters and which must stay last.
+      insert_at = len(command)
+      for idx, arg in enumerate(command):
+        if arg == "${args}":
+          insert_at = idx
+          break
+      command.insert(insert_at, f"{token}{value}")
+      changed = True
+
+    if self.kind == "perl":
+      changed = self._scale_perl_geometry(command) or changed
+
+    if changed:
+      message = f"Launcher: {self.config.describe_launcher(self.kind)}"
+      logger.info(message)
+      if live_line_callback:
+        live_line_callback(f"  {message}")
+
+  def _scale_perl_geometry(self, command: List[Any]) -> bool:
+    """Rewrites the PE-RL batch geometry pinned in a sweep command.
+
+    The sweep and the winner's retraining must use the same geometry, or the
+    published policy is not the one the sweep ranked. The retraining reads
+    :func:`src.orchestrator.model_manager.perl_batch_geometry`, which applies
+    the same scaling to the same baseline, so the two stay in step.
+
+    Args:
+      command: The sweep's ``command`` list, patched in place.
+
+    Returns:
+      True when anything changed.
+    """
+    positions = {}
+    geometry = {}
+    for idx, arg in enumerate(command):
+      if not isinstance(arg, str) or not arg.startswith("--"):
+        continue
+      key, sep, value = arg[2:].partition("=")
+      if sep and key in accel.PERL_GEOMETRY_KEYS:
+        positions[key] = idx
+        geometry[key] = value
+    if not geometry:
+      return False
+
+    scaled = accel.scale_perl_geometry(
+        geometry, self.config.base_model, self.config.reward_base_model
+    )
+    changed = False
+    for key, value in scaled.items():
+      if key in positions and value != geometry.get(key):
+        command[positions[key]] = f"--{key}={value}"
+        changed = True
+    return changed
+
   def tunable_keys(self, sweep_dict: Dict[str, Any]) -> Set[str]:
     """Returns the hyperparameter names this sweep actually searches over.
 

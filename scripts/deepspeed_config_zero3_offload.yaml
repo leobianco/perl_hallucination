@@ -1,0 +1,49 @@
+# ==============================================================================
+# Accelerate + DeepSpeed ZeRO Stage 3 with CPU offload.
+#
+# The last resort. Selected automatically only above accel.OFFLOAD_THRESHOLD_B
+# (currently 30B), and otherwise reachable on purpose with
+#
+#     python3 scripts/run_campaign.py run --task npov \
+#         --base-model <repo> --deepspeed-profile zero3_offload
+#
+# WHEN IT IS THE RIGHT ANSWER
+# When the weights alone do not fit: parameters and optimizer state are paged
+# to host RAM and streamed back per layer. That buys a model that would
+# otherwise be un-runnable, at a cost of several times the step time - the
+# PCIe link, not the GPU, becomes the bottleneck.
+#
+# WHEN IT IS THE WRONG ANSWER
+# For a LoRA campaign at 7B. Only the adapter is trainable, so the optimizer
+# state that offloading moves is already tiny (tens of MB), and
+# `offload_param_device: cpu` would pay the full streaming cost to solve a
+# problem plain Stage 3 already solves. Reach for
+# scripts/deepspeed_config_zero3.yaml first and only come here if it OOMs.
+#
+# Host RAM is now a hard requirement: budget at least 2 bytes per parameter
+# per *process*, so ~30 GB of free RAM for a 7B model on two GPUs, more if
+# pin_memory keeps it resident.
+# ==============================================================================
+compute_environment: LOCAL_MACHINE
+debug: false
+deepspeed_config:
+  gradient_accumulation_steps: auto
+  offload_optimizer_device: cpu
+  offload_param_device: cpu
+  zero3_init_flag: true
+  zero3_save_16bit_model: true
+  zero_stage: 3
+distributed_type: DEEPSPEED
+downcast_bf16: 'no'
+enable_cpu_affinity: false
+machine_rank: 0
+main_training_function: main
+mixed_precision: bf16
+num_machines: 1
+num_processes: 2
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false

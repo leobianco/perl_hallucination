@@ -1,0 +1,57 @@
+# ==============================================================================
+# Accelerate + DeepSpeed ZeRO Stage 3 (no offload).
+#
+# Selected automatically by src/orchestrator/accel.py for the PE-RL stage of a
+# campaign whose policy or reward model is "large" (>= accel.ZERO3_THRESHOLD_B
+# parameters, currently 6B). Everything else keeps ZeRO Stage 2, which is both
+# faster and sufficient below that size.
+#
+# WHY STAGE 3 HERE AND NOWHERE ELSE
+# PE-RL is the only stage that holds two full models resident at once: the
+# policy being optimised and the reward model scoring its rollouts. At 7B that
+# is ~29 GB of bf16 weights per GPU under Stage 2, before activations and
+# before the rollout KV cache. Stage 3 partitions the parameters across the
+# data-parallel group, so a 2-GPU box holds ~14.5 GB of weights per GPU
+# instead, and the headroom goes to the rollouts.
+#
+# WHAT IT COSTS
+# Parameters are all-gathered layer by layer on every forward, and
+# `reward_fn` in src/pipelines.py must gather the *whole* reward model for
+# each scored batch (see the `deepspeed.zero.GatheredParameters` block there:
+# TRL's `ds3_gather_for_generation` only covers the policy). Expect the PE-RL
+# stage to run roughly 20-30% slower than it does under Stage 2.
+#
+# zero3_init_flag: true is load-bearing, not cosmetic. With it false,
+# `from_pretrained` materialises the full checkpoint on every rank before the
+# trainer partitions it, which both spikes memory at startup and leaves the
+# auxiliary reward model unpartitioned - i.e. it gives up exactly the saving
+# this file exists for.
+# ==============================================================================
+compute_environment: LOCAL_MACHINE
+debug: false
+deepspeed_config:
+  gradient_accumulation_steps: auto
+  offload_optimizer_device: none
+  offload_param_device: none
+  zero3_init_flag: true
+  # LoRA adapters are saved through the trainer, but the consolidated 16-bit
+  # state dict is what makes a crashed run recoverable and what
+  # `--load_best_model_at_end` needs to reload a partitioned checkpoint.
+  zero3_save_16bit_model: true
+  zero_stage: 3
+distributed_type: DEEPSPEED
+downcast_bf16: 'no'
+enable_cpu_affinity: false
+machine_rank: 0
+main_training_function: main
+mixed_precision: bf16
+num_machines: 1
+# Must equal the number of visible GPUs. Two, matching the A100-80GB pair the
+# campaigns run on; see scripts/deepspeed_config.yaml.
+num_processes: 2
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false

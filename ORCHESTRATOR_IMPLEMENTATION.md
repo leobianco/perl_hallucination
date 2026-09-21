@@ -171,6 +171,57 @@ sequenceDiagram
   `--sft_model_path=<sft_repo_id>` and `--reward_model_path=<rm_repo_id>`
   directly into the in-memory command dictionary before calling `wandb.sweep(...)`. No manual file editing required.
 
+#### 4.3.1. Size-aware launcher selection (`src/orchestrator/accel.py`)
+
+`--base-model` made the model a free variable, but two settings pinned in the
+sweep YAMLs were tuned for a ~4B policy and did not follow it: the
+`--config_file` handed to `accelerate launch`, and the PE-RL batch geometry.
+With `auto_find_batch_size=False` in `sweep_perl.yaml` there is no runtime
+escape from the consequences, so a 7B campaign OOMed hours in.
+
+`accel.py` derives everything from the parameter count the checkpoint's *name*
+advertises - no Hub round-trip, no torch import, no GPU query, because the
+orchestrator has to run hermetically under plain `python3` and produce the
+same command in a dry run as in a real one. An unparseable name yields `None`,
+which every caller reads as "keep the historical behaviour".
+
+| Estimated size | SFT / RM | PE-RL |
+|---|---|---|
+| < 6B | ZeRO-2 | ZeRO-2 |
+| 6B - 30B | ZeRO-2 + gradient checkpointing | ZeRO-3 + gradient checkpointing + halved micro-batch |
+| >= 30B | ZeRO-3 + CPU offload | ZeRO-3 + CPU offload |
+
+Three decisions worth keeping:
+
+1. **PE-RL is sized on `max(policy, reward_model)`, not their sum.** Summing
+   would push the existing 4B campaigns (4 + 4 = 8) onto a launcher they have
+   never run under, invalidating every comparison against `BASELINES_*.md`.
+   The two-models-resident cost is absorbed by putting the threshold at 6
+   instead.
+2. **Stage 3 is applied to PE-RL only.** SFT and RM hold one model and train a
+   LoRA adapter on it; at 7B that is ~14.5 GB of bf16 weights, which Stage 2
+   handles comfortably, and sharding would buy nothing but all-gather latency.
+3. **Halving the micro-batch doubles accumulation.** The effective batch, and
+   therefore the optimisation problem the sweep searches, is invariant - only
+   the peak activation memory of one micro-step falls. The scaling is applied
+   by the same function on both sides (`BaseStage.apply_launcher_settings` for
+   the trials, `model_manager.perl_batch_geometry` for the winner's
+   retraining), because a winner selected under Stage 3 that is retrained
+   under Stage 2 fails at the most expensive possible moment.
+
+Escape hatches, in increasing order of bluntness: `--deepspeed-profile
+{auto,zero2,zero3,zero3_offload}` or a literal path; `PERL_<KEY>` environment
+variables for the geometry (always beat the automatic value); `DEEPSPEED_CONFIG`
+for hand-run `scripts/*.sh`, which never consult the orchestrator.
+
+One trap the change had to fix in the training code: LoRA plus gradient
+checkpointing do not compose on their own. Reentrant checkpointing only
+recomputes a segment whose *inputs* require grad, and with a frozen base model
+nothing upstream of the first adapter does, so the backward pass raises
+"element 0 of tensors does not require grad". `Pipeline._attach_lora` now calls
+`enable_input_require_grads()` whenever `--gradient_checkpointing` is on.
+
+
 ### 4.4. "Stylish & Intelligible" Reporting Engine
 The reporting engine consolidates the entire campaign into three formats:
 1. **Rich Terminal Scorecard**: Clean CLI table displaying stages, durations, winning hyperparams, and delta metrics.

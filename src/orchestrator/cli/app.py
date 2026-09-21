@@ -19,6 +19,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from src.orchestrator import accel
 from src.orchestrator import flavors
 from src.orchestrator import shutdown
 from src.orchestrator.cli import renderables
@@ -158,6 +159,20 @@ def build_parser() -> argparse.ArgumentParser:
       help=(
           "Base model for the reward model, when it should differ from"
           " --base-model. Defaults to --base-model."
+      ),
+  )
+  run_parser.add_argument(
+      "--deepspeed-profile", default=None,
+      help=(
+          "DeepSpeed launcher profile: "
+          + ", ".join(accel.VALID_PROFILES)
+          + ", or a path to an accelerate config. Default 'auto' reads the"
+          " size off the base model's name: ZeRO Stage 2 throughout below"
+          f" {accel.ZERO3_THRESHOLD_B:g}B, Stage 3 for the PE-RL stage at or"
+          " above it (that stage holds the policy and the reward model at"
+          " once). A large model also gets gradient checkpointing and half"
+          " the PE-RL micro-batch, with accumulation doubled to keep the"
+          " effective batch."
       ),
   )
   run_parser.add_argument(
@@ -670,6 +685,8 @@ def cmd_run(args: argparse.Namespace, console: UiConsole) -> int:
     config.base_model = args.base_model
   if getattr(args, "reward_base_model", None):
     config.reward_base_model = args.reward_base_model
+  if getattr(args, "deepspeed_profile", None):
+    config.deepspeed_profile = args.deepspeed_profile
   if args.sft_model:
     config.perl.sft_model_path = args.sft_model
   if args.reward_model:

@@ -77,6 +77,11 @@ class SftStage(BaseStage):
       if not has_model:
         cmd_list.append(f"--model_repo_id={self.config.base_model}")
 
+    # Must come after the model is pinned above: the launcher profile and the
+    # memory flags are derived from which model this sweep will actually
+    # train, not from whatever the YAML shipped with.
+    self.apply_launcher_settings(sweep_dict, live_line_callback)
+
     # Apply parameter search overrides if specified
     if cfg.parameter_overrides and "parameters" in sweep_dict:
       for param_name, param_spec in cfg.parameter_overrides.items():
@@ -132,6 +137,8 @@ class SftStage(BaseStage):
         live_line_callback=live_line_callback,
         tunable_keys=self.tunable_keys(sweep_dict),
         stop_requested_callback=self.materialization_stop_callback(),
+        deepspeed_config=self.config.deepspeed_config_for(self.kind),
+        memory_flags=self.config.memory_flags_for(self.kind),
         **self.materialization_checkpoint_kwargs(cfg),
     )
 

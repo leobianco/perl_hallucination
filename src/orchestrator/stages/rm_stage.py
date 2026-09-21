@@ -121,6 +121,11 @@ class RmStage(BaseStage):
       if not has_model:
         cmd_list.append(f"--model_repo_id={rm_base_model}")
 
+    # Sized on `resolved_reward_base_model`, not on the policy: an
+    # asymmetric campaign (small reward model, large policy) must not pay
+    # the large model's launcher for the small model's sweep.
+    self.apply_launcher_settings(sweep_dict, live_line_callback)
+
     # Apply parameter search overrides if specified
     if cfg.parameter_overrides and "parameters" in sweep_dict:
       for param_name, param_spec in cfg.parameter_overrides.items():
@@ -178,6 +183,8 @@ class RmStage(BaseStage):
         live_line_callback=live_line_callback,
         tunable_keys=self.tunable_keys(sweep_dict),
         stop_requested_callback=self.materialization_stop_callback(),
+        deepspeed_config=self.config.deepspeed_config_for(self.kind),
+        memory_flags=self.config.memory_flags_for(self.kind),
         **self.materialization_checkpoint_kwargs(cfg),
     )
 

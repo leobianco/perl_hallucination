@@ -642,6 +642,18 @@ class Pipeline(abc.ABC):
     `--lora_target_modules` works everywhere rather than in whichever
     pipeline remembered to read it.
 
+    It is also where gradient checkpointing is made safe under LoRA. The
+    orchestrator turns `--gradient_checkpointing` on for any base model at or
+    above `src.orchestrator.accel.ZERO3_THRESHOLD_B`, and the two features do
+    not compose on their own: reentrant checkpointing only recomputes a
+    segment whose *inputs* require grad, and with a frozen base model nothing
+    upstream of the first adapter does. The backward pass then fails with
+    "element 0 of tensors does not require grad", or - worse, on some
+    versions - silently produces no adapter gradient at all.
+    `enable_input_require_grads` attaches a forward hook to the input
+    embeddings that flips `requires_grad` on their output, which is the
+    documented fix and a no-op when checkpointing is off.
+
     Args:
       model: The base model to adapt.
       lora_config: The `peft.LoraConfig` to apply.
@@ -652,12 +664,28 @@ class Pipeline(abc.ABC):
     explicit = parse_target_modules(
         getattr(getattr(self, "_lora_args", None), "lora_target_modules", None)
     )
-    return safe_get_peft_model(
+    peft_model = safe_get_peft_model(
         model,
         lora_config,
         get_peft_model_fn=get_peft_model,
         explicit_target_modules=explicit,
     )
+    if getattr(self.training_args, "gradient_checkpointing", False):
+      enable = getattr(peft_model, "enable_input_require_grads", None)
+      if callable(enable):
+        enable()
+        logger.info(
+            "Gradient checkpointing is on: enabled input gradients so the "
+            "LoRA adapter still receives one."
+        )
+      else:
+        logger.warning(
+            "Gradient checkpointing is on but %s has no "
+            "enable_input_require_grads; if the backward pass raises "
+            "'element 0 of tensors does not require grad', that is why.",
+            type(peft_model).__name__,
+        )
+    return peft_model
 
   def _training_callbacks(self) -> list[Any]:
     """Builds the callback list shared by every training pipeline.
