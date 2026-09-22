@@ -60,6 +60,11 @@ _STAGE_TITLES = {
 #: Metric keys inside the eval stage that are not per-target measurements.
 _EVAL_META_METRICS = frozenset({"decoding_temperature", "num_samples"})
 
+# The orchestrator's dry-run mode fabricates sweep ids of the form
+# "mock_sweep_<epoch>". Campaigns predating the persisted ``dry_run`` config
+# key can only be recognised by this marker.
+_MOCK_SWEEP_MARKER = "mock_sweep"
+
 
 def _redact(value: Any) -> Any:
   """Recursively replaces secret-looking values in a parsed JSON structure.
@@ -275,6 +280,28 @@ class CampaignSummary:
     return self.status == "COMPLETED"
 
   @property
+  def is_dry_run(self) -> bool:
+    """Whether the campaign was a rehearsal rather than real training.
+
+    Dry runs never touch W&B or Hugging Face: the orchestrator fabricates
+    sweep and run ids locally, so every outbound link the dashboard builds
+    for them points at something that does not exist. That is worth saying
+    out loud rather than letting the reader discover it by clicking.
+
+    The ``dry_run`` config key is authoritative, but campaigns recorded
+    before it was persisted only betray themselves through their mock sweep
+    ids, so both are checked.
+
+    Returns:
+      True when the campaign's recorded ids are fabricated.
+    """
+    if self.config.get("dry_run"):
+      return True
+    return any(
+        _MOCK_SWEEP_MARKER in (stage.sweep_id or "") for stage in self.stages
+    )
+
+  @property
   def elapsed_seconds(self) -> Optional[float]:
     """Wall-clock time from campaign creation to its last update."""
     return _elapsed_seconds(self.created_at, self.updated_at)
@@ -367,6 +394,7 @@ class CampaignSummary:
         "eval_metric_names": list(self.eval_metric_names),
         "is_terminal": self.is_terminal,
         "is_completed": self.is_completed,
+        "is_dry_run": self.is_dry_run,
         "elapsed_seconds": self.elapsed_seconds,
         "headline": self.headline,
         "warnings": self.warnings,

@@ -22,18 +22,28 @@ only when logged in as `leobianco`).
 
 ## What it shows
 
-**Campaign list** — every campaign found under `checkpoints/`, newest first,
-with its task, status, RM dataset flavor, hallucination rate, delta against the
-SFT baseline, elapsed time and last update. Filter by task, status, base model
-or RM dataset; search across campaign ids, sweep names and model repo ids;
-toggle *Completed only* and *Show archived*. Filtering happens in the browser
-and your selection is remembered between visits.
+**Campaign list** — every campaign found under `checkpoints/`, newest first:
+campaign id, task, base model, status and RM dataset flavor. Filter by task,
+status, base model or RM dataset; search across campaign ids, sweep names and
+model repo ids; toggle *Completed only*, *Hide dry runs* and *Show archived*.
+Filtering happens in the browser and your selection is remembered between
+visits. The list deliberately carries no metrics: it is for *finding* a
+campaign, and the numbers only mean something next to the run that produced
+them.
 
-**Campaign page** — identity block, per-stage table (status, trials, best
-metric with its selection provenance, published model), the evaluation metric
-table with one column per target (`sft`, `sft@t0.7`, `perl`, `delta`), the
-links panel, the rendered markdown report, and the campaign configuration as
-launched.
+**Campaign page** — title, status and dry-run chips, a one-line identity strip,
+the headline result (PE-RL hallucination rate and the signed improvement over
+SFT), the run metadata, a per-stage table (status, trials, best metric with its
+selection provenance, published model), the evaluation metric table with one
+column per target (`sft`, `sft@t0.7`, `perl`, `delta`), the links panel, the
+rendered markdown report, and the campaign configuration as launched.
+
+**Dry runs are labelled.** A rehearsal (`dry_run: true`, or — for states
+written before that flag was persisted — sweep ids of the form `mock_sweep_*`)
+gets a chip in the list and a banner on its page. Its W&B links are built from
+ids the orchestrator invented locally and will not resolve; its model and
+dataset links follow the real naming convention but nothing was ever pushed
+under those names. Everything a *real* campaign records is real.
 
 **Links panel** — the point of the whole thing:
 
@@ -60,13 +70,20 @@ state files  ->  index  ->  build (static HTML)  ->  publish (HF Space)
 | `index.py` | Glob `checkpoints/**/*_state.json`, parse into view models, redact secrets |
 | `links.py` | The only place a W&B or Hub URL is constructed |
 | `render.py` | Markdown → HTML (tables, GitHub alerts, heading anchors) |
-| `build.py` | Emit `site/`: list page, campaign pages, `data/index.json`, assets |
+| `build.py` | Emit `site/`: list page, campaign pages, `data/index.json` |
 | `publish.py` | Upload to a static Space, or copy to a directory |
 | `watcher.py` | Poll, debounce, publish on change |
 
 It is **read-only**: it never writes into `checkpoints/` or `reports/`, never
 imports the campaign engine, and never talks to a running campaign. Deleting
 `src/dashboard/` and `scripts/dashboard.py` restores the repository exactly.
+
+The CSS and JS live in `static/` in the source tree but are **inlined into
+every generated page**, so `site/` has no `static/` directory. On a private
+Space the document is fetched with credentials the browser already holds,
+while a subresource on the same host is not guaranteed to inherit them — and a
+stylesheet that 401s gives you unstyled HTML with no visible error. Inlining
+costs ~15 KB a page and removes the failure mode entirely.
 
 ### Zero new dependencies
 

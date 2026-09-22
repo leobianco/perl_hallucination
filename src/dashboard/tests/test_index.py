@@ -121,6 +121,52 @@ class LoadCampaignTest(unittest.TestCase):
     self.assertIn("npov_campaign_2609211206", payload)
 
 
+class DryRunTest(unittest.TestCase):
+  """Rehearsals must be distinguishable from real runs.
+
+  A dry run records mock sweep ids, which the dashboard happily turns into
+  W&B URLs that go nowhere. Detecting the rehearsal is what lets the page
+  say so instead of quietly serving dead links.
+  """
+
+  def setUp(self):
+    self.root = tempfile.mkdtemp()
+    self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+
+  def _load(self, state):
+    path = os.path.join(
+        self.root, "checkpoints", "npov", "npov_campaign_2609211206_state.json"
+    )
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+      json.dump(state, handle)
+    return index_mod.load_campaign(path, root=self.root)
+
+  def test_explicit_flag_is_honoured(self):
+    state = fixtures.campaign_state()
+    state["config_dict"]["dry_run"] = True
+    self.assertTrue(self._load(state).is_dry_run)
+
+  def test_mock_sweep_ids_betray_older_rehearsals(self):
+    """States written before ``dry_run`` was persisted still have mock ids."""
+    state = fixtures.campaign_state()
+    state["config_dict"].pop("dry_run", None)
+    for stage in state["stages"].values():
+      if stage.get("sweep_id"):
+        stage["sweep_id"] = "leobianco/new_perl/mock_sweep_1789992366"
+    self.assertTrue(self._load(state).is_dry_run)
+
+  def test_a_real_campaign_is_not_flagged(self):
+    state = fixtures.campaign_state()
+    state["config_dict"]["dry_run"] = False
+    for stage in state["stages"].values():
+      if stage.get("sweep_id"):
+        stage["sweep_id"] = stage["sweep_id"].replace("mock_sweep_", "")
+    campaign = self._load(state)
+    self.assertFalse(campaign.is_dry_run)
+    self.assertFalse(campaign.to_dict()["is_dry_run"])
+
+
 class ResilienceTest(unittest.TestCase):
   """One bad file must never empty an index of good ones."""
 

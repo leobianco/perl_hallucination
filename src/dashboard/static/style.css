@@ -131,9 +131,26 @@ th {
 }
 tbody tr:hover { background: #ffffff06; }
 td.num, th.num { text-align: right; font-family: var(--mono); white-space: nowrap; }
+td.num .sub { text-align: right; white-space: normal; }
+td code { overflow-wrap: anywhere; }
 
 .campaigns td:first-child { font-weight: 600; }
-.campaigns .sub { display: block; color: var(--text-faint); font-size: 12px; font-weight: 400; }
+td .sub {
+  display: block;
+  color: var(--text-faint);
+  font-size: 12px;
+  font-weight: 400;
+  font-family: var(--sans);
+}
+.campaigns td.model {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* ---------- chips ---------- */
 
@@ -156,11 +173,55 @@ td.num, th.num { text-align: right; font-family: var(--mono); white-space: nowra
 .chip-skipped   { color: var(--text-faint); border-color: var(--border); }
 .chip-archived  { color: var(--info); border-color: #9d7cd840; background: #9d7cd814; }
 .chip-stale     { color: var(--warn); border-color: #e0af6840; background: #e0af6814; }
+.chip-dry-run   { color: var(--text-faint); border-color: var(--border); background: var(--bg-raised); }
 
 /* ---------- campaign detail ---------- */
 
 .crumb { font-size: 12.5px; color: var(--text-faint); margin-bottom: 6px; }
-h2.page-title { font-size: 20px; margin: 0 0 4px; letter-spacing: -0.01em; }
+
+.page-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+}
+h2.page-title {
+  font-size: 22px;
+  margin: 0;
+  letter-spacing: -0.02em;
+  font-family: var(--mono);
+  font-weight: 600;
+}
+.page-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.subtitle { color: var(--text-dim); font-size: 13px; margin-top: 4px; }
+
+.kpis {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 18px 0 0;
+}
+.kpi {
+  flex: 0 1 240px;
+  padding: 12px 16px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.kpi-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+}
+.kpi-value {
+  font-family: var(--mono);
+  font-size: 24px;
+  line-height: 1.3;
+  letter-spacing: -0.02em;
+}
+.kpi-value.good { color: var(--ok); }
+.kpi-value.bad { color: var(--bad); }
 
 .meta-grid {
   display: grid;
@@ -179,7 +240,12 @@ h2.page-title { font-size: 20px; margin: 0 0 4px; letter-spacing: -0.01em; }
   color: var(--text-faint);
   margin-bottom: 1px;
 }
-.meta-grid dd { margin: 0; font-family: var(--mono); font-size: 12.5px; word-break: break-all; }
+.meta-grid dd {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
 
 section { margin: 28px 0; }
 section > h3 {
@@ -192,10 +258,32 @@ section > h3 {
   margin: 0 0 12px;
 }
 
-.links-group { margin-bottom: 14px; }
-.links-group h4 { font-size: 12.5px; margin: 0 0 6px; color: var(--text-dim); font-weight: 600; }
+/* Multi-column rather than grid: the groups have wildly different heights
+ * (two W&B links, ten HF ones) and a grid row is as tall as its tallest
+ * cell, which left a hole the size of a card. Columns pack them densely. */
+.links-grid {
+  columns: 3 300px;
+  column-gap: 20px;
+}
+.links-group {
+  padding: 12px 14px;
+  margin: 0 0 16px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  /* Without this a card is sliced across the column boundary. */
+  break-inside: avoid;
+}
+.links-group h4 {
+  font-size: 11px;
+  margin: 0 0 8px;
+  color: var(--text-faint);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
 .links-group ul { list-style: none; margin: 0; padding: 0; }
-.links-group li { padding: 2px 0; }
+.links-group li { padding: 2px 0; overflow-wrap: anywhere; }
 .links-group .note { color: var(--text-faint); font-size: 12px; margin-left: 8px; font-family: var(--mono); }
 .links-group .derived {
   color: var(--text-faint);

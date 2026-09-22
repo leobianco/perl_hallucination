@@ -20,6 +20,7 @@
       flavor: document.getElementById("f-flavor"),
       search: document.getElementById("f-search"),
       completed: document.getElementById("f-completed"),
+      real: document.getElementById("f-real"),
       archived: document.getElementById("f-archived")
     };
     var counter = document.getElementById("f-count");
@@ -33,6 +34,7 @@
         flavor: controls.flavor ? controls.flavor.value : "",
         search: controls.search ? controls.search.value.toLowerCase().trim() : "",
         completed: controls.completed ? controls.completed.checked : false,
+        real: controls.real ? controls.real.checked : false,
         archived: controls.archived ? controls.archived.checked : false
       };
     }
@@ -45,6 +47,7 @@
         return false;
       }
       if (state.completed && row.dataset.status !== "COMPLETED") return false;
+      if (state.real && row.dataset.dryrun === "1") return false;
       if (!state.archived && row.dataset.archived === "1") return false;
       if (state.search && (row.dataset.haystack || "").indexOf(state.search) < 0) {
         return false;
