@@ -13,9 +13,18 @@ tmux this matters a lot:
   * If the campaign is backgrounded with ``nohup``/piped to a file, the exact
     same code path emits clean, timestamped plain text.
 
-The visible result is a docker-compose style UI: a pinned status block at the
-bottom (header, DAG, live sweep leaderboard, hotkeys) with logs streaming
-above it.
+The visible result is a pinned status block at the bottom of the pane: header,
+DAG, live sweep leaderboard, and a footer carrying the hotkey legend on the
+left and the most recent log line on the right.
+
+Subprocess logs do **not** stream above it by default. They used to, which made
+the pinned block repaint on every line a ``wandb agent`` emitted - a constant
+flicker, for output that is already in W&B and in
+``logs/campaign/{campaign_id}.log``. The footer's last-activity column is the
+part of that stream worth watching, so it is the part that stayed. Press ``l``
+to bring the full stream back (off -> all -> milestones); stage failures and
+notices print above the block at every verbosity, because those you do want
+interrupting you.
 """
 
 from __future__ import annotations
@@ -42,6 +51,30 @@ from src.orchestrator.cli.theme import Theme
 #: Log verbosity levels cycled with the ``l`` hotkey.
 LOG_ALL, LOG_MILESTONES, LOG_OFF = 0, 1, 2
 LOG_LEVEL_NAMES = {LOG_ALL: "all", LOG_MILESTONES: "milestones", LOG_OFF: "off"}
+
+
+def initial_log_level(console: Optional[UiConsole]) -> int:
+  """Picks the starting verbosity for a campaign's log stream.
+
+  A rich console gets a pinned block, and streaming subprocess logs above it
+  repaints that block on every line - a flicker bad enough to make the
+  dashboard hard to read, in exchange for output that is already in W&B and
+  in ``logs/campaign/{campaign_id}.log``. The footer's last-activity column
+  carries the part worth watching, so the stream starts off and ``l`` turns
+  it on.
+
+  A plain console has no pinned block. There the stream is the entire user
+  interface, so silencing it would leave a multi-hour campaign showing
+  nothing at all.
+
+  Args:
+    console: The output surface, or None (treated as plain).
+
+  Returns:
+    :data:`LOG_OFF` or :data:`LOG_ALL`.
+  """
+  return LOG_OFF if console is not None and console.is_rich else LOG_ALL
+
 
 #: Substrings that always deserve to be shown, even in milestone mode.
 MILESTONE_HINTS = (
@@ -78,7 +111,22 @@ class DashboardModel:
       state: Any,
       controls: Optional[ControlSignals] = None,
       log_capacity: int = 400,
+      log_level: int = LOG_ALL,
   ):
+    """Initializes the model.
+
+    Args:
+      config: The ``CampaignConfig`` being executed.
+      state: The ``CampaignState`` the engine is updating.
+      controls: Shared pause/stop/advance signals.
+      log_capacity: How many log lines to keep for the footer and the final
+        scorecard.
+      log_level: Where the ``l`` hotkey's cycle starts. Defaults to
+        :data:`LOG_ALL`, which is what a plain (non-rich) renderer needs,
+        since there the scrollback stream is the only output there is.
+        :func:`run_campaign_with_dashboard` overrides it to :data:`LOG_OFF`
+        whenever it has a pinned block to render instead.
+    """
     self.config = config
     self.state = state
     self.controls = controls or ControlSignals()
@@ -86,7 +134,7 @@ class DashboardModel:
     self.finished = False
     self.final_status: Optional[str] = None
     self.current_stage: Optional[str] = None
-    self.log_level = LOG_ALL
+    self.log_level = log_level
     self.show_help = False
     self.log_window = 0  # Extra rows requested by the user with +/-.
     self.notices: Deque[str] = collections.deque(maxlen=5)
@@ -797,7 +845,12 @@ def run_campaign_with_dashboard(
 
   engine = factory(config=config, state=state, event_bus=bus, controls=controls)
 
-  model = DashboardModel(config=config, state=engine.state, controls=controls)
+  model = DashboardModel(
+      config=config,
+      state=engine.state,
+      controls=controls,
+      log_level=initial_log_level(console),
+  )
   bus.subscribe(model.on_event)
   dashboard = LiveDashboard(model, console=console)
 

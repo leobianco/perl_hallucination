@@ -383,7 +383,7 @@ HELP_TEXT: List[Tuple[str, str]] = [
     ("p", "Pause before the next stage (current trial finishes cleanly)."),
     ("s", "Stop: seal the sweep now (trial in flight dies), publish, report."),
     ("x", "Abort now: no materialization, no report; resumable with `resume`."),
-    ("l", "Cycle log verbosity: all -> milestones -> off."),
+    ("l", "Stream logs above the dashboard: off -> all -> milestones."),
     ("+/-", "Grow or shrink the live log window."),
     ("?", "Toggle this help overlay."),
     ("q", "Detach the dashboard; the campaign keeps running headless."),

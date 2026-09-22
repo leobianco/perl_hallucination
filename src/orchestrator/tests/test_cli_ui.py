@@ -961,6 +961,77 @@ def event(event_type, stage=None, message="", **payload):
   )
 
 
+class InitialLogLevelTest(unittest.TestCase):
+  """Mission control owns the pane; the log stream is opt-in.
+
+  Streaming subprocess logs above the pinned block repainted it on every
+  line the sweep agent emitted. The output is already in W&B and in the
+  campaign log file, and the one line worth watching is in the footer, so
+  the stream now starts off wherever there is a block to protect.
+  """
+
+  def _console(self, force_plain):
+    return console_mod.UiConsole(
+        theme=theme_mod.detect_theme(force_color=False),
+        file=io.StringIO(),
+        force_plain=force_plain,
+        width=100,
+    )
+
+  @requires_rich
+  def test_a_rich_console_starts_with_the_stream_off(self):
+    console = self._console(force_plain=False)
+    self.assertTrue(console.is_rich)
+    self.assertEqual(
+        dashboard_mod.initial_log_level(console), dashboard_mod.LOG_OFF
+    )
+
+  def test_a_plain_console_keeps_the_stream(self):
+    # No pinned block there: the stream is the entire interface, and
+    # silencing it would leave a multi-hour campaign showing nothing.
+    console = self._console(force_plain=True)
+    self.assertFalse(console.is_rich)
+    self.assertEqual(
+        dashboard_mod.initial_log_level(console), dashboard_mod.LOG_ALL
+    )
+
+  def test_no_console_is_treated_as_plain(self):
+    self.assertEqual(
+        dashboard_mod.initial_log_level(None), dashboard_mod.LOG_ALL
+    )
+
+  def test_the_model_still_defaults_to_all(self):
+    # Every other construction site - and every existing test - relies on
+    # this; only run_campaign_with_dashboard overrides it.
+    config = CampaignConfig.create_default(task_name="npov", sft_runs=3)
+    model = dashboard_mod.DashboardModel(config, make_state())
+    self.assertEqual(model.log_level, dashboard_mod.LOG_ALL)
+
+  def test_with_the_stream_off_the_footer_still_sees_everything(self):
+    """The whole point: quiet scrollback, live last-activity column."""
+    config = CampaignConfig.create_default(task_name="npov", sft_runs=3)
+    model = dashboard_mod.DashboardModel(
+        config, make_state(), log_level=dashboard_mod.LOG_OFF
+    )
+    model.on_event(event(events_mod.EventType.LOG, message="step 42/900"))
+    model.on_event(event(events_mod.EventType.LOG, message="step 43/900"))
+    self.assertEqual(model.drain_pending_logs(), [])
+    self.assertEqual(model.recent_logs()[-1][2], "step 43/900")
+
+  def test_the_l_hotkey_turns_the_stream_back_on(self):
+    config = CampaignConfig.create_default(task_name="npov", sft_runs=3)
+    model = dashboard_mod.DashboardModel(
+        config, make_state(), log_level=dashboard_mod.LOG_OFF
+    )
+    notice = dashboard_mod.handle_key("l", model, model.controls)
+    self.assertIn("all", notice)
+    self.assertEqual(model.log_level, dashboard_mod.LOG_ALL)
+    model.on_event(event(events_mod.EventType.LOG, message="step 44/900"))
+    self.assertEqual(
+        [entry[2] for entry in model.drain_pending_logs()], ["step 44/900"]
+    )
+
+
 class DashboardModelTest(unittest.TestCase):
   """Folding the event stream into UI state."""
 
