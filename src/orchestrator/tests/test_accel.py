@@ -35,6 +35,12 @@ MISTRAL = "mistralai/Mistral-7B-Instruct-v0.3"
 #: Above :data:`accel.ZERO3_THRESHOLD_B`, unlike MISTRAL. Stage 3 assertions
 #: need a model that genuinely crosses the threshold; 7B deliberately does not.
 LLAMA_13B = "meta-llama/Llama-2-13b-hf"
+#: The small end of :data:`src.orchestrator.cli.wizard.BASE_MODEL_CATALOGUE`,
+#: added for campaigns where SFT alone already saturates the autorater. Both
+#: sit far below every threshold, so they must change nothing about the
+#: launcher.
+QWEN_1_5B = "Qwen/Qwen2.5-1.5B-Instruct"
+SMOLLM2_1_7B = "HuggingFaceTB/SmolLM2-1.7B-Instruct"
 
 
 class _Captured(Exception):
@@ -52,10 +58,23 @@ class EstimateParametersTest(unittest.TestCase):
         "meta-llama/Llama-3.1-70B-Instruct": 70.0,
         "Qwen/Qwen3-4B": 4.0,
         "someone/model-1.5b": 1.5,
+        QWEN_1_5B: 1.5,
+        SMOLLM2_1_7B: 1.7,
     }
     for repo_id, expected in cases.items():
       with self.subTest(repo_id=repo_id):
         self.assertEqual(accel.estimate_parameters_b(repo_id), expected)
+
+  def test_a_version_number_is_not_mistaken_for_a_size(self):
+    """``Qwen2.5-1.5B`` holds two decimals; only the one before ``B`` counts.
+
+    The size token has to be preceded by a separator, so the ``2.5`` in the
+    family name cannot match. Worth pinning: reading it as 2.5B would still
+    be under every threshold, so the mistake would never surface as a
+    failure - only as a wrong number in the campaign transcript.
+    """
+    self.assertEqual(accel.estimate_parameters_b(QWEN_1_5B), 1.5)
+    self.assertEqual(accel.estimate_parameters_b(SMOLLM2_1_7B), 1.7)
 
   def test_reads_the_size_of_a_checkpoint_this_project_published(self):
     # Campaign checkpoints are named <user>/<task>_<stage>_<model>_<details>,
@@ -233,6 +252,51 @@ class MemoryFlagsTest(unittest.TestCase):
             accel.memory_flags(stage, MISTRAL),
             {"gradient_checkpointing": "True"},
         )
+
+
+class SmallCatalogueModelsTest(unittest.TestCase):
+  """The 1.5B/1.7B entries must be invisible to the launcher.
+
+  They were added to give PE-RL headroom on datasets where SFT alone already
+  saturates the autorater, not to exercise a new execution path. If any of
+  these assertions starts failing, a threshold has moved underneath a
+  configuration nobody intended to change.
+  """
+
+  def test_they_stay_on_stage_2_in_every_stage(self):
+    for model in (QWEN_1_5B, SMOLLM2_1_7B):
+      for stage in ("sft", "rm", "perl"):
+        with self.subTest(model=model, stage=stage):
+          self.assertEqual(accel.select_profile(stage, model), accel.ZERO2)
+
+  def test_they_get_no_memory_saving_flags(self):
+    for model in (QWEN_1_5B, SMOLLM2_1_7B):
+      for stage in ("sft", "rm", "perl"):
+        with self.subTest(model=model, stage=stage):
+          self.assertEqual(accel.memory_flags(stage, model), {})
+
+  def test_they_leave_the_perl_geometry_alone(self):
+    baseline = dict(model_manager_mod.PERL_BATCH_GEOMETRY)
+    for model in (QWEN_1_5B, SMOLLM2_1_7B):
+      with self.subTest(model=model):
+        self.assertEqual(accel.scale_perl_geometry(baseline, model), baseline)
+
+  def test_a_small_policy_against_a_large_reward_model_is_sized_on_the_pair(
+      self,
+  ):
+    """The asymmetric configuration these models make attractive.
+
+    ``reward_base_model`` lets a weak policy be scored by a competent reward
+    model. PE-RL holds both resident, so the stage must be sized on the
+    larger of the two - sizing on the 1.5B policy alone would under-provision
+    it.
+    """
+    self.assertEqual(
+        accel.resident_parameters_b("perl", QWEN_1_5B, LLAMA_13B), 13.0
+    )
+    self.assertEqual(
+        accel.select_profile("perl", QWEN_1_5B, LLAMA_13B), accel.ZERO3
+    )
 
 
 class ScalePerlGeometryTest(unittest.TestCase):

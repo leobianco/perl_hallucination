@@ -640,6 +640,39 @@ class BaseModelQuestionTest(unittest.TestCase):
     )
     self.assertEqual(config.base_model, "Qwen/Qwen3-4B-Instruct-2507")
 
+  def test_the_small_models_are_offered(self):
+    """Added for campaigns where SFT alone already saturates the autorater."""
+    offered = [repo_id for repo_id, _ in wizard.BASE_MODEL_CATALOGUE]
+    self.assertIn("Qwen/Qwen2.5-1.5B-Instruct", offered)
+    self.assertIn("HuggingFaceTB/SmolLM2-1.7B-Instruct", offered)
+
+  def test_a_small_model_choice_reaches_the_config(self):
+    config, _ = self.run_wizard(
+        [
+            "npov",
+            "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+            ["sft"],
+            "smoke",
+            True,
+            True,
+        ]
+    )
+    self.assertEqual(
+        config.base_model, "HuggingFaceTB/SmolLM2-1.7B-Instruct"
+    )
+
+  def test_every_catalogue_id_fits_the_pickers_column(self):
+    """The picker pads the repo id to 36 characters before the description.
+
+    ``HuggingFaceTB/SmolLM2-1.7B-Instruct`` is 35, which fits with one space
+    to spare. A longer id would not be truncated - it would push the
+    description out of alignment on that row only, which looks like a
+    rendering bug rather than a too-long name.
+    """
+    for repo_id, _ in wizard.BASE_MODEL_CATALOGUE:
+      with self.subTest(repo_id=repo_id):
+        self.assertLessEqual(len(repo_id), 36)
+
   def test_custom_opens_a_free_text_prompt(self):
     config, prompter = self.run_wizard(
         [

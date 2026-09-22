@@ -85,9 +85,22 @@ _REPO_ID_RE = re.compile(r"^[\w.\-]+/[\w.\-]+$")
 #: disagree with :class:`~src.orchestrator.config.CampaignConfig`.
 DEFAULT_BASE_MODEL: str = config_mod.CampaignConfig.base_model
 
-#: Base models we have actually exercised end-to-end, offered as a shortlist.
-#: This is a convenience, not a whitelist - "custom" accepts any HF repo id,
-#: and nothing downstream branches on the vendor.
+#: Base models offered as a shortlist. This is a convenience, not a whitelist -
+#: "custom" accepts any HF repo id, and nothing downstream branches on the
+#: vendor.
+#:
+#: Ordered largest-capability first. The two small entries at the end exist for
+#: a specific problem: on the current datasets the 4B and 7B policies are
+#: already faithful after SFT alone, so the autorater scores PE-RL and its SFT
+#: baseline identically and ``delta`` measures nothing. A weaker policy is what
+#: restores the headroom the campaign is trying to measure.
+#:
+#: The first three have been exercised end-to-end. The small two have been
+#: checked for pipeline compatibility - a Transformers sequence-classification
+#: head for the RM stage, no ``trust_remote_code``, bf16 weights (nothing here
+#: can load a quantized checkpoint), and a pad token distinct from EOS - but
+#: have not yet completed a campaign. Say so rather than implying otherwise:
+#: this list is where the next person picks from.
 BASE_MODEL_CATALOGUE: List[Tuple[str, str]] = [
     (
         DEFAULT_BASE_MODEL,
@@ -100,6 +113,14 @@ BASE_MODEL_CATALOGUE: List[Tuple[str, str]] = [
     (
         "mistralai/Mistral-7B-Instruct-v0.3",
         "Apache-2.0, 7B - needs more VRAM than the 4B models",
+    ),
+    (
+        "Qwen/Qwen2.5-1.5B-Instruct",
+        "Apache-2.0, ungated, 1.5B - headroom when SFT saturates",
+    ),
+    (
+        "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+        "Apache-2.0, ungated, 1.7B - only 8k context, check prompts",
     ),
 ]
 
