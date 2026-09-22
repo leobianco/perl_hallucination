@@ -186,3 +186,7 @@ reports/
 
 # Linting results
 errors.err
+
+# Auto-PERL dashboard (generated artifacts, never committed)
+/site/
+.dashboard_publish.json

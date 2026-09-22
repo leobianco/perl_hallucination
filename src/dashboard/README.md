@@ -1,0 +1,190 @@
+# Auto-PERL Dashboard
+
+A **static web dashboard** for Auto-PERL campaigns, published to a private
+Hugging Face Space so you can read it from anywhere — including when the
+research VM is powered off.
+
+```bash
+# Preview locally
+python3 scripts/dashboard.py serve
+
+# Publish a snapshot now
+python3 scripts/dashboard.py publish --repo-id leobianco/auto-perl
+
+# Keep publishing as campaigns progress (the normal mode)
+python3 scripts/dashboard.py watch --repo-id leobianco/auto-perl
+```
+
+Live at **https://huggingface.co/spaces/leobianco/auto-perl** (private: visible
+only when logged in as `leobianco`).
+
+---
+
+## What it shows
+
+**Campaign list** — every campaign found under `checkpoints/`, newest first,
+with its task, status, RM dataset flavor, hallucination rate, delta against the
+SFT baseline, elapsed time and last update. Filter by task, status, base model
+or RM dataset; search across campaign ids, sweep names and model repo ids;
+toggle *Completed only* and *Show archived*. Filtering happens in the browser
+and your selection is remembered between visits.
+
+**Campaign page** — identity block, per-stage table (status, trials, best
+metric with its selection provenance, published model), the evaluation metric
+table with one column per target (`sft`, `sft@t0.7`, `perl`, `delta`), the
+links panel, the rendered markdown report, and the campaign configuration as
+launched.
+
+**Links panel** — the point of the whole thing:
+
+| Group | Contents |
+| :--- | :--- |
+| Weights & Biases | One sweep per stage, the winning run of each, the project and the evaluation project |
+| Hugging Face models | Every published adapter, plus its file tree (companion checkpoint + `checkpoints.json`) |
+| Hugging Face generations | The completions dataset of each evaluation target, labelled with its decoding temperature |
+| Hugging Face datasets | The autorater calibration set, the SFT/PE-RL sets, and one RM set per dataset flavor |
+
+The dashboard makes **no API calls**. Every one of those is a plain hyperlink
+that your browser follows with credentials this code never sees.
+
+---
+
+## Architecture
+
+```
+state files  ->  index  ->  build (static HTML)  ->  publish (HF Space)
+```
+
+| Module | Responsibility |
+| :--- | :--- |
+| `index.py` | Glob `checkpoints/**/*_state.json`, parse into view models, redact secrets |
+| `links.py` | The only place a W&B or Hub URL is constructed |
+| `render.py` | Markdown → HTML (tables, GitHub alerts, heading anchors) |
+| `build.py` | Emit `site/`: list page, campaign pages, `data/index.json`, assets |
+| `publish.py` | Upload to a static Space, or copy to a directory |
+| `watcher.py` | Poll, debounce, publish on change |
+
+It is **read-only**: it never writes into `checkpoints/` or `reports/`, never
+imports the campaign engine, and never talks to a running campaign. Deleting
+`src/dashboard/` and `scripts/dashboard.py` restores the repository exactly.
+
+### Zero new dependencies
+
+`markdown-it-py`, `huggingface-hub` and `pyyaml` are already pinned in
+`requirements.txt`. `markdown-it-py` is imported optionally: without it the
+reports render verbatim in a `<pre>` block instead of failing the build.
+
+---
+
+## When it publishes
+
+| Trigger | Behaviour |
+| :--- | :--- |
+| A campaign reaches `COMPLETED` / `FAILED` / `STOPPED` / `ABORTED` | **Immediately**, bypassing the debounce |
+| Trial counters, best metric, a new report | After `--debounce` seconds (default 60) |
+| Nothing changed | Never — the content fingerprint is compared first |
+
+> [!IMPORTANT]
+> The terminal-transition rule is what makes `shutdown_when_done` safe. The VM
+> powers off after `shutdown_grace_seconds` (default 60), and the campaign's
+> *result* is the single most valuable snapshot of its life. On campaigns armed
+> with `--shutdown`, consider `shutdown_grace_seconds: 120` to leave the upload
+> more room.
+
+The snapshot timestamp in the page header is **when the content last changed**,
+not when the watcher last looked. An idle repository produces no commits, so a
+long-unchanged timestamp on an idle VM is expected; an in-progress campaign
+whose timestamp has stopped moving is flagged as *stale* instead, with a banner
+saying the VM is most likely off.
+
+---
+
+## Running it permanently
+
+In a tmux window next to your campaigns:
+
+```bash
+tmux new-window -t auto-perl -n dashboard
+python3 scripts/dashboard.py watch --repo-id leobianco/auto-perl
+```
+
+Or as a user service that survives reboots:
+
+```ini
+# ~/.config/systemd/user/auto-perl-dashboard.service
+[Unit]
+Description=Auto-PERL dashboard publisher
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/new_perl
+ExecStart=/usr/bin/python3 scripts/dashboard.py watch --repo-id leobianco/auto-perl
+Restart=always
+RestartSec=30
+Environment=HF_HOME=%h/.cache/huggingface
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now auto-perl-dashboard
+journalctl --user -u auto-perl-dashboard -f
+```
+
+`AUTO_PERL_SPACE=leobianco/auto-perl` can replace `--repo-id` everywhere.
+
+---
+
+## Commands
+
+| Command | What it does |
+| :--- | :--- |
+| `build` | Emit the static site into `./site` |
+| `serve` | Build, then preview at `http://127.0.0.1:8000` (the exact bytes that get published) |
+| `publish` | Build, then upload if the content changed (`--force` to override, `--dry-run` to rehearse) |
+| `watch` | Build and publish continuously (`--once` for cron-style use) |
+
+Shared flags: `--root`, `--out`, `--no-archived`, `--repo-id`, `--backend
+{hf_space,dir}`, `--destination`, `--public`, `--force`, `--dry-run`.
+
+> [!CAUTION]
+> `--public` only applies when the Space is *created*. An existing Space never
+> has its visibility changed by this tool: silently making a private page
+> public is not something a build script should be able to do.
+
+---
+
+## Security and privacy
+
+* The Space is **private**. Only your Hugging Face account can read it.
+* `config_dict` is **redacted** before publishing: any string under a key
+  matching `key|token|secret|password|credential` is replaced.
+* Raw HTML in a report is **not** rendered, and every dynamic string (campaign
+  ids, sweep names, repo ids) is HTML-escaped.
+* Nothing is uploaded except the built site: no state files, no logs, no
+  checkpoints.
+
+---
+
+## Known coupling
+
+The completions dataset ids are **recomputed at build time** with
+`src.utils.build_eval_dataset_repo_id`, the same function the eval stage used,
+rather than read from the state file. This avoids persisting anything new, at
+the cost that changing the naming convention retroactively breaks the
+generations links of older campaigns. Those links carry a `derived` badge, and
+`tests/test_links.py` pins the current convention with golden values so the
+change is at least noisy.
+
+---
+
+## Tests
+
+```bash
+python3 -m unittest discover -s src/dashboard/tests -t .
+```
+
+143 tests, hermetic, no network. They pass on a bare `/usr/bin/python3` (13
+markdown-specific tests skip) and in the project environment (all run).
