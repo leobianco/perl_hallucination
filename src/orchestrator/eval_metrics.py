@@ -9,6 +9,7 @@ way, including metrics written by older single-model runs.
 
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 from src.orchestrator import flavors
@@ -239,6 +240,95 @@ def delta_label(target_label: str) -> str:
   stage_id, _ = split_target_label(target_label)
   _, flavor = flavors.split_stage_id(stage_id)
   return "delta" if not flavor else f"delta{flavors.SEPARATOR}{flavor}"
+
+
+def delta_sign(metric: str) -> int:
+  """Returns the factor that turns a raw difference into a signed delta.
+
+  ``compute_deltas`` multiplies ``policy - baseline`` by this so that a
+  positive delta always reads as an improvement, whichever direction the
+  underlying metric runs in.
+
+  Args:
+    metric: The bare metric name, without its target prefix.
+
+  Returns:
+    ``-1`` for a metric in :data:`LOWER_IS_BETTER`, ``+1`` otherwise. Note
+    that membership is literal: ``perplexity_std`` is not ``perplexity``, so
+    it is signed upward. That is a quirk of the convention rather than a
+    claim about the metric, and it is exactly why every consumer has to ask
+    this function instead of re-implementing the test.
+  """
+  return -1 if metric in LOWER_IS_BETTER else 1
+
+
+def baseline_from_delta(
+    metric: str, improvement: float, policy_value: float
+) -> float:
+  """Recovers the baseline value a signed delta was measured against.
+
+  Deltas are stored without a record of which baseline row produced them -
+  a policy is compared against the SFT row sampled at its own decoding
+  temperature, which varies per branch. Inverting the arithmetic recovers
+  that number from the two columns a reader already has in front of them,
+  and inherits the pairing for free rather than re-deriving it.
+
+  Args:
+    metric: The bare metric name, used only to know the delta's direction.
+    improvement: The stored delta, positive meaning the policy improved.
+    policy_value: The policy's value for the same metric.
+
+  Returns:
+    The baseline the delta was taken against.
+  """
+  return policy_value - delta_sign(metric) * improvement
+
+
+def relative_change(
+    metric: str, improvement: Any, policy_value: Any
+) -> Optional[float]:
+  """Expresses a signed delta as a fraction of the baseline it improved on.
+
+  An absolute delta hides how much room there was to move: dropping a
+  hallucination rate from 0.20 to 0.10 and from 0.90 to 0.80 are both
+  ``+0.10``, but the first halved the failures and the second shaved off a
+  ninth of them.
+
+  Args:
+    metric: The bare metric name, used only to know the delta's direction.
+    improvement: The stored delta, positive meaning the policy improved.
+    policy_value: The policy's value for the same metric.
+
+  Returns:
+    The improvement as a fraction of the baseline, keeping the delta's sign
+    convention so that positive still means better. None when either input
+    is not a finite number, or when the baseline is not strictly positive:
+    a ratio against a zero or negative reference is not a statement anyone
+    can read, and inventing one would be worse than leaving the cell blank.
+  """
+  if not _is_number(improvement) or not _is_number(policy_value):
+    return None
+  baseline = baseline_from_delta(
+      metric, float(improvement), float(policy_value)
+  )
+  if not math.isfinite(baseline) or baseline <= 0.0:
+    return None
+  return float(improvement) / baseline
+
+
+def _is_number(value: Any) -> bool:
+  """Returns whether a metric value is a usable finite number.
+
+  Args:
+    value: The candidate, straight out of a metric map.
+
+  Returns:
+    True for finite ints and floats. Booleans are excluded: they are ints
+    to Python but flags to the eval stage.
+  """
+  if not isinstance(value, (int, float)) or isinstance(value, bool):
+    return False
+  return math.isfinite(float(value))
 
 
 def target_title(target_label: str) -> str:

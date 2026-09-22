@@ -319,6 +319,11 @@ class EvalTarget:
   is_delta: bool
   metrics: Dict[str, float] = field(default_factory=dict)
   model_repo_id: Optional[str] = None
+  #: Each delta re-expressed as a fraction of the baseline it improved on,
+  #: keyed by the same bare metric name. Populated for delta targets only,
+  #: and only for metrics whose baseline could be recovered and was
+  #: positive, so a missing key means "not expressible" rather than "zero".
+  metric_ratios: Dict[str, float] = field(default_factory=dict)
 
   def to_dict(self) -> Dict[str, Any]:
     """Returns a JSON-serializable copy."""
@@ -603,6 +608,57 @@ def _order_eval_targets(targets: Iterable["EvalTarget"]) -> List["EvalTarget"]:
   return ordered
 
 
+def _policy_for_delta(
+    delta: "EvalTarget", targets: Iterable["EvalTarget"]
+) -> Optional["EvalTarget"]:
+  """Finds the policy column a delta column was derived from.
+
+  Args:
+    delta: A delta target.
+    targets: All eval targets.
+
+  Returns:
+    The PE-RL target sharing the delta's flavor, or None when the metrics
+    hold a delta whose policy never made it into the table.
+  """
+  flavor = _eval_target_flavor(delta)
+  for target in targets:
+    if target.is_delta or _eval_target_kind(target) != "perl":
+      continue
+    if _eval_target_flavor(target) == flavor:
+      return target
+  return None
+
+
+def _attach_metric_ratios(targets: List["EvalTarget"]) -> None:
+  """Fills in each delta's relative change, in place.
+
+  An absolute delta is hard to read on its own: whether ``+0.043`` is a rout
+  or a rounding error depends entirely on what it started from. The baseline
+  is not stored - a policy is compared against the SFT row sampled at *its
+  own* decoding temperature, which differs per branch - but it is recoverable
+  by inverting the delta against the policy column beside it. Doing it that
+  way means the ratio automatically uses whichever baseline the eval stage
+  chose, including the per-flavor temperature matching, without this module
+  having to know the pairing rules.
+
+  Args:
+    targets: The eval targets; delta entries are mutated in place.
+  """
+  for delta in targets:
+    if not delta.is_delta:
+      continue
+    policy = _policy_for_delta(delta, targets)
+    if policy is None:
+      continue
+    for metric, improvement in delta.metrics.items():
+      ratio = eval_metrics.relative_change(
+          metric, improvement, policy.metrics.get(metric)
+      )
+      if ratio is not None:
+        delta.metric_ratios[metric] = ratio
+
+
 def _extract_eval_targets(
     stage: Optional[StageView], stages: Iterable[StageView]
 ) -> Tuple[List[EvalTarget], List[str]]:
@@ -661,6 +717,7 @@ def _extract_eval_targets(
       target.model_repo_id = owner.model_repo_id
 
   ordered = _order_eval_targets(by_label.values())
+  _attach_metric_ratios(ordered)
   metric_names.sort(key=_metric_sort_key)
   return ordered, metric_names
 

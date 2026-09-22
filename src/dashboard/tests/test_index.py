@@ -371,6 +371,109 @@ class EvalTargetTest(unittest.TestCase):
     self.assertIsNone(campaign.headline["hallucination_rate"])
 
 
+class MetricRatioTest(unittest.TestCase):
+  """Each delta re-expressed as a share of the baseline it improved on."""
+
+  def setUp(self):
+    super().setUp()
+    self.root = tempfile.mkdtemp()
+    self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+
+  def _campaign(self, extra=None):
+    """Loads a campaign with extra eval metrics.
+
+    Args:
+      extra: Additional eval metrics to record.
+
+    Returns:
+      The loaded campaign summary.
+    """
+    state = fixtures.campaign_state()
+    state["stages"]["eval"]["metrics"].update(extra or {})
+    root = tempfile.mkdtemp()
+    self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+    path = fixtures.write_campaign(root, state=state)
+    return index_mod.load_campaign(path, root=root)
+
+  def _delta(self, campaign, label="delta"):
+    """Returns a campaign's delta target by label.
+
+    Args:
+      campaign: The campaign.
+      label: The delta column's label.
+
+    Returns:
+      The matching eval target.
+    """
+    return next(t for t in campaign.eval_targets if t.label == label)
+
+  def test_the_ratio_uses_the_temperature_matched_baseline(self):
+    """0.105 -> 0.062, not 0.091 -> 0.062.
+
+    The fixture has two SFT rows; the policy was scored at 0.7, so the
+    greedy row must not be what the percentage is taken against.
+    """
+    delta = self._delta(self._campaign())
+    self.assertAlmostEqual(
+        delta.metric_ratios["hallucination_rate"], 0.043 / 0.105
+    )
+
+  def test_a_higher_is_better_metric_is_inverted_the_other_way(self):
+    delta = self._delta(self._campaign())
+    self.assertAlmostEqual(delta.metric_ratios["bertscore_f1"], 0.018 / 0.874)
+
+  def test_each_branch_uses_its_own_baseline(self):
+    """The two flavors were scored at different temperatures.
+
+    Organic improves 0.105 -> 0.062 and synthetic 0.200 -> 0.100; the
+    absolute deltas differ, and so must the shares.
+    """
+    campaign = self._campaign({
+        "sft@t1.0/hallucination_rate": 0.200,
+        "sft@t1.0/decoding_temperature": 1.0,
+        "perl:synthetic_struct/hallucination_rate": 0.100,
+        "perl:synthetic_struct/decoding_temperature": 1.0,
+        "delta:synthetic_struct/hallucination_rate": 0.100,
+    })
+    self.assertAlmostEqual(
+        self._delta(campaign).metric_ratios["hallucination_rate"],
+        0.043 / 0.105,
+    )
+    self.assertAlmostEqual(
+        self._delta(campaign, "delta:synthetic_struct").metric_ratios[
+            "hallucination_rate"
+        ],
+        0.5,
+    )
+
+  def test_only_delta_columns_carry_a_ratio(self):
+    campaign = self._campaign()
+    for target in campaign.eval_targets:
+      if not target.is_delta:
+        self.assertEqual(target.metric_ratios, {}, target.label)
+
+  def test_a_zero_baseline_leaves_the_cell_empty(self):
+    """A metric that was already perfect has no share to improve on."""
+    campaign = self._campaign({
+        "sft@t0.7/autorater_n_dropped": 0,
+        "perl/autorater_n_dropped": 0,
+        "delta/autorater_n_dropped": 0.0,
+    })
+    self.assertNotIn(
+        "autorater_n_dropped", self._delta(campaign).metric_ratios
+    )
+
+  def test_an_orphan_delta_is_left_alone(self):
+    """A delta whose policy column is missing has nothing to invert."""
+    state = fixtures.campaign_state()
+    metrics = state["stages"]["eval"]["metrics"]
+    for key in [k for k in metrics if k.startswith("perl/")]:
+      del metrics[key]
+    path = fixtures.write_campaign(self.root, state=state)
+    campaign = index_mod.load_campaign(path, root=self.root)
+    self.assertEqual(self._delta(campaign).metric_ratios, {})
+
+
 class BranchedCampaignTest(unittest.TestCase):
   """Dataset-flavor branches produce ``kind:flavor`` stage ids."""
 

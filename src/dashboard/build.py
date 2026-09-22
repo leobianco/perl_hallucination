@@ -239,6 +239,22 @@ def format_metric(value: Optional[float], places: int = 4) -> str:
   return str(value)
 
 
+def format_relative(value: Optional[float]) -> str:
+  """Renders a relative change as a signed percentage.
+
+  Args:
+    value: The change as a fraction of its baseline, or None.
+
+  Returns:
+    A signed percentage, or an em dash. The sign follows the delta it was
+    derived from, so ``+41.0%`` means the policy removed 41% of whatever the
+    baseline was doing wrong - not that the metric itself rose.
+  """
+  if not isinstance(value, (int, float)) or isinstance(value, bool):
+    return "\u2014"
+  return f"{value * 100:+.1f}%"
+
+
 def _chip(text: str, kind: Optional[str] = None) -> str:
   """Renders a status chip.
 
@@ -574,11 +590,34 @@ def _metric_rows(
   rows = []
   for name in names:
     cells = "".join(
-        f'<td class="num">{_e(format_metric(target.metrics.get(name)))}</td>'
-        for target in campaign.eval_targets
+        _metric_cell(target, name) for target in campaign.eval_targets
     )
     rows.append(f"<tr><td>{_e(_metric_title(name))}</td>{cells}</tr>")
   return "".join(rows)
+
+
+def _metric_cell(target: index_mod.EvalTarget, name: str) -> str:
+  """Renders one metric cell, with the relative change under a delta.
+
+  The absolute delta stays the headline number because it is the one that
+  composes with the policy column beside it. The ratio goes underneath in
+  small type because it answers a different question - how much of the
+  baseline's failures were removed - and a reader who wants it wants it for
+  every row at once, not one column over.
+
+  Args:
+    target: The column's evaluated target.
+    name: The bare metric name.
+
+  Returns:
+    A ``<td>`` element.
+  """
+  value = _e(format_metric(target.metrics.get(name)))
+  ratio = target.metric_ratios.get(name)
+  if ratio is None:
+    return f'<td class="num">{value}</td>'
+  sub = f'<span class="sub">{_e(format_relative(ratio))}</span>'
+  return f'<td class="num">{value}{sub}</td>'
 
 
 def _metric_title(name: str) -> str:
@@ -619,6 +658,7 @@ def _eval_table(campaign: index_mod.CampaignSummary) -> str:
       for target in campaign.eval_targets
   )
   head = f"<thead><tr><th>Metric</th>{header}</tr></thead>"
+  legend = _eval_legend(campaign)
   main = f"""<table class="eval">
 {head}
 <tbody>{_metric_rows(campaign, campaign.headline_metric_names)}</tbody>
@@ -626,7 +666,7 @@ def _eval_table(campaign: index_mod.CampaignSummary) -> str:
 
   secondary = campaign.secondary_metric_names
   if not secondary:
-    return main
+    return f"{main}{legend}"
   count = len(secondary)
   return f"""{main}
 <details class="more-metrics">
@@ -635,7 +675,29 @@ def _eval_table(campaign: index_mod.CampaignSummary) -> str:
 {head}
 <tbody>{_metric_rows(campaign, secondary)}</tbody>
 </table>
-</details>"""
+</details>{legend}"""
+
+
+def _eval_legend(campaign: index_mod.CampaignSummary) -> str:
+  """Explains the small number printed under each delta.
+
+  Said once below the table rather than as a per-cell qualifier, which at
+  three delta columns would have repeated the same six words forty times.
+
+  Args:
+    campaign: The campaign.
+
+  Returns:
+    A one-line note, or an empty string when no column has a ratio to
+    explain - an older campaign, or one whose baselines were all zero.
+  """
+  if not any(target.metric_ratios for target in campaign.eval_targets):
+    return ""
+  return (
+      '\n<p class="subtitle">Under each delta: the same improvement as a '
+      "share of the baseline it was measured against, so +50% means half "
+      "of what the baseline was doing is gone.</p>"
+  )
 
 
 def _links_panel(campaign: index_mod.CampaignSummary) -> str:

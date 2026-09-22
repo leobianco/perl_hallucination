@@ -387,6 +387,99 @@ class DeltaPairingTest(unittest.TestCase):
     self.assertAlmostEqual(deltas["delta/hallucination_rate"], 0.06)
 
 
+class RelativeChangeTest(unittest.TestCase):
+  """Re-expressing a delta as a share of what it started from.
+
+  The dashboard prints this under every delta column. It cannot look the
+  baseline up - which SFT row a policy was compared against depends on the
+  branch's decoding temperature - so it inverts the delta instead. These
+  tests pin that inversion against the function that produced the delta in
+  the first place.
+  """
+
+  def test_a_halved_rate_reads_as_fifty_percent(self):
+    # The motivating example: 0.20 -> 0.10 is not "-0.10", it is half the
+    # hallucinations gone.
+    self.assertAlmostEqual(
+        eval_metrics.relative_change("hallucination_rate", 0.10, 0.10), 0.5
+    )
+
+  def test_a_lower_is_better_metric_keeps_improvement_positive(self):
+    # Stored delta is positive-is-better, and so is the ratio, even though
+    # the metric itself went down.
+    ratio = eval_metrics.relative_change("hallucination_rate", 0.043, 0.062)
+    self.assertGreater(ratio, 0.0)
+    self.assertAlmostEqual(ratio, 0.043 / 0.105)
+
+  def test_a_higher_is_better_metric_uses_the_other_direction(self):
+    # bertscore_f1 rose from 0.874 to 0.892; the delta is +0.018 and the
+    # baseline must come back as 0.874, not 0.910.
+    self.assertAlmostEqual(
+        eval_metrics.baseline_from_delta("bertscore_f1", 0.018, 0.892), 0.874
+    )
+
+  def test_a_regression_reads_as_a_negative_share(self):
+    # Policy 0.12 against a 0.10 baseline: a fifth worse.
+    self.assertAlmostEqual(
+        eval_metrics.relative_change("hallucination_rate", -0.02, 0.12), -0.2
+    )
+
+  def test_the_inversion_agrees_with_the_delta_it_came_from(self):
+    # The contract the dashboard leans on, checked end to end and per
+    # branch: each delta must invert back to the baseline row the eval
+    # stage actually paired the policy with, not to the greedy `sft` row.
+    metrics = {
+        "sft/hallucination_rate": 0.10,
+        "sft/decoding_temperature": 0.0,
+        "sft@t0.3/hallucination_rate": 0.12,
+        "sft@t0.3/decoding_temperature": 0.3,
+        "sft@t1.0/hallucination_rate": 0.20,
+        "sft@t1.0/decoding_temperature": 1.0,
+        "perl:organic/hallucination_rate": 0.09,
+        "perl:organic/decoding_temperature": 0.3,
+        "perl:synthetic_struct/hallucination_rate": 0.15,
+        "perl:synthetic_struct/decoding_temperature": 1.0,
+    }
+    deltas = compute_deltas(metrics)
+    for policy, baseline in (
+        ("organic", "sft@t0.3"),
+        ("synthetic_struct", "sft@t1.0"),
+    ):
+      recovered = eval_metrics.baseline_from_delta(
+          "hallucination_rate",
+          deltas[f"delta:{policy}/hallucination_rate"],
+          metrics[f"perl:{policy}/hallucination_rate"],
+      )
+      self.assertAlmostEqual(
+          recovered, metrics[f"{baseline}/hallucination_rate"]
+      )
+
+  def test_a_zero_baseline_has_no_ratio_rather_than_an_infinite_one(self):
+    # Nothing to improve on; 0/0 is not a 100% win.
+    self.assertIsNone(
+        eval_metrics.relative_change("hallucination_rate", 0.0, 0.0)
+    )
+
+  def test_a_negative_baseline_is_refused(self):
+    # A share of a negative reference flips sign for no reason a reader
+    # could follow, so the cell stays blank.
+    self.assertIsNone(
+        eval_metrics.relative_change("bertscore_f1", 0.2, -0.1)
+    )
+
+  def test_a_missing_or_non_numeric_value_is_refused(self):
+    for improvement, policy in ((None, 0.1), (0.1, None), (True, 0.1)):
+      self.assertIsNone(
+          eval_metrics.relative_change(
+              "hallucination_rate", improvement, policy
+          )
+      )
+
+  def test_the_sign_matches_how_the_delta_was_built(self):
+    self.assertEqual(eval_metrics.delta_sign("hallucination_rate"), -1)
+    self.assertEqual(eval_metrics.delta_sign("bertscore_f1"), 1)
+
+
 class ExecutionTest(unittest.TestCase):
   """What a full (dry) pass records."""
 

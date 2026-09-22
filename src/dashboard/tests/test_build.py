@@ -619,6 +619,71 @@ class EvalTableTest(unittest.TestCase):
       headers = re.findall(r'<th class="num">([^<]*)</th>', chunk)
       self.assertEqual(headers, expected)
 
+  def test_a_delta_also_reads_as_a_share_of_its_baseline(self):
+    """0.105 -> 0.062 is +0.043, which is 41% of what SFT was getting wrong.
+
+    The absolute number alone cannot say whether that is a rout or noise.
+    """
+    html = self._table()
+    self.assertIn('0.043<span class="sub">+41.0%</span>', html)
+
+  def test_the_share_sits_only_under_the_delta(self):
+    """The policy and baseline columns are levels, not changes."""
+    html = self._table()
+    row = next(
+        line
+        for line in html.split("<tr>")
+        if line.startswith("<td>hallucination rate</td>")
+    )
+    self.assertEqual(row.count('class="sub"'), 1)
+
+  def test_each_branch_shows_its_own_share(self):
+    """Two branches compared against baselines at different temperatures."""
+    html = self._table({
+        "sft@t1.0/hallucination_rate": 0.200,
+        "sft@t1.0/decoding_temperature": 1.0,
+        "perl:synthetic_struct/hallucination_rate": 0.100,
+        "perl:synthetic_struct/decoding_temperature": 1.0,
+        "delta:synthetic_struct/hallucination_rate": 0.100,
+    })
+    self.assertIn('0.043<span class="sub">+41.0%</span>', html)
+    self.assertIn('0.1<span class="sub">+50.0%</span>', html)
+
+  def test_a_regression_keeps_its_sign(self):
+    html = self._table({
+        "sft@t0.7/bertscore_f1": 0.900,
+        "perl/bertscore_f1": 0.810,
+        "delta/bertscore_f1": -0.090,
+    })
+    self.assertIn('-0.09<span class="sub">-10.0%</span>', html)
+
+  def test_the_disclosure_gets_the_shares_too(self):
+    """A metric behind "N more" is read the same way as one above it."""
+    html = self._table({
+        "sft@t0.7/rouge1_precision_median": 0.50,
+        "perl/rouge1_precision_median": 0.55,
+        "delta/rouge1_precision_median": 0.05,
+    })
+    more = html.partition("<details")[2]
+    self.assertIn('0.05<span class="sub">+10.0%</span>', more)
+
+  def test_the_legend_explains_the_small_number_once(self):
+    html = self._table()
+    self.assertEqual(html.count('<p class="subtitle">'), 1)
+    self.assertIn("share of the baseline", html)
+
+  def test_a_campaign_without_shares_gets_no_legend(self):
+    """Nothing to explain when no column carries one."""
+    state = fixtures.campaign_state()
+    metrics = state["stages"]["eval"]["metrics"]
+    for key in [k for k in metrics if k.startswith("delta/")]:
+      del metrics[key]
+    root = tempfile.mkdtemp()
+    self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+    fixtures.write_campaign(root, state=state)
+    html = build_mod._eval_table(index_mod.build_index(root)[0])
+    self.assertNotIn('<p class="subtitle">', html)
+
 
 if __name__ == "__main__":
   unittest.main()

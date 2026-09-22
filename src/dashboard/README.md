@@ -58,6 +58,21 @@ ROUGE variant in F1/precision/recall form — and tabulating all of them produce
 a table too wide to read. The rest sit behind an *N more metrics* disclosure
 directly below, and the full report further down has everything.
 
+Every `delta` cell carries a second, smaller number: the same improvement as a
+**share of the baseline it was measured against**, so a hallucination rate of
+0.20 dropping to 0.10 reads `+0.1` with `+50.0%` beneath it rather than only
+`+0.1`. The sign convention is the delta's, not the metric's — positive is
+always better.
+
+> The baseline is not stored anywhere: each policy is compared against the SFT
+> row sampled at *its own* decoding temperature, which differs per branch. So
+> the share is computed by inverting the delta against the policy column beside
+> it (`baseline = policy - sign * delta`), which inherits whatever pairing the
+> eval stage chose instead of re-deriving it. The sign comes from
+> `eval_metrics.delta_sign`, the same function that produced the delta, so the
+> two cannot drift apart. A baseline that is zero or negative gets no share at
+> all rather than an invented one.
+
 `provenance_*` keys never reach either table: their *values* are adapter repo
 ids and checkpoint directories, which is what made the table wide in the first
 place. The dashboard imports `src.orchestrator.eval_metrics` to decide what
@@ -228,5 +243,5 @@ change is at least noisy.
 python3 -m unittest discover -s src/dashboard/tests -t .
 ```
 
-143 tests, hermetic, no network. They pass on a bare `/usr/bin/python3` (13
+182 tests, hermetic, no network. They pass on a bare `/usr/bin/python3` (13
 markdown-specific tests skip) and in the project environment (all run).

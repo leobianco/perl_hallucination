@@ -920,8 +920,11 @@ def compute_deltas(metrics: Dict[str, Any]) -> Dict[str, Any]:
           sft_value, bool
       ):
         continue
-      improvement = float(perl_value) - float(sft_value)
-      if bare in LOWER_IS_BETTER:
-        improvement = -improvement
+      # Signed through the shared helper rather than an inline membership
+      # test: the dashboard inverts this arithmetic to recover the baseline,
+      # and two copies of the rule would drift apart without a failing test.
+      improvement = eval_metrics.delta_sign(bare) * (
+          float(perl_value) - float(sft_value)
+      )
       deltas[f"{namespace}/{bare}"] = improvement
   return deltas
