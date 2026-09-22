@@ -414,5 +414,49 @@ class DryRunTest(unittest.TestCase):
     self.assertNotIn("Dry run.", detail)
 
 
+class ContentHashTest(unittest.TestCase):
+  """What the publisher's skip-if-unchanged guard is allowed to ignore."""
+
+  def setUp(self):
+    super().setUp()
+    self.root = tempfile.mkdtemp()
+    self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+    fixtures.write_campaign(self.root)
+
+  def _hash(self, **kwargs):
+    """Builds the site and returns its content hash.
+
+    Args:
+      **kwargs: Passed through to ``build_site``.
+
+    Returns:
+      The build's content hash.
+    """
+    out = tempfile.mkdtemp()
+    self.addCleanup(shutil.rmtree, out, ignore_errors=True)
+    return build_mod.build_site(root=self.root, out_dir=out, **kwargs).content_hash
+
+  def test_the_clock_is_not_part_of_it(self):
+    """Otherwise every poll would look like a change and republish."""
+    early = datetime.datetime(2026, 9, 22, 9, 0, tzinfo=datetime.timezone.utc)
+    late = datetime.datetime(2026, 9, 22, 18, 0, tzinfo=datetime.timezone.utc)
+    self.assertEqual(
+        self._hash(generated_at=early), self._hash(generated_at=late)
+    )
+
+  def test_the_renderer_is_part_of_it(self):
+    """A stylesheet edit changes the site, so it must change the hash.
+
+    The data is identical in both builds; only the presentation moved. Before
+    this was folded in, restyling the dashboard produced a visibly different
+    site that the publisher skipped as unchanged.
+    """
+    before = self._hash()
+    original = build_mod._asset("style.css")
+    build_mod._ASSET_CACHE["style.css"] = original + "\n.kpi { color: red; }\n"
+    self.addCleanup(build_mod._ASSET_CACHE.__setitem__, "style.css", original)
+    self.assertNotEqual(before, self._hash())
+
+
 if __name__ == "__main__":
   unittest.main()

@@ -79,6 +79,33 @@ def _asset(name: str) -> str:
   return _ASSET_CACHE[name]
 
 
+#: Files whose contents determine what the HTML looks like, as opposed to
+#: what it says. Folded into the content hash so that a template, stylesheet
+#: or script change republishes on its own: without this, editing the CSS
+#: produced a site that was visibly different and a hash that was not, and
+#: the publisher correctly - and uselessly - skipped it.
+_RENDERER_SOURCES = ("style.css", "app.js")
+
+
+def _renderer_fingerprint() -> str:
+  """Hashes the code and assets that shape the emitted HTML.
+
+  Returns:
+    A short hex digest, stable across runs and across the clock.
+  """
+  digest = hashlib.sha256()
+  for name in _RENDERER_SOURCES:
+    digest.update(_asset(name).encode("utf-8"))
+  for module in (__file__, render_mod.__file__, links_mod.__file__):
+    try:
+      with open(module, "rb") as handle:
+        digest.update(handle.read())
+    except OSError:
+      # A frozen or zipped deployment: the campaign data still fingerprints.
+      continue
+  return digest.hexdigest()[:16]
+
+
 #: Hoisted out of the f-strings that use them: a backslash escape inside an
 #: f-string *expression* is a syntax error before Python 3.12, and the VM's
 #: interpreter is not guaranteed to be newer than that.
@@ -919,6 +946,7 @@ def build_site(
   serialized = [c.to_dict() for c in campaigns]
   content_hash = hashlib.sha256(
       json.dumps(serialized, sort_keys=True).encode("utf-8")
+      + _renderer_fingerprint().encode("utf-8")
   ).hexdigest()
   payload: Dict[str, Any] = {
       "generated_at": iso,
