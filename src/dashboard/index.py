@@ -540,6 +540,69 @@ def _parse_eval_label(label: str) -> Tuple[str, Optional[float], bool]:
   return base, temperature, base.split(":")[0] == "delta"
 
 
+def _eval_target_kind(target: "EvalTarget") -> str:
+  """Returns the target's stage kind, e.g. ``perl`` for ``perl:organic``."""
+  return target.base_label.partition(":")[0]
+
+
+def _eval_target_flavor(target: "EvalTarget") -> str:
+  """Returns the target's branch flavor, empty for unbranched campaigns."""
+  return target.base_label.partition(":")[2]
+
+
+def _order_eval_targets(targets: Iterable["EvalTarget"]) -> List["EvalTarget"]:
+  """Orders eval columns so every policy sits next to its own delta.
+
+  Baselines come first (``sft``, ``sft@t0.6``, ``sft@t1.0``), then one block
+  per trained policy: the policy column immediately followed by the delta
+  measured against it. Sorting deltas to the end instead pushed the two
+  numbers a reader compares to opposite ends of the table, and a fan-out
+  campaign made that worse by interleaving the flavors.
+
+  Args:
+    targets: The eval targets, in any order.
+
+  Returns:
+    A new list in display order.
+  """
+  targets = list(targets)
+  baselines = sorted(
+      (
+          t
+          for t in targets
+          if not t.is_delta and _eval_target_kind(t) != "perl"
+      ),
+      key=lambda t: t.label,
+  )
+  policies = sorted(
+      (t for t in targets if not t.is_delta and _eval_target_kind(t) == "perl"),
+      key=lambda t: t.label,
+  )
+  deltas_by_flavor: Dict[str, List["EvalTarget"]] = {}
+  for target in sorted(
+      (t for t in targets if t.is_delta), key=lambda t: t.label
+  ):
+    deltas_by_flavor.setdefault(_eval_target_flavor(target), []).append(target)
+
+  ordered: List["EvalTarget"] = list(baselines)
+  paired: set = set()
+  for policy in policies:
+    ordered.append(policy)
+    for delta in deltas_by_flavor.get(_eval_target_flavor(policy), []):
+      if id(delta) not in paired:
+        ordered.append(delta)
+        paired.add(id(delta))
+  # An orphan delta - one whose policy never made it into the metrics -
+  # still belongs in the table; it just has nothing to sit beside.
+  ordered.extend(
+      t
+      for deltas in deltas_by_flavor.values()
+      for t in deltas
+      if id(t) not in paired
+  )
+  return ordered
+
+
 def _extract_eval_targets(
     stage: Optional[StageView], stages: Iterable[StageView]
 ) -> Tuple[List[EvalTarget], List[str]]:
@@ -597,9 +660,7 @@ def _extract_eval_targets(
     if owner is not None:
       target.model_repo_id = owner.model_repo_id
 
-  ordered = sorted(
-      by_label.values(), key=lambda t: (t.is_delta, t.label)
-  )
+  ordered = _order_eval_targets(by_label.values())
   metric_names.sort(key=_metric_sort_key)
   return ordered, metric_names
 

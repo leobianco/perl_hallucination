@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -592,6 +593,31 @@ class EvalTableTest(unittest.TestCase):
     })
     self.assertIn("<td>bertscore f1</td>", html)
     self.assertIn("<td>bertscore f1 std</td>", html)
+
+  def test_both_tables_lead_with_the_baselines_and_pair_the_deltas(self):
+    """The disclosure reuses the header, so it must not drift from the main.
+
+    A reader who expands the tail is comparing the same columns; renumbering
+    them halfway down the page would be worse than not pairing them at all.
+    """
+    html = self._table({
+        "perl:organic/hallucination_rate": 0.062,
+        "delta:organic/hallucination_rate": 0.043,
+        "perl:organic/rouge1_precision_median": 0.4,
+        "sft/rouge1_precision_median": 0.5,
+    })
+    expected = [
+        "sft",
+        "sft@t0.7",
+        "perl",
+        "delta",
+        "perl:organic",
+        "delta:organic",
+    ]
+    main, _, more = html.partition("<details")
+    for chunk in (main, more):
+      headers = re.findall(r'<th class="num">([^<]*)</th>', chunk)
+      self.assertEqual(headers, expected)
 
 
 if __name__ == "__main__":

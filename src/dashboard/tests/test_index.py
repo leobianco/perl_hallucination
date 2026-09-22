@@ -261,7 +261,7 @@ class EvalTargetTest(unittest.TestCase):
 
   def test_targets_are_split_by_label(self):
     labels = [target.label for target in self.campaign.eval_targets]
-    self.assertEqual(labels, ["perl", "sft", "sft@t0.7", "delta"])
+    self.assertEqual(labels, ["sft", "sft@t0.7", "perl", "delta"])
 
   def test_temperature_suffix_is_parsed(self):
     target = next(
@@ -274,8 +274,45 @@ class EvalTargetTest(unittest.TestCase):
     target = next(t for t in self.campaign.eval_targets if t.label == "sft")
     self.assertEqual(target.temperature, 0.0)
 
-  def test_delta_is_flagged_and_sorted_last(self):
+  def test_delta_is_flagged_and_follows_its_policy(self):
+    """The delta is the policy's column, so it sits beside it, not at the end.
+
+    Baselines lead, because they are what everything else is measured
+    against.
+    """
     self.assertTrue(self.campaign.eval_targets[-1].is_delta)
+    self.assertEqual(self.campaign.eval_targets[-2].label, "perl")
+    self.assertFalse(any(t.is_delta for t in self.campaign.eval_targets[:2]))
+
+  def test_a_fan_out_pairs_each_flavor_with_its_own_delta(self):
+    """Two branches must not interleave: organic's delta is organic's.
+
+    Sorting deltas last put `delta:organic` next to `delta:synthetic_struct`
+    and both a table-width away from the numbers they qualify.
+    """
+    state = fixtures.campaign_state()
+    metrics = state["stages"]["eval"]["metrics"]
+    for key in [k for k in metrics if k.startswith(("perl/", "delta/"))]:
+      namespace, _, suffix = key.partition("/")
+      metrics[f"{namespace}:organic/{suffix}"] = metrics.pop(key)
+    metrics["perl:synthetic_struct/hallucination_rate"] = 0.081
+    metrics["delta:synthetic_struct/hallucination_rate"] = 0.024
+    root = tempfile.mkdtemp()
+    self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+    path = fixtures.write_campaign(root, state=state)
+    campaign = index_mod.load_campaign(path, root=root)
+    labels = [target.label for target in campaign.eval_targets]
+    self.assertEqual(
+        labels,
+        [
+            "sft",
+            "sft@t0.7",
+            "perl:organic",
+            "delta:organic",
+            "perl:synthetic_struct",
+            "delta:synthetic_struct",
+        ],
+    )
 
   def test_targets_are_attributed_to_their_model(self):
     perl = next(t for t in self.campaign.eval_targets if t.label == "perl")
