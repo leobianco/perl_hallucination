@@ -32,11 +32,36 @@ campaign, and the numbers only mean something next to the run that produced
 them.
 
 **Campaign page** — title, status and dry-run chips, a one-line identity strip,
-the headline result (PE-RL hallucination rate and the signed improvement over
-SFT), the run metadata, a per-stage table (status, trials, best metric with its
-selection provenance, published model), the evaluation metric table with one
-column per target (`sft`, `sft@t0.7`, `perl`, `delta`), the links panel, the
-rendered markdown report, and the campaign configuration as launched.
+the headline cards, the run metadata, a per-stage table (status, trials, best
+metric with its selection provenance, published model), the evaluation table,
+the links panel, the rendered markdown report, and the campaign configuration
+as launched.
+
+**Headline cards** — one pair per trained policy, so a campaign that fanned out
+over two reward-model dataset flavors gets a pair for each rather than one
+number that hides the comparison the fan-out exists to make. The first card is
+the policy's hallucination rate; the second is how that rate *changed* against
+the SFT baseline sampled at the same temperature, as a percentage. Fewer
+hallucinations reads as a negative number and is green.
+
+> The eval stage stores deltas signed so that positive always means
+> improvement, whichever direction the underlying metric runs in. The card
+> negates that, because "the hallucination rate went up by 2%" is how the
+> number is spoken, and a green `+` is a trap.
+
+**Evaluation table** — one column per target (`sft`, `sft@t0.7`, `perl`,
+`delta`) and one row per *curated* metric: decoding temperature, hallucination
+and faithfulness rates, the reward-hacking rubric, repetition rate, ROUGE-1/2/L
+F1, BERTScore mean and std, perplexity. The eval stage records upwards of fifty
+keys per target — every generation statistic in mean/std/median form, every
+ROUGE variant in F1/precision/recall form — and tabulating all of them produced
+a table too wide to read. The rest sit behind an *N more metrics* disclosure
+directly below, and the full report further down has everything.
+
+`provenance_*` keys never reach either table: their *values* are adapter repo
+ids and checkpoint directories, which is what made the table wide in the first
+place. The dashboard imports `src.orchestrator.eval_metrics` to decide what
+counts as an audit key, so its definition cannot drift from the report's.
 
 **Dry runs are labelled.** A rehearsal (`dry_run: true`, or — for states
 written before that flag was persisted — sweep ids of the form `mock_sweep_*`)

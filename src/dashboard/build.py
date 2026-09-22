@@ -559,8 +559,52 @@ def _stage_table(campaign: index_mod.CampaignSummary) -> str:
 </table>"""
 
 
+def _metric_rows(
+    campaign: index_mod.CampaignSummary, names: Sequence[str]
+) -> str:
+  """Renders one table row per metric, one column per evaluated target.
+
+  Args:
+    campaign: The campaign.
+    names: Bare metric names to render, in order.
+
+  Returns:
+    The concatenated ``<tr>`` elements.
+  """
+  rows = []
+  for name in names:
+    cells = "".join(
+        f'<td class="num">{_e(format_metric(target.metrics.get(name)))}</td>'
+        for target in campaign.eval_targets
+    )
+    rows.append(f"<tr><td>{_e(_metric_title(name))}</td>{cells}</tr>")
+  return "".join(rows)
+
+
+def _metric_title(name: str) -> str:
+  """Renders a metric key as a column label.
+
+  Args:
+    name: The bare metric name.
+
+  Returns:
+    A human-readable label. The ``_mean`` suffix is dropped because every
+    unqualified number in the table is a mean; ``_std`` is kept because it
+    is the one that would otherwise be mistaken for one.
+  """
+  if name.endswith("_mean"):
+    name = name[: -len("_mean")]
+  return name.replace("_", " ")
+
+
 def _eval_table(campaign: index_mod.CampaignSummary) -> str:
-  """Renders the evaluation metric table, one column per target.
+  """Renders the evaluation comparison, one column per target.
+
+  Only the curated metrics get a row. The eval stage records upwards of
+  forty keys per target - every generation statistic in mean/std/median
+  form, every ROUGE variant in F1/precision/recall form - and rendering all
+  of them produced a table too wide to read, which is the opposite of what a
+  summary is for. The rest stay one click away.
 
   Args:
     campaign: The campaign.
@@ -570,25 +614,28 @@ def _eval_table(campaign: index_mod.CampaignSummary) -> str:
   """
   if not campaign.eval_targets or not campaign.eval_metric_names:
     return ""
-  targets = campaign.eval_targets
   header = "".join(
-      f'<th class="num">{_e(target.label)}</th>' for target in targets
+      f'<th class="num">{_e(target.label)}</th>'
+      for target in campaign.eval_targets
   )
-  temperatures = "".join(
-      f'<td class="num">{_e(format_metric(target.temperature, 2))}</td>'
-      for target in targets
-  )
-  rows = [f"<tr><td>decoding temperature</td>{temperatures}</tr>"]
-  for name in campaign.eval_metric_names:
-    cells = "".join(
-        f'<td class="num">{_e(format_metric(target.metrics.get(name)))}</td>'
-        for target in targets
-    )
-    rows.append(f"<tr><td>{_e(name)}</td>{cells}</tr>")
-  return f"""<table>
-<thead><tr><th>Metric</th>{header}</tr></thead>
-<tbody>{"".join(rows)}</tbody>
+  head = f"<thead><tr><th>Metric</th>{header}</tr></thead>"
+  main = f"""<table class="eval">
+{head}
+<tbody>{_metric_rows(campaign, campaign.headline_metric_names)}</tbody>
 </table>"""
+
+  secondary = campaign.secondary_metric_names
+  if not secondary:
+    return main
+  count = len(secondary)
+  return f"""{main}
+<details class="more-metrics">
+<summary>{count} more metric(s) recorded for each target</summary>
+<table class="eval">
+{head}
+<tbody>{_metric_rows(campaign, secondary)}</tbody>
+</table>
+</details>"""
 
 
 def _links_panel(campaign: index_mod.CampaignSummary) -> str:
@@ -686,13 +733,53 @@ def _subtitle(campaign: index_mod.CampaignSummary) -> str:
   return f'<div class="subtitle">{_e(_MIDDOT.join(bits))}</div>'
 
 
+def format_rate(value: Optional[float]) -> str:
+  """Renders a rate in [0, 1] as a percentage.
+
+  Args:
+    value: The rate, or None.
+
+  Returns:
+    ``6.2%``, or an em dash.
+  """
+  if not isinstance(value, (int, float)) or isinstance(value, bool):
+    return _DASH
+  return f"{float(value) * 100:.1f}%"
+
+
+def _kpi(label: str, value: str, tone: str = "", note: str = "") -> str:
+  """Renders one headline card.
+
+  Args:
+    label: Small uppercase caption.
+    value: The number itself.
+    tone: ``good``, ``bad`` or empty.
+    note: Optional muted line under the value.
+
+  Returns:
+    An HTML snippet.
+  """
+  sub = f'<div class="kpi-note">{note}</div>' if note else ""
+  return (
+      f'<div class="kpi"><div class="kpi-label">{_e(label)}</div>'
+      f'<div class="kpi-value {tone}">{value}</div>{sub}</div>'
+  )
+
+
 def _kpis(campaign: index_mod.CampaignSummary) -> str:
   """Renders the headline numbers as cards above the fold.
 
-  These used to live in the campaign list, where they were noise: you cannot
-  compare two campaigns by squinting at a column of four-decimal floats, and
-  the list is for finding a campaign, not for reading one. Here they answer
-  the only question worth asking on arrival, which is whether PE-RL helped.
+  One pair of cards per trained policy: what it hallucinates, and how that
+  compares with the SFT baseline sampled at the same temperature. A branched
+  campaign trains one policy per reward-model dataset flavor, and collapsing
+  them into a single "the" rate would hide exactly the comparison the branch
+  exists to make.
+
+  The comparison is expressed as the *change in the hallucination rate*, so
+  it reads the way the metric does: fewer hallucinations is a negative
+  number, and it is green. The eval stage stores the opposite sign - it
+  signs every delta so that positive means improvement, whichever direction
+  the underlying metric runs in - so the value is negated on the way in.
 
   Args:
     campaign: The campaign.
@@ -700,26 +787,62 @@ def _kpis(campaign: index_mod.CampaignSummary) -> str:
   Returns:
     An HTML snippet, empty when the campaign never evaluated.
   """
-  headline = campaign.headline
-  rate = headline["hallucination_rate"]
-  delta = headline["hallucination_delta"]
-  if rate is None and delta is None:
+  policies = [
+      target
+      for target in campaign.eval_targets
+      if not target.is_delta and target.base_label.startswith("perl")
+  ]
+  if not policies:
     return ""
 
-  cards = [
-      '<div class="kpi"><div class="kpi-label">PE-RL hallucination rate</div>'
-      f'<div class="kpi-value">{_e(format_metric(rate))}</div></div>'
-  ]
-  if delta is not None:
-    # The eval stage signs every delta so that positive always means PE-RL
-    # improved, whichever direction the underlying metric runs in.
-    tone = "good" if delta > 0 else ("bad" if delta < 0 else "")
-    sign = "+" if delta > 0 else ""
-    cards.append(
-        f'<div class="kpi"><div class="kpi-label">Improvement vs SFT</div>'
-        f'<div class="kpi-value {tone}">{sign}{_e(format_metric(delta))}</div>'
-        "</div>"
+  deltas = {
+      target.base_label.partition(":")[2]: target
+      for target in campaign.eval_targets
+      if target.is_delta
+  }
+
+  cards = []
+  for target in policies:
+    flavor = target.base_label.partition(":")[2]
+    suffix = f" ({flavor})" if flavor else ""
+    rate = target.metrics.get("hallucination_rate")
+    if rate is None:
+      continue
+    cards.append(_kpi(f"PE-RL hallucination rate{suffix}", format_rate(rate)))
+
+    delta_target = deltas.get(flavor)
+    improvement = (
+        delta_target.metrics.get("hallucination_rate")
+        if delta_target is not None
+        else None
     )
+    if not isinstance(improvement, (int, float)) or isinstance(
+        improvement, bool
+    ):
+      continue
+    # Stored positive-is-better; shown as the change in the rate itself.
+    change = -float(improvement)
+    tone = "good" if change < 0 else ("bad" if change > 0 else "")
+    sign = "+" if change > 0 else ""
+    baseline = None
+    if isinstance(rate, (int, float)):
+      baseline = float(rate) - change
+    note = (
+        f"{_e(format_rate(baseline))} \u2192 {_e(format_rate(rate))} vs SFT"
+        if baseline is not None
+        else ""
+    )
+    cards.append(
+        _kpi(
+            f"Change vs SFT{suffix}",
+            f"{sign}{format_rate(change)}",
+            tone=tone,
+            note=note,
+        )
+    )
+
+  if not cards:
+    return ""
   return f'<div class="kpis">{"".join(cards)}</div>'
 
 

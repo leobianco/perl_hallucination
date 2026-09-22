@@ -28,6 +28,8 @@ import os
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from src.orchestrator import eval_metrics
+
 #: Campaign statuses that mean the campaign will not progress further on its
 #: own. Used by the watcher to publish immediately (a terminal transition is
 #: the most valuable snapshot of a campaign's life) and by the UI's default
@@ -58,7 +60,94 @@ _STAGE_TITLES = {
 }
 
 #: Metric keys inside the eval stage that are not per-target measurements.
-_EVAL_META_METRICS = frozenset({"decoding_temperature", "num_samples"})
+_EVAL_META_METRICS = frozenset({"num_samples"})
+
+#: The metrics worth a row in the comparison table, in display order.
+#:
+#: The eval stage records upwards of forty keys per target: every generation
+#: statistic in mean/std/median form, every ROUGE variant in F1/precision/
+#: recall form, plus a `provenance_*` audit trail whose *values* are adapter
+#: repo ids. Tabulating all of them produced a table wide enough that the two
+#: numbers the campaign is about scrolled off the screen. The full set is
+#: still one click away under the table, and the report below has all of it.
+HEADLINE_EVAL_METRICS: Tuple[str, ...] = (
+    "decoding_temperature",
+    "hallucination_rate",
+    "faithfulness_rate",
+    "reward_hacking_quality",
+    "reward_hacking_rate",
+    "reward_hacking_fluency",
+    "reward_hacking_non_repetition",
+    "reward_hacking_non_extractiveness",
+    "repetition_rate_mean",
+    "rouge1_f1_mean",
+    "rouge2_f1_mean",
+    "rougeL_f1_mean",
+    "bertscore_f1_mean",
+    "bertscore_f1_std",
+    "perplexity_mean",
+)
+
+#: Older single-temperature runs wrote these bare, without the `_mean`
+#: suffix that the generation-metrics evaluator adds today. Both spellings
+#: are headline metrics; only one of them will ever be present.
+_HEADLINE_ALIASES: Dict[str, str] = {
+    "bertscore_f1": "bertscore_f1_mean",
+    "perplexity": "perplexity_mean",
+    "repetition_rate": "repetition_rate_mean",
+    "rouge1_f1": "rouge1_f1_mean",
+    "rouge2_f1": "rouge2_f1_mean",
+    "rougeL_f1": "rougeL_f1_mean",
+}
+
+
+def is_headline_metric(name: str) -> bool:
+  """Whether a metric earns a row in the main comparison table.
+
+  Args:
+    name: The bare metric name, without its target prefix.
+
+  Returns:
+    True for the curated set, including the pre-`_mean` spellings.
+  """
+  return name in HEADLINE_EVAL_METRICS or name in _HEADLINE_ALIASES
+
+
+def is_tabulated_metric(name: str) -> bool:
+  """Whether a metric belongs in a table at all.
+
+  ``provenance_*`` keys hold adapter repo ids and checkpoint directories, and
+  most ``autorater_*`` keys describe how the judge behaved rather than how
+  the model did. The orchestrator's own report excludes them from its
+  comparison table; this keeps the dashboard's definition identical instead
+  of letting the two drift.
+
+  Args:
+    name: The bare metric name.
+
+  Returns:
+    Whether the metric is a measurement rather than an audit trail.
+  """
+  if name in _EVAL_META_METRICS:
+    return False
+  if name in eval_metrics.TABULATED_AUDIT_KEYS:
+    return True
+  return not name.startswith(eval_metrics.AUDIT_PREFIXES)
+
+
+def _metric_sort_key(name: str) -> Tuple[int, str]:
+  """Orders metrics by the curated sequence, then alphabetically.
+
+  Args:
+    name: The bare metric name.
+
+  Returns:
+    A sort key.
+  """
+  canonical = _HEADLINE_ALIASES.get(name, name)
+  if canonical in HEADLINE_EVAL_METRICS:
+    return (HEADLINE_EVAL_METRICS.index(canonical), name)
+  return (len(HEADLINE_EVAL_METRICS), name)
 
 # The orchestrator's dry-run mode fabricates sweep ids of the form
 # "mock_sweep_<epoch>". Campaigns predating the persisted ``dry_run`` config
@@ -350,6 +439,33 @@ class CampaignSummary:
     return [stage for stage in self.stages if stage.kind == kind]
 
   @property
+  def headline_metric_names(self) -> List[str]:
+    """The curated metrics, in display order.
+
+    A state written across a version boundary can hold both spellings of the
+    same quantity - `bertscore_f1` and `bertscore_f1_mean` - which rendered
+    as two identically labelled rows with different numbers. The current
+    spelling wins.
+    """
+    names = [n for n in self.eval_metric_names if is_headline_metric(n)]
+    canonical = {_HEADLINE_ALIASES.get(n, n) for n in names}
+    return [
+        n
+        for n in names
+        if n not in _HEADLINE_ALIASES or _HEADLINE_ALIASES[n] not in canonical
+    ]
+
+  @property
+  def secondary_metric_names(self) -> List[str]:
+    """Everything else that is still a measurement, in display order.
+
+    Includes any superseded spelling dropped from the headline set, so that
+    no recorded measurement disappears from the page entirely.
+    """
+    headline = set(self.headline_metric_names)
+    return [n for n in self.eval_metric_names if n not in headline]
+
+  @property
   def headline(self) -> Dict[str, Optional[float]]:
     """The two numbers worth putting in a list row.
 
@@ -458,7 +574,7 @@ def _extract_eval_targets(
           is_delta=is_delta,
       )
     by_label[label].metrics[metric] = value
-    if metric not in metric_names and metric not in _EVAL_META_METRICS:
+    if metric not in metric_names and is_tabulated_metric(metric):
       metric_names.append(metric)
 
   # The decoding temperature is recorded as a metric rather than in the
@@ -484,6 +600,7 @@ def _extract_eval_targets(
   ordered = sorted(
       by_label.values(), key=lambda t: (t.is_delta, t.label)
   )
+  metric_names.sort(key=_metric_sort_key)
   return ordered, metric_names
 
 

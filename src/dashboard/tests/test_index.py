@@ -285,8 +285,39 @@ class EvalTargetTest(unittest.TestCase):
 
   def test_metric_names_exclude_bookkeeping_keys(self):
     self.assertIn("hallucination_rate", self.campaign.eval_metric_names)
-    self.assertNotIn("decoding_temperature", self.campaign.eval_metric_names)
     self.assertNotIn("num_samples", self.campaign.eval_metric_names)
+
+  def test_decoding_temperature_leads_the_table(self):
+    """It is a setting, not a measurement, but the table must state it.
+
+    Every other row is meaningless without knowing the decoding regime the
+    completions were sampled under, so it earns the first row rather than a
+    hand-written one bolted on by the renderer.
+    """
+    names = self.campaign.eval_metric_names
+    self.assertEqual(names[0], "decoding_temperature")
+    self.assertIn("decoding_temperature", self.campaign.headline_metric_names)
+
+  def test_provenance_and_audit_keys_never_reach_a_table(self):
+    """Their values are adapter repo ids, which made the table unreadable."""
+    for name in (
+        "provenance_sft_adapter",
+        "provenance_policy_dir",
+        "autorater_score_mean",
+    ):
+      self.assertFalse(index_mod.is_tabulated_metric(name), name)
+    # ... but the handful of audit keys the report does tabulate survive.
+    self.assertTrue(index_mod.is_tabulated_metric("autorater_accuracy"))
+
+  def test_headline_metrics_are_separated_from_the_rest(self):
+    """The wide tail goes behind a disclosure, not into the main table."""
+    self.assertIn("hallucination_rate", self.campaign.headline_metric_names)
+    self.assertNotIn("hallucination_rate", self.campaign.secondary_metric_names)
+    combined = (
+        self.campaign.headline_metric_names
+        + self.campaign.secondary_metric_names
+    )
+    self.assertCountEqual(combined, self.campaign.eval_metric_names)
 
   def test_headline_reports_the_perl_rate_and_delta(self):
     headline = self.campaign.headline

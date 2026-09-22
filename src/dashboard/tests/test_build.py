@@ -458,5 +458,141 @@ class ContentHashTest(unittest.TestCase):
     self.assertNotEqual(before, self._hash())
 
 
+class KpiTest(unittest.TestCase):
+  """The headline cards, whose sign convention is easy to get backwards."""
+
+  def _cards(self, state):
+    """Renders the KPI strip for a campaign state.
+
+    Args:
+      state: The campaign state dict.
+
+    Returns:
+      The KPI HTML.
+    """
+    root = tempfile.mkdtemp()
+    self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+    fixtures.write_campaign(root, state=state)
+    campaign = index_mod.build_index(root)[0]
+    return build_mod._kpis(campaign)
+
+  def test_fewer_hallucinations_reads_as_a_negative_and_is_green(self):
+    """The stage stores positive-is-better; the card shows the rate's change.
+
+    The fixture improves from 10.5% to 6.2%, so the card must say -4.3% and
+    be green. Showing "+0.043" was correct arithmetic and the wrong story.
+    """
+    html = self._cards(fixtures.campaign_state())
+    self.assertIn("-4.3%", html)
+    self.assertNotIn("+4.3%", html)
+    self.assertIn('kpi-value good', html)
+    self.assertNotIn('kpi-value bad', html)
+
+  def test_more_hallucinations_reads_as_a_positive_and_is_red(self):
+    state = fixtures.campaign_state()
+    metrics = state["stages"]["eval"]["metrics"]
+    metrics["delta/hallucination_rate"] = -0.02
+    html = self._cards(state)
+    self.assertIn("+2.0%", html)
+    self.assertIn('kpi-value bad', html)
+
+  def test_rates_are_rendered_as_percentages(self):
+    html = self._cards(fixtures.campaign_state())
+    self.assertIn("6.2%", html)
+    self.assertNotIn("0.062", html)
+
+  def test_every_branch_gets_its_own_pair_of_cards(self):
+    """A fan-out campaign has no single "the" PE-RL rate.
+
+    Collapsing the branches would hide the comparison the fan-out exists to
+    make, so each flavor is named and carries its own change card.
+    """
+    state = fixtures.campaign_state()
+    metrics = state["stages"]["eval"]["metrics"]
+    for key in [k for k in metrics if k.startswith(("perl/", "delta/"))]:
+      suffix = key.split("/", 1)[1]
+      namespace = key.split("/", 1)[0]
+      metrics[f"{namespace}:organic/{suffix}"] = metrics[key]
+      del metrics[key]
+    metrics["perl:synthetic_struct/hallucination_rate"] = 0.081
+    metrics["perl:synthetic_struct/decoding_temperature"] = 0.7
+    metrics["delta:synthetic_struct/hallucination_rate"] = 0.024
+    html = self._cards(state)
+    self.assertIn("PE-RL hallucination rate (organic)", html)
+    self.assertIn("PE-RL hallucination rate (synthetic_struct)", html)
+    self.assertIn("Change vs SFT (organic)", html)
+    self.assertIn("Change vs SFT (synthetic_struct)", html)
+    self.assertIn("8.1%", html)
+
+
+class EvalTableTest(unittest.TestCase):
+  """The comparison table, which used to be unreadably wide."""
+
+  def _table(self, extra=None):
+    """Builds a campaign page's evaluation table.
+
+    Args:
+      extra: Additional eval metrics to record.
+
+    Returns:
+      The table HTML.
+    """
+    state = fixtures.campaign_state()
+    state["stages"]["eval"]["metrics"].update(extra or {})
+    root = tempfile.mkdtemp()
+    self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+    fixtures.write_campaign(root, state=state)
+    return build_mod._eval_table(index_mod.build_index(root)[0])
+
+  def test_provenance_never_appears(self):
+    """Its values are adapter repo ids; they are what made the table wide."""
+    html = self._table({
+        "perl/provenance_policy_adapter": "leobianco/" + "x" * 90,
+        "sft/provenance_policy_adapter": "leobianco/" + "y" * 90,
+    })
+    self.assertNotIn("provenance", html)
+    self.assertNotIn("x" * 90, html)
+
+  def test_the_wide_tail_goes_behind_a_disclosure(self):
+    html = self._table({
+        "perl/rouge1_precision_median": 0.4,
+        "sft/rouge1_precision_median": 0.5,
+    })
+    main, _, more = html.partition("<details")
+    self.assertNotIn("rouge1 precision median", main)
+    self.assertIn("rouge1 precision median", more)
+    self.assertIn("hallucination rate", main)
+
+  def test_the_temperature_leads_the_table(self):
+    html = self._table()
+    body = html.split("<tbody>")[1]
+    self.assertTrue(
+        body.lstrip().startswith("<tr><td>decoding temperature</td>"), body[:120]
+    )
+
+  def test_the_superseded_spelling_does_not_duplicate_a_row(self):
+    """`bertscore_f1` and `bertscore_f1_mean` are the same measurement.
+
+    A state written across a version boundary can hold both, which rendered
+    as two rows labelled "bertscore f1" with different numbers.
+    """
+    html = self._table({
+        "perl/bertscore_f1_mean": 0.9,
+        "sft/bertscore_f1_mean": 0.88,
+    })
+    main = html.partition("<details")[0]
+    self.assertEqual(main.count("<td>bertscore f1</td>"), 1)
+
+  def test_mean_suffixes_are_dropped_but_std_is_kept(self):
+    html = self._table({
+        "perl/bertscore_f1_mean": 0.9,
+        "perl/bertscore_f1_std": 0.02,
+        "sft/bertscore_f1_mean": 0.88,
+        "sft/bertscore_f1_std": 0.03,
+    })
+    self.assertIn("<td>bertscore f1</td>", html)
+    self.assertIn("<td>bertscore f1 std</td>", html)
+
+
 if __name__ == "__main__":
   unittest.main()
