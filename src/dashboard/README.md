@@ -49,6 +49,25 @@ hallucinations reads as a negative number and is green.
 > negates that, because "the hallucination rate went up by 2%" is how the
 > number is spoken, and a green `+` is a trap.
 
+**Evaluation charts** — for campaigns scored over a temperature grid (see
+the orchestrator README, section 4c), the evaluation section opens with
+inline SVG charts, generated in Python by `charts.py` so the static Space
+needs no plotting library or JavaScript bundle:
+
+* hallucination rate vs. temperature, grouped bars per policy;
+* reward-hacking audit quality vs. temperature, grouped bars — read with the
+  previous one to see whether fewer hallucinations cost fluency;
+* quality (x) vs. faithfulness (y), one connected trajectory per policy
+  through T = 0.0 → 1.25 (up and right is better);
+* hallucination-rate reduction vs. SFT at the same temperature;
+* perplexity vs. temperature.
+
+Error bars are 95% confidence intervals (Wilson for rates, normal for means),
+unpaired and hence conservative. A ★ (bars) or ring (trajectory) marks the
+temperature a PE-RL policy was trained at. The tables below are then split
+into one per temperature. Older campaigns, which scored each policy at a
+single temperature, keep the single table and get no charts.
+
 **Evaluation table** — one column per target (`sft`, `sft@t0.7`, `perl`,
 `delta`) and one row per *curated* metric: decoding temperature, hallucination
 and faithfulness rates, the reward-hacking rubric, repetition rate, ROUGE-1/2/L
@@ -65,7 +84,7 @@ Every `delta` cell carries a second, smaller number: the same improvement as a
 always better.
 
 > The baseline is not stored anywhere: each policy is compared against the SFT
-> row sampled at *its own* decoding temperature, which differs per branch. So
+> row sampled at the *same* decoding temperature, which differs per column. So
 > the share is computed by inverting the delta against the policy column beside
 > it (`baseline = policy - sign * delta`), which inherits whatever pairing the
 > eval stage chose instead of re-deriving it. The sign comes from

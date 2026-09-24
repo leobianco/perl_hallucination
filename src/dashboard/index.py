@@ -26,7 +26,7 @@ import datetime
 import json
 import os
 import re
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from src.orchestrator import eval_metrics
 
@@ -555,6 +555,65 @@ def _eval_target_flavor(target: "EvalTarget") -> str:
   return target.base_label.partition(":")[2]
 
 
+def is_temperature_grid(targets: Iterable["EvalTarget"]) -> bool:
+  """Whether the campaign scored some policy at more than one temperature.
+
+  Campaigns from before the temperature grid scored each trained policy
+  once, at its own rollout temperature, and only the SFT baseline was
+  repeated. Those keep their original one-table layout; grid campaigns are
+  laid out one temperature at a time instead.
+
+  Args:
+    targets: The eval targets.
+
+  Returns:
+    True when any non-delta base label appears at two or more temperatures.
+  """
+  seen: Dict[str, set] = {}
+  for target in targets:
+    if target.is_delta or target.temperature is None:
+      continue
+    seen.setdefault(target.base_label, set()).add(
+        eval_metrics.format_temperature(target.temperature)
+    )
+  return any(
+      len(temps) > 1
+      for label, temps in seen.items()
+      if _eval_target_kind_of(label) == "perl"
+  )
+
+
+def _eval_target_kind_of(base_label: str) -> str:
+  return base_label.partition(":")[0]
+
+
+def temperature_groups(
+    targets: Sequence["EvalTarget"],
+) -> List[Tuple[Optional[float], List["EvalTarget"]]]:
+  """Splits display-ordered targets into per-temperature groups.
+
+  Args:
+    targets: Targets as returned by :func:`_order_eval_targets`.
+
+  Returns:
+    ``(temperature, targets)`` pairs, coldest first, with targets of unknown
+    temperature last. Order within a group is preserved.
+  """
+  groups: Dict[Optional[str], Tuple[Optional[float], List["EvalTarget"]]] = {}
+  for target in targets:
+    temperature = target.temperature
+    key = (
+        None
+        if temperature is None
+        else eval_metrics.format_temperature(temperature)
+    )
+    groups.setdefault(key, (temperature, []))[1].append(target)
+  return sorted(
+      groups.values(),
+      key=lambda group: (group[0] is None, group[0] or 0.0),
+  )
+
+
 def _order_eval_targets(targets: Iterable["EvalTarget"]) -> List["EvalTarget"]:
   """Orders eval columns so every policy sits next to its own delta.
 
@@ -564,6 +623,9 @@ def _order_eval_targets(targets: Iterable["EvalTarget"]) -> List["EvalTarget"]:
   numbers a reader compares to opposite ends of the table, and a fan-out
   campaign made that worse by interleaving the flavors.
 
+  A temperature-grid campaign applies the same layout once per temperature,
+  coldest first, so each temperature reads as a self-contained comparison.
+
   Args:
     targets: The eval targets, in any order.
 
@@ -571,6 +633,18 @@ def _order_eval_targets(targets: Iterable["EvalTarget"]) -> List["EvalTarget"]:
     A new list in display order.
   """
   targets = list(targets)
+  if is_temperature_grid(targets):
+    ordered: List["EvalTarget"] = []
+    for _, group in temperature_groups(targets):
+      ordered.extend(_order_single_temperature(group))
+    return ordered
+  return _order_single_temperature(targets)
+
+
+def _order_single_temperature(
+    targets: List["EvalTarget"],
+) -> List["EvalTarget"]:
+  """Lays out baselines, then each policy followed by its deltas."""
   baselines = sorted(
       (
           t
@@ -618,15 +692,27 @@ def _policy_for_delta(
     targets: All eval targets.
 
   Returns:
-    The PE-RL target sharing the delta's flavor, or None when the metrics
-    hold a delta whose policy never made it into the table.
+    The PE-RL target sharing the delta's flavor - and its temperature, when
+    the delta's label is temperature-tagged - or None when the metrics hold
+    a delta whose policy never made it into the table.
   """
   flavor = _eval_target_flavor(delta)
+  wanted = (
+      None
+      if delta.temperature is None
+      else eval_metrics.format_temperature(delta.temperature)
+  )
   for target in targets:
     if target.is_delta or _eval_target_kind(target) != "perl":
       continue
-    if _eval_target_flavor(target) == flavor:
-      return target
+    if _eval_target_flavor(target) != flavor:
+      continue
+    if wanted is not None and (
+        target.temperature is None
+        or eval_metrics.format_temperature(target.temperature) != wanted
+    ):
+      continue
+    return target
   return None
 
 
@@ -704,6 +790,13 @@ def _extract_eval_targets(
       recorded = target.metrics.get("decoding_temperature")
       if isinstance(recorded, (int, float)):
         target.temperature = float(recorded)
+  # An untagged delta records no temperature of its own; it inherits the
+  # policy it was measured on, so per-temperature grouping keeps the pair.
+  for target in by_label.values():
+    if target.is_delta and target.temperature is None:
+      policy = _policy_for_delta(target, by_label.values())
+      if policy is not None:
+        target.temperature = policy.temperature
 
   stage_by_kind: Dict[str, StageView] = {}
   for candidate in stages:

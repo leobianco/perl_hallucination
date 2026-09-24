@@ -41,6 +41,9 @@ class TestEvalTargets(unittest.TestCase):
 
   def _stage(self, sft=None, perl=None, state_path=None):
     config = CampaignConfig.create_default(task_name="ragtruth", dry_run=True)
+    # One temperature: these tests are about which policies are scored, and
+    # the grid has its own suite in test_eval_temperature.py.
+    config.eval.temperature_grid = [0.0]
     state = CampaignState(campaign_id="c", task_name="ragtruth")
     if sft:
       state.stages["sft"] = StageResult(
@@ -56,9 +59,8 @@ class TestEvalTargets(unittest.TestCase):
     """Returns the (label, repo) of each pass, dropping the temperature.
 
     These tests are about *which* policies get scored and in what order;
-    temperature matching has its own suite. With no ``best_params`` recorded
-    every target falls back to ``eval.temperature``, so no extra baseline is
-    scheduled here.
+    the temperature grid has its own suite. The fixture pins a one-point grid
+    and records no ``best_params``, so there is one pass per policy.
 
     Args:
       stage: The eval stage to resolve.

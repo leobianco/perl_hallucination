@@ -75,9 +75,17 @@ parameters:
     distribution: log_uniform_values
     min: 0.01
     max: 0.2
+  # Rollout temperature. Deliberately the evaluation grid
+  # (EvalStageConfig.temperature_grid = 0.0, 0.7, 1.0, 1.25) minus greedy, so
+  # every winner is also scored at the temperature it was trained at. 0.0 is
+  # excluded because RLOO needs distinct rollouts: at greedy all
+  # num_generations samples of a prompt are identical, the leave-one-out
+  # advantage is exactly zero and only the KL term is optimized. The high end
+  # is kept on purpose - hallucinations are more frequent there, which is
+  # more reward signal, not less.
   temperature:
     values:
-      - 0.3
-      - 0.6
+      - 0.7
       - 1.0
+      - 1.25
 

@@ -119,6 +119,22 @@ This codebase uses a **4-pillar evaluation framework**:
 > diverse. `reward_hacking_non_extractiveness` is the one that catches that,
 > and it costs an API call.
 
+### Confidence intervals
+
+The orchestrator's report and the dashboard attach a 95% interval to each
+cell (`src/orchestrator/eval_metrics.py::confidence_interval`), computed from
+keys the summary JSON already holds, so no re-scoring is needed:
+
+| Metric kind | Interval | Sample size / spread |
+| :--- | :--- | :--- |
+| `hallucination_rate`, `faithfulness_rate`, `reward_hacking_rate` | Wilson score | `autorater_scored_count` (rubric: `reward_hacking_audit_n_scored`) |
+| `X_mean` (perplexity, BERTScore, ...) | $\bar{x} \pm 1.96\,s/\sqrt{n}$ | `X_std`, `num_samples` |
+| `reward_hacking_quality`, `reward_hacking_{dim}` | $\bar{x} \pm 1.96\,s/\sqrt{n}$ | `reward_hacking_audit_*_std`, `reward_hacking_audit_n_scored` |
+
+Missing sample size means no interval rather than a guessed one. Intervals are
+per cell and unpaired: comparing two policies scored on the same prompts this
+way is conservative.
+
 ---
 
 ## Storage, Artifacts & Weights & Biases (WandB)

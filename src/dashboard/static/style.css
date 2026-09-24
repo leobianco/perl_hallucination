@@ -412,3 +412,43 @@ footer {
   .toc ul { columns: 1; }
   .hide-narrow { display: none; }
 }
+
+/* ---------- evaluation charts (inline SVG, see charts.py) ---------- */
+
+.chart-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(440px, 1fr));
+  gap: 14px;
+  margin: 10px 0 6px;
+}
+.chart {
+  margin: 0;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px 6px;
+}
+.chart svg { width: 100%; height: auto; display: block; }
+.chart text { fill: var(--text-dim); font-family: var(--sans); font-size: 11px; }
+.chart .chart-title { fill: var(--text); font-size: 12.5px; font-weight: 600; }
+.chart .axis-label { fill: var(--text-faint); }
+.chart .point-label { fill: var(--text-dim); font-family: var(--mono); font-size: 10px; }
+.chart .marker { fill: var(--warn); font-size: 12px; }
+.chart .grid { stroke: var(--border-soft); stroke-width: 1; }
+.chart .axis { stroke: var(--border); stroke-width: 1.2; }
+.chart .errbar { stroke: var(--text); stroke-width: 1.2; fill: none; opacity: 0.8; }
+.chart .trajectory { stroke-width: 2; opacity: 0.85; }
+.chart .ring { stroke-width: 1.6; }
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  font-size: 12px;
+  color: var(--text-dim);
+  padding: 4px 4px 2px;
+}
+.legend-item { display: inline-flex; align-items: center; gap: 6px; }
+.swatch { width: 11px; height: 11px; border-radius: 2px; display: inline-block; }
+.legend-note { color: var(--text-faint); flex-basis: 100%; }
+.temperature-heading { margin: 18px 0 6px; font-size: 13.5px; color: var(--text-dim); }
+.sub.ci { color: var(--text-faint); }

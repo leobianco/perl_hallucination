@@ -10,10 +10,12 @@ Each target goes through the same two phases as ``scripts/evaluator.sh``:
 generation of test completions, then Gemini autorating plus BertScore and
 perplexity.
 
-A target is a (policy, temperature) pair rather than just a policy. PE-RL
-searches its rollout temperature, and a policy is scored at the temperature it
-was trained to sample at; the SFT baseline is additionally re-scored at each
-of those temperatures so that no delta ever spans two decoding regimes. See
+A target is a (policy, temperature) pair rather than just a policy. Every
+policy - the SFT baseline and each PE-RL branch - is scored on the same
+decoding-temperature grid (``EvalStageConfig.temperature_grid``), so that
+checkpoints are compared on identical footing at every temperature and each
+PE-RL delta is taken against the SFT row decoded the same way. A PE-RL policy
+whose rollout temperature is off the grid is additionally scored there; see
 ``EvalStageConfig.match_perl_rollout_temperature``.
 """
 
@@ -58,17 +60,22 @@ class EvalTarget:
   """One generation-and-scoring pass: a policy at a decoding temperature.
 
   Attributes:
-    label: Metric namespace and display key, e.g. ``sft``, ``sft@t0.6`` or
-      ``perl:organic``.
+    label: Metric namespace and display key, e.g. ``sft@t0.7`` or
+      ``perl:organic@t1.25``; bare (``sft``, ``perl:organic``) when the
+      campaign scores a single temperature.
     model_repo_id: The LoRA adapter to serve.
     temperature: Sampling temperature for generation. Part of the completions
       repo name, so two targets differing only here keep separate datasets and
       neither has to be regenerated when the other is.
+    rollout_temperature: For a PE-RL policy, the temperature its winning trial
+      sampled rollouts at, when recorded. Written alongside the metrics so a
+      plot can mark the training regime; None for SFT.
   """
 
   label: str
   model_repo_id: str
   temperature: float
+  rollout_temperature: Optional[float] = None
 
 
 class EvalStage(BaseStage):
@@ -148,22 +155,34 @@ class EvalStage(BaseStage):
 
   # --- Target resolution ----------------------------------------------
 
-  def target_temperature(self, flavor: Optional[str]) -> float:
-    """Returns the temperature one PE-RL branch should be scored at.
+  def temperature_grid(self) -> List[float]:
+    """Returns the configured decoding temperatures, de-duplicated, coldest first.
+
+    Two entries that format identically (``1`` and ``1.0``) are one regime:
+    the label and the completions repo name both key on the formatted token,
+    so scoring both would overwrite one with the other.
+
+    Returns:
+      The grid, or ``[eval.temperature]`` when the grid is empty.
+    """
+    cfg = self.config.eval
+    raw = list(cfg.temperature_grid or []) or [cfg.temperature]
+    by_token: Dict[str, float] = {}
+    for value in raw:
+      by_token.setdefault(eval_metrics.format_temperature(value), float(value))
+    return sorted(by_token.values())
+
+  def rollout_temperature(self, flavor: Optional[str]) -> Optional[float]:
+    """Returns the rollout temperature one PE-RL branch was trained at.
 
     Args:
       flavor: The branch's reward-model dataset flavor, or None.
 
     Returns:
-      The branch's recorded rollout temperature when matching is enabled and
-      the value was recorded; otherwise the configured evaluation
-      temperature.
+      The winning trial's recorded temperature, or None when the sweep never
+      recorded one (it pinned temperature outside its parameters block).
     """
-    cfg = self.config.eval
-    if not cfg.match_perl_rollout_temperature:
-      return float(cfg.temperature)
-    recorded = self.context.perl_rollout_temperature_for(flavor)
-    return float(cfg.temperature) if recorded is None else recorded
+    return self.context.perl_rollout_temperature_for(flavor)
 
   def resolve_targets(self) -> List[EvalTarget]:
     """Lists the passes to run, in report order.
@@ -173,17 +192,18 @@ class EvalStage(BaseStage):
     each namespaced by its branch id (``perl:synthetic_struct``) so the report
     can put them side by side.
 
-    Each PE-RL branch is scored at its own rollout temperature. Whenever that
-    differs from ``eval.temperature`` the SFT baseline is scheduled a second
-    time at the same temperature, tagged ``sft@t0.6``, so that the branch's
-    delta is measured against a baseline decoded identically and reflects the
-    weights alone. Distinct temperatures are de-duplicated: two branches that
-    happened to win at the same temperature share one extra baseline.
+    Every policy is scored at every temperature of the grid, SFT included,
+    so each PE-RL delta is measured against a baseline decoded identically
+    and reflects the weights alone. With ``match_perl_rollout_temperature``
+    on, a branch whose rollout temperature is off the grid is also scored
+    there - and so is SFT, so that point has a baseline too. Under a
+    single-temperature plan the labels stay bare, preserving the metric keys
+    of every campaign run before the grid existed.
 
     Returns:
-      One entry per (policy, temperature) pass. Baselines come first, so the
-      last entry remains the primary model - the last PE-RL branch when any
-      exists, otherwise SFT.
+      One entry per (policy, temperature) pass. Baselines come first,
+      coldest first, then each branch's passes coldest first, so the last
+      entry remains a PE-RL policy whenever one exists.
 
     Raises:
       ValueError: When the campaign produced no policy to evaluate. Falling
@@ -191,54 +211,69 @@ class EvalStage(BaseStage):
         they were the campaign's results.
     """
     cfg = self.config.eval
-    base_temperature = float(cfg.temperature)
+    grid = self.temperature_grid()
     sft_repo_id = self.context.sft_model_repo_id
-
-    baselines: List[EvalTarget] = []
-    if sft_repo_id:
-      baselines.append(
-          EvalTarget(
-              label=eval_metrics.BASELINE_LABEL,
-              model_repo_id=sft_repo_id,
-              temperature=base_temperature,
-          )
-      )
 
     # Branches come from the flavor list, not from ``config.stages``: a
     # `--stages eval` rerun over a finished campaign has no 'perl' entry
     # there but still has the policies to score.
-    policies: List[EvalTarget] = []
+    branches: List[Tuple[str, str, Optional[float]]] = []
     seen = {sft_repo_id} if sft_repo_id else set()
     for flavor in flavors.campaign_flavors(self.config):
       repo_id = self.context.perl_model_repo_id_for(flavor)
       if not repo_id or repo_id in seen:
         continue
       seen.add(repo_id)
-      policies.append(
-          EvalTarget(
-              label=flavors.stage_id_for_flavor(self.config, "perl", flavor),
-              model_repo_id=repo_id,
-              temperature=self.target_temperature(flavor),
-          )
+      branches.append((
+          flavors.stage_id_for_flavor(self.config, "perl", flavor),
+          repo_id,
+          self.rollout_temperature(flavor),
+      ))
+
+    # Keyed on the formatted token rather than the float so that this agrees
+    # exactly with the pairing `eval_metrics.baseline_label_for` does later.
+    grid_tokens = {eval_metrics.format_temperature(t) for t in grid}
+    extras: Dict[str, float] = {}
+    if cfg.match_perl_rollout_temperature:
+      for _, _, rollout in branches:
+        if rollout is None:
+          continue
+        token = eval_metrics.format_temperature(rollout)
+        if token not in grid_tokens:
+          extras.setdefault(token, rollout)
+    all_temperatures = sorted(grid + list(extras.values()))
+    tagged = len(all_temperatures) > 1
+
+    def _label(stage_id: str, temperature: float) -> str:
+      return eval_metrics.make_target_label(
+          stage_id, temperature if tagged else None
       )
 
-    # One matched baseline per distinct policy temperature. Keyed on the
-    # formatted token rather than the float so that this agrees exactly with
-    # the pairing `eval_metrics.baseline_label_for` will do later.
+    baselines: List[EvalTarget] = []
     if sft_repo_id:
-      already = {eval_metrics.format_temperature(base_temperature)}
-      for policy in policies:
-        token = eval_metrics.format_temperature(policy.temperature)
-        if token in already:
-          continue
-        already.add(token)
+      for temperature in all_temperatures:
         baselines.append(
             EvalTarget(
-                label=eval_metrics.make_target_label(
-                    eval_metrics.BASELINE_LABEL, policy.temperature
-                ),
+                label=_label(eval_metrics.BASELINE_LABEL, temperature),
                 model_repo_id=sft_repo_id,
-                temperature=policy.temperature,
+                temperature=temperature,
+            )
+        )
+
+    policies: List[EvalTarget] = []
+    for stage_id, repo_id, rollout in branches:
+      own = list(grid)
+      if rollout is not None:
+        token = eval_metrics.format_temperature(rollout)
+        if token in extras:
+          own.append(extras[token])
+      for temperature in sorted(own):
+        policies.append(
+            EvalTarget(
+                label=_label(stage_id, temperature),
+                model_repo_id=repo_id,
+                temperature=temperature,
+                rollout_temperature=rollout,
             )
         )
 
@@ -259,45 +294,52 @@ class EvalStage(BaseStage):
       targets: The resolved passes.
 
     Returns:
-      Zero or more lines. Empty when every target shares one temperature,
-      which is the case for a campaign with matching switched off and for one
-      whose policies happened to train at ``eval.temperature``.
+      One line describing the grid, plus one per branch trained off the grid
+      and one naming branches whose rollout temperature was never recorded.
     """
     cfg = self.config.eval
-    if not cfg.match_perl_rollout_temperature:
-      return [
-          "Temperature matching is off: every target is scored at "
-          f"{cfg.temperature}."
-      ]
+    grid = self.temperature_grid()
+    grid_text = ", ".join(eval_metrics.format_temperature(t) for t in grid)
     policies = [t for t in targets if not eval_metrics.is_baseline(t.label)]
-    unmatched = [
-        t.label
-        for t in policies
-        if self.context.perl_rollout_temperature_for(
-            flavors.split_stage_id(t.label)[1]
+    policy_ids = []
+    for target in policies:
+      stage_id, _ = eval_metrics.split_target_label(target.label)
+      if stage_id not in policy_ids:
+        policy_ids.append(stage_id)
+    notes = [
+        f"Temperature grid {grid_text}: every policy (SFT and "
+        f"{len(policy_ids)} PE-RL branch(es)) is scored at each, "
+        f"{len(targets)} pass(es) in total."
+    ]
+    grid_tokens = {eval_metrics.format_temperature(t) for t in grid}
+    unrecorded = []
+    off_grid = []
+    for stage_id in policy_ids:
+      flavor = flavors.split_stage_id(stage_id)[1]
+      rollout = self.rollout_temperature(flavor)
+      if rollout is None:
+        unrecorded.append(stage_id)
+      elif eval_metrics.format_temperature(rollout) not in grid_tokens:
+        off_grid.append((stage_id, rollout))
+    for stage_id, rollout in off_grid:
+      token = eval_metrics.format_temperature(rollout)
+      if cfg.match_perl_rollout_temperature:
+        notes.append(
+            f"{stage_id} was trained at T={token}, off the grid; scoring it "
+            "and SFT there as well so its training regime is reported."
         )
-        is None
-    ]
-    notes = []
-    extra = [
-        t
-        for t in targets
-        if eval_metrics.is_baseline(t.label)
-        and t.label != eval_metrics.BASELINE_LABEL
-    ]
-    if extra:
-      notes.append(
-          "Scoring the SFT baseline again at "
-          + ", ".join(str(t.temperature) for t in extra)
-          + " so each PE-RL delta compares like with like."
-      )
-    if unmatched:
+      else:
+        notes.append(
+            f"{stage_id} was trained at T={token}, off the grid, and "
+            "match_perl_rollout_temperature is off: its training regime is "
+            "not evaluated."
+        )
+    if unrecorded:
       notes.append(
           "No rollout temperature was recorded for "
-          + ", ".join(unmatched)
-          + f"; falling back to {cfg.temperature}. The sweep pinned "
-          "temperature outside its parameters block, so it was never logged "
-          "per trial."
+          + ", ".join(unrecorded)
+          + ". The sweep pinned temperature outside its parameters block, "
+          "so it was never logged per trial and cannot be marked."
       )
     return notes
 
@@ -389,6 +431,10 @@ class EvalStage(BaseStage):
     # of the same table were sampled differently, and the report has to be
     # able to say so without the config in hand.
     captured[eval_metrics.DECODING_TEMPERATURE_KEY] = target.temperature
+    if target.rollout_temperature is not None:
+      captured[eval_metrics.ROLLOUT_TEMPERATURE_KEY] = (
+          target.rollout_temperature
+      )
     return {f"{label}/{key}": value for key, value in captured.items()}
 
   def _summary_path(
@@ -741,15 +787,21 @@ class EvalStage(BaseStage):
             f"[DRY-RUN] Scoring {target.label} with Gemini autorater..."
         )
       time.sleep(0.4)
-      # Labels are 'perl:synthetic_struct' or 'sft@t0.6'; the mock is per
-      # *kind*, so both branches and matched baselines resolve to a number.
+      # Labels are 'perl:synthetic_struct@t0.7' or 'sft@t1.0'; the mock is
+      # per *kind*, so every branch and temperature resolves to a number.
       kind = eval_metrics.target_kind(target.label)
       values = dict(mock_per_target.get(kind, mock_per_target["sft"]))
-      values["num_samples"] = self.config.eval.max_eval_samples
-      # Sampling costs faithfulness, so a rehearsal that ignored temperature
-      # would show a matched baseline scoring identically to the greedy one
-      # and make the extra pass look pointless.
-      penalty = 0.02 * float(target.temperature)
+      samples = self.config.eval.max_eval_samples
+      values["num_samples"] = samples
+      values["autorater_scored_count"] = samples
+      values["perplexity_std"] = 2.1
+      values["bertscore_f1_std"] = 0.05
+      # Sampling costs faithfulness, and costs SFT more than the policy RL
+      # sharpened: that divergence with temperature is precisely what the
+      # grid exists to show, so a rehearsal that ignored it would make the
+      # grid look pointless.
+      slope = 0.08 if kind == eval_metrics.BASELINE_LABEL else 0.04
+      penalty = slope * float(target.temperature) ** 2
       if "hallucination_rate" in values:
         values["hallucination_rate"] = round(
             values["hallucination_rate"] + penalty, 4
@@ -759,12 +811,18 @@ class EvalStage(BaseStage):
             values["faithfulness_rate"] - penalty, 4
         )
       if self.config.eval.run_reward_hacking_autorater:
-        values.update(
-            self._mock_rubric_metrics(
-                mock_rubric.get(kind, mock_rubric["sft"])
-            )
-        )
+        # Heat degrades prose as well as faithfulness, so the rehearsal's
+        # quality-faithfulness trajectories are curves rather than points.
+        grades = {
+            key: round(max(0.0, grade - 0.06 * float(target.temperature)), 4)
+            for key, grade in mock_rubric.get(kind, mock_rubric["sft"]).items()
+        }
+        values.update(self._mock_rubric_metrics(grades))
       values[eval_metrics.DECODING_TEMPERATURE_KEY] = target.temperature
+      if target.rollout_temperature is not None:
+        values[eval_metrics.ROLLOUT_TEMPERATURE_KEY] = (
+            target.rollout_temperature
+        )
       metrics.update({f"{target.label}/{k}": v for k, v in values.items()})
     metrics.update(compute_deltas(metrics))
     return StageResult(
@@ -807,6 +865,12 @@ class EvalStage(BaseStage):
       # the row's sign meaningful in a rehearsal.
       values[REWARD_HACKING_RATE_KEY] = round(max(0.0, 1.0 - quality) / 2, 4)
     values[f"{REWARD_HACKING_AUDIT_PREFIX}n_dropped"] = 0
+    values[f"{REWARD_HACKING_AUDIT_PREFIX}n_scored"] = (
+        self.config.eval.max_eval_samples
+    )
+    values[f"{REWARD_HACKING_AUDIT_PREFIX}quality_std"] = 0.18
+    for key in reward_hacking_dimension_keys():
+      values[f"{REWARD_HACKING_AUDIT_PREFIX}{key}_std"] = 0.22
     return values
 
   def _run_subprocess(

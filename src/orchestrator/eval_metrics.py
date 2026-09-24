@@ -27,6 +27,8 @@ NO_DELTA: FrozenSet[str] = frozenset({
     # Not a measurement but the condition the measurement was taken under.
     # A "delta" on it would read as if decoding had improved by 0.6.
     "decoding_temperature",
+    # Likewise a setting: the temperature the policy was *trained* at.
+    "rollout_temperature",
 })
 
 #: Metrics where a *lower* value is better. Used both to sign the SFT->PE-RL
@@ -49,12 +51,13 @@ BASELINE_LABEL: str = "sft"
 KIND_TITLES: Dict[str, str] = {"sft": "SFT", "perl": "PE-RL"}
 
 #: Separates a stage id from the decoding temperature it was scored at, as in
-#: ``sft@t0.6``. PE-RL labels are deliberately left bare: a branch is scored at
-#: exactly one temperature (its own rollout temperature), so tagging it would
-#: rename every existing ``perl/`` key for no new information. Only the extra
-#: SFT baselines - the ones evaluated a second time to match a policy - carry
-#: the marker, which is also what keeps a single-temperature campaign's metric
-#: keys byte-identical to those of every campaign run before this feature.
+#: ``sft@t0.7`` or ``perl:organic@t1.25``. Under a temperature grid every
+#: target - SFT and PE-RL alike - carries the marker, and so does its delta
+#: namespace (``delta:organic@t1.25``). A single-temperature campaign keeps
+#: its labels bare, which keeps its metric keys byte-identical to those of
+#: every campaign run before the grid existed. Older campaigns that tagged
+#: only the extra SFT baselines still parse: an untagged label falls back to
+#: its recorded ``decoding_temperature``.
 TEMPERATURE_MARKER: str = "@t"
 
 #: Per-target metric recording the temperature its completions were sampled
@@ -62,6 +65,14 @@ TEMPERATURE_MARKER: str = "@t"
 #: outright, and so that :func:`baseline_label_for` can pair a policy with the
 #: baseline measured under the same regime without consulting the config.
 DECODING_TEMPERATURE_KEY: str = "decoding_temperature"
+
+#: Per-target metric recording the rollout temperature a PE-RL policy was
+#: trained at, when known. Lets every consumer mark the training regime on a
+#: temperature plot without reading the PE-RL stage's ``best_params``.
+ROLLOUT_TEMPERATURE_KEY: str = "rollout_temperature"
+
+#: Two-sided 95% normal quantile, used for every confidence interval.
+Z_95: float = 1.959963984540054
 
 #: Evaluated policies in report order, with their display names. Retained for
 #: callers that only ever deal with unbranched campaigns; prefer
@@ -85,6 +96,7 @@ METRIC_ORDER: Tuple[str, ...] = (
     "perplexity",
     "num_samples",
     "decoding_temperature",
+    "rollout_temperature",
 )
 
 #: Summary keys with this prefix describe *which model* produced the
@@ -229,17 +241,20 @@ def delta_label(target_label: str) -> str:
   """Returns the namespace holding ``target_label``'s improvement over SFT.
 
   Args:
-    target_label: ``perl`` or ``perl:synthetic_struct``.
+    target_label: ``perl``, ``perl:synthetic_struct`` or
+      ``perl:synthetic_struct@t0.7``.
 
   Returns:
-    ``delta`` or ``delta:synthetic_struct``. The flavor suffix rides along
-    unchanged so that a two-branch campaign gets two independent delta
-    namespaces rather than one that silently holds whichever branch was
-    scored last.
+    ``delta``, ``delta:synthetic_struct`` or ``delta:synthetic_struct@t0.7``.
+    The flavor suffix rides along unchanged so that a two-branch campaign
+    gets two independent delta namespaces rather than one that silently
+    holds whichever branch was scored last, and the temperature tag rides
+    along for the same reason across a temperature grid.
   """
-  stage_id, _ = split_target_label(target_label)
+  stage_id, temperature = split_target_label(target_label)
   _, flavor = flavors.split_stage_id(stage_id)
-  return "delta" if not flavor else f"delta{flavors.SEPARATOR}{flavor}"
+  base = "delta" if not flavor else f"delta{flavors.SEPARATOR}{flavor}"
+  return make_target_label(base, temperature)
 
 
 def delta_sign(metric: str) -> int:
@@ -392,8 +407,61 @@ def target_labels(metrics: Dict[str, Any]) -> List[str]:
   return sorted(found, key=_target_sort_key)
 
 
+def target_temperature(
+    metrics: Dict[str, Any], label: str
+) -> Optional[float]:
+  """Returns the decoding temperature a target was scored at.
+
+  Args:
+    metrics: The eval stage metric map.
+    label: A target label.
+
+  Returns:
+    The recorded ``decoding_temperature`` when present, else the label's
+    ``@t`` tag, else None (an untagged target from a run that predates the
+    temperature being recorded).
+  """
+  recorded = metrics.get(f"{label}/{DECODING_TEMPERATURE_KEY}")
+  if _is_number(recorded):
+    return float(recorded)
+  _, tagged = split_target_label(label)
+  return tagged
+
+
+def temperature_groups(
+    metrics: Dict[str, Any],
+) -> List[Tuple[Optional[float], List[str]]]:
+  """Groups the targets by the temperature they were decoded at.
+
+  Args:
+    metrics: The eval stage metric map.
+
+  Returns:
+    ``(temperature, labels)`` pairs, coldest first, each ``labels`` in
+    report order. Targets with no known temperature form a single ``None``
+    group at the end. Two temperatures that format identically are one
+    group, mirroring how :func:`baseline_label_for` pairs them.
+  """
+  groups: Dict[Optional[str], List[str]] = {}
+  values: Dict[Optional[str], Optional[float]] = {}
+  for label in target_labels(metrics):
+    temperature = target_temperature(metrics, label)
+    token = None if temperature is None else format_temperature(temperature)
+    groups.setdefault(token, []).append(label)
+    values.setdefault(token, temperature)
+  ordered: List[Optional[str]] = sorted(
+      (token for token in groups if token is not None),
+      key=lambda token: float(values[token]),
+  )
+  if None in groups:
+    ordered.append(None)
+  return [(values[token], groups[token]) for token in ordered]
+
+
 def headline_metric(
-    metrics: Dict[str, Any], name: str = "hallucination_rate"
+    metrics: Dict[str, Any],
+    name: str = "hallucination_rate",
+    reference_temperature: Optional[float] = None,
 ) -> Optional[float]:
   """Returns the headline value of ``name`` for the campaign's best policy.
 
@@ -404,9 +472,17 @@ def headline_metric(
   ``eval/``-prefixed keys are still honored so reports from earlier
   single-model runs keep rendering.
 
+  Under a temperature grid the headline is quoted at one fixed temperature,
+  never as the best cell of the grid: taking the best over temperatures as
+  well as branches would report whichever decode happened to flatter the
+  policy, which is exactly the selection bias the grid exists to remove.
+
   Args:
     metrics: The eval stage metric map.
     name: Metric to look up.
+    reference_temperature: Temperature to quote the headline at. Defaults to
+      the coldest temperature any policy was scored at - greedy, on the
+      default grid - which is the deterministic reading.
 
   Returns:
     The metric value, or None when absent.
@@ -414,6 +490,20 @@ def headline_metric(
   policies = [
       label for label in target_labels(metrics) if not is_baseline(label)
   ]
+  temperatures = {
+      label: target_temperature(metrics, label) for label in policies
+  }
+  known = [t for t in temperatures.values() if t is not None]
+  if len({format_temperature(t) for t in known}) > 1:
+    if reference_temperature is None:
+      reference_temperature = min(known)
+    wanted = format_temperature(reference_temperature)
+    policies = [
+        label
+        for label in policies
+        if temperatures[label] is not None
+        and format_temperature(temperatures[label]) == wanted
+    ]
   values = []
   for label in policies:
     value = metrics.get(f"{label}/{name}")
@@ -456,20 +546,23 @@ def metric_names(metrics: Dict[str, Any]) -> List[str]:
 
 def comparison_rows(
     metrics: Dict[str, Any],
+    labels: Optional[List[str]] = None,
 ) -> List[Tuple[str, List[Optional[Any]], List[Optional[float]]]]:
   """Pivots the namespaced metrics into per-metric comparison rows.
 
   Args:
     metrics: The eval stage metric map.
+    labels: Restricts the rows to these targets, in this order - typically
+      one group of :func:`temperature_groups`. Defaults to every target.
 
   Returns:
     One ``(metric_name, values, deltas)`` tuple per metric. ``values`` is
-    aligned with :func:`present_targets`. ``deltas`` holds one entry per
-    *non-baseline* policy, in the same relative order, each the signed
-    improvement over SFT (positive is always better) or None when the
-    comparison is unavailable.
+    aligned with ``labels`` (by default :func:`present_targets`). ``deltas``
+    holds one entry per *non-baseline* policy, in the same relative order,
+    each the signed improvement over SFT (positive is always better) or None
+    when the comparison is unavailable.
   """
-  targets = target_labels(metrics)
+  targets = target_labels(metrics) if labels is None else list(labels)
   policies = [label for label in targets if not is_baseline(label)]
   rows = []
   for name in metric_names(metrics):
@@ -498,10 +591,170 @@ def format_row_value(name: str, value: Any) -> str:
   Returns:
     The formatted value.
   """
-  if name == DECODING_TEMPERATURE_KEY and isinstance(value, (int, float)):
+  if name in (DECODING_TEMPERATURE_KEY, ROLLOUT_TEMPERATURE_KEY) and (
+      isinstance(value, (int, float))
+  ):
     if not isinstance(value, bool):
       return format_temperature(value)
   return format_value(value)
+
+
+# --- Confidence intervals -------------------------------------------------
+
+#: Rates that are a proportion of autorated completions, and therefore get a
+#: Wilson score interval rather than a normal one. A normal interval on a
+#: rate near 0 - exactly where a good policy's hallucination rate lives -
+#: runs below zero and is too narrow.
+PROPORTION_METRICS: FrozenSet[str] = frozenset({
+    "hallucination_rate",
+    "faithfulness_rate",
+    REWARD_HACKING_RATE_KEY,
+})
+
+
+def wilson_interval(
+    proportion: float, n: int, z: float = Z_95
+) -> Tuple[float, float]:
+  """Wilson score interval for a binomial proportion.
+
+  Args:
+    proportion: Observed success fraction, clamped to [0, 1].
+    n: Number of trials. Must be positive.
+    z: Normal quantile; 1.96 for 95%.
+
+  Returns:
+    ``(low, high)``, always inside [0, 1].
+  """
+  p = min(1.0, max(0.0, float(proportion)))
+  denominator = 1.0 + z * z / n
+  center = (p + z * z / (2.0 * n)) / denominator
+  half = (
+      z * math.sqrt(p * (1.0 - p) / n + z * z / (4.0 * n * n)) / denominator
+  )
+  return max(0.0, center - half), min(1.0, center + half)
+
+
+def _sample_count(values: Dict[str, Any], name: str) -> Optional[int]:
+  """Returns how many samples a target's metric was computed over.
+
+  Args:
+    values: One target's metrics, keyed by bare name.
+    name: The bare metric name.
+
+  Returns:
+    The count, or None when the summary did not record one. Rubric metrics
+    use the rubric's own scored count: its verdicts are parsed per sample
+    and drop independently of the hallucination judge's.
+  """
+  if name.startswith("reward_hacking_"):
+    candidates: Tuple[str, ...] = (f"{REWARD_HACKING_AUDIT_PREFIX}n_scored",)
+  elif name in PROPORTION_METRICS:
+    candidates = ("autorater_scored_count", "num_samples")
+  else:
+    candidates = ("num_samples", "autorater_scored_count")
+  for key in candidates:
+    count = values.get(key)
+    if _is_number(count) and count >= 1:
+      return int(count)
+  return None
+
+
+def _standard_deviation(
+    values: Dict[str, Any], name: str
+) -> Optional[float]:
+  """Returns the per-sample standard deviation recorded for ``name``.
+
+  Args:
+    values: One target's metrics, keyed by bare name.
+    name: The bare metric name.
+
+  Returns:
+    The spread, from wherever the summary keeps it: next to the mean for
+    generation metrics (``x_mean`` / ``x_std``), under the audit prefix for
+    the rubric. None when it was not recorded.
+  """
+  if name == REWARD_HACKING_QUALITY_KEY:
+    key = f"{REWARD_HACKING_AUDIT_PREFIX}quality_std"
+  elif name.startswith("reward_hacking_"):
+    key = f"{REWARD_HACKING_AUDIT_PREFIX}{name[len('reward_hacking_'):]}_std"
+  elif name.endswith("_mean"):
+    key = f"{name[:-len('_mean')]}_std"
+  else:
+    key = f"{name}_std"
+  spread = values.get(key)
+  return float(spread) if _is_number(spread) else None
+
+
+def confidence_interval(
+    values: Dict[str, Any], name: str
+) -> Optional[Tuple[float, float]]:
+  """Returns a 95% confidence interval for one target's metric.
+
+  Derived purely from what the scoring summary already records - counts
+  and per-sample spreads - so it applies retroactively to every campaign on
+  disk, with no re-scoring. Proportions get a Wilson interval; means get a
+  normal interval on the standard error.
+
+  Intervals are per target and unpaired. Comparing two policies with them
+  is conservative: every target is scored on the same prompts, so a paired
+  test on the per-sample columns would be tighter.
+
+  Args:
+    values: One target's metrics, keyed by bare name.
+    name: The bare metric name.
+
+  Returns:
+    ``(low, high)``, or None when the value, its count or its spread was not
+    recorded.
+  """
+  value = values.get(name)
+  if not _is_number(value):
+    return None
+  n = _sample_count(values, name)
+  if n is None:
+    return None
+  if name in PROPORTION_METRICS:
+    return wilson_interval(float(value), n)
+  spread = _standard_deviation(values, name)
+  if spread is None:
+    return None
+  half = Z_95 * spread / math.sqrt(n)
+  return float(value) - half, float(value) + half
+
+
+def target_values(metrics: Dict[str, Any], label: str) -> Dict[str, Any]:
+  """Strips one target's namespace off the metric map.
+
+  Args:
+    metrics: The eval stage metric map.
+    label: A target label.
+
+  Returns:
+    That target's metrics keyed by bare name.
+  """
+  prefix = f"{label}/"
+  return {
+      str(key)[len(prefix):]: value
+      for key, value in metrics.items()
+      if str(key).startswith(prefix)
+  }
+
+
+def format_with_interval(values: Dict[str, Any], name: str) -> str:
+  """Renders ``value [low, high]`` when an interval exists, else the value.
+
+  Args:
+    values: One target's metrics, keyed by bare name.
+    name: The bare metric name.
+
+  Returns:
+    The formatted cell.
+  """
+  text = format_row_value(name, values.get(name))
+  interval = confidence_interval(values, name)
+  if interval is None:
+    return text
+  return f"{text} [{interval[0]:.4f}, {interval[1]:.4f}]"
 
 
 def format_value(value: Any) -> str:

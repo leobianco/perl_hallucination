@@ -13,6 +13,137 @@ from src.orchestrator.state import CampaignState, StageResult, StageStatus
 
 logger = logging.getLogger(__name__)
 
+#: Metrics summarised across the temperature grid, in the order the report
+#: shows them. Hallucination rate and rubric quality are read together: a
+#: faithfulness gain that costs prose quality is a copied context, not a win.
+SWEEP_SUMMARY_METRICS = (
+    ("hallucination_rate", "Hallucination rate"),
+    (eval_metrics.REWARD_HACKING_QUALITY_KEY, "Reward-hacking quality"),
+)
+
+
+def _comparison_table_lines(
+    metrics: Dict[str, Any], labels: List[str], caption: str
+) -> List[str]:
+  """Renders one per-metric comparison table over ``labels``.
+
+  Args:
+    metrics: The eval stage metric map.
+    labels: Target labels to put in columns, in order.
+    caption: Bullet line placed above the table.
+
+  Returns:
+    Markdown lines, ending with a blank line.
+  """
+  titles = [eval_metrics.target_title(label) for label in labels]
+  policies = [
+      eval_metrics.target_title(label)
+      for label in labels
+      if not eval_metrics.is_baseline(label)
+  ]
+  delta_heads = [
+      "Δ" if len(policies) == 1 else f"Δ {title}" for title in policies
+  ]
+  header = (
+      "| Metric | "
+      + " | ".join(titles)
+      + "".join(f" | {head}" for head in delta_heads)
+      + " |"
+  )
+  divider = (
+      "| :--- | "
+      + " | ".join("---:" for _ in titles)
+      + "".join(" | ---:" for _ in delta_heads)
+      + " |"
+  )
+  lines = [caption, "", header, divider]
+  for name, values, deltas in eval_metrics.comparison_rows(metrics, labels):
+    cells = " | ".join(
+        f"**{eval_metrics.format_row_value(name, v)}**" for v in values
+    )
+    delta_cells = "".join(
+        f" | {d:+.4f}" if isinstance(d, float) else " | -" for d in deltas
+    )
+    lines.append(f"| `{name}` | {cells}{delta_cells} |")
+  lines.append("")
+  return lines
+
+
+def _sweep_summary_lines(metrics: Dict[str, Any]) -> List[str]:
+  """Renders the metric-vs-temperature tables with 95% confidence intervals.
+
+  One table per summary metric: a row per temperature, a column per policy,
+  every cell ``value [low, high]``. A star marks the temperature a PE-RL
+  policy was trained at, so the reader can see the result is not confined
+  to the training regime.
+
+  Args:
+    metrics: The eval stage metric map.
+
+  Returns:
+    Markdown lines, empty when the campaign scored a single temperature.
+  """
+  groups = eval_metrics.temperature_groups(metrics)
+  if len(groups) < 2:
+    return []
+  stage_ids: List[str] = []
+  for label in eval_metrics.target_labels(metrics):
+    stage_id, _ = eval_metrics.split_target_label(label)
+    if stage_id not in stage_ids:
+      stage_ids.append(stage_id)
+  lines = [
+      "* **Temperature sweep** (95% confidence intervals: Wilson for rates,"
+      " normal on the standard error for means; ★ = the PE-RL policy's"
+      " rollout temperature). Intervals are per cell and unpaired, hence"
+      " conservative for comparing two policies on the same prompts.",
+      "",
+  ]
+  for name, title in SWEEP_SUMMARY_METRICS:
+    rows = []
+    for temperature, labels in groups:
+      by_stage = {
+          eval_metrics.split_target_label(label)[0]: label for label in labels
+      }
+      cells = []
+      for stage_id in stage_ids:
+        label = by_stage.get(stage_id)
+        values = (
+            eval_metrics.target_values(metrics, label) if label else {}
+        )
+        if name not in values:
+          cells.append("-")
+          continue
+        cell = eval_metrics.format_with_interval(values, name)
+        rollout = values.get(eval_metrics.ROLLOUT_TEMPERATURE_KEY)
+        if (
+            temperature is not None
+            and isinstance(rollout, (int, float))
+            and eval_metrics.format_temperature(rollout)
+            == eval_metrics.format_temperature(temperature)
+        ):
+          cell += " ★"
+        cells.append(cell)
+      if all(cell == "-" for cell in cells):
+        continue
+      head = (
+          "?" if temperature is None
+          else eval_metrics.format_temperature(temperature)
+      )
+      rows.append(f"| {head} | " + " | ".join(cells) + " |")
+    if not rows:
+      continue
+    lines.extend([
+        f"**{title}** vs. decoding temperature:",
+        "",
+        "| T | "
+        + " | ".join(eval_metrics.target_title(s) for s in stage_ids)
+        + " |",
+        "| ---: | " + " | ".join("---:" for _ in stage_ids) + " |",
+        *rows,
+        "",
+    ])
+  return lines
+
 
 def _selection_lines(result: StageResult, metric_label: str) -> List[str]:
   """Explains how a stage's headline number was picked, when that matters.
@@ -421,50 +552,30 @@ class CampaignReporter:
         # Δ is signed so that positive always means PE-RL improved on SFT,
         # regardless of whether the metric is minimized or maximized. One Δ
         # column per PE-RL branch. Every SFT row is a baseline and gets no Δ
-        # of its own - including the extra ones scored at a policy's rollout
-        # temperature, which would otherwise be compared against themselves.
-        policies = [
-            (label, title)
-            for label, title in targets
-            if not eval_metrics.is_baseline(label)
-        ]
-        delta_heads = [
-            "Δ" if len(policies) == 1 else f"Δ {title}"
-            for _, title in policies
-        ]
-        header = (
-            "| Metric | "
-            + " | ".join(t for _, t in targets)
-            + "".join(f" | {head}" for head in delta_heads)
-            + " |"
-        )
-        divider = (
-            "| :--- | "
-            + " | ".join("---:" for _ in targets)
-            + "".join(" | ---:" for _ in delta_heads)
-            + " |"
-        )
-        baselines = [
-            label for label, _ in targets if eval_metrics.is_baseline(label)
-        ]
-        caption = "* **Per-policy results** (Δ = PE-RL improvement over SFT"
-        if len(baselines) > 1:
-          caption += ", each against the SFT column sampled at its own"
-          caption += " temperature"
-        caption += "):"
-        lines.extend([caption, "", header, divider])
-        for name, values, deltas in eval_metrics.comparison_rows(
-            eval_res.metrics
-        ):
-          cells = " | ".join(
-              f"**{eval_metrics.format_row_value(name, v)}**" for v in values
-          )
-          delta_cells = "".join(
-              f" | {d:+.4f}" if isinstance(d, float) else " | -"
-              for d in deltas
-          )
-          lines.append(f"| `{name}` | {cells}{delta_cells} |")
-        lines.append("")
+        # of its own.
+        groups = eval_metrics.temperature_groups(eval_res.metrics)
+        if len(groups) > 1:
+          # A grid: the summary with intervals first, then one table per
+          # temperature, so every column in a table was decoded identically
+          # and each Δ is against the SFT column right beside it.
+          lines.extend(_sweep_summary_lines(eval_res.metrics))
+          for temperature, labels in groups:
+            head = (
+                "unknown temperature" if temperature is None
+                else f"T = {eval_metrics.format_temperature(temperature)}"
+            )
+            lines.extend(_comparison_table_lines(
+                eval_res.metrics,
+                labels,
+                f"* **Per-policy results at {head}** (Δ = PE-RL improvement"
+                " over the SFT column sampled at the same temperature):",
+            ))
+        else:
+          lines.extend(_comparison_table_lines(
+              eval_res.metrics,
+              [label for label, _ in targets],
+              "* **Per-policy results** (Δ = PE-RL improvement over SFT):",
+          ))
         if eval_cfg.run_reward_hacking_autorater:
           lines.extend([
               "The `reward_hacking_*` rows grade the *writing*, not the"

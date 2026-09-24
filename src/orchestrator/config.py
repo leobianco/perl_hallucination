@@ -182,29 +182,39 @@ class EvalStageConfig:
   autorater_num_samples: int = 1
   writer_num_fewshot: int = 0
   max_tokens: int = 250
-  #: Decoding temperature for the SFT baseline, and for every target when
-  #: ``match_perl_rollout_temperature`` is off. 0.0 means greedy: SFT has no
-  #: training temperature of its own (``sweep_sft.yaml`` does not search one),
-  #: so there is nothing for it to match and the deterministic decode is the
-  #: cleanest reference point.
+  #: Reference decoding temperature. Used as the fallback for command
+  #: builders, as the single temperature when ``temperature_grid`` is empty,
+  #: and as the temperature the headline number is quoted at. 0.0 (greedy) is
+  #: the deterministic, zero-sampling-variance reading of a policy, which is
+  #: the one number that cannot be accused of being a lucky draw.
   temperature: float = 0.0
-  #: Score each PE-RL policy at the rollout temperature its winning trial was
-  #: trained with, rather than at ``temperature``.
+  #: Decoding temperatures *every* evaluated policy is scored at: the SFT
+  #: baseline and each PE-RL branch alike, so all checkpoints are compared on
+  #: identical footing at every point.
   #:
-  #: ``sweep_perl.yaml`` searches ``temperature`` over {0.3, 0.6, 1.0}, and
-  #: RLOO optimises the reward under samples drawn at that temperature. Scoring
-  #: the resulting policy greedily measures a decode it was never optimised
-  #: for, so a real reward improvement can fail to show up in the evaluation.
+  #: Scoring each PE-RL policy only at its own rollout temperature is a
+  #: one-point estimate of a curve, taken at the point most favourable to it:
+  #: RL concentrates the policy, so a sharpened policy sampled at T looks like
+  #: the SFT model sampled colder. The grid exposes that. 0.0 is greedy (where
+  #: temperature scaling cannot help, so a win there is a win of the mode
+  #: itself); 0.7 and 1.0 are the recommended chat temperatures of Qwen and
+  #: Gemma respectively; 1.25 is a deliberately hot stress regime.
   #:
-  #: Because temperature moves the hallucination rate on its own, matching it
-  #: would make ``delta`` conflate decoding with weights. To prevent that the
-  #: stage also re-scores the SFT baseline at each distinct rollout
-  #: temperature in play, and every delta is taken against the baseline
-  #: sampled the same way. That costs one extra generation and autorating pass
-  #: per distinct temperature.
+  #: Costs one generation + autorating pass per (policy, temperature).
+  #: An empty list falls back to the single ``temperature``, which is what
+  #: every campaign run before the grid existed did.
+  temperature_grid: List[float] = field(
+      default_factory=lambda: [0.0, 0.7, 1.0, 1.25]
+  )
+  #: Also score each PE-RL branch (and the SFT baseline) at the rollout
+  #: temperature its winning trial was trained with, when that temperature
+  #: is not already on ``temperature_grid``.
   #:
-  #: Set to False to put every target back on a single fixed ``temperature``,
-  #: which is what campaigns run before this option did.
+  #: ``sweep_perl.yaml`` searches rollout temperature over the grid minus
+  #: greedy, so for new campaigns this adds nothing. It exists for policies
+  #: trained under an older sweep grid (0.3/0.6): a reviewer is entitled to
+  #: ask for the number at the temperature a policy was optimised for, and
+  #: this guarantees it is there. Additive only - it never replaces the grid.
   match_perl_rollout_temperature: bool = True
   top_p: float = 1.0
   top_k: int = 0
@@ -584,6 +594,23 @@ class CampaignConfig:
           "shutdown_grace_seconds must be >= 0, got "
           f"{self.shutdown_grace_seconds}. Use 0 to power off immediately."
       )
+
+    # Checked here rather than at generation time: a bad grid entry would
+    # otherwise surface as a vLLM error hours in, after SFT and PE-RL had
+    # already been paid for.
+    for value in list(self.eval.temperature_grid or []) + [
+        self.eval.temperature
+    ]:
+      if (
+          isinstance(value, bool)
+          or not isinstance(value, (int, float))
+          or not math.isfinite(float(value))
+          or float(value) < 0.0
+      ):
+        raise ValueError(
+            "eval.temperature and every eval.temperature_grid entry must be "
+            f"a finite number >= 0, got {value!r}."
+        )
 
   def to_dict(self) -> Dict[str, Any]:
     """Converts the config dataclass to a nested dictionary."""

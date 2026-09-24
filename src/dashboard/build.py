@@ -34,11 +34,13 @@ import html
 import json
 import os
 import shutil
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from src.dashboard import charts as charts_mod
 from src.dashboard import index as index_mod
 from src.dashboard import links as links_mod
 from src.dashboard import render as render_mod
+from src.orchestrator import eval_metrics
 
 #: A campaign still marked in-progress whose last update predates the
 #: snapshot by more than this is shown as stale rather than live. Publishing
@@ -576,22 +578,25 @@ def _stage_table(campaign: index_mod.CampaignSummary) -> str:
 
 
 def _metric_rows(
-    campaign: index_mod.CampaignSummary, names: Sequence[str]
+    campaign: index_mod.CampaignSummary,
+    names: Sequence[str],
+    targets: Optional[Sequence[index_mod.EvalTarget]] = None,
 ) -> str:
   """Renders one table row per metric, one column per evaluated target.
 
   Args:
     campaign: The campaign.
     names: Bare metric names to render, in order.
+    targets: The columns to render; defaults to every eval target.
 
   Returns:
     The concatenated ``<tr>`` elements.
   """
+  if targets is None:
+    targets = campaign.eval_targets
   rows = []
   for name in names:
-    cells = "".join(
-        _metric_cell(target, name) for target in campaign.eval_targets
-    )
+    cells = "".join(_metric_cell(target, name) for target in targets)
     rows.append(f"<tr><td>{_e(_metric_title(name))}</td>{cells}</tr>")
   return "".join(rows)
 
@@ -615,6 +620,18 @@ def _metric_cell(target: index_mod.EvalTarget, name: str) -> str:
   value = _e(format_metric(target.metrics.get(name)))
   ratio = target.metric_ratios.get(name)
   if ratio is None:
+    interval = (
+        None
+        if target.is_delta
+        else eval_metrics.confidence_interval(target.metrics, name)
+    )
+    if interval is not None:
+      low, high = (format_metric(bound) for bound in interval)
+      sub = (
+          '<span class="sub ci" title="95% confidence interval">'
+          f"[{_e(low)}, {_e(high)}]</span>"
+      )
+      return f'<td class="num">{value}{sub}</td>'
     return f'<td class="num">{value}</td>'
   sub = f'<span class="sub">{_e(format_relative(ratio))}</span>'
   return f'<td class="num">{value}{sub}</td>'
@@ -653,29 +670,334 @@ def _eval_table(campaign: index_mod.CampaignSummary) -> str:
   """
   if not campaign.eval_targets or not campaign.eval_metric_names:
     return ""
+  legend = _eval_legend(campaign)
+  if not index_mod.is_temperature_grid(campaign.eval_targets):
+    return f"{_eval_table_block(campaign, campaign.eval_targets)}{legend}"
+  blocks = []
+  for temperature, group in index_mod.temperature_groups(
+      campaign.eval_targets
+  ):
+    heading = (
+        "Unknown decoding temperature"
+        if temperature is None
+        else f"Decoding temperature T = "
+        f"{eval_metrics.format_temperature(temperature)}"
+    )
+    blocks.append(
+        f'<h4 class="temperature-heading">{_e(heading)}</h4>'
+        f"{_eval_table_block(campaign, group)}"
+    )
+  return "\n".join(blocks) + legend
+
+
+def _eval_table_block(
+    campaign: index_mod.CampaignSummary,
+    targets: Sequence[index_mod.EvalTarget],
+) -> str:
+  """Renders the headline table and the collapsed secondary one.
+
+  Args:
+    campaign: The campaign.
+    targets: The columns to render.
+
+  Returns:
+    An HTML snippet.
+  """
   header = "".join(
-      f'<th class="num">{_e(target.label)}</th>'
-      for target in campaign.eval_targets
+      f'<th class="num">{_e(target.label)}</th>' for target in targets
   )
   head = f"<thead><tr><th>Metric</th>{header}</tr></thead>"
-  legend = _eval_legend(campaign)
   main = f"""<table class="eval">
 {head}
-<tbody>{_metric_rows(campaign, campaign.headline_metric_names)}</tbody>
+<tbody>{_metric_rows(campaign, campaign.headline_metric_names, targets)}</tbody>
 </table>"""
 
   secondary = campaign.secondary_metric_names
   if not secondary:
-    return f"{main}{legend}"
+    return main
   count = len(secondary)
   return f"""{main}
 <details class="more-metrics">
 <summary>{count} more metric(s) recorded for each target</summary>
 <table class="eval">
 {head}
-<tbody>{_metric_rows(campaign, secondary)}</tbody>
+<tbody>{_metric_rows(campaign, secondary, targets)}</tbody>
 </table>
-</details>{legend}"""
+</details>"""
+
+
+#: Legend text for the star/ring drawn at a policy's own rollout temperature.
+_ROLLOUT_NOTE = (
+    "\u2605 / ring: the temperature this PE-RL policy was trained with "
+    "(selected by the sweep, so that cell is favoured by construction)."
+)
+
+
+def _policy_series(
+    campaign: index_mod.CampaignSummary,
+) -> Tuple[List[str], List[Tuple[str, Dict[str, index_mod.EvalTarget]]]]:
+  """Arranges non-delta eval targets as policy x temperature.
+
+  Args:
+    campaign: The campaign.
+
+  Returns:
+    ``(temperature_tokens, [(base_label, {token: target})])`` with tokens
+    sorted coldest first and policies in display order (SFT first).
+  """
+  temperatures: Dict[str, float] = {}
+  by_policy: Dict[str, Dict[str, index_mod.EvalTarget]] = {}
+  for target in campaign.eval_targets:
+    if target.is_delta or target.temperature is None:
+      continue
+    token = eval_metrics.format_temperature(target.temperature)
+    temperatures[token] = target.temperature
+    by_policy.setdefault(target.base_label, {})[token] = target
+  tokens = sorted(temperatures, key=temperatures.get)
+  return tokens, list(by_policy.items())
+
+
+def _is_rollout_cell(target: index_mod.EvalTarget) -> bool:
+  """Whether the target was scored at its own training rollout temperature."""
+  rollout = target.metrics.get(eval_metrics.ROLLOUT_TEMPERATURE_KEY)
+  if not isinstance(rollout, (int, float)) or target.temperature is None:
+    return False
+  return eval_metrics.format_temperature(
+      rollout
+  ) == eval_metrics.format_temperature(target.temperature)
+
+
+def _bar_chart(
+    title: str,
+    tokens: List[str],
+    policies: List[Tuple[str, Dict[str, index_mod.EvalTarget]]],
+    name: str,
+    y_label: str,
+    percent: bool,
+) -> str:
+  """Renders one metric as grouped bars: temperature x policy."""
+  series = []
+  for index, (base_label, cells) in enumerate(policies):
+    values, intervals, marked = [], [], []
+    for token in tokens:
+      target = cells.get(token)
+      value = target.metrics.get(name) if target else None
+      values.append(value if isinstance(value, (int, float)) else None)
+      intervals.append(
+          eval_metrics.confidence_interval(target.metrics, name)
+          if target
+          else None
+      )
+      marked.append(bool(target) and _is_rollout_cell(target))
+    if any(v is not None for v in values):
+      series.append(
+          charts_mod.BarSeries(
+              name=eval_metrics.target_title(base_label),
+              color=charts_mod.series_color(base_label, index),
+              values=values,
+              intervals=intervals,
+              marked=marked,
+          )
+      )
+  return charts_mod.grouped_bar_chart(
+      title,
+      [f"T = {token}" for token in tokens],
+      series,
+      y_label,
+      percent=percent,
+      marker_note=_ROLLOUT_NOTE,
+  )
+
+
+def _standard_error(
+    target: index_mod.EvalTarget, name: str
+) -> Optional[float]:
+  interval = eval_metrics.confidence_interval(target.metrics, name)
+  if interval is None:
+    return None
+  return (interval[1] - interval[0]) / (2 * eval_metrics.Z_95)
+
+
+def _reduction_chart(
+    tokens: List[str],
+    policies: List[Tuple[str, Dict[str, index_mod.EvalTarget]]],
+) -> str:
+  """Renders SFT-minus-policy hallucination rate per temperature.
+
+  The interval treats the two samples as independent, which overstates the
+  uncertainty when both were scored on the same prompts: it is conservative,
+  never optimistic.
+  """
+  baseline = dict(policies).get(eval_metrics.BASELINE_LABEL)
+  if not baseline:
+    return ""
+  name = "hallucination_rate"
+  series = []
+  for index, (base_label, cells) in enumerate(policies):
+    if base_label == eval_metrics.BASELINE_LABEL:
+      continue
+    values, intervals, marked = [], [], []
+    for token in tokens:
+      policy, sft = cells.get(token), baseline.get(token)
+      p_value = policy.metrics.get(name) if policy else None
+      s_value = sft.metrics.get(name) if sft else None
+      if not isinstance(p_value, (int, float)) or not isinstance(
+          s_value, (int, float)
+      ):
+        values.append(None)
+        intervals.append(None)
+        marked.append(False)
+        continue
+      reduction = s_value - p_value
+      values.append(reduction)
+      p_se, s_se = _standard_error(policy, name), _standard_error(sft, name)
+      if p_se is None or s_se is None:
+        intervals.append(None)
+      else:
+        half = eval_metrics.Z_95 * (p_se**2 + s_se**2) ** 0.5
+        intervals.append((reduction - half, reduction + half))
+      marked.append(_is_rollout_cell(policy))
+    if any(v is not None for v in values):
+      series.append(
+          charts_mod.BarSeries(
+              name=eval_metrics.target_title(base_label),
+              color=charts_mod.series_color(base_label, index),
+              values=values,
+              intervals=intervals,
+              marked=marked,
+          )
+      )
+  return charts_mod.grouped_bar_chart(
+      "Hallucination-rate reduction vs. SFT at the same temperature",
+      [f"T = {token}" for token in tokens],
+      series,
+      "SFT rate \u2212 policy rate (higher is better)",
+      percent=True,
+      marker_note=_ROLLOUT_NOTE,
+  )
+
+
+def _pareto_chart(
+    tokens: List[str],
+    policies: List[Tuple[str, Dict[str, index_mod.EvalTarget]]],
+) -> str:
+  """Renders quality vs. faithfulness, one trajectory per policy."""
+  series = []
+  for index, (base_label, cells) in enumerate(policies):
+    points = []
+    for token in tokens:
+      target = cells.get(token)
+      if target is None:
+        continue
+      x = target.metrics.get("reward_hacking_quality")
+      y = target.metrics.get("faithfulness_rate")
+      if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+        continue
+      points.append(
+          charts_mod.TrajectoryPoint(
+              x=x,
+              y=y,
+              label=token,
+              x_interval=eval_metrics.confidence_interval(
+                  target.metrics, "reward_hacking_quality"
+              ),
+              y_interval=eval_metrics.confidence_interval(
+                  target.metrics, "faithfulness_rate"
+              ),
+              marked=_is_rollout_cell(target),
+          )
+      )
+    if points:
+      series.append(
+          charts_mod.TrajectorySeries(
+              name=eval_metrics.target_title(base_label),
+              color=charts_mod.series_color(base_label, index),
+              points=points,
+          )
+      )
+  return charts_mod.trajectory_plot(
+      "Quality vs. faithfulness across temperatures (up and right is better)",
+      series,
+      "Reward-hacking audit quality",
+      "Faithfulness rate",
+      y_percent=True,
+      marker_note="Ring: the policy's own rollout temperature. "
+      "Points are labelled with T.",
+  )
+
+
+def _perplexity_key(
+    policies: List[Tuple[str, Dict[str, index_mod.EvalTarget]]],
+) -> str:
+  """Returns whichever perplexity spelling the campaign recorded.
+
+  Summaries write ``perplexity_mean``; older states (and the dry-run mock)
+  hold the bare ``perplexity``. Both carry ``perplexity_std`` beside them.
+  """
+  for _, cells in policies:
+    for target in cells.values():
+      if "perplexity_mean" in target.metrics:
+        return "perplexity_mean"
+  return "perplexity"
+
+
+def _eval_charts(campaign: index_mod.CampaignSummary) -> str:
+  """Renders the temperature-sweep charts above the evaluation tables.
+
+  Only temperature-grid campaigns get charts: an older campaign scored each
+  policy at a single temperature, so every chart would be one bar wide.
+
+  Args:
+    campaign: The campaign.
+
+  Returns:
+    An HTML snippet, or an empty string when there is nothing to plot.
+  """
+  if not index_mod.is_temperature_grid(campaign.eval_targets):
+    return ""
+  tokens, policies = _policy_series(campaign)
+  if len(tokens) < 2 or not policies:
+    return ""
+  figures = [
+      _bar_chart(
+          "Hallucination rate by decoding temperature (lower is better)",
+          tokens,
+          policies,
+          "hallucination_rate",
+          "Hallucination rate",
+          percent=True,
+      ),
+      _bar_chart(
+          "Reward-hacking audit quality by decoding temperature "
+          "(higher is better)",
+          tokens,
+          policies,
+          "reward_hacking_quality",
+          "Audit quality",
+          percent=False,
+      ),
+      _pareto_chart(tokens, policies),
+      _reduction_chart(tokens, policies),
+      _bar_chart(
+          "Perplexity by decoding temperature (lower is better)",
+          tokens,
+          policies,
+          _perplexity_key(policies),
+          "Perplexity",
+          percent=False,
+      ),
+  ]
+  figures = [figure for figure in figures if figure]
+  if not figures:
+    return ""
+  note = (
+      '<p class="subtitle">Error bars are 95% confidence intervals: Wilson '
+      "score intervals for rates, normal approximations (mean \u00b1 1.96 "
+      "\u00b7 std / \u221an) for means. Intervals are unpaired, so they are "
+      "conservative for comparisons between policies scored on the same "
+      "prompts.</p>"
+  )
+  return f'<div class="chart-grid">{"".join(figures)}</div>{note}'
 
 
 def _eval_legend(campaign: index_mod.CampaignSummary) -> str:
@@ -984,7 +1306,8 @@ def render_campaign_page(
 
   eval_table = _eval_table(campaign)
   eval_section = (
-      f"<section><h3>Evaluation</h3>{eval_table}</section>"
+      f"<section><h3>Evaluation</h3>{_eval_charts(campaign)}"
+      f"{eval_table}</section>"
       if eval_table
       else ""
   )

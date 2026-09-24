@@ -101,6 +101,20 @@ class EstimateTest(unittest.TestCase):
         wizard.estimate_runtime(trimmed)[1], wizard.estimate_runtime(full)[1]
     )
 
+  def test_estimate_scales_with_the_temperature_grid(self):
+    # Every policy is scored at every grid temperature, so a four-point grid
+    # must cost more evaluation time than a one-point one.
+    single = CampaignConfig.create_default(task_name="npov")
+    single.stages = ["eval"]
+    single.eval.temperature_grid = [0.0]
+    grid = CampaignConfig.create_default(task_name="npov")
+    grid.stages = ["eval"]
+    grid.eval.temperature_grid = [0.0, 0.7, 1.0, 1.25]
+    self.assertAlmostEqual(
+        wizard.estimate_runtime(grid)[0],
+        4 * wizard.estimate_runtime(single)[0],
+    )
+
   def test_format_estimate_switches_unit(self):
     self.assertIn("min", wizard.format_estimate(0.1, 0.4))
     self.assertIn("h", wizard.format_estimate(2.0, 5.0))

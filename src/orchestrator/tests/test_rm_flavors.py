@@ -366,6 +366,7 @@ class BranchedEvaluationTest(unittest.TestCase):
 
   def _stage(self, flavor_list, policies):
     config = _config(flavor_list)
+    config.eval.temperature_grid = [0.0]
     state = CampaignState(campaign_id="c", task_name="ragtruth")
     state.stages["sft"] = StageResult(
         status=StageStatus.COMPLETED, model_repo_id="u/sft"
@@ -379,9 +380,9 @@ class BranchedEvaluationTest(unittest.TestCase):
   def _pairs(self, stage):
     """Returns each pass as (label, repo), dropping the temperature.
 
-    No ``best_params`` are recorded by this fixture, so every target falls
-    back to ``eval.temperature`` and the plan has one pass per policy. See
-    test_eval_temperature.py for the matched-baseline behaviour.
+    The fixture pins a one-point temperature grid and records no
+    ``best_params``, so the plan has one pass per policy. See
+    test_eval_temperature.py for the temperature-grid behaviour.
 
     Args:
       stage: The eval stage to resolve.

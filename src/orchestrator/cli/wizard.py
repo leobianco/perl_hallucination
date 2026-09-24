@@ -162,11 +162,12 @@ def estimate_runtime(config: CampaignConfig) -> Tuple[float, float]:
   and PE-RL sweeps twice, and an estimate that ignored it would understate
   the most expensive campaigns by half.
 
-  Evaluation is priced per *pass*, not per stage: one for the SFT baseline and
-  one per PE-RL branch. With ``match_perl_rollout_temperature`` on there may
-  be up to one further baseline pass per branch, but how many is not knowable
-  until the sweeps have picked their temperatures, so that cost is carried by
-  the upper bound alone.
+  Evaluation is priced per *pass*, not per stage: one per (policy,
+  temperature), i.e. SFT plus every PE-RL branch, times the temperature grid.
+  With ``match_perl_rollout_temperature`` on a branch trained off the grid
+  adds two more passes (itself and SFT at that temperature), but whether any
+  is is not knowable until the sweeps have picked, so that cost is carried
+  by the upper bound alone.
 
   Args:
     config: The campaign to price.
@@ -182,11 +183,12 @@ def estimate_runtime(config: CampaignConfig) -> Tuple[float, float]:
     if stage == "eval":
       samples = getattr(config.eval, "max_eval_samples", 0) or 0
       per_pass = 15.0 + samples / 100.0 * 2.0
-      minutes += per_pass * (1 + branches)
+      grid = len(set(getattr(config.eval, "temperature_grid", None) or [])) or 1
+      minutes += per_pass * (1 + branches) * grid
       if getattr(config.eval, "match_perl_rollout_temperature", False):
-        # Worst case: every branch wins at a different temperature, none of
-        # them the configured one, so each needs its own extra baseline.
-        optimistic_extra += per_pass * branches
+        # Worst case: every branch wins at a different off-grid temperature,
+        # each then needing itself and an SFT baseline scored there.
+        optimistic_extra += per_pass * 2 * branches
       continue
     if stage == "autorater":
       # One judging pass over the labelled set - no generation, no GPU, so
@@ -297,10 +299,12 @@ def config_summary_lines(config: CampaignConfig, theme: theme_mod.Theme) -> List
     rows.append(("RM dataset", flavors.describe_flavors(campaign_flavors)))
   for stage in stages:
     if stage == "eval":
+      grid = sorted(set(config.eval.temperature_grid or [])) or [
+          config.eval.temperature
+      ]
+      decoding = "every policy at T = " + ", ".join(f"{t:g}" for t in grid)
       if config.eval.match_perl_rollout_temperature:
-        decoding = "PE-RL at its own rollout temperature, SFT matched"
-      else:
-        decoding = f"every target at temperature {config.eval.temperature}"
+        decoding += " (+ any off-grid rollout T)"
       rows.append(("Decoding", decoding))
       rows.append(
           ("Eval budget", f"{config.eval.max_eval_samples} samples "
