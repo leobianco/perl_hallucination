@@ -1792,7 +1792,18 @@ class TestContinualEvalDefaultsParity(unittest.TestCase):
     )
     for key, variable in self._FINAL_EVAL_VARIABLES.items():
       with self.subTest(setting=key):
-        self.assertEqual(defaults[variable], CONTINUAL_EVAL_DEFAULTS[key])
+        if key == "max_samples":
+          expected = str(
+              int(
+                  round(
+                      int(defaults[variable])
+                      * continual_eval_mod.CONTINUAL_EVAL_SAMPLE_FRACTION
+                  )
+              )
+          )
+          self.assertEqual(CONTINUAL_EVAL_DEFAULTS[key], expected)
+        else:
+          self.assertEqual(defaults[variable], CONTINUAL_EVAL_DEFAULTS[key])
 
 
 class TestEvalPhaseTimeout(unittest.TestCase):
@@ -2057,7 +2068,189 @@ class TestOrchestratorContinualEvalWiring(unittest.TestCase):
     self.assertEqual(_flag_value(score_cmd, "--evaluator_model"), "gemini-x")
     self.assertEqual(_flag_value(score_cmd, "--compute_perplexity"), "False")
     for cmd in (gen_cmd, score_cmd):
-      self.assertEqual(_flag_value(cmd, "--max_eval_samples"), "200")
+      self.assertEqual(_flag_value(cmd, "--max_eval_samples"), "50")
+
+
+class TestConstrainedCheckpointSelection(unittest.TestCase):
+  """Constrained continual-eval checkpoint selection and root promotion."""
+
+  def setUp(self):
+    super().setUp()
+    self.temp_dir = tempfile.mkdtemp(prefix="test_constrained_ckpt_")
+
+  def tearDown(self):
+    shutil.rmtree(self.temp_dir, ignore_errors=True)
+    super().tearDown()
+
+  def test_excludes_step_zero_and_enforces_reward_hacking_ceiling(self):
+    history = [
+        # Step 0 (untrained SFT baseline): low hallu, rh_rate=0.04 -> ceiling = max(0.10, 0.04+0.05) = 0.10
+        {
+            "step": 0,
+            "hallucination_rate": 0.05,
+            "reward_hacking_rate": 0.04,
+            "reward_hacking_quality": 0.90,
+        },
+        # Step 24: lower hallu than step 48, but violates ceiling (0.18 > 0.10)
+        {
+            "step": 24,
+            "hallucination_rate": 0.08,
+            "reward_hacking_rate": 0.18,
+            "reward_hacking_quality": 0.70,
+        },
+        # Step 48: satisfies ceiling (0.07 <= 0.10)
+        {
+            "step": 48,
+            "hallucination_rate": 0.12,
+            "reward_hacking_rate": 0.07,
+            "reward_hacking_quality": 0.85,
+        },
+        # Step 72 (final): satisfies ceiling (0.09 <= 0.10) but higher hallu (0.15)
+        {
+            "step": 72,
+            "hallucination_rate": 0.15,
+            "reward_hacking_rate": 0.09,
+            "reward_hacking_quality": 0.82,
+        },
+    ]
+    sel = continual_eval_mod.select_best_continual_checkpoint(history)
+    self.assertIsNotNone(sel)
+    assert sel is not None
+    # Step 0 is excluded, step 24 is rejected by ceiling, step 48 wins over 72
+    self.assertEqual(sel.step, 48)
+    self.assertAlmostEqual(sel.hallucination_rate, 0.12)
+    self.assertAlmostEqual(sel.reward_hacking_rate, 0.07)
+    self.assertAlmostEqual(sel.ceiling, 0.10)
+    self.assertTrue(sel.met_ceiling)
+
+  def test_step_zero_only_returns_none(self):
+    history = [
+        {
+            "step": 0,
+            "hallucination_rate": 0.10,
+            "reward_hacking_rate": 0.02,
+            "reward_hacking_quality": 0.90,
+        }
+    ]
+    self.assertIsNone(
+        continual_eval_mod.select_best_continual_checkpoint(history)
+    )
+
+  def test_fallback_when_all_trained_checkpoints_exceed_ceiling(self):
+    history = [
+        {
+            "step": 0,
+            "hallucination_rate": 0.20,
+            "reward_hacking_rate": 0.02,
+            "reward_hacking_quality": 0.90,
+        },
+        {
+            "step": 24,
+            "hallucination_rate": 0.10,
+            "reward_hacking_rate": 0.30,
+            "reward_hacking_quality": 0.60,
+        },
+        {
+            "step": 48,
+            "hallucination_rate": 0.14,
+            "reward_hacking_rate": 0.15,
+            "reward_hacking_quality": 0.75,
+        },
+    ]
+    sel = continual_eval_mod.select_best_continual_checkpoint(history)
+    self.assertIsNotNone(sel)
+    assert sel is not None
+    self.assertFalse(sel.met_ceiling)
+    # Minimizes reward_hacking_rate when all step > 0 exceed ceiling
+    self.assertEqual(sel.step, 48)
+
+  def test_preserve_and_finalize_promotes_best_to_root_and_saves_last(self):
+    # Create step-24 and step-48 checkpoints; step 24 wins and is preserved
+    ckpt24 = os.path.join(self.temp_dir, "checkpoint-24")
+    os.makedirs(ckpt24, exist_ok=True)
+    with open(os.path.join(ckpt24, "adapter_model.safetensors"), "wb") as f:
+      f.write(b"weights-step-24")
+    with open(os.path.join(ckpt24, "optimizer.pt"), "wb") as f:
+      f.write(b"opt-24")
+
+    history = [
+        {
+            "step": 0,
+            "hallucination_rate": 0.25,
+            "reward_hacking_rate": 0.03,
+            "reward_hacking_quality": 0.88,
+        },
+        {
+            "step": 24,
+            "hallucination_rate": 0.11,
+            "reward_hacking_rate": 0.05,
+            "reward_hacking_quality": 0.86,
+        },
+    ]
+    with open(
+        os.path.join(self.temp_dir, "continual_eval_history.json"),
+        "w",
+        encoding="utf-8",
+    ) as f:
+      json.dump(history, f)
+    sel24 = continual_eval_mod.preserve_best_continual_checkpoint(
+        self.temp_dir, step=24, checkpoint_dir=ckpt24
+    )
+    self.assertIsNotNone(sel24)
+    # Simulate HF Trainer save_total_limit deleting checkpoint-24 later, and
+    # saving final step-48 weights at root + checkpoint-48
+    shutil.rmtree(ckpt24)
+    ckpt48 = os.path.join(self.temp_dir, "checkpoint-48")
+    os.makedirs(ckpt48, exist_ok=True)
+    for target in (self.temp_dir, ckpt48):
+      with open(os.path.join(target, "adapter_model.safetensors"), "wb") as f:
+        f.write(b"weights-step-48")
+
+    history.append({
+        "step": 48,
+        "hallucination_rate": 0.19,
+        "reward_hacking_rate": 0.06,
+        "reward_hacking_quality": 0.84,
+    })
+    with open(
+        os.path.join(self.temp_dir, "continual_eval_history.json"),
+        "w",
+        encoding="utf-8",
+    ) as f:
+      json.dump(history, f)
+
+    status48 = ContinualEvalStatus(
+        paused_for_eval=True,
+        current_step=48,
+        checkpoint_dir=ckpt48,
+        training_completed=True,
+    )
+    continual_eval_mod.finalize_continual_eval_checkpoints(
+        output_dir=self.temp_dir,
+        flags={"push_to_hub": "False"},
+        status=status48,
+    )
+
+    # Root now has step-24 weights, and last/ has step-48 weights!
+    with open(
+        os.path.join(self.temp_dir, "adapter_model.safetensors"), "rb"
+    ) as f:
+      self.assertEqual(f.read(), b"weights-step-24")
+    with open(
+        os.path.join(self.temp_dir, "last", "adapter_model.safetensors"), "rb"
+    ) as f:
+      self.assertEqual(f.read(), b"weights-step-48")
+    with open(
+        os.path.join(self.temp_dir, "checkpoints.json"),
+        "r",
+        encoding="utf-8",
+    ) as f:
+      manifest = json.load(f)
+    self.assertEqual(manifest["default"], "best")
+    self.assertEqual(manifest["default_step"], 24)
+    self.assertIsNone(manifest["checkpoints"]["best"]["subfolder"])
+    self.assertEqual(manifest["checkpoints"]["last"]["subfolder"], "last")
+    self.assertEqual(manifest["checkpoints"]["last"]["step"], 48)
 
 
 class TestPerlEntryPoint(unittest.TestCase):

@@ -251,5 +251,56 @@ class TestUploadIgnorePatterns(unittest.TestCase):
         self.assertFalse(matched, f"{name} would be excluded from the upload")
 
 
+class TestCheckpointResolution(unittest.TestCase):
+  """Loaders understand repo_id, repo_id:best, repo_id:last, and local dirs."""
+
+  def test_resolves_root_and_companion_subfolders_from_manifest(self):
+    import json  # pylint: disable=g-import-not-at-top
+    import os  # pylint: disable=g-import-not-at-top
+    import tempfile  # pylint: disable=g-import-not-at-top
+
+    with tempfile.TemporaryDirectory() as base_dir:
+      # Best is at root (subfolder: None), last is in last/
+      plan = cp.plan_publication(
+          root_is_best=True,
+          best_dir="/o/checkpoint-24",
+          best_step=24,
+          last_dir="/o/checkpoint-48",
+          last_step=48,
+      )
+      manifest = cp.build_manifest(
+          plan,
+          best_step=24,
+          last_step=48,
+          companion_published=True,
+          metric_for_best_model="eval/hallucination_rate",
+          greater_is_better=False,
+          best_metric=0.11,
+      )
+      with open(
+          os.path.join(base_dir, cp.CHECKPOINT_MANIFEST_FILENAME),
+          "w",
+          encoding="utf-8",
+      ) as f:
+        json.dump(manifest, f)
+      os.makedirs(os.path.join(base_dir, "last"), exist_ok=True)
+
+      # Asking for :best when best is at root resolves to base_dir (root)
+      self.assertEqual(cp.resolve_checkpoint_subfolder(base_dir, "best"), base_dir)
+      # Asking for :last resolves to base_dir/last
+      self.assertEqual(
+          cp.resolve_checkpoint_subfolder(base_dir, "last"),
+          os.path.join(base_dir, "last"),
+      )
+      # Local dir resolution
+      self.assertEqual(
+          cp.resolve_local_checkpoint_dir(f"{base_dir}:best"), base_dir
+      )
+      self.assertEqual(
+          cp.resolve_local_checkpoint_dir(f"{base_dir}:last"),
+          os.path.join(base_dir, "last"),
+      )
+
+
 if __name__ == "__main__":
   unittest.main()

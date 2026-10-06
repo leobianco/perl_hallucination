@@ -177,6 +177,24 @@ def _selection_lines(result: StageResult, metric_label: str) -> List[str]:
           "have moved this trial."
       )
     return lines
+  if result.selection_strategy == "constrained_continual_eval":
+    if result.selection_step is None:
+      return [
+          "* **Selection**: best constrained continual-eval hallucination rate "
+          "(step > 0, under the reward-hacking ceiling; the winning trial "
+          "ended at its best constrained checkpoint)."
+      ]
+    lines = [
+        "* **Selection**: best constrained continual-eval hallucination rate "
+        f"(step > 0, under the reward-hacking ceiling), reached at step "
+        f"`{result.selection_step}` (early stopping)."
+    ]
+    if result.final_metric_val is not None:
+      lines.append(
+          f"* **Final-step continual-eval hallucination rate**: "
+          f"`{result.final_metric_val:.5f}`."
+      )
+    return lines
   if result.selection_strategy != "best":
     return []
   if result.selection_step is None:

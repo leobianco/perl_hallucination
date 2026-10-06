@@ -136,7 +136,17 @@ def sweep_timeout_minutes(
 #:   The extremum over every logged step, i.e. early-stopping semantics.
 #:   Correct when the deployed checkpoint is itself the best-step one, which
 #:   is what ``--load_best_model_at_end`` gives us for SFT and RM.
-SELECTION_STRATEGIES = ("final", "final_window", "best")
+#: ``constrained_continual_eval``
+#:   The lowest continual-eval hallucination rate over trained checkpoints
+#:   (step > 0) whose reward-hacking rate stays within the reward-hacking
+#:   ceiling. Used automatically for PE-RL sweeps whenever trials log
+#:   continual-evaluation metrics.
+SELECTION_STRATEGIES = (
+    "final",
+    "final_window",
+    "best",
+    "constrained_continual_eval",
+)
 
 #: Which checkpoint of the materialization run becomes the *default* of the
 #: published Hub repository, i.e. the one a bare ``from_pretrained(repo_id)``
@@ -216,6 +226,12 @@ class EvalStageConfig:
   # is deliberately independent.
   seed: int = 12345
   max_eval_samples: int = 1000
+  #: Fraction of ``max_eval_samples`` scored at each continual-evaluation step
+  #: during PE-RL training (1/4 by default: 250 samples when the final
+  #: temperature-grid evaluation uses 1000). Because continual evaluation uses
+  #: the same deterministic shuffle ``seed``, this is the first 1/4 prefix of
+  #: the evaluation set, leaving 3/4 unseen during checkpoint/trial selection.
+  continual_eval_sample_fraction: float = 0.25
   eval_batch_size: int = 32
   max_workers: int = 32
   threshold: float = 0.1025
@@ -223,6 +239,14 @@ class EvalStageConfig:
   # autorating comfortably fits in three hours; beyond that something is
   # wedged (a stalled Vertex call, a hung vLLM worker).
   timeout_minutes: int = 180
+
+  def continual_eval_samples(self) -> int:
+    """Returns the per-step sample budget for PE-RL continual evaluation."""
+    full_samples = max(1, int(self.max_eval_samples or 1000))
+    fraction = float(self.continual_eval_sample_fraction or 0.25)
+    if fraction <= 0.0:
+      fraction = 0.25
+    return max(1, int(round(full_samples * fraction)))
 
   evaluator_num_fewshot: int = 2
   #: ROC-AUC below which the ``autorater`` stage flags the judge as too weak
@@ -809,7 +833,7 @@ class CampaignConfig:
             checkpoint_policy="final",
             # Mirrors --eval_steps in scripts/sweep_perl.yaml, so the "best/"
             # companion is located at the same resolution the sweep used.
-            materialization_eval_steps=50,
+            materialization_eval_steps=24,
             sft_model_path="auto",
             reward_model_path="auto",
         ),

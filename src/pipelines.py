@@ -235,6 +235,8 @@ def _load_sequence_classifier(
     ValueError: Propagated from Transformers when the architecture genuinely
       has no classification head available.
   """
+  resolved_ref, ref_kwargs = _resolve_pretrained_ref_and_kwargs(model_ref)
+  target_ref = resolved_ref or model_ref
   id2label = {0: "Yes", 1: "No"}
   label2id = {"Yes": 0, "No": 1}
   kwargs = dict(
@@ -242,25 +244,46 @@ def _load_sequence_classifier(
       id2label=id2label,
       label2id=label2id,
       torch_dtype=torch_dtype,
+      **ref_kwargs,
   )
 
   # No-op for every family other than Gemma 4; see the registration helper.
-  register_gemma4_for_sequence_classification(model_ref)
+  register_gemma4_for_sequence_classification(target_ref)
   try:
     return AutoModelForSequenceClassification.from_pretrained(
-        model_ref, **kwargs
+        target_ref, **kwargs
     )
   except (ValueError, KeyError) as e:
     if Gemma4ForSequenceClassification is None:
       raise
     try:
       return Gemma4ForSequenceClassification.from_pretrained(
-          model_ref, **kwargs
+          target_ref, **kwargs
       )
     except Exception:  # pylint: disable=broad-except
       # The Gemma 4 head could not load it either, so the original
       # Transformers error is the informative one.
       raise e  # pylint: disable=raise-missing-from
+
+
+def _resolve_pretrained_ref_and_kwargs(
+    model_ref: Optional[str],
+) -> tuple[Optional[str], Dict[str, Any]]:
+  """Resolves a model reference (local path or HF Hub ref with optional subfolder/revision) for ``from_pretrained``."""
+  if not model_ref or not isinstance(model_ref, str):
+    return model_ref, {}
+  local_dir = checkpoint_publication.resolve_local_checkpoint_dir(model_ref)
+  if local_dir is not None:
+    return local_dir, {}
+  repo_id, subfolder, revision = parse_hf_repo_reference(model_ref)
+  if repo_id and (subfolder or revision):
+    extra: Dict[str, Any] = {}
+    if subfolder:
+      extra["subfolder"] = subfolder
+    if revision:
+      extra["revision"] = revision
+    return repo_id, extra
+  return model_ref, {}
 
 
 _CHAT_TOKENIZER_UNSET = object()
@@ -1112,10 +1135,8 @@ class Pipeline(abc.ABC):
           revision=revision,
       )
 
-      target_dir = (
-          os.path.join(downloaded_dir, subfolder)
-          if subfolder
-          else downloaded_dir
+      target_dir = checkpoint_publication.resolve_checkpoint_subfolder(
+          downloaded_dir, subfolder
       )
 
       if not os.path.isdir(target_dir):
@@ -1188,12 +1209,13 @@ class Pipeline(abc.ABC):
     if base_model_id and cleaned_ref == str(base_model_id).strip():
       return False, None
 
-    # 1. Check if it's an existing local directory
-    if os.path.isdir(cleaned_ref):
-      if os.path.isfile(os.path.join(cleaned_ref, "adapter_config.json")):
-        return True, cleaned_ref
+    # 1. Check if it's an existing local directory (or local :best / :last role)
+    local_dir = checkpoint_publication.resolve_local_checkpoint_dir(cleaned_ref)
+    if local_dir is not None and os.path.isdir(local_dir):
+      if os.path.isfile(os.path.join(local_dir, "adapter_config.json")):
+        return True, local_dir
       try:
-        last_ckpt = get_last_checkpoint(cleaned_ref)
+        last_ckpt = get_last_checkpoint(local_dir)
       except Exception:
         last_ckpt = None
       if last_ckpt and os.path.isfile(
@@ -1203,14 +1225,14 @@ class Pipeline(abc.ABC):
       adapter_files = sorted(
           p
           for p in glob.glob(
-              os.path.join(cleaned_ref, "**/adapter_config.json"),
+              os.path.join(local_dir, "**/adapter_config.json"),
               recursive=True,
           )
           if os.path.basename(os.path.dirname(p)) != "ref"
       )
       if adapter_files:
         return True, os.path.dirname(adapter_files[-1])
-      return False, cleaned_ref
+      return False, local_dir
 
     # 2. Check Hugging Face Hub repo reference
     repo_id, subfolder, revision = parse_hf_repo_reference(cleaned_ref)
@@ -1227,10 +1249,8 @@ class Pipeline(abc.ABC):
             revision=revision,
             allow_patterns=["*.json", "*.safetensors", "*.bin"],
         )
-        target_dir = (
-            os.path.join(downloaded_dir, subfolder)
-            if subfolder
-            else downloaded_dir
+        target_dir = checkpoint_publication.resolve_checkpoint_subfolder(
+            downloaded_dir, subfolder
         )
         if os.path.isdir(target_dir):
           if os.path.isfile(os.path.join(target_dir, "adapter_config.json")):
@@ -1316,19 +1336,22 @@ class Pipeline(abc.ABC):
 
     # 2. Handle string path or Hugging Face Hub repo reference
     if isinstance(resume_arg, str):
-      # If it is an existing local directory:
-      if os.path.isdir(resume_arg):
+      # If it is an existing local directory (or local :best / :last role):
+      local_resume_dir = checkpoint_publication.resolve_local_checkpoint_dir(
+          resume_arg
+      )
+      if local_resume_dir is not None and os.path.isdir(local_resume_dir):
         try:
-          last_ckpt = get_last_checkpoint(resume_arg)
+          last_ckpt = get_last_checkpoint(local_resume_dir)
         except Exception:
           last_ckpt = None
-        if last_ckpt is not None and last_ckpt != resume_arg:
+        if last_ckpt is not None and last_ckpt != local_resume_dir:
           print(
               f"Resuming training from checkpoint found in '{resume_arg}':"
               f" {last_ckpt}"
           )
           return last_ckpt
-        return resume_arg
+        return local_resume_dir
 
       # If it's not a local directory, check if it's a Hugging Face Hub path/repo
       repo_id, subfolder, revision = parse_hf_repo_reference(resume_arg)
@@ -2091,9 +2114,13 @@ class PERLPipeline(Pipeline):
     self.reward_model.to(device)
     self.reward_model.eval()
 
+    resolved_rm_ref, rm_ref_kwargs = _resolve_pretrained_ref_and_kwargs(
+        reward_model_path
+    )
     self.reward_tokenizer = AutoTokenizer.from_pretrained(
-        reward_model_path,
+        resolved_rm_ref or reward_model_path,
         padding_side="right",
+        **rm_ref_kwargs,
     )
     # Must follow the *same* rule the reward model was trained under
     # (`RewardModelPipeline.setup_tokenizer`), otherwise the pooled position

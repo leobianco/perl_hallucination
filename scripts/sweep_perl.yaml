@@ -36,7 +36,7 @@ command:
   - --do_train=True
   - --do_eval=True
   - --eval_strategy=steps
-  - --eval_steps=50
+  - --eval_steps=24
   - --eval_on_start=True
   - --save_only_model=True
   - --save_strategy=no

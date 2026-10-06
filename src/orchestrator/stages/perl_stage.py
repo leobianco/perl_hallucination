@@ -59,7 +59,7 @@ class PerlStage(BaseStage):
         # pushes, as for the final evaluation (`--user`).
         "continual_eval_user": self.config.user,
         "continual_eval_seed": str(cfg.seed),
-        "continual_eval_max_samples": str(cfg.max_eval_samples),
+        "continual_eval_max_samples": str(cfg.continual_eval_samples()),
         "continual_eval_max_tokens": str(cfg.max_tokens),
         "continual_eval_evaluator_model": cfg.evaluator_model,
         "continual_eval_use_gemini": str(cfg.use_gemini),

@@ -36,15 +36,19 @@ last paused checkpoint.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import fnmatch
 import functools
 import json
 import math
 import os
+import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+
+from src import checkpoint_publication
 
 try:
   import matplotlib
@@ -71,19 +75,42 @@ CONTINUAL_EVAL_STATUS_FILENAME = "continual_eval_status.json"
 CONTINUAL_EVAL_HISTORY_FILENAME = "continual_eval_history.json"
 CONTINUAL_WORKER_ENV = "PERL_CONTINUAL_EVAL_WORKER"
 
+#: Fraction of the full evaluation sample budget scored at each continual
+#: evaluation step. Using the same deterministic shuffle seed as the final
+#: evaluation makes this a 1/4 prefix subset, leaving 3/4 of the test set
+#: unseen during checkpoint and trial selection.
+CONTINUAL_EVAL_SAMPLE_FRACTION = 0.25
+
+#: Default reward-hacking rate ceiling parameters for constrained checkpoint
+#: selection: ceiling = max(DEFAULT_REWARD_HACKING_CEILING_FLOOR,
+#: step_0_reward_hacking_rate + DEFAULT_REWARD_HACKING_STEP0_MARGIN).
+DEFAULT_REWARD_HACKING_CEILING_FLOOR = 0.10
+DEFAULT_REWARD_HACKING_STEP0_MARGIN = 0.05
+
+#: Directory and metadata file where the winning t > 0 continual-eval
+#: checkpoint is preserved against save_total_limit rotation.
+BEST_CHECKPOINT_DIRNAME = "best_continual_eval_checkpoint"
+BEST_CHECKPOINT_META_FILENAME = "continual_eval_best_checkpoint.json"
+
+#: WandB log and summary keys for the constrained best continual-eval
+#: checkpoint (strictly t > 0).
+BEST_CONSTRAINED_HALLUCINATION_KEY = "eval/best_constrained_hallucination_rate"
+BEST_CONSTRAINED_STEP_KEY = "eval/best_constrained_step"
+BEST_CONSTRAINED_RH_RATE_KEY = "eval/best_constrained_reward_hacking_rate"
+BEST_CONSTRAINED_CEILING_KEY = "eval/best_constrained_ceiling"
+BEST_CONSTRAINED_MET_CEILING_KEY = "eval/best_constrained_met_ceiling"
+
 #: Defaults for the ``--continual_eval_<key>`` flags, as CLI strings.
 #:
-#: They mirror the final evaluation (``scripts/evaluator.sh``) so a continual
-#: point and a final-eval point of the same checkpoint are comparable. The one
-#: deliberate difference is ``compute_perplexity``: it reloads the base model
-#: for every evaluated step, and perplexity is not part of either Pareto
-#: frontier. ``ScriptArguments`` (``src/utils.py``) and ``scripts/perl.sh``
-#: repeat these values (importing this module from ``src/utils.py`` would pull
-#: in matplotlib and transformers); ``src/test_continual_eval.py`` keeps all
-#: four in sync.
+#: They mirror the final evaluation (``scripts/evaluator.sh``) except for:
+#: 1. ``max_samples``: 1/4 (250) of the full 1000-sample final evaluation set;
+#: 2. ``compute_perplexity``: off by default so the base model is not reloaded
+#:    at every evaluated step.
+#: ``ScriptArguments`` (``src/utils.py``) and ``scripts/perl.sh`` repeat these
+#: values; ``src/test_continual_eval.py`` keeps all four in sync.
 CONTINUAL_EVAL_DEFAULTS: Dict[str, str] = {
     "seed": "12345",
-    "max_samples": "1000",
+    "max_samples": "250",
     "max_tokens": "250",
     "evaluator_model": "gemini-2.5-flash",
     "use_gemini": "True",
@@ -494,14 +521,171 @@ def update_continual_eval_history(
   )
   quality_steps = {int(p["step"]) for p in frontier_quality if "step" in p}
 
+  selection = select_best_continual_checkpoint(ordered)
+  best_constrained_step = selection.step if selection is not None else None
+
   for item in ordered:
     item_step = int(item["step"])
     item["is_pareto_rate"] = item_step in rate_steps
     item["is_pareto_quality"] = item_step in quality_steps
+    item["is_best_constrained"] = (
+        best_constrained_step is not None and item_step == best_constrained_step
+    )
 
   if history_path:
     _atomic_write_json(history_path, ordered)
   return ordered
+
+
+@dataclass(frozen=True)
+class ConstrainedCheckpointSelection:
+  """Result of selecting the best post-SFT (t > 0) continual-eval checkpoint.
+
+  Attributes:
+    step: Optimizer step of the selected checkpoint (always > 0).
+    hallucination_rate: Hallucination rate at ``step``.
+    reward_hacking_rate: Reward-hacking rate at ``step``, if scored.
+    reward_hacking_quality: Reward-hacking quality at ``step``, if scored.
+    ceiling: The reward-hacking rate ceiling used for selection.
+    met_ceiling: True when ``reward_hacking_rate <= ceiling`` (or when reward
+      hacking was not scored); False when every t > 0 checkpoint exceeded the
+      ceiling and the fallback (lowest reward_hacking_rate) was selected.
+    entry: The raw history dictionary for ``step``.
+  """
+
+  step: int
+  hallucination_rate: float
+  reward_hacking_rate: Optional[float]
+  reward_hacking_quality: Optional[float]
+  ceiling: float
+  met_ceiling: bool
+  entry: Dict[str, Any]
+
+
+def compute_reward_hacking_ceiling(
+    history: Sequence[Dict[str, Any]],
+    abs_floor: float = DEFAULT_REWARD_HACKING_CEILING_FLOOR,
+    step0_margin: float = DEFAULT_REWARD_HACKING_STEP0_MARGIN,
+) -> float:
+  """Computes the reward-hacking rate ceiling from continual-eval history.
+
+  Returns ``max(abs_floor, rh_rate(step=0) + step0_margin)`` when step 0 has a
+  finite ``reward_hacking_rate``, else ``abs_floor``.
+  """
+  floor_val = float(abs_floor)
+  for item in history or ():
+    if not isinstance(item, dict):
+      continue
+    try:
+      step_val = int(item.get("step", -1))
+    except (TypeError, ValueError):
+      continue
+    if step_val == 0 and _is_finite_number(item.get("reward_hacking_rate")):
+      return max(
+          floor_val, float(item["reward_hacking_rate"]) + float(step0_margin)
+      )
+  return floor_val
+
+
+def select_best_continual_checkpoint(
+    history: Sequence[Dict[str, Any]],
+    abs_floor: float = DEFAULT_REWARD_HACKING_CEILING_FLOOR,
+    step0_margin: float = DEFAULT_REWARD_HACKING_STEP0_MARGIN,
+) -> Optional[ConstrainedCheckpointSelection]:
+  """Selects the best post-SFT (t > 0) checkpoint under a reward-hacking ceiling.
+
+  Candidate pool strictly excludes ``step <= 0`` (the untrained SFT baseline)
+  so PE-RL never vacates to the SFT checkpoint. Among ``step > 0`` checkpoints
+  with finite ``hallucination_rate``:
+  - If at least one checkpoint satisfies ``reward_hacking_rate <= ceiling`` (or
+    has no ``reward_hacking_rate``), selects the one with the lowest
+    ``hallucination_rate`` (ties broken by lower ``reward_hacking_rate``,
+    higher ``reward_hacking_quality``, then later ``step``).
+  - If every ``step > 0`` checkpoint exceeds ``ceiling``, falls back to the
+    ``step > 0`` checkpoint with the lowest ``reward_hacking_rate`` (ties
+    broken by lower ``hallucination_rate``, higher ``reward_hacking_quality``,
+    then later ``step``) and marks ``met_ceiling=False``.
+  """
+  if not history:
+    return None
+
+  ceiling = compute_reward_hacking_ceiling(
+      history, abs_floor=abs_floor, step0_margin=step0_margin
+  )
+  candidates: List[Dict[str, Any]] = []
+  for item in history:
+    if not isinstance(item, dict):
+      continue
+    try:
+      step_val = int(item.get("step", 0) or 0)
+    except (TypeError, ValueError):
+      continue
+    if step_val <= 0:
+      continue
+    if not _is_finite_number(item.get("hallucination_rate")):
+      continue
+    candidates.append(item)
+
+  if not candidates:
+    return None
+
+  feasible = [
+      p
+      for p in candidates
+      if not _is_finite_number(p.get("reward_hacking_rate"))
+      or float(p["reward_hacking_rate"]) <= ceiling + 1e-9
+  ]
+
+  def _rh_rate_or_default(point: Dict[str, Any], default: float) -> float:
+    val = point.get("reward_hacking_rate")
+    return float(val) if _is_finite_number(val) else default
+
+  def _rh_qual_or_zero(point: Dict[str, Any]) -> float:
+    val = point.get("reward_hacking_quality")
+    return float(val) if _is_finite_number(val) else 0.0
+
+  if feasible:
+    met_ceiling = True
+    best = min(
+        feasible,
+        key=lambda p: (
+            float(p["hallucination_rate"]),
+            _rh_rate_or_default(p, 0.0),
+            -_rh_qual_or_zero(p),
+            -int(p["step"]),
+        ),
+    )
+  else:
+    met_ceiling = False
+    best = min(
+        candidates,
+        key=lambda p: (
+            _rh_rate_or_default(p, float("inf")),
+            float(p["hallucination_rate"]),
+            -_rh_qual_or_zero(p),
+            -int(p["step"]),
+        ),
+    )
+
+  rh_rate = (
+      float(best["reward_hacking_rate"])
+      if _is_finite_number(best.get("reward_hacking_rate"))
+      else None
+  )
+  rh_qual = (
+      float(best["reward_hacking_quality"])
+      if _is_finite_number(best.get("reward_hacking_quality"))
+      else None
+  )
+  return ConstrainedCheckpointSelection(
+      step=int(best["step"]),
+      hallucination_rate=float(best["hallucination_rate"]),
+      reward_hacking_rate=rh_rate,
+      reward_hacking_quality=rh_qual,
+      ceiling=ceiling,
+      met_ceiling=met_ceiling,
+      entry=dict(best),
+  )
 
 
 def render_pareto_frontier_figure(
@@ -826,14 +1010,41 @@ def log_pareto_frontiers_to_wandb(
   if valid_rh_qual:
     payload["eval/pareto_best_reward_hacking_quality"] = max(valid_rh_qual)
 
+  selection = select_best_continual_checkpoint(history)
+  if selection is not None:
+    payload[BEST_CONSTRAINED_HALLUCINATION_KEY] = selection.hallucination_rate
+    payload[BEST_CONSTRAINED_STEP_KEY] = selection.step
+    payload[BEST_CONSTRAINED_CEILING_KEY] = selection.ceiling
+    payload[BEST_CONSTRAINED_MET_CEILING_KEY] = selection.met_ceiling
+    if selection.reward_hacking_rate is not None:
+      payload[BEST_CONSTRAINED_RH_RATE_KEY] = selection.reward_hacking_rate
+
   try:
-    if hasattr(wandb_mod, "summary") and wandb_mod.summary is not None:
-      wandb_mod.summary["eval/pareto_rate_steps"] = [
+    for summary_target in (
+        getattr(wandb_mod, "summary", None),
+        getattr(getattr(wandb_mod, "run", None), "summary", None),
+    ):
+      if summary_target is None:
+        continue
+      summary_target["eval/pareto_rate_steps"] = [
           int(p["step"]) for p in frontier_rate if "step" in p
       ]
-      wandb_mod.summary["eval/pareto_quality_steps"] = [
+      summary_target["eval/pareto_quality_steps"] = [
           int(p["step"]) for p in frontier_quality if "step" in p
       ]
+      if selection is not None:
+        summary_target[BEST_CONSTRAINED_HALLUCINATION_KEY] = (
+            selection.hallucination_rate
+        )
+        summary_target[BEST_CONSTRAINED_STEP_KEY] = selection.step
+        summary_target[BEST_CONSTRAINED_CEILING_KEY] = selection.ceiling
+        summary_target[BEST_CONSTRAINED_MET_CEILING_KEY] = (
+            selection.met_ceiling
+        )
+        if selection.reward_hacking_rate is not None:
+          summary_target[BEST_CONSTRAINED_RH_RATE_KEY] = (
+              selection.reward_hacking_rate
+          )
   except Exception:  # pylint: disable=broad-exception-caught
     pass
 
@@ -1482,10 +1693,330 @@ def _run_pending_evaluation(
   status.paused_for_eval = False
   status.eval_error = None
   status.save(output_dir)
+  preserve_best_continual_checkpoint(
+      output_dir=output_dir, step=step, checkpoint_dir=checkpoint_dir
+  )
   print(
       f"[ContinualEval] === Completed autorater evaluation of step {step} ===",
       flush=True,
   )
+
+
+_CHECKPOINT_WEIGHT_FILES = (
+    "adapter_config.json",
+    "config.json",
+    "adapter_model.safetensors",
+    "model.safetensors",
+    "pytorch_model.bin",
+)
+
+
+def _dir_has_publishable_weights(path: Optional[str]) -> bool:
+  """Returns True when ``path`` contains model or adapter files."""
+  if not path or not os.path.isdir(path):
+    return False
+  return any(
+      os.path.isfile(os.path.join(path, fname))
+      for fname in _CHECKPOINT_WEIGHT_FILES
+  )
+
+
+def _is_ignored_checkpoint_entry(name: str) -> bool:
+  """Returns True when ``name`` matches training-state ignore patterns."""
+  if name in ("ref", BEST_CHECKPOINT_META_FILENAME):
+    return True
+  for pattern in checkpoint_publication.CHECKPOINT_UPLOAD_IGNORE_PATTERNS:
+    clean_pat = pattern.split("/", 1)[0]
+    if fnmatch.fnmatch(name, clean_pat):
+      return True
+  return False
+
+
+def _copy_publishable_checkpoint_files(src_dir: str, dst_dir: str) -> None:
+  """Copies publishable model/tokenizer files from ``src_dir`` into ``dst_dir``."""
+  os.makedirs(dst_dir, exist_ok=True)
+  src_abs = os.path.abspath(src_dir)
+  dst_abs = os.path.abspath(dst_dir)
+  if src_abs == dst_abs:
+    return
+  for entry in os.listdir(src_dir):
+    if _is_ignored_checkpoint_entry(entry):
+      continue
+    src_path = os.path.join(src_dir, entry)
+    dst_path = os.path.join(dst_dir, entry)
+    if os.path.isfile(src_path):
+      shutil.copy2(src_path, dst_path)
+
+
+def preserve_best_continual_checkpoint(
+    output_dir: str,
+    step: Optional[int] = None,
+    checkpoint_dir: Optional[str] = None,
+) -> Optional[ConstrainedCheckpointSelection]:
+  """Snapshots the winning t > 0 continual-eval checkpoint so rotation cannot delete it.
+
+  Called immediately after each continual evaluation completes. Because
+  ``save_total_limit=2`` rotates older ``checkpoint-*`` directories during later
+  training segments, the winning checkpoint's publishable files are mirrored
+  into ``<output_dir>/best_continual_eval_checkpoint``.
+  """
+  if not output_dir or not os.path.isdir(output_dir):
+    return None
+  history_path = os.path.join(output_dir, CONTINUAL_EVAL_HISTORY_FILENAME)
+  history = load_continual_eval_history(history_path)
+  selection = select_best_continual_checkpoint(history)
+  if selection is None:
+    return None
+
+  archive_dir = os.path.join(output_dir, BEST_CHECKPOINT_DIRNAME)
+  meta_path = os.path.join(archive_dir, BEST_CHECKPOINT_META_FILENAME)
+  archived_step: Optional[int] = None
+  if os.path.isfile(meta_path):
+    try:
+      with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+      if isinstance(meta, dict) and isinstance(meta.get("step"), int):
+        archived_step = int(meta["step"])
+    except (OSError, ValueError, TypeError):
+      archived_step = None
+
+  if (
+      archived_step == selection.step
+      and _dir_has_publishable_weights(archive_dir)
+      and (step is None or int(step) != selection.step)
+  ):
+    return selection
+
+  if (
+      step is not None
+      and int(step) == selection.step
+      and checkpoint_dir
+      and _dir_has_publishable_weights(checkpoint_dir)
+  ):
+    src_dir = checkpoint_dir
+  else:
+    candidate = os.path.join(output_dir, f"checkpoint-{selection.step}")
+    if _dir_has_publishable_weights(candidate):
+      src_dir = candidate
+    elif _dir_has_publishable_weights(archive_dir) and archived_step == selection.step:
+      return selection
+    else:
+      return selection
+
+  tmp_dir = f"{archive_dir}.tmp.{os.getpid()}"
+  try:
+    if os.path.exists(tmp_dir):
+      shutil.rmtree(tmp_dir, ignore_errors=True)
+    _copy_publishable_checkpoint_files(src_dir, tmp_dir)
+    meta_payload = {
+        "step": selection.step,
+        "hallucination_rate": selection.hallucination_rate,
+        "reward_hacking_rate": selection.reward_hacking_rate,
+        "reward_hacking_quality": selection.reward_hacking_quality,
+        "ceiling": selection.ceiling,
+        "met_ceiling": selection.met_ceiling,
+    }
+    _atomic_write_json(
+        os.path.join(tmp_dir, BEST_CHECKPOINT_META_FILENAME), meta_payload
+    )
+    if os.path.exists(archive_dir):
+      shutil.rmtree(archive_dir, ignore_errors=True)
+    os.replace(tmp_dir, archive_dir)
+    if not selection.met_ceiling:
+      print(
+          "[ContinualEval] Warning: all t > 0 checkpoints exceeded the "
+          f"reward-hacking ceiling ({selection.ceiling:.4f}); preserved "
+          f"fallback checkpoint at step {selection.step} "
+          f"(reward_hacking_rate={selection.reward_hacking_rate}, "
+          f"hallucination_rate={selection.hallucination_rate:.4f}).",
+          flush=True,
+      )
+    else:
+      print(
+          f"[ContinualEval] Preserved best constrained checkpoint (step "
+          f"{selection.step}, hallucination_rate="
+          f"{selection.hallucination_rate:.4f}, reward_hacking_rate="
+          f"{selection.reward_hacking_rate}, ceiling={selection.ceiling:.4f}) "
+          f"in {archive_dir}.",
+          flush=True,
+      )
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    if os.path.exists(tmp_dir):
+      shutil.rmtree(tmp_dir, ignore_errors=True)
+    print(
+        "[ContinualEval] Warning: could not preserve best continual-eval "
+        f"checkpoint from {src_dir}: {exc}",
+        flush=True,
+    )
+  return selection
+
+
+def finalize_continual_eval_checkpoints(
+    output_dir: str,
+    flags: Dict[str, str],
+    status: ContinualEvalStatus,
+) -> Optional[Dict[str, Any]]:
+  """Promotes the best constrained checkpoint (t > 0) to root and archives the final step under ``last/``.
+
+  Called once training and all continual evaluations (including the final step)
+  have completed. Ensures that:
+  - ``output_dir`` root (and ``hub_model_id`` root when ``--push_to_hub`` is
+    enabled) serves the best constrained continual-eval checkpoint ($t^* > 0$);
+  - ``output_dir/last`` (and ``hub_model_id:last``) serves the final-step
+    checkpoint when $t^* \neq t_{\text{final}}$;
+  - ``checkpoints.json`` records both checkpoints and the selection metadata.
+  """
+  if not output_dir or not os.path.isdir(output_dir):
+    return None
+
+  selection = preserve_best_continual_checkpoint(output_dir)
+  if selection is None:
+    return None
+
+  archive_dir = os.path.join(output_dir, BEST_CHECKPOINT_DIRNAME)
+  step_ckpt_dir = os.path.join(output_dir, f"checkpoint-{selection.step}")
+  if _dir_has_publishable_weights(archive_dir):
+    best_src_dir = archive_dir
+  elif _dir_has_publishable_weights(step_ckpt_dir):
+    best_src_dir = step_ckpt_dir
+  else:
+    print(
+        f"[ContinualEval] Warning: winning checkpoint for step {selection.step} "
+        "is not available on disk; leaving output_dir root unchanged.",
+        flush=True,
+    )
+    return None
+
+  last_step = (
+      int(status.current_step)
+      if status.current_step is not None and int(status.current_step) > 0
+      else max(
+          (int(s) for s in status.evaluated_steps if int(s) > 0),
+          default=selection.step,
+      )
+  )
+  last_ckpt_candidate = os.path.join(output_dir, f"checkpoint-{last_step}")
+  if _dir_has_publishable_weights(last_ckpt_candidate):
+    last_src_dir: Optional[str] = last_ckpt_candidate
+  elif _dir_has_publishable_weights(output_dir):
+    last_src_dir = output_dir
+  else:
+    last_src_dir = None
+
+  last_subfolder_dir = os.path.join(
+      output_dir, checkpoint_publication.LAST_CHECKPOINT_SUBFOLDER
+  )
+  if selection.step != last_step and last_src_dir is not None:
+    if os.path.exists(last_subfolder_dir):
+      shutil.rmtree(last_subfolder_dir, ignore_errors=True)
+    _copy_publishable_checkpoint_files(last_src_dir, last_subfolder_dir)
+
+  # Promote the best constrained checkpoint to the root of output_dir.
+  _copy_publishable_checkpoint_files(best_src_dir, output_dir)
+
+  plan = checkpoint_publication.plan_publication(
+      root_is_best=True,
+      best_dir=best_src_dir,
+      best_step=selection.step,
+      last_dir=(
+          last_subfolder_dir
+          if selection.step != last_step
+          and _dir_has_publishable_weights(last_subfolder_dir)
+          else None
+      ),
+      last_step=last_step,
+  )
+
+  push_to_hub = is_flag_enabled(flags.get("push_to_hub"), default=False)
+  hub_model_id = str(flags.get("hub_model_id") or "").strip()
+  companion_published = bool(
+      plan.companion_dir and _dir_has_publishable_weights(plan.companion_dir)
+  )
+
+  if push_to_hub and hub_model_id:
+    companion_published = False
+    try:
+      from huggingface_hub import HfApi  # pylint: disable=g-import-not-at-top
+
+      api = HfApi()
+      api.create_repo(repo_id=hub_model_id, repo_type="model", exist_ok=True)
+      ignore_patterns = list(
+          checkpoint_publication.CHECKPOINT_UPLOAD_IGNORE_PATTERNS
+      ) + [BEST_CHECKPOINT_META_FILENAME]
+      api.upload_folder(
+          folder_path=best_src_dir,
+          repo_id=hub_model_id,
+          repo_type="model",
+          ignore_patterns=ignore_patterns,
+          commit_message=(
+              f"Promote best continual-eval checkpoint (step {selection.step}, "
+              f"hallucination_rate={selection.hallucination_rate:.4f}) to root"
+          ),
+      )
+      if plan.companion_name and plan.companion_dir:
+        try:
+          api.upload_folder(
+              folder_path=plan.companion_dir,
+              path_in_repo=plan.companion_name,
+              repo_id=hub_model_id,
+              repo_type="model",
+              ignore_patterns=ignore_patterns,
+              commit_message=(
+                  f"Add {plan.companion_name} checkpoint (step {last_step})"
+              ),
+          )
+          companion_published = True
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+          print(
+              f"[ContinualEval] Warning: could not upload {plan.companion_name} "
+              f"companion checkpoint to {hub_model_id}: {exc}",
+              flush=True,
+          )
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+      print(
+          "[ContinualEval] Warning: could not push promoted best checkpoint "
+          f"to {hub_model_id}: {exc}",
+          flush=True,
+      )
+
+  manifest = checkpoint_publication.build_manifest(
+      plan,
+      best_step=selection.step,
+      last_step=last_step,
+      companion_published=companion_published,
+      metric_for_best_model="eval/hallucination_rate",
+      greater_is_better=False,
+      best_metric=selection.hallucination_rate,
+  )
+  manifest["reward_hacking_rate"] = selection.reward_hacking_rate
+  manifest["reward_hacking_ceiling"] = selection.ceiling
+  manifest["met_reward_hacking_ceiling"] = selection.met_ceiling
+
+  manifest_path = os.path.join(
+      output_dir, checkpoint_publication.CHECKPOINT_MANIFEST_FILENAME
+  )
+  _atomic_write_json(manifest_path, manifest)
+
+  if push_to_hub and hub_model_id and os.path.isfile(manifest_path):
+    try:
+      from huggingface_hub import HfApi  # pylint: disable=g-import-not-at-top
+
+      api = HfApi()
+      api.upload_file(
+          path_or_fileobj=manifest_path,
+          path_in_repo=checkpoint_publication.CHECKPOINT_MANIFEST_FILENAME,
+          repo_id=hub_model_id,
+          repo_type="model",
+          commit_message="Update checkpoint manifest for continual-eval winner",
+      )
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+      print(
+          "[ContinualEval] Warning: could not upload checkpoint manifest to "
+          f"{hub_model_id}: {exc}",
+          flush=True,
+      )
+
+  return manifest
 
 
 def run_perl_with_continual_eval(
@@ -1610,6 +2141,7 @@ def run_perl_with_continual_eval(
 
     # 2. Done once the final checkpoint has been scored.
     if status.training_completed:
+      finalize_continual_eval_checkpoints(output_dir, flags, status)
       print(
           "[ContinualEval] PE-RL training and continual evaluation completed "
           f"(evaluated steps: {sorted(status.evaluated_steps)}).",

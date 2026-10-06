@@ -83,7 +83,7 @@ class ScriptArguments:
   continual_eval_launch_config: Optional[str] = None
   continual_eval_user: Optional[str] = None
   continual_eval_seed: int = 12345
-  continual_eval_max_samples: int = 1000
+  continual_eval_max_samples: int = 250
   continual_eval_max_tokens: int = 250
   continual_eval_evaluator_model: str = "gemini-2.5-flash"
   continual_eval_use_gemini: bool = True

@@ -23,7 +23,9 @@ can be exercised without importing the training stack.
 from __future__ import annotations
 
 import dataclasses
+import json
 import math
+import os
 import re
 from typing import Any, Dict, Optional
 
@@ -239,3 +241,107 @@ def build_manifest(
           ),
       },
   }
+
+
+def resolve_checkpoint_subfolder(
+    base_dir: str, subfolder: Optional[str]
+) -> str:
+  """Resolves a requested subfolder inside a downloaded or local repo directory.
+
+  When ``subfolder`` is ``'best'`` or ``'last'``, consults ``checkpoints.json``
+  at ``base_dir`` if present: a role whose manifest entry has
+  ``"subfolder": null`` lives at the repository root (``base_dir``), and a role
+  whose manifest entry names a subfolder resolves to that directory.
+
+  Args:
+    base_dir: Root directory of the local or downloaded repository.
+    subfolder: Requested subfolder (e.g. ``'best'``, ``'last'``,
+      ``'checkpoint-48'``, or ``None``).
+
+  Returns:
+    The resolved directory path inside ``base_dir``.
+  """
+  if not subfolder:
+    return base_dir
+
+  cleaned_sub = str(subfolder).strip("/")
+  if not cleaned_sub:
+    return base_dir
+
+  if cleaned_sub in (BEST_CHECKPOINT_SUBFOLDER, LAST_CHECKPOINT_SUBFOLDER):
+    manifest_path = os.path.join(base_dir, CHECKPOINT_MANIFEST_FILENAME)
+    if os.path.isfile(manifest_path):
+      try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+          manifest = json.load(f)
+        if isinstance(manifest, dict):
+          checkpoints = manifest.get("checkpoints")
+          if isinstance(checkpoints, dict):
+            role_entry = checkpoints.get(cleaned_sub)
+            if isinstance(role_entry, dict) and role_entry.get("available"):
+              mapped = role_entry.get("subfolder")
+              if mapped is None:
+                return base_dir
+              mapped_dir = os.path.join(base_dir, str(mapped).strip("/"))
+              if os.path.isdir(mapped_dir):
+                return mapped_dir
+      except (OSError, ValueError, TypeError):
+        pass
+
+  candidate = os.path.join(base_dir, cleaned_sub)
+  if os.path.isdir(candidate):
+    return candidate
+
+  if cleaned_sub in (BEST_CHECKPOINT_SUBFOLDER, LAST_CHECKPOINT_SUBFOLDER):
+    if any(
+        os.path.isfile(os.path.join(base_dir, fname))
+        for fname in (
+            "adapter_config.json",
+            "config.json",
+            "adapter_model.safetensors",
+            "model.safetensors",
+            "pytorch_model.bin",
+        )
+    ):
+      return base_dir
+
+  return candidate
+
+
+def resolve_local_checkpoint_dir(ref: Optional[str]) -> Optional[str]:
+  """Resolves a local checkpoint reference, supporting ``:best``/``:last`` and ``/best``/``/last``.
+
+  Args:
+    ref: A local directory path, optionally suffixed with ``:subfolder`` or
+      ``/best`` / ``/last``.
+
+  Returns:
+    The existing local directory path if ``ref`` points to a local directory or
+    manifest-mapped role, else ``None``.
+  """
+  if not ref or not isinstance(ref, str):
+    return None
+  cleaned = ref.strip()
+  if not cleaned:
+    return None
+  if os.path.isdir(cleaned):
+    return cleaned
+  if ":" in cleaned:
+    base_dir, subfolder = cleaned.rsplit(":", 1)
+    if base_dir and os.path.isdir(base_dir):
+      resolved = resolve_checkpoint_subfolder(base_dir, subfolder)
+      if os.path.isdir(resolved):
+        return resolved
+  norm = os.path.normpath(cleaned)
+  parent = os.path.dirname(norm)
+  leaf = os.path.basename(norm)
+  if (
+      leaf in (BEST_CHECKPOINT_SUBFOLDER, LAST_CHECKPOINT_SUBFOLDER)
+      and parent
+      and os.path.isdir(parent)
+  ):
+    resolved = resolve_checkpoint_subfolder(parent, leaf)
+    if os.path.isdir(resolved):
+      return resolved
+  return None
+

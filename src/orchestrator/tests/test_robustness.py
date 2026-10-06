@@ -765,7 +765,7 @@ class TestStageSelectionDefaults(unittest.TestCase):
   def test_perl_materialization_can_locate_its_best_checkpoint(self):
     # PE-RL serves the final checkpoint, but the best one is still published
     # as a companion, so the cadence still has to mirror the sweep.
-    self.assertEqual(self.config.perl.materialization_eval_steps, 50)
+    self.assertEqual(self.config.perl.materialization_eval_steps, 24)
 
   def test_validate_rejects_an_unknown_strategy(self):
     self.config.rm.selection_strategy = "peak"

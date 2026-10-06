@@ -353,5 +353,118 @@ class ContinualEvalSalvageGuardTest(unittest.TestCase):
     )
 
 
+class ContinualEvalSampleFractionAndTrialRankingTest(unittest.TestCase):
+  """Continual eval uses 1/4 of max_eval_samples and ranks trials on constrained hallucination rate."""
+
+  def test_continual_eval_uses_one_quarter_of_full_eval_samples(self):
+    config = CampaignConfig.create_default(task_name="npov", dry_run=True)
+    self.assertEqual(config.eval.max_eval_samples, 1000)
+    self.assertEqual(config.eval.continual_eval_samples(), 250)
+    state = CampaignState(campaign_id="c", task_name="npov")
+    stage = PerlStage(
+        CampaignContext(
+            config=config,
+            state=state,
+            sweep_controller=mock.MagicMock(),
+            model_manager=mock.MagicMock(),
+        )
+    )
+    self.assertEqual(
+        stage.continual_eval_flags()["continual_eval_max_samples"], "250"
+    )
+
+  def test_sweep_controller_ranks_perl_trials_by_constrained_continual_eval(
+      self,
+  ):
+    import sys  # pylint: disable=g-import-not-at-top
+    import types  # pylint: disable=g-import-top
+    from src.orchestrator.sweep_controller import SweepController  # pylint: disable=g-import-not-at-top
+
+    class _Run:
+
+      def __init__(self, run_id, history, reward_final):
+        self.id = run_id
+        self.state = "finished"
+        self.config = {"learning_rate": 1e-5}
+        self._history = history
+        self.summary = {
+            "train/rewards/reward_fn/mean": reward_final,
+            "eval/hallucination_rate": history[-1]["eval/hallucination_rate"],
+        }
+
+      def scan_history(self, keys=None):
+        if not keys:
+          return list(self._history)
+        return [row for row in self._history if all(k in row for k in keys)]
+
+    # Trial A has higher training reward (0.95) and a low hallucination rate at
+    # step 24 (0.05), but only by reward hacking (0.25 > ceiling 0.10); its only
+    # non-hacking step-48 checkpoint has hallucination_rate=0.22.
+    trial_a = _Run(
+        "trial_a_hacker",
+        [
+            {
+                "_step": 0,
+                "eval/hallucination_rate": 0.25,
+                "eval/reward_hacking_rate": 0.04,
+            },
+            {
+                "_step": 24,
+                "eval/hallucination_rate": 0.05,
+                "eval/reward_hacking_rate": 0.25,
+            },
+            {
+                "_step": 48,
+                "eval/hallucination_rate": 0.22,
+                "eval/reward_hacking_rate": 0.08,
+            },
+        ],
+        reward_final=0.95,
+    )
+    # Trial B has lower training reward (0.60), step 0 has hallu=0.01 (must be
+    # excluded!), step 24 has hallu=0.11 with rh_rate=0.06 <= 0.10, and step 48
+    # drifts to hallu=0.16. Its best constrained step > 0 is step 24 (0.11).
+    trial_b = _Run(
+        "trial_b_clean",
+        [
+            {
+                "_step": 0,
+                "eval/hallucination_rate": 0.01,
+                "eval/reward_hacking_rate": 0.04,
+            },
+            {
+                "_step": 24,
+                "eval/hallucination_rate": 0.11,
+                "eval/reward_hacking_rate": 0.06,
+            },
+            {
+                "_step": 48,
+                "eval/hallucination_rate": 0.16,
+                "eval/reward_hacking_rate": 0.07,
+            },
+        ],
+        reward_final=0.60,
+    )
+
+    fake_wandb = types.ModuleType("wandb")
+    fake_sweep = types.SimpleNamespace(runs=[trial_a, trial_b])
+    fake_wandb.Api = lambda: types.SimpleNamespace(sweep=lambda _p: fake_sweep)
+    with mock.patch.dict(sys.modules, {"wandb": fake_wandb}):
+      ctrl = SweepController(entity="e", project="p", dry_run=False)
+      winner = ctrl.fetch_best_run_details(
+          "s",
+          "train/rewards/reward_fn/mean",
+          goal="maximize",
+          selection="final_window",
+          window=10,
+      )
+    self.assertEqual(winner.run_id, "trial_b_clean")
+    self.assertEqual(winner.selection, "constrained_continual_eval")
+    self.assertAlmostEqual(winner.value, 0.11)
+    self.assertAlmostEqual(winner.final_value, 0.16)
+    self.assertEqual(winner.step, 24)
+    self.assertTrue(winner.met_reward_hacking_ceiling)
+
+
 if __name__ == "__main__":
   unittest.main()

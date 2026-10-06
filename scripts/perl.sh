@@ -45,18 +45,18 @@ NUM_FEWSHOT=0
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-8}"
 REWARD_PENALTY_ALPHA="${REWARD_PENALTY_ALPHA:-1.0}"
 SAVE_STRATEGY="steps"
-# Evaluate (and save) every 50 optimizer steps. With CONTINUAL_EVAL=True every
+# Evaluate (and save) every 24 optimizer steps. With CONTINUAL_EVAL=True every
 # evaluation step pauses training, and TRL does not checkpoint its rollout
 # buffer, so a pause must fall on an RLOO generation boundary:
 # EVAL_STEPS x GRADIENT_ACCUMULATION_STEPS must be a multiple of
-# STEPS_PER_GENERATION x NUM_ITERATIONS (50 x 8 = 400 = 25 x 16; it stays
+# STEPS_PER_GENERATION x NUM_ITERATIONS (24 x 8 = 192 = 12 x 16; it stays
 # aligned when the orchestrator doubles the accumulation for >= 6B models).
-# 50 is also the PE-RL cadence of the orchestrator (scripts/sweep_perl.yaml and
+# 24 is also the PE-RL cadence of the orchestrator (scripts/sweep_perl.yaml and
 # the materialization run), so hand-run and orchestrated curves line up.
-SAVE_STEPS=50
+SAVE_STEPS=24
 DO_EVAL=True
 EVAL_STRATEGY="steps"
-EVAL_STEPS=50
+EVAL_STEPS=24
 EVAL_ON_START=True
 
 # Continual Autorater Evaluation Parameters (Stop -> Generate & Score -> Resume)
@@ -66,12 +66,13 @@ EVAL_ON_START=True
 # (src/continual_eval.py) instead of `accelerate launch`: it launches every
 # training segment with `accelerate launch --config_file $DEEPSPEED_CONFIG`
 # itself and scores each evaluation checkpoint in between. Every evaluation
-# step costs one vLLM generation pass plus Gemini judge calls.
+# step costs one vLLM generation pass plus Gemini judge calls on a 1/4 subset
+# (250 samples) of the evaluation set.
 # The judge settings below match the final evaluation (scripts/evaluator.sh);
 # completions are sampled at the PE-RL rollout TEMPERATURE.
 CONTINUAL_EVAL="${CONTINUAL_EVAL:-False}"
 CONTINUAL_EVAL_SEED="${CONTINUAL_EVAL_SEED:-12345}"
-CONTINUAL_EVAL_MAX_SAMPLES="${CONTINUAL_EVAL_MAX_SAMPLES:-1000}"
+CONTINUAL_EVAL_MAX_SAMPLES="${CONTINUAL_EVAL_MAX_SAMPLES:-250}"
 CONTINUAL_EVAL_MAX_TOKENS="${CONTINUAL_EVAL_MAX_TOKENS:-250}"
 CONTINUAL_EVAL_EVALUATOR_MODEL="${CONTINUAL_EVAL_EVALUATOR_MODEL:-gemini-2.5-flash}"
 CONTINUAL_EVAL_USE_GEMINI="${CONTINUAL_EVAL_USE_GEMINI:-True}"

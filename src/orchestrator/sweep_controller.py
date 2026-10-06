@@ -142,6 +142,26 @@ def agent_forwards_signals() -> bool:
   return False
 
 
+#: Continual-evaluation metric and summary keys used to rank PE-RL sweep trials
+#: by their best constrained continual-eval hallucination rate (step > 0, under
+#: the reward-hacking ceiling).
+CONSTRAINED_CONTINUAL_EVAL_SELECTION = "constrained_continual_eval"
+EVAL_HALLUCINATION_RATE_KEY = "eval/hallucination_rate"
+EVAL_REWARD_HACKING_RATE_KEY = "eval/reward_hacking_rate"
+EVAL_REWARD_HACKING_QUALITY_KEY = "eval/reward_hacking_quality"
+BEST_CONSTRAINED_HALLUCINATION_KEY = "eval/best_constrained_hallucination_rate"
+BEST_CONSTRAINED_STEP_KEY = "eval/best_constrained_step"
+BEST_CONSTRAINED_RH_RATE_KEY = "eval/best_constrained_reward_hacking_rate"
+BEST_CONSTRAINED_CEILING_KEY = "eval/best_constrained_ceiling"
+BEST_CONSTRAINED_MET_CEILING_KEY = "eval/best_constrained_met_ceiling"
+DEFAULT_REWARD_HACKING_CEILING_FLOOR = 0.10
+DEFAULT_REWARD_HACKING_STEP0_MARGIN = 0.05
+_PERL_REWARD_METRICS = (
+    "train/rewards/reward_fn/mean",
+    "rewards/reward_fn/mean",
+)
+
+
 @dataclasses.dataclass(frozen=True)
 class RunScore:
   """How one sweep trial scored, and how that score was arrived at.
@@ -156,8 +176,8 @@ class RunScore:
       strictly better than ``final_value``. None otherwise, including when
       the trial simply ended at its best point. Always None under
       ``final_window``, whose score belongs to no single step.
-    selection: The strategy that produced ``value`` ('final', 'final_window'
-      or 'best').
+    selection: The strategy that produced ``value`` ('final', 'final_window',
+      'best', or 'constrained_continual_eval').
     from_history: True when ``value`` came from the logged history rather
       than from ``run.summary``. False under ``selection="best"`` or
       ``"final_window"`` means the history was unreadable and the summary was
@@ -169,6 +189,12 @@ class RunScore:
     pool_scored: How many of those were eligible and actually ranked.
     pool_dropped: Why the rest were excluded, as ``reason -> count``. Empty
       when every run was ranked.
+    reward_hacking_rate: Reward-hacking rate at the selected continual-eval
+      checkpoint (when ``selection == 'constrained_continual_eval'``).
+    reward_hacking_ceiling: Reward-hacking ceiling applied during constrained
+      continual-eval selection.
+    met_reward_hacking_ceiling: Whether the selected continual-eval checkpoint
+      satisfied ``reward_hacking_rate <= reward_hacking_ceiling``.
   """
 
   run_id: str
@@ -182,12 +208,36 @@ class RunScore:
   pool_total: int = 0
   pool_scored: int = 0
   pool_dropped: Dict[str, int] = dataclasses.field(default_factory=dict)
+  reward_hacking_rate: Optional[float] = None
+  reward_hacking_ceiling: Optional[float] = None
+  met_reward_hacking_ceiling: bool = True
 
   def describe_selection(self) -> str:
     """Returns a short human-readable account of how ``value`` was chosen."""
     tail = ""
     if self.final_value is not None:
       tail = f" (final was {self.final_value:.5f})"
+    if self.selection == CONSTRAINED_CONTINUAL_EVAL_SELECTION:
+      if not self.from_history:
+        return (
+            "best constrained continual-eval hallucination rate; "
+            f"history unavailable{tail}"
+        )
+      if not self.met_reward_hacking_ceiling:
+        step_str = f", at step {self.step}" if self.step is not None else ""
+        return (
+            "lowest-reward-hacking continual-eval checkpoint"
+            f"{step_str} (all step > 0 checkpoints exceeded ceiling){tail}"
+        )
+      if self.step is None:
+        return (
+            "best constrained continual-eval hallucination rate, which is "
+            f"also the final one{tail}"
+        )
+      return (
+          f"best constrained continual-eval hallucination rate, at step "
+          f"{self.step}{tail}"
+      )
     if self.selection == "final_window":
       if not self.from_history:
         return "final logged value; history unavailable for the window"
@@ -441,6 +491,225 @@ def _tail_mean_history(
     return None
   tail = values[-max(1, window):]
   return sum(tail) / len(tail), len(tail)
+
+
+def _iter_continual_eval_history_rows(run: Any) -> Optional[Sequence[Any]]:
+  """Reads continual-evaluation rows from ``run.scan_history``."""
+  scan = getattr(run, "scan_history", None)
+  if not callable(scan):
+    return None
+  key_lists = (
+      [
+          EVAL_HALLUCINATION_RATE_KEY,
+          EVAL_REWARD_HACKING_RATE_KEY,
+          EVAL_REWARD_HACKING_QUALITY_KEY,
+          "train/global_step",
+          "_step",
+      ],
+      [
+          EVAL_HALLUCINATION_RATE_KEY,
+          EVAL_REWARD_HACKING_RATE_KEY,
+          "train/global_step",
+          "_step",
+      ],
+      [
+          EVAL_HALLUCINATION_RATE_KEY,
+          EVAL_REWARD_HACKING_RATE_KEY,
+          "_step",
+      ],
+      [EVAL_HALLUCINATION_RATE_KEY, "train/global_step", "_step"],
+      [EVAL_HALLUCINATION_RATE_KEY, "_step"],
+      [EVAL_HALLUCINATION_RATE_KEY],
+  )
+  for keys in key_lists:
+    try:
+      rows = list(scan(keys=keys))
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      logger.debug("scan_history(%s) failed for run %s: %s", keys, run, e)
+      continue
+    if rows:
+      return rows
+  return None
+
+
+def score_run_constrained_continual_eval(
+    run: Any,
+    abs_floor: float = DEFAULT_REWARD_HACKING_CEILING_FLOOR,
+    step0_margin: float = DEFAULT_REWARD_HACKING_STEP0_MARGIN,
+) -> Optional[RunScore]:
+  """Scores a PE-RL trial by its best constrained continual-eval hallucination rate.
+
+  Strictly excludes ``step <= 0`` (the untrained SFT checkpoint) from the
+  candidate pool, computes ``ceiling = max(abs_floor, rh_rate(0) + step0_margin)``,
+  and selects the ``step > 0`` checkpoint minimizing ``eval/hallucination_rate``
+  subject to ``eval/reward_hacking_rate <= ceiling`` (or minimizing
+  ``eval/reward_hacking_rate`` if every ``step > 0`` checkpoint exceeds the
+  ceiling).
+
+  Args:
+    run: A ``wandb`` run object.
+    abs_floor: Minimum ceiling on ``eval/reward_hacking_rate``.
+    step0_margin: Allowed margin above the step-0 SFT baseline's
+      ``eval/reward_hacking_rate``.
+
+  Returns:
+    A :class:`RunScore` with ``selection="constrained_continual_eval"``, or
+    None when the run logged no usable continual-evaluation metrics.
+  """
+  params = dict(getattr(run, "config", {}) or {})
+  rows = _iter_continual_eval_history_rows(run)
+  if rows:
+    points: List[Dict[str, Any]] = []
+    for index, row in enumerate(rows):
+      if index >= MAX_HISTORY_ROWS:
+        break
+      if not isinstance(row, Mapping):
+        continue
+      hallu = _coerce_float(row.get(EVAL_HALLUCINATION_RATE_KEY))
+      if hallu is None:
+        continue
+      rh_rate = _coerce_float(row.get(EVAL_REWARD_HACKING_RATE_KEY))
+      rh_quality = _coerce_float(row.get(EVAL_REWARD_HACKING_QUALITY_KEY))
+      raw_step = row.get("train/global_step")
+      if raw_step is None or isinstance(raw_step, bool):
+        raw_step = row.get("_step")
+      step = (
+          int(raw_step)
+          if isinstance(raw_step, (int, float)) and not isinstance(raw_step, bool)
+          else None
+      )
+      points.append({
+          "step": step,
+          "hallu": hallu,
+          "rh_rate": rh_rate,
+          "rh_quality": rh_quality,
+          "order": index,
+      })
+
+    if points:
+      if any(p["step"] is not None for p in points):
+        step0_rh_rates = [
+            p["rh_rate"]
+            for p in points
+            if p["step"] is not None
+            and p["step"] <= 0
+            and p["rh_rate"] is not None
+        ]
+        candidates = [
+            p for p in points if p["step"] is not None and p["step"] > 0
+        ]
+      elif len(points) > 1:
+        step0_rh_rates = (
+            [points[0]["rh_rate"]] if points[0]["rh_rate"] is not None else []
+        )
+        candidates = points[1:]
+      else:
+        step0_rh_rates = []
+        candidates = points
+
+      if candidates:
+        ceiling = float(abs_floor)
+        if step0_rh_rates:
+          ceiling = max(ceiling, float(step0_rh_rates[0]) + float(step0_margin))
+        feasible = [
+            p
+            for p in candidates
+            if p["rh_rate"] is None or p["rh_rate"] <= ceiling + 1e-9
+        ]
+        if feasible:
+          winner = min(
+              feasible,
+              key=lambda p: (
+                  p["hallu"],
+                  p["rh_rate"] if p["rh_rate"] is not None else 0.0,
+                  -(p["rh_quality"] if p["rh_quality"] is not None else 0.0),
+                  -(p["step"] if p["step"] is not None else p["order"]),
+              ),
+          )
+          met_ceiling = True
+        else:
+          winner = min(
+              candidates,
+              key=lambda p: (
+                  p["rh_rate"] if p["rh_rate"] is not None else float("inf"),
+                  p["hallu"],
+                  -(p["rh_quality"] if p["rh_quality"] is not None else 0.0),
+                  -(p["step"] if p["step"] is not None else p["order"]),
+              ),
+          )
+          met_ceiling = False
+
+        final_point = candidates[-1]
+        final_hallu = float(final_point["hallu"])
+        improved = (
+            winner["step"] is not None
+            and final_point["step"] is not None
+            and winner["step"] != final_point["step"]
+        )
+        return RunScore(
+            run_id=run.id,
+            value=float(winner["hallu"]),
+            params=params,
+            final_value=final_hallu,
+            step=int(winner["step"]) if improved else None,
+            selection=CONSTRAINED_CONTINUAL_EVAL_SELECTION,
+            from_history=True,
+            reward_hacking_rate=winner["rh_rate"],
+            reward_hacking_ceiling=ceiling,
+            met_reward_hacking_ceiling=met_ceiling,
+        )
+
+  summary = getattr(run, "summary", {}) or {}
+  best_hallu = _coerce_float(summary.get(BEST_CONSTRAINED_HALLUCINATION_KEY))
+  if best_hallu is not None:
+    final_hallu = _coerce_float(summary.get(EVAL_HALLUCINATION_RATE_KEY))
+    if final_hallu is None:
+      final_hallu = best_hallu
+    raw_step = summary.get(BEST_CONSTRAINED_STEP_KEY)
+    best_step = (
+        int(raw_step)
+        if isinstance(raw_step, (int, float))
+        and not isinstance(raw_step, bool)
+        and int(raw_step) > 0
+        else None
+    )
+    rh_rate = _coerce_float(summary.get(BEST_CONSTRAINED_RH_RATE_KEY))
+    ceiling = _coerce_float(summary.get(BEST_CONSTRAINED_CEILING_KEY))
+    raw_met = summary.get(BEST_CONSTRAINED_MET_CEILING_KEY)
+    met_ceiling = bool(raw_met) if isinstance(raw_met, bool) else True
+    return RunScore(
+        run_id=run.id,
+        value=best_hallu,
+        params=params,
+        final_value=final_hallu,
+        step=(
+            best_step
+            if best_step is not None and abs(best_hallu - final_hallu) > 1e-12
+            else None
+        ),
+        selection=CONSTRAINED_CONTINUAL_EVAL_SELECTION,
+        from_history=False,
+        reward_hacking_rate=rh_rate,
+        reward_hacking_ceiling=ceiling,
+        met_reward_hacking_ceiling=met_ceiling,
+    )
+  return None
+
+
+def _constrained_continual_eval_sort_key(score: RunScore) -> Tuple[Any, ...]:
+  """Sort key (ascending) for constrained continual-eval trial scores."""
+  rh_rate = (
+      score.reward_hacking_rate
+      if score.reward_hacking_rate is not None
+      else (0.0 if score.met_reward_hacking_ceiling else float("inf"))
+  )
+  primary = score.value if score.met_reward_hacking_ceiling else rh_rate
+  return (
+      not score.met_reward_hacking_ceiling,
+      primary,
+      score.value,
+      rh_rate,
+  )
 
 
 
@@ -1136,23 +1405,29 @@ class SweepController:
       final_metric = 0.300 if goal == "minimize" else 0.950
       chose_peak = selection == "best"
       chose_window = selection == "final_window"
+      chose_constrained = selection == CONSTRAINED_CONTINUAL_EVAL_SELECTION
       if chose_window:
         value = (final_metric + mock_metric) / 2
-      elif chose_peak:
-        value = mock_metric
+      elif chose_peak or chose_constrained:
+        value = 0.285 if chose_constrained else mock_metric
       else:
         value = final_metric
+      if chose_constrained:
+        final_metric = 0.300
       return RunScore(
           run_id=mock_run_id,
           value=value,
           params=mock_params,
           final_value=final_metric,
-          step=120 if chose_peak else None,
+          step=48 if chose_constrained else (120 if chose_peak else None),
           selection=selection,
-          from_history=chose_peak or chose_window,
+          from_history=chose_peak or chose_window or chose_constrained,
           window_points=max(1, window) if chose_window else None,
           pool_total=1,
           pool_scored=1,
+          reward_hacking_rate=0.05 if chose_constrained else None,
+          reward_hacking_ceiling=0.10 if chose_constrained else None,
+          met_reward_hacking_ceiling=True,
       )
 
     # This query happens right after hours of sweeping: a transient API error
@@ -1183,13 +1458,17 @@ class SweepController:
       run: A ``wandb`` run object.
       metric_name: Metric the sweep optimises.
       goal: 'minimize' or 'maximize'.
-      selection: 'final', 'final_window' or 'best'.
+      selection: 'final', 'final_window', 'best', or
+        'constrained_continual_eval'.
       window: Trailing points to average under ``final_window``; ignored by
         the other strategies.
 
     Returns:
       The run's :class:`RunScore`, or None when it never logged the metric.
     """
+    if selection == CONSTRAINED_CONTINUAL_EVAL_SELECTION:
+      return score_run_constrained_continual_eval(run)
+
     summary = getattr(run, "summary", {}) or {}
     key = _resolve_metric_key(summary, metric_name)
     if key is None:
@@ -1280,6 +1559,43 @@ class SweepController:
       if not runs:
         raise ValueError(f"No runs found in sweep {full_sweep_id}")
 
+      effective_selection = selection
+      effective_metric = metric_name
+      # PE-RL sweeps run with continual evaluation enabled: whenever trials log
+      # continual-evaluation metrics, rank them by their best constrained
+      # continual-eval hallucination rate (step > 0, under the reward-hacking
+      # ceiling) rather than by the noisy training reward. Legacy runs or unit
+      # tests that only log the training reward fall back to `selection`.
+      if (
+          selection in ("final_window", CONSTRAINED_CONTINUAL_EVAL_SELECTION)
+          and metric_name in _PERL_REWARD_METRICS
+      ):
+        rankable_candidates = [
+            r
+            for r in runs
+            if str(getattr(r, "state", "") or "") in RANKABLE_STATES
+            and not paused_mid_training(r)
+        ]
+        if not rankable_candidates:
+          rankable_candidates = [
+              r
+              for r in runs
+              if str(getattr(r, "state", "") or "") in FALLBACK_STATES
+              or str(getattr(r, "state", "") or "") in RANKABLE_STATES
+          ]
+        if any(
+            score_run_constrained_continual_eval(r) is not None
+            for r in rankable_candidates
+        ):
+          effective_selection = CONSTRAINED_CONTINUAL_EVAL_SELECTION
+          effective_metric = EVAL_HALLUCINATION_RATE_KEY
+      elif metric_name in (
+          BEST_CONSTRAINED_HALLUCINATION_KEY,
+          EVAL_HALLUCINATION_RATE_KEY,
+      ) and selection == CONSTRAINED_CONTINUAL_EVAL_SELECTION:
+        effective_selection = CONSTRAINED_CONTINUAL_EVAL_SELECTION
+        effective_metric = EVAL_HALLUCINATION_RATE_KEY
+
       finished_runs: List[RunScore] = []
       other_runs: List[RunScore] = []
       # Why each excluded run was excluded. Counted rather than merely
@@ -1292,9 +1608,11 @@ class SweepController:
 
       for run in runs:
         state = str(getattr(run, "state", "") or "unknown")
-        score = self._score_run(run, metric_name, goal, selection, window)
+        score = self._score_run(
+            run, effective_metric, goal, effective_selection, window
+        )
         if score is None:
-          drop(f"logged no '{metric_name}'")
+          drop(f"logged no '{effective_metric}'")
           continue
         if state in RANKABLE_STATES and not paused_mid_training(run):
           finished_runs.append(score)
@@ -1330,15 +1648,18 @@ class SweepController:
         )
         raise ValueError(
             f"No run in sweep {full_sweep_id} logged the metric "
-            f"'{metric_name}' ({len(runs)} run(s) inspected). "
+            f"'{effective_metric}' ({len(runs)} run(s) inspected). "
             "Check that the training script logs this key, or fix "
             "'metric.name' in the sweep YAML. Observed summary keys: "
             f"{observed_keys[:40]}"
         )
 
       # Sort by metric
-      reverse = goal == "maximize"
-      valid_runs.sort(key=lambda score: score.value, reverse=reverse)
+      if effective_selection == CONSTRAINED_CONTINUAL_EVAL_SELECTION:
+        valid_runs.sort(key=_constrained_continual_eval_sort_key)
+      else:
+        reverse = goal == "maximize"
+        valid_runs.sort(key=lambda score: score.value, reverse=reverse)
       best = dataclasses.replace(
           valid_runs[0],
           pool_total=len(runs),
@@ -1350,17 +1671,17 @@ class SweepController:
           "Best run for %s is %s with %s=%.5f (%s), chosen from %d of %d runs",
           sweep_id,
           best.run_id,
-          metric_name,
+          effective_metric,
           best.value,
           best.describe_selection(),
           best.pool_scored,
           best.pool_total,
       )
-      if live_line_callback and selection in ("best", "final_window"):
+      if live_line_callback and effective_selection in ("best", "final_window"):
         if not any(score.from_history for score in valid_runs):
           intent = (
               "their best evaluation step"
-              if selection == "best"
+              if effective_selection == "best"
               else f"the mean of their last {window} logged points"
           )
           live_line_callback(

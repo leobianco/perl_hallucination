@@ -300,7 +300,7 @@ class ModelManager:
   DEFAULT_EVAL_STEPS: Dict[str, Optional[int]] = {
       "sft": None,
       "rm": 50,
-      "perl": 50,
+      "perl": 24,
   }
 
   def _checkpointing_flags(
