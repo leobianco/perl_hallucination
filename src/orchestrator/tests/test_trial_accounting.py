@@ -10,15 +10,18 @@ from __future__ import annotations
 
 import datetime
 import os
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
 
 from src.orchestrator import naming
+from src.orchestrator import sweep_controller as sweep_controller_mod
 from src.orchestrator.cli import renderables
 from src.orchestrator.cli import theme as theme_mod
 from src.orchestrator.config import CampaignConfig
 from src.orchestrator.model_manager import ModelManager
+from src.orchestrator.process import ProcessOutcome
 from src.orchestrator.reporter import CampaignReporter
 from src.orchestrator.stages.base import CampaignContext
 from src.orchestrator.stages.perl_stage import PerlStage
@@ -347,6 +350,99 @@ class AgentRunTest(unittest.TestCase):
   def test_backwards_compatible_wrapper_returns_the_code(self):
     controller = SweepController(dry_run=True)
     self.assertEqual(controller.run_sweep_agent("e/p/s", max_runs=1), 0)
+
+
+class AgentSignalForwardingTest(unittest.TestCase):
+  """Stopping the agent must not leave the trial it runs holding the GPUs."""
+
+  def setUp(self):
+    super().setUp()
+    probe = sweep_controller_mod.agent_forwards_signals
+    probe.cache_clear()
+    self.addCleanup(probe.cache_clear)
+
+  def _help(self, stdout, returncode=0):
+    return subprocess.CompletedProcess(
+        args=["wandb", "agent", "--help"],
+        returncode=returncode,
+        stdout=stdout,
+        stderr="",
+    )
+
+  def _probe(self, **run_kwargs):
+    sweep_controller_mod.agent_forwards_signals.cache_clear()
+    with mock.patch.object(
+        sweep_controller_mod.subprocess, "run", **run_kwargs
+    ) as run:
+      return sweep_controller_mod.agent_forwards_signals(), run
+
+  def test_the_cli_that_will_run_is_asked(self):
+    supported, run = self._probe(
+        return_value=self._help("  -f, --forward-signals  Forward signals")
+    )
+    self.assertTrue(supported)
+    self.assertEqual(run.call_args.args[0], ["wandb", "agent", "--help"])
+    # wandb < 0.24.0 has no such option and would reject it.
+    self.assertFalse(self._probe(return_value=self._help("  --count INT"))[0])
+    self.assertFalse(
+        self._probe(
+            return_value=self._help("--forward-signals", returncode=1)
+        )[0]
+    )
+
+  def test_a_failed_probe_leaves_the_flag_out(self):
+    for error in (
+        FileNotFoundError("wandb"),
+        subprocess.TimeoutExpired(cmd="wandb", timeout=120),
+    ):
+      with self.subTest(error=type(error).__name__):
+        self.assertFalse(self._probe(side_effect=error)[0])
+
+  def test_undecodable_help_output_is_still_read(self):
+    with tempfile.TemporaryDirectory() as bin_dir:
+      fake_cli = os.path.join(bin_dir, "wandb")
+      with open(fake_cli, "w") as f:
+        # Invalid UTF-8 ahead of the option.
+        f.write("#!/bin/sh\nprintf '\\377\\376 --forward-signals\\n'\n")
+      os.chmod(fake_cli, 0o755)
+      path = bin_dir + os.pathsep + os.environ.get("PATH", "")
+      with mock.patch.dict(os.environ, {"PATH": path}):
+        self.assertTrue(sweep_controller_mod.agent_forwards_signals())
+
+  def test_the_cli_is_asked_once_per_process(self):
+    with mock.patch.object(
+        sweep_controller_mod.subprocess,
+        "run",
+        return_value=self._help("--forward-signals"),
+    ) as run:
+      sweep_controller_mod.agent_forwards_signals()
+      sweep_controller_mod.agent_forwards_signals()
+    self.assertEqual(run.call_count, 1)
+
+  def _agent_command(self, supported):
+    controller = SweepController(entity="e", project="p")
+    controller.stop_sweep = mock.Mock()
+    with mock.patch.object(
+        sweep_controller_mod, "agent_forwards_signals", return_value=supported
+    ), mock.patch.object(
+        sweep_controller_mod,
+        "stream_subprocess",
+        return_value=ProcessOutcome(returncode=0),
+    ) as stream:
+      controller.run_sweep_agent_detailed(sweep_id="s", max_runs=3)
+    return stream.call_args.args[0]
+
+  def test_the_agent_relays_its_shutdown_signal_to_the_trial(self):
+    self.assertEqual(
+        self._agent_command(supported=True),
+        ["wandb", "agent", "--count", "3", "--forward-signals", "e/p/s"],
+    )
+
+  def test_an_agent_without_the_option_runs_as_before(self):
+    self.assertEqual(
+        self._agent_command(supported=False),
+        ["wandb", "agent", "--count", "3", "e/p/s"],
+    )
 
 
 class StageViewTest(unittest.TestCase):

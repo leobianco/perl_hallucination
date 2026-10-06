@@ -905,6 +905,10 @@ class GenerationMetricsEvaluator:
       log_to_wandb: bool = False,
       wandb_project: str = "new_perl_eval",
       wandb_run_name: Optional[str] = None,
+      wandb_run_id: Optional[str] = None,
+      wandb_entity: Optional[str] = None,
+      eval_step: Optional[int] = None,
+      continual_eval_history_path: Optional[str] = None,
   ) -> str:
     """Saves evaluation summary locally and logs rich dashboards to WandB.
 
@@ -919,6 +923,13 @@ class GenerationMetricsEvaluator:
         log_to_wandb: Whether to initialize and log to WandB.
         wandb_project: WandB project name.
         wandb_run_name: WandB run name.
+        wandb_run_id: Optional existing WandB run ID to resume and attach
+          continual evaluation metrics to.
+        wandb_entity: Optional WandB entity/team name.
+        eval_step: Optional training global step associated with the evaluated
+          checkpoint.
+        continual_eval_history_path: Optional path to the JSON file tracking
+          continual evaluation history across steps for Pareto frontier plots.
 
     Returns:
         Path to the saved local summary JSON file.
@@ -947,25 +958,63 @@ class GenerationMetricsEvaluator:
         summary["autorater_score_mean"] = autorater_stats["mean"]
         summary["autorater_score_std"] = autorater_stats["std"]
 
+    if eval_step is not None:
+      summary["eval_step"] = int(eval_step)
+
     with open(summary_path, "w") as f:
       json.dump(summary, f, indent=2)
     print(f"Summary metrics saved locally to: {summary_path}")
 
+    continual_history = None
+    if continual_eval_history_path and eval_step is not None:
+      try:
+        from src.continual_eval import update_continual_eval_history
+
+        continual_history = update_continual_eval_history(
+            continual_eval_history_path,
+            step=int(eval_step),
+            summary=summary,
+            dataset_name=dataset_name,
+        )
+      except Exception as e:
+        print(f"Warning: Failed to update continual evaluation history: {e}")
+
     if log_to_wandb and wandb is not None:
       try:
-        run_name = wandb_run_name or dataset_name
         is_wandb_active = wandb.run is not None
         if not is_wandb_active:
-          wandb.init(
-              project=wandb_project,
-              name=run_name,
-              config={"dataset_name": dataset_name, "threshold": threshold},
-          )
+          init_kwargs: dict[str, Any] = {"project": wandb_project}
+          if wandb_entity:
+            init_kwargs["entity"] = wandb_entity
+          if wandb_run_id:
+            # Attach to an existing run (the PE-RL run, for continual
+            # evaluation). Its name and config belong to that run, so it is
+            # only renamed when a name is passed explicitly.
+            init_kwargs["id"] = wandb_run_id
+            init_kwargs["resume"] = "allow"
+            if wandb_run_name:
+              init_kwargs["name"] = wandb_run_name
+          else:
+            init_kwargs["name"] = wandb_run_name or dataset_name
+            init_kwargs["config"] = {
+                "dataset_name": dataset_name,
+                "threshold": threshold,
+            }
+          wandb.init(**init_kwargs)
+
+        if eval_step is not None and hasattr(wandb, "define_metric"):
+          try:
+            wandb.define_metric("train/global_step")
+            wandb.define_metric("eval/*", step_metric="train/global_step")
+          except Exception:
+            pass
 
         wandb_metrics = {f"eval/{k}": v for k, v in summary.items()}
+        if eval_step is not None:
+          wandb_metrics["train/global_step"] = int(eval_step)
         wandb.log(wandb_metrics)
-        for k, v in wandb_metrics.items():
-          wandb.summary[k] = v
+        for k, v in summary.items():
+          wandb.summary[f"eval/{k}"] = v
 
         table_cols = [
             "prompt",
@@ -1022,7 +1071,30 @@ class GenerationMetricsEvaluator:
           table_data.append(row)
 
         eval_table = wandb.Table(columns=table_cols, data=table_data)
-        wandb.log({"eval/generations_table": eval_table})
+        table_payload: dict[str, Any] = {"eval/generations_table": eval_table}
+        if eval_step is not None:
+          table_payload["train/global_step"] = int(eval_step)
+          table_payload[f"eval/generations_table_step_{int(eval_step)}"] = (
+              eval_table
+          )
+        wandb.log(table_payload)
+
+        if continual_history is not None:
+          from src.continual_eval import log_pareto_frontiers_to_wandb
+
+          log_pareto_frontiers_to_wandb(
+              wandb,
+              continual_history,
+              eval_step=eval_step,
+              # Next to the history, i.e. in the PE-RL output directory.
+              output_dir=os.path.dirname(
+                  os.path.abspath(continual_eval_history_path)
+              ),
+          )
+
+        if not is_wandb_active and wandb_run_id and hasattr(wandb, "finish"):
+          wandb.finish()
+
         print("Logged interactive generation table and metrics to WandB.")
       except Exception as e:
         print(f"Warning: Failed to log metrics to WandB: {e}")

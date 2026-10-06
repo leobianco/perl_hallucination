@@ -13,7 +13,9 @@ import types
 import unittest
 from unittest import mock
 
+from src.orchestrator import config as config_mod
 from src.orchestrator import model_manager as model_manager_mod
+from src.orchestrator import sweep_controller as sweep_controller_mod
 from src.orchestrator.cli import events as events_mod
 from src.orchestrator.config import CampaignConfig
 from src.orchestrator.model_manager import ModelManager
@@ -461,6 +463,52 @@ class TestFetchBestRunIsStrict(unittest.TestCase):
     self.assertAlmostEqual(value, 0.50)
     self.assertEqual(config, {"learning_rate": 0.001})
 
+  def test_a_run_paused_for_continual_eval_never_outranks_a_finished_one(self):
+    # Every continual-evaluation pause finishes the W&B run, so a trial that
+    # stopped at a pause reads "finished" with only part of its training done.
+    key = sweep_controller_mod.CONTINUAL_EVAL_PAUSED_KEY
+    self._install_wandb([
+        _FakeRun("paused", {"eval/loss": 0.10, key: True}, state="finished"),
+        _FakeRun("done", {"eval/loss": 0.50, key: False}, state="finished"),
+    ])
+    controller = SweepController(entity="e", project="p", dry_run=False)
+    run_id, value, _ = controller.fetch_best_run(
+        "sweep123", "eval/loss", goal="minimize"
+    )
+    self.assertEqual(run_id, "done")
+    self.assertAlmostEqual(value, 0.50)
+
+  def test_a_paused_run_remains_a_fallback_when_nothing_finished(self):
+    key = sweep_controller_mod.CONTINUAL_EVAL_PAUSED_KEY
+    self._install_wandb([
+        _FakeRun("paused", {"eval/loss": 0.10, key: True}, state="finished"),
+        _FakeRun("dead", {"eval/loss": 0.05}, state="crashed"),
+    ])
+    controller = SweepController(entity="e", project="p", dry_run=False)
+    run_id, _, _ = controller.fetch_best_run(
+        "sweep123", "eval/loss", goal="minimize"
+    )
+    self.assertEqual(run_id, "paused")
+
+  def test_paused_flag_parsing(self):
+    paused = sweep_controller_mod.paused_mid_training
+    key = sweep_controller_mod.CONTINUAL_EVAL_PAUSED_KEY
+
+    class _Unreadable:
+
+      def get(self, _key):
+        raise RuntimeError("summary unavailable")
+
+    for value, expected in (
+        (True, True), (1, True), (1.0, True), ("true", True), ("1", True),
+        (False, False), (0, False), ("false", False), (None, False),
+    ):
+      with self.subTest(value=value):
+        self.assertIs(paused(_FakeRun("r", {key: value})), expected)
+    self.assertFalse(paused(_FakeRun("r", {})))
+    self.assertFalse(paused(_FakeRun("r", None)))
+    self.assertFalse(paused(_FakeRun("r", _Unreadable())))
+
   def test_empty_sweep_raises(self):
     self._install_wandb([])
     controller = SweepController(entity="e", project="p", dry_run=False)
@@ -830,6 +878,28 @@ class TestSweepTimeoutBudgets(unittest.TestCase):
     )
     self.assertEqual(config.sft.timeout_minutes, 240)
     self.assertEqual(config.perl.timeout_minutes, 240)
+
+  def test_perl_timeout_covers_continual_evaluation(self):
+    # Every trial scores its step-0 and final checkpoints (35 min apiece at
+    # 1000 samples) and relaunches training once in between (5 min).
+    self.assertEqual(config_mod.continual_eval_minutes_per_trial(1000), 75.0)
+    # 10 trials * (35 training + 75 evaluation) * 1.5 headroom.
+    self.assertEqual(config_mod.sweep_timeout_minutes("perl", 10), 1650)
+    config = CampaignConfig.create_default(task_name="ragtruth", perl_runs=10)
+    self.assertEqual(config.perl.timeout_minutes, 1650)
+    # Larger evaluations take longer: 10 * (35 + 115) * 1.5.
+    self.assertEqual(
+        config_mod.sweep_timeout_minutes("perl", 10, eval_samples=2000), 2250
+    )
+
+  def test_only_perl_trials_pay_for_continual_evaluation(self):
+    self.assertEqual(config_mod.sweep_timeout_minutes("sft", 30), 540)
+    for stage in ("sft", "rm"):
+      with self.subTest(stage=stage):
+        self.assertEqual(
+            config_mod.sweep_timeout_minutes(stage, 30, eval_samples=5000),
+            config_mod.sweep_timeout_minutes(stage, 30),
+        )
 
 
 class _InterruptibleStream:

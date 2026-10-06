@@ -68,6 +68,9 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 from src import checkpoint_publication
+from src.continual_eval import ContinualEvalStatus
+from src.continual_eval import ContinualEvalStopCallback
+from src.continual_eval import PAUSED_SUMMARY_KEY
 from src.metrics import GenerationMetricsEvaluator
 from src.model_compat import (
     chat_wrap_user,
@@ -368,7 +371,38 @@ def parse_hf_repo_reference(
 
 
 class WandbResumptionCallback(TrainerCallback):
-  """TrainerCallback that records the active WandB run ID to disk and HF Hub for seamless cross-machine resumption, and ensures the final step checkpoint is saved locally."""
+  """Records the WandB run id for resumption and saves the final step.
+
+  The id of the active WandB run is written to disk and to the Hub for
+  seamless cross-machine resumption. When training stops (``max_steps``, the
+  end of the last epoch, or another callback setting
+  ``should_training_stop``), the callback forces an evaluation and a save of
+  the final step, unless that step was already evaluated / saved. Hugging
+  Face calls ``on_epoch_end`` and ``_maybe_log_save_evaluate`` once more
+  after the training loop breaks, so forcing unconditionally would evaluate
+  and save the same step twice.
+  """
+
+  def __init__(self):
+    self._last_evaluated_step: Optional[int] = None
+    self._last_saved_step: Optional[int] = None
+
+  def _force_final_evaluate_and_save(
+      self,
+      args: TrainingArguments,
+      state: TrainerState,
+      control: TrainerControl,
+  ) -> None:
+    """Requests the evaluation and save of the current step if still missing."""
+    step = getattr(state, "global_step", None)
+    if (
+        getattr(args, "do_eval", False)
+        and getattr(args, "eval_strategy", "no") != "no"
+        and step != self._last_evaluated_step
+    ):
+      control.should_evaluate = True
+    if step != self._last_saved_step:
+      control.should_save = True
 
   def on_train_begin(
       self,
@@ -377,6 +411,8 @@ class WandbResumptionCallback(TrainerCallback):
       control: TrainerControl,
       **kwargs,
   ):
+    self._last_evaluated_step = None
+    self._last_saved_step = None
     if getattr(args, "load_best_model_at_end", False) and getattr(
         args, "save_strategy", "no"
     ) != "no":
@@ -440,11 +476,7 @@ class WandbResumptionCallback(TrainerCallback):
           (max_steps > 0 and state.global_step >= max_steps)
           or getattr(control, "should_training_stop", False)
       ):
-        if getattr(args, "do_eval", False) and getattr(
-            args, "eval_strategy", "no"
-        ) != "no":
-          control.should_evaluate = True
-        control.should_save = True
+        self._force_final_evaluate_and_save(args, state, control)
 
   def on_epoch_end(
       self,
@@ -464,11 +496,17 @@ class WandbResumptionCallback(TrainerCallback):
           )
           or getattr(control, "should_training_stop", False)
       ):
-        if getattr(args, "do_eval", False) and getattr(
-            args, "eval_strategy", "no"
-        ) != "no":
-          control.should_evaluate = True
-        control.should_save = True
+        self._force_final_evaluate_and_save(args, state, control)
+
+  def on_evaluate(
+      self,
+      args: TrainingArguments,
+      state: TrainerState,
+      control: TrainerControl,
+      **kwargs,
+  ):
+    del args, control, kwargs
+    self._last_evaluated_step = getattr(state, "global_step", None)
 
   def on_save(
       self,
@@ -477,6 +515,7 @@ class WandbResumptionCallback(TrainerCallback):
       control: TrainerControl,
       **kwargs,
   ):
+    self._last_saved_step = getattr(state, "global_step", None)
     if (
         getattr(state, "is_world_process_zero", True)
         and wandb is not None
@@ -628,6 +667,7 @@ class Pipeline(abc.ABC):
     self.vllm_model: Optional[str] = None
     self.use_vllm: bool = False
     self._best_archiver: Optional[BestCheckpointArchiver] = None
+    self._continual_stop_callback: Optional[ContinualEvalStopCallback] = None
     #: Set by `setup_tokenizer`; see `src.model_compat.PaddingReport`. None
     #: for the pipelines that need no tokenizer at all (generation).
     self.padding_report: Optional[Any] = None
@@ -725,8 +765,17 @@ class Pipeline(abc.ABC):
     orig_load_best_model = getattr(self.trainer, "_load_best_model", None)
     if callable(orig_load_best_model):
       trainer_ref = self.trainer
+      pipeline_ref = self
 
       def _wrapped_load_best_model(*args, **kwargs):
+        stop_cb = getattr(pipeline_ref, "_continual_stop_callback", None)
+        if getattr(stop_cb, "stopped_for_continual_eval", False):
+          if getattr(trainer_ref.state, "is_world_process_zero", True):
+            print(
+                "[ContinualEval] Skipping best-model reload and checkpoint "
+                "pruning during intermediate continual evaluation pause."
+            )
+          return None
         output_dir = getattr(trainer_ref.args, "output_dir", None)
         global_step = getattr(trainer_ref.state, "global_step", 0)
         last_ckpt_dir = None
@@ -1765,6 +1814,45 @@ class RewardModelPipeline(Pipeline):
       self._publish_best_and_last(description="Reward model")
 
 
+#: Files of which every saved model or adapter checkpoint has at least one.
+_CHECKPOINT_WEIGHT_FILES = (
+    "adapter_model.safetensors",
+    "adapter_model.bin",
+    "model.safetensors",
+    "model.safetensors.index.json",
+    "pytorch_model.bin",
+    "pytorch_model.bin.index.json",
+)
+
+
+def _checkpoint_has_weights(checkpoint_dir: Optional[str]) -> bool:
+  """Returns True if ``checkpoint_dir`` holds saved model or adapter weights."""
+  return bool(checkpoint_dir) and any(
+      os.path.isfile(os.path.join(checkpoint_dir, name))
+      for name in _CHECKPOINT_WEIGHT_FILES
+  )
+
+
+def _is_untrained_step_zero_checkpoint(checkpoint: Optional[str]) -> bool:
+  """Returns True for the ``checkpoint-0`` of the continual-eval baseline.
+
+  It only holds the untrained adapter, with no trainer state, optimizer, or
+  scheduler, so it cannot be resumed from. ``--resume_from_checkpoint True``
+  picks it as the latest checkpoint until the first real save.
+
+  Args:
+    checkpoint: Resolved checkpoint path, or None.
+
+  Returns:
+    Whether ``checkpoint`` is such a step-0 checkpoint.
+  """
+  return (
+      isinstance(checkpoint, str)
+      and os.path.basename(os.path.normpath(checkpoint)) == "checkpoint-0"
+      and not os.path.isfile(os.path.join(checkpoint, "trainer_state.json"))
+  )
+
+
 class PERLPipeline(Pipeline):
   """Pipeline for PERL training (perl.py).
 
@@ -1835,7 +1923,85 @@ class PERLPipeline(Pipeline):
       self.training_args.run_name = run_name
     if wandb is not None and getattr(wandb, "run", None) is not None:
       wandb.run.name = run_name
+
+    if getattr(script_args, "continual_eval", False):
+      self._configure_continual_eval_checkpointing()
+
     self._setup_wandb_resumption()
+
+  def _configure_continual_eval_checkpointing(self) -> None:
+    """Makes every continual-evaluation pause leave a resumable checkpoint.
+
+    A pause happens right after a checkpoint is saved, so evaluation steps
+    must save, and save the optimizer, scheduler, and RNG states too.
+    Resumption is driven by the coordinator, which passes the paused
+    checkpoint explicitly with ``--resume_from_checkpoint``; it is deliberately
+    not forced to auto-resume here, which could pick up an unrelated
+    checkpoint from the Hub.
+    """
+    args = self.training_args
+    if getattr(args, "save_only_model", False):
+      print(
+          "[ContinualEval] Overriding save_only_model=False so optimizer, "
+          "scheduler, and RNG states are saved for continual evaluation "
+          "resumption."
+      )
+      args.save_only_model = False
+    eval_steps = getattr(args, "eval_steps", None)
+    if getattr(args, "save_strategy", "no") == "no":
+      args.save_strategy = "steps"
+    if (
+        isinstance(eval_steps, (int, float))
+        and eval_steps > 0
+        and getattr(args, "save_strategy", None) == "steps"
+    ):
+      args.save_steps = eval_steps
+    limit = getattr(args, "save_total_limit", None)
+    if limit is not None and int(limit) == 1:
+      # `Trainer._finalize_training` deletes every checkpoint except the best
+      # one when save_total_limit == 1, i.e. also the checkpoint a pause has
+      # just saved for evaluation and resumption.
+      print(
+          "[ContinualEval] Raising save_total_limit from 1 to 2 so the "
+          "checkpoint saved at each pause survives until it is evaluated and "
+          "resumed from."
+      )
+      args.save_total_limit = 2
+    self._warn_if_rollout_buffer_misaligned()
+
+  def _warn_if_rollout_buffer_misaligned(self) -> None:
+    """Warns when pauses fall in the middle of an RLOO generation cycle.
+
+    RLOO generates rollouts for ``steps_per_generation * num_iterations``
+    micro-batches at a time and does not checkpoint that buffer. A resume in
+    the middle of a cycle regenerates rollouts, so the run drifts from an
+    uninterrupted one (it stays a valid RLOO run).
+    """
+    args = self.training_args
+    try:
+      save_steps = float(getattr(args, "save_steps", 0) or 0)
+    except (TypeError, ValueError):
+      return
+    if save_steps < 1 or not save_steps.is_integer():
+      return  # A ratio of the total steps: the interval is not known yet.
+    grad_accum = int(getattr(args, "gradient_accumulation_steps", 1) or 1)
+    steps_per_generation = int(
+        getattr(args, "steps_per_generation", None) or grad_accum
+    )
+    num_iterations = int(getattr(args, "num_iterations", 1) or 1)
+    cycle = steps_per_generation * num_iterations
+    micro_batches = int(save_steps) * grad_accum
+    if cycle > 0 and micro_batches % cycle:
+      print(
+          "[ContinualEval] Warning: pauses every "
+          f"{int(save_steps)} steps ({micro_batches} micro-batches) are not a "
+          "multiple of the RLOO generation cycle (steps_per_generation x "
+          f"num_iterations = {cycle} micro-batches). TRL does not checkpoint "
+          "its rollout buffer, so every resume regenerates rollouts "
+          "mid-cycle and the run drifts from an uninterrupted one. Choose "
+          "eval_steps such that eval_steps x gradient_accumulation_steps is "
+          f"a multiple of {cycle} to avoid this."
+      )
 
   def load_data(self) -> None:
     self.data = load_dataset(self.args.dataset_repo_id)
@@ -2143,17 +2309,294 @@ class PERLPipeline(Pipeline):
         callbacks=self._training_callbacks(),
     )
 
-  def run_and_save(self) -> None:
-    if self.training_args.do_train:
-      resume_ckpt = self._resolve_resume_checkpoint()
-      self.trainer.train(resume_from_checkpoint=resume_ckpt)
-      if getattr(self.training_args, "output_dir", None):
-        self.trainer.save_model(self.training_args.output_dir)
-      if getattr(self.training_args, "push_to_hub", False):
-        _push_to_hub_with_retry(
-            self.trainer.push_to_hub, description="PERL model push"
+  def _training_callbacks(self) -> list[Any]:
+    callbacks = super()._training_callbacks()
+    if getattr(self.args, "continual_eval", False):
+      status = ContinualEvalStatus.load(self.training_args.output_dir)
+      self._continual_stop_callback = ContinualEvalStopCallback(
+          evaluated_steps=status.evaluated_steps
+      )
+      callbacks.append(self._continual_stop_callback)
+    return callbacks
+
+  def _is_world_process_zero(self) -> bool:
+    state = getattr(self.trainer, "state", None) if self.trainer else None
+    if state is not None:
+      return bool(getattr(state, "is_world_process_zero", True))
+    return int(os.environ.get("RANK", "0")) == 0
+
+  @staticmethod
+  def _wandb_run_info() -> dict[str, str]:
+    """Returns the id, project, entity, and name of the live WandB run.
+
+    Only the live run is trusted, since it is the run this segment logged to;
+    an environment variable or a stale ``wandb_run_id.txt`` may name a run
+    that never received the training logs. Attributes the run does not expose
+    are omitted, so the caller keeps previously recorded values.
+
+    Returns:
+      A dict keyed by the matching ``ContinualEvalStatus`` field names.
+    """
+    run = getattr(wandb, "run", None) if wandb is not None else None
+    if run is None:
+      return {}
+    info: dict[str, str] = {}
+    for key, attr in (
+        ("wandb_run_id", "id"),
+        ("wandb_project", "project"),
+        ("wandb_entity", "entity"),
+        ("wandb_run_name", "name"),
+    ):
+      try:
+        value = getattr(run, attr, None)
+      except Exception:  # pylint: disable=broad-exception-caught
+        value = None
+      if isinstance(value, str) and value.strip():
+        info[key] = value.strip()
+    return info
+
+  def _record_continual_eval_status(
+      self,
+      *,
+      step: int,
+      checkpoint_dir: Optional[str],
+      paused_for_eval: bool,
+      training_completed: bool,
+  ) -> None:
+    """Records the outcome of this training segment for the coordinator.
+
+    Called on the world process zero only. Besides the pause / completion
+    state, it records what the coordinator needs to score the checkpoint: the
+    rollout temperature it was trained with and the WandB run its scores
+    belong to.
+
+    Args:
+      step: ``global_step`` of the pause or of the end of training.
+      checkpoint_dir: Checkpoint saved at ``step``, or None if there is none.
+      paused_for_eval: Whether ``checkpoint_dir`` awaits its evaluation.
+      training_completed: Whether training has reached its end.
+    """
+    output_dir = self.training_args.output_dir
+    status = ContinualEvalStatus.load(output_dir)
+    status.current_step = int(step)
+    # Kept in the form of `output_dir`, which perl.sh and the orchestrator
+    # pass relative to the working directory the coordinator and the
+    # evaluator share with this segment. The completions dataset is named
+    # after this path, and an absolute path running through '<hf_user>/'
+    # (e.g. /home/<hf_user>/...) would make that name illegible.
+    status.checkpoint_dir = checkpoint_dir or None
+    status.paused_for_eval = bool(paused_for_eval)
+    status.training_completed = bool(training_completed)
+    temperature = getattr(self.training_args, "temperature", None)
+    if isinstance(temperature, (int, float)) and not isinstance(
+        temperature, bool
+    ):
+      status.rollout_temperature = float(temperature)
+    for key, value in self._wandb_run_info().items():
+      setattr(status, key, value)
+    status.save(output_dir)
+
+  @staticmethod
+  def _finish_wandb_run(*, training_completed: bool) -> None:
+    """Flags and closes the live WandB run before the segment exits.
+
+    The coordinator's scoring process attaches to the same run next, and the
+    next segment resumes it; finishing first flushes the training logs.
+    Finishing marks the run ``finished`` in W&B even when training is only
+    paused, so the run summary records which one it is
+    (:data:`src.continual_eval.PAUSED_SUMMARY_KEY`): the orchestrator must
+    not count or rank a trial that stopped during a pause as a finished one.
+
+    Args:
+      training_completed: Whether training has completed, as opposed to
+        being paused for an evaluation.
+    """
+    if wandb is None or getattr(wandb, "run", None) is None:
+      return
+    try:
+      wandb.run.summary[PAUSED_SUMMARY_KEY] = not training_completed
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      print(f"[ContinualEval] Warning: could not flag the WandB run: {e}")
+    try:
+      wandb.finish()
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      print(f"[ContinualEval] Warning: wandb.finish() failed: {e}")
+
+  def _init_wandb_run_without_training(self) -> None:
+    """Creates the PE-RL WandB run the way ``trainer.train()`` would.
+
+    The step-0 segment never calls ``train()``, which is where Hugging Face's
+    ``WandbCallback`` creates the run. Creating it here, with the same
+    project, name, and config, gives the step-0 scores a run to attach to,
+    which the following segments then resume.
+    """
+    try:
+      from transformers.integrations import WandbCallback  # pylint: disable=g-import-not-at-top
+    except ImportError:
+      return
+    handler = getattr(self.trainer, "callback_handler", None)
+    for callback in getattr(handler, "callbacks", None) or []:
+      if isinstance(callback, WandbCallback) and not getattr(
+          callback, "_initialized", False
+      ):
+        callback.setup(
+            self.trainer.args, self.trainer.state, self.trainer.model
         )
-        self._publish_best_and_last(description="PERL")
+        return
+
+  def _pause_before_first_step(self) -> None:
+    """Saves the untrained policy as ``checkpoint-0`` and pauses for scoring.
+
+    Replaces ``train()`` in the first continual-evaluation segment when
+    ``eval_on_start`` is set, so the step-0 baseline is scored before any
+    update. Only the adapter and the tokenizer are saved: there is no
+    optimizer state yet, and the next segment trains from scratch. The trainer
+    is bypassed on purpose: ``evaluate()`` or ``save_model()`` before
+    ``train()`` would set DeepSpeed up outside of training, and
+    ``save_model()`` would push the untrained adapter to the Hub. The
+    step-0 trainer evaluation (``eval_on_start``) runs in the next segment.
+    """
+    output_dir = self.training_args.output_dir
+    checkpoint_dir = os.path.join(output_dir, "checkpoint-0")
+    is_main_process = self._is_world_process_zero()
+    accelerator = getattr(self.trainer, "accelerator", None)
+    model = (
+        accelerator.unwrap_model(self.trainer.model)
+        if accelerator is not None
+        else self.trainer.model
+    )
+    # Before `train()` the adapter is only partitioned if the model was built
+    # inside `deepspeed.zero.Init()` (ZeRO-3 with zero3_init_flag=true).
+    # Gathering is a collective operation, so every rank enters the context.
+    partitioned = [
+        param
+        for param in model.parameters()
+        if param.requires_grad and hasattr(param, "ds_id")
+    ]
+    gather = contextlib.nullcontext()
+    if partitioned:
+      import deepspeed  # pylint: disable=g-import-not-at-top
+
+      gather = deepspeed.zero.GatheredParameters(
+          partitioned, modifier_rank=None
+      )
+    with gather:
+      if is_main_process:
+        print(
+            "[ContinualEval] Saving the untrained policy to "
+            f"{checkpoint_dir} for the step-0 baseline evaluation."
+        )
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        model.save_pretrained(checkpoint_dir)
+        processing_class = getattr(self.trainer, "processing_class", None)
+        if processing_class is not None:
+          processing_class.save_pretrained(checkpoint_dir)
+    if not is_main_process:
+      return
+    self._init_wandb_run_without_training()
+    self._record_continual_eval_status(
+        step=0,
+        checkpoint_dir=checkpoint_dir,
+        paused_for_eval=True,
+        training_completed=False,
+    )
+    self._finish_wandb_run(training_completed=False)
+
+  def _pause_for_continual_eval(self, step: int) -> None:
+    """Records a pause at ``step``, whose checkpoint was just saved."""
+    if not self._is_world_process_zero():
+      return
+    self._record_continual_eval_status(
+        step=step,
+        checkpoint_dir=os.path.join(
+            self.training_args.output_dir, f"checkpoint-{step}"
+        ),
+        paused_for_eval=True,
+        training_completed=False,
+    )
+    self._finish_wandb_run(training_completed=False)
+
+  def _record_training_completion(self) -> None:
+    """Records the end of training and schedules scoring the final step.
+
+    The final step is scored from ``checkpoint-{global_step}``. If that
+    checkpoint was not saved, the final step is not scored: the model held by
+    the trainer at this point may be the best checkpoint rather than the
+    final one (``load_best_model_at_end``), so saving it under the final
+    step's name would mislabel it.
+    """
+    if not self._is_world_process_zero():
+      return
+    output_dir = self.training_args.output_dir
+    step = int(getattr(self.trainer.state, "global_step", 0) or 0)
+    checkpoint_dir = os.path.join(output_dir, f"checkpoint-{step}")
+    has_weights = _checkpoint_has_weights(checkpoint_dir)
+    if not has_weights:
+      print(
+          f"[ContinualEval] Warning: the final checkpoint {checkpoint_dir} "
+          "holds no saved weights, so the final step is not scored by "
+          "continual evaluation."
+      )
+    evaluated_steps = ContinualEvalStatus.load(output_dir).evaluated_steps
+    self._record_continual_eval_status(
+        step=step,
+        checkpoint_dir=checkpoint_dir if has_weights else None,
+        paused_for_eval=has_weights and step not in evaluated_steps,
+        training_completed=True,
+    )
+    self._finish_wandb_run(training_completed=True)
+
+  def run_and_save(self) -> None:
+    if not self.training_args.do_train:
+      return
+    continual_eval = bool(getattr(self.args, "continual_eval", False))
+    resume_ckpt = self._resolve_resume_checkpoint()
+    if _is_untrained_step_zero_checkpoint(resume_ckpt):
+      print(
+          f"[ContinualEval] {resume_ckpt} only holds the untrained adapter of "
+          "the step-0 baseline (no trainer state); training starts from "
+          "scratch instead of resuming from it."
+      )
+      resume_ckpt = None
+
+    if (
+        continual_eval
+        and resume_ckpt is None
+        and getattr(self.training_args, "eval_on_start", False)
+    ):
+      status = ContinualEvalStatus.load(self.training_args.output_dir)
+      if 0 not in status.evaluated_steps:
+        self._pause_before_first_step()
+        return
+
+    if continual_eval and resume_ckpt is not None:
+      # Each pause happens right after its step was evaluated and saved, so
+      # `eval_on_start` would evaluate the resumed step a second time.
+      self.training_args.eval_on_start = False
+      trainer_args = getattr(self.trainer, "args", None)
+      if trainer_args is not None:
+        trainer_args.eval_on_start = False
+
+    self.trainer.train(resume_from_checkpoint=resume_ckpt)
+
+    stop_cb = getattr(self, "_continual_stop_callback", None)
+    if continual_eval and getattr(stop_cb, "stopped_for_continual_eval", False):
+      step = stop_cb.stopped_step
+      if step is None:
+        step = int(getattr(self.trainer.state, "global_step", 0) or 0)
+      self._pause_for_continual_eval(int(step))
+      return
+
+    if getattr(self.training_args, "output_dir", None):
+      self.trainer.save_model(self.training_args.output_dir)
+    if getattr(self.training_args, "push_to_hub", False):
+      _push_to_hub_with_retry(
+          self.trainer.push_to_hub, description="PERL model push"
+      )
+      self._publish_best_and_last(description="PERL")
+
+    if continual_eval:
+      self._record_training_completion()
 
 
 class DPOPipeline(Pipeline):
@@ -5970,6 +6413,12 @@ class EvaluationScoringPipeline(EvaluationPipeline):
           log_to_wandb=getattr(self.args, "log_to_wandb", False),
           wandb_project=getattr(self.args, "wandb_project", "new_perl_eval"),
           wandb_run_name=getattr(self.args, "wandb_run_name", None),
+          wandb_run_id=getattr(self.args, "wandb_run_id", None),
+          wandb_entity=getattr(self.args, "wandb_entity", None),
+          eval_step=getattr(self.args, "eval_step", None),
+          continual_eval_history_path=getattr(
+              self.args, "continual_eval_history_path", None
+          ),
       )
 
     if self.is_subsampled:

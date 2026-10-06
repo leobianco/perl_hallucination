@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from src.orchestrator import shutdown as shutdown_mod
+from src.orchestrator import sweep_controller as sweep_controller_mod
 from src.orchestrator.cli import events as events_mod
 from src.orchestrator.config import CampaignConfig, VALID_STAGES
 from src.orchestrator.engine import CampaignEngine
@@ -258,6 +259,22 @@ class TestCrashedTrialsDoNotConsumeBudget(unittest.TestCase):
 
   def test_state_casing_is_irrelevant(self):
     self.assertEqual(self._controller_seeing(["Finished", "FINISHED"]), 2)
+
+  def test_a_trial_paused_for_continual_eval_is_not_counted(self):
+    # Every continual-evaluation pause finishes the W&B run; a trial that
+    # stopped at a pause is "finished" but produced no fully trained model.
+    key = sweep_controller_mod.CONTINUAL_EVAL_PAUSED_KEY
+    fake_wandb = mock.MagicMock()
+    fake_sweep = mock.MagicMock()
+    fake_sweep.runs = [
+        mock.MagicMock(state="finished", summary={key: True}),
+        mock.MagicMock(state="finished", summary={key: False}),
+        mock.MagicMock(state="finished", summary={}),
+    ]
+    fake_wandb.Api.return_value.sweep.return_value = fake_sweep
+    with mock.patch.dict("sys.modules", {"wandb": fake_wandb}):
+      ctrl = SweepController(entity="e", project="p", dry_run=False)
+      self.assertEqual(ctrl.count_finished_runs("sweep-abc"), 2)
 
 
 class TestResumeBaseline(unittest.TestCase):

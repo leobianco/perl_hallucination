@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import json
 import logging
 import os
 import shutil
@@ -138,6 +139,36 @@ def perl_batch_geometry(
       )
   return geometry
 
+
+#: Handshake file of a PE-RL run with continual evaluation, written into its
+#: output directory. Mirrors
+#: ``src.continual_eval.CONTINUAL_EVAL_STATUS_FILENAME`` (not imported here:
+#: that module pulls in transformers and matplotlib);
+#: ``src/test_continual_eval.py`` keeps the two in sync.
+CONTINUAL_EVAL_STATUS_FILENAME = "continual_eval_status.json"
+
+
+def continual_eval_training_completed(output_dir: str) -> Optional[bool]:
+  """Reads whether a run with continual evaluation has finished training.
+
+  Args:
+    output_dir: The training run's output directory.
+
+  Returns:
+    None when the run has no continual-evaluation state (it ran without
+    continual evaluation, or never started); otherwise whether training
+    completed. An unreadable state reads as not completed.
+  """
+  path = os.path.join(output_dir, CONTINUAL_EVAL_STATUS_FILENAME)
+  if not os.path.exists(path):
+    return None
+  try:
+    with open(path, encoding="utf-8") as handle:
+      status = json.load(handle)
+  except (OSError, ValueError) as e:
+    logger.warning("Unreadable continual-evaluation status %s: %s", path, e)
+    return False
+  return isinstance(status, dict) and status.get("training_completed") is True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -356,6 +387,7 @@ class ModelManager:
       flavor: Optional[str] = None,
       deepspeed_config: Optional[str] = None,
       memory_flags: Optional[Dict[str, str]] = None,
+      continual_eval_flags: Optional[Dict[str, str]] = None,
   ) -> MaterializationPlan:
     """Builds the retraining command for a sweep's winning configuration.
 
@@ -363,9 +395,10 @@ class ModelManager:
     flags it emits must reproduce the trial that won the sweep: every flag the
     sweep YAML pins is pinned here to the same value, and only the
     checkpointing and publication flags differ (the sweep saves nothing, see
-    ``--save_strategy=no`` in ``scripts/sweep_*.yaml``). That correspondence is
-    enforced by ``TestSweepMaterializationParity``; read its allowlists before
-    adding or removing a flag below.
+    ``--save_strategy=no`` in ``scripts/sweep_*.yaml``, except the checkpoints
+    a PE-RL trial's continual evaluation pauses and resumes from). That
+    correspondence is enforced by ``TestSweepMaterializationParity``; read its
+    allowlists before adding or removing a flag below.
 
     Args:
         stage_name: 'sft', 'rm', or 'perl'.
@@ -388,6 +421,9 @@ class ModelManager:
         memory_flags: Extra ``flag -> value`` training arguments the base
           model's size calls for (gradient checkpointing, today). The sweep
           passes the same ones; see ``BaseStage.apply_launcher_settings``.
+        continual_eval_flags: ``flag -> value`` arguments that turn on
+          continual autorater evaluation (PE-RL). The sweep trials ran with
+          the same ones; see ``PerlStage.continual_eval_flags``.
 
     Returns:
         The :class:`MaterializationPlan` describing the run.
@@ -656,6 +692,12 @@ class ModelManager:
       if f"--{flag}" not in cmd:
         cmd.extend([f"--{flag}", str(value)])
 
+    # Continual evaluation, exactly as in the sweep trials, so the retrained
+    # winner logs the same autorater curves as the trial that won.
+    for flag, value in (continual_eval_flags or {}).items():
+      if f"--{flag}" not in cmd:
+        cmd.extend([f"--{flag}", str(value)])
+
     # Inject the winning hyperparameters (scalars only, allowlisted).
     #
     # The W&B run config of a Hugging Face Trainer run is a merge of the sweep
@@ -706,6 +748,7 @@ class ModelManager:
       flavor: Optional[str] = None,
       deepspeed_config: Optional[str] = None,
       memory_flags: Optional[Dict[str, str]] = None,
+      continual_eval_flags: Optional[Dict[str, str]] = None,
   ) -> str:
     """Executes a single training run with winning hyperparameters and pushes to HF Hub.
 
@@ -735,6 +778,8 @@ class ModelManager:
         deepspeed_config: The launcher the sweep ran under. None keeps the
           manager's default; see :meth:`build_materialization_command`.
         memory_flags: Size-derived training flags the sweep also passed.
+        continual_eval_flags: Continual-evaluation flags the sweep also
+          passed; see :meth:`build_materialization_command`.
 
     Returns:
         The uploaded Hugging Face model repository ID.
@@ -758,6 +803,7 @@ class ModelManager:
         flavor=flavor,
         deepspeed_config=deepspeed_config,
         memory_flags=memory_flags,
+        continual_eval_flags=continual_eval_flags,
     )
     repo_id = plan.repo_id
     output_dir = plan.output_dir
@@ -801,11 +847,29 @@ class ModelManager:
             "before the checkpoint could be pushed."
         )
       if outcome.returncode != 0:
+        # With continual evaluation the run stops at every evaluation step,
+        # leaving a checkpoint behind each time. Those are intermediate
+        # policies: publishing one as the trained model would be silently
+        # wrong. Until training completes, fail (a retry resumes from the
+        # last pause); after that, only the final model at the root of
+        # output_dir may be salvaged.
+        training_completed = continual_eval_training_completed(output_dir)
+        if training_completed is False:
+          raise RuntimeError(
+              f"Materialization failed for {stage_name} with exit code "
+              f"{outcome.returncode} before training completed; its "
+              "continual-evaluation checkpoints are intermediate policies "
+              "and are not published. A retry resumes from the last one."
+          )
         # If the training completed and saved weights locally, but the push_to_hub
         # failed at the very end due to a transient error, salvage the checkpoint
         # by uploading the local folder directly with retries.
         candidate_dirs = [output_dir]
-        if os.path.exists(output_dir):
+        # A finished continual-evaluation run's checkpoint-* folders are its
+        # pause checkpoints, i.e. earlier policies, and only the root holds the
+        # final one: they are salvage candidates only without continual
+        # evaluation (no status file).
+        if training_completed is None and os.path.exists(output_dir):
           try:
             for entry in os.listdir(output_dir):
               sub = os.path.join(output_dir, entry)

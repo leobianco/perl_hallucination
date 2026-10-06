@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import logging
 import math
 import os
@@ -48,6 +49,97 @@ EXCLUDED_STATES = {
     "preempted": "preempted",
 }
 
+#: Run summary flag of a PE-RL trial with continual evaluation: True while its
+#: training is paused for an evaluation, False once training has completed.
+#: Every pause finishes the W&B run (the scorer attaches to it next), so a
+#: trial that stops during a pause - aborted, timed out, or a failed
+#: evaluation - stays ``finished`` in W&B with only part of its training done.
+#: Such a run is neither counted nor ranked as a finished trial. Mirrors
+#: ``src.continual_eval.PAUSED_SUMMARY_KEY``, which is not imported here
+#: because that module pulls in transformers and matplotlib.
+CONTINUAL_EVAL_PAUSED_KEY = "continual_eval/paused"
+
+
+def paused_mid_training(run: Any) -> bool:
+  """Whether a W&B run is a continual-evaluation trial paused mid-training.
+
+  Args:
+    run: A W&B public-API run (anything with a dict-like ``summary``).
+
+  Returns:
+    True only when the run's summary flags a pause. Runs without the flag
+    (every run without continual evaluation) and unreadable summaries are
+    not paused.
+  """
+  try:
+    summary = getattr(run, "summary", None) or {}
+    value = summary.get(CONTINUAL_EVAL_PAUSED_KEY)
+  except Exception:  # pylint: disable=broad-exception-caught
+    return False
+  if isinstance(value, bool):
+    return value
+  if isinstance(value, (int, float)):
+    return value != 0
+  if isinstance(value, str):
+    return value.strip().lower() in ("1", "true")
+  return False
+
+
+#: The ``wandb agent`` option (wandb >= 0.24.0) that relays the signals the
+#: agent receives to the trial it is running.
+FORWARD_SIGNALS_FLAG = "--forward-signals"
+
+#: Upper bound on ``wandb agent --help``, which only has to import the CLI.
+_AGENT_HELP_TIMEOUT_S = 120.0
+
+
+@functools.lru_cache(maxsize=None)
+def agent_forwards_signals() -> bool:
+  """Whether ``wandb agent`` accepts ``--forward-signals``.
+
+  The agent starts every trial in a process group of its own and, without
+  the flag, installs no handler for SIGTERM. The SIGTERM with which
+  ``process.stream_subprocess`` ends the agent on a stop, an advance or a
+  timeout therefore kills the agent alone: the trial outlives it, holding the
+  GPUs that the winner's retraining needs next. With the flag the agent
+  relays the signal to the trial's launcher, which takes its workers down.
+  Continual evaluation makes PE-RL trials long enough for this to matter.
+
+  The CLI that is going to run is asked, rather than the ``wandb`` package
+  this interpreter imports, because nothing guarantees they are the same
+  installation, and an agent that predates the flag rejects it and fails
+  every sweep. Answered once per process.
+
+  Returns:
+    True when ``wandb agent --help`` lists the flag.
+  """
+  try:
+    result = subprocess.run(
+        ["wandb", "agent", "--help"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        # Undecodable output must not fail the stage; the flag is ASCII.
+        errors="replace",
+        timeout=_AGENT_HELP_TIMEOUT_S,
+        check=False,
+    )
+  except (OSError, subprocess.SubprocessError) as error:
+    logger.warning(
+        "Could not ask `wandb agent` whether it supports %s (%s): stopping "
+        "a sweep may leave its running trial behind.",
+        FORWARD_SIGNALS_FLAG,
+        error,
+    )
+    return False
+  if result.returncode == 0 and FORWARD_SIGNALS_FLAG in (result.stdout or ""):
+    return True
+  logger.warning(
+      "`wandb agent` does not support %s (wandb >= 0.24.0 does): stopping a "
+      "sweep may leave its running trial behind.",
+      FORWARD_SIGNALS_FLAG,
+  )
+  return False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -585,7 +677,12 @@ class SweepController:
     if "/" not in sweep_id:
       full_sweep_id = f"{entity}/{self.project}/{sweep_id}"
 
-    cmd = ["wandb", "agent", "--count", str(max_runs), full_sweep_id]
+    cmd = ["wandb", "agent", "--count", str(max_runs)]
+    # Without it, the SIGTERM ending the agent (stop, advance, timeout)
+    # orphans the running trial; see agent_forwards_signals.
+    if agent_forwards_signals():
+      cmd.append(FORWARD_SIGNALS_FLAG)
+    cmd.append(full_sweep_id)
     logger.info("Launching sweep agent: %s", " ".join(cmd))
 
     try:
@@ -709,7 +806,9 @@ class SweepController:
     campaign config means "10 models to choose the best from", not "10
     attempts". Counting the wreckage would silently shrink the search - and
     since aborting the campaign (``[x]``) kills the trial in flight, every
-    interruption would otherwise cost the user a trial.
+    interruption would otherwise cost the user a trial. For the same reason
+    a ``finished`` run that is only paused for continual evaluation
+    (:func:`paused_mid_training`) is not counted.
 
     Args:
       sweep_id: Sweep id in any accepted shape.
@@ -732,6 +831,7 @@ class SweepController:
           1
           for run in sweep.runs
           if str(getattr(run, "state", "")).lower() == "finished"
+          and not paused_mid_training(run)
       )
     except Exception as e:  # pylint: disable=broad-exception-caught
       logger.warning(
@@ -1196,9 +1296,11 @@ class SweepController:
         if score is None:
           drop(f"logged no '{metric_name}'")
           continue
-        if state in RANKABLE_STATES:
+        if state in RANKABLE_STATES and not paused_mid_training(run):
           finished_runs.append(score)
-        elif state in FALLBACK_STATES:
+        elif state in FALLBACK_STATES or state in RANKABLE_STATES:
+          # RANKABLE_STATES here: W&B says finished, but the trial stopped at
+          # a continual-evaluation pause, half-trained.
           other_runs.append(score)
         elif state in EXCLUDED_STATES:
           drop(EXCLUDED_STATES[state])

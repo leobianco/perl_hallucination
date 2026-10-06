@@ -47,6 +47,19 @@ class ScriptArguments:
       reward_max_length (int): Token budget used whenever the reward model
         scores a (prompt, completion) pair, both at reward-model training time
         and at PE-RL scoring time.
+      continual_eval (bool): Pause PE-RL at every evaluation step to score the
+        checkpoint with the autoraters (see ``src/continual_eval.py``).
+      continual_eval_launch_config (Optional[str]): Accelerate config each
+        training segment is launched with (e.g. the DeepSpeed config); None
+        runs segments as a single plain Python process.
+      continual_eval_user (Optional[str]): Hub user owning the evaluation
+        datasets (defaults to the owner of ``dataset_repo_id``).
+      continual_eval_timeout_minutes (float): Wall-clock budget of each
+        evaluation phase (generation, scoring), as for the final evaluation;
+        a value that is not positive disables it.
+      continual_eval_* (judge settings): Defaults match the final evaluation
+        (``scripts/evaluator.sh``), except ``compute_perplexity``; they mirror
+        ``src.continual_eval.CONTINUAL_EVAL_DEFAULTS``.
   """
 
   task_name: str
@@ -64,6 +77,33 @@ class ScriptArguments:
   # RLOO advantage is exactly zero, and only the KL term is optimized.
   # RAGTruth: 2048 covers ~p98 of prompt+response, 4096 covers all of it.
   reward_max_length: int = 2048
+  # Continual autorater evaluation. These defaults are kept equal to
+  # `src.continual_eval.CONTINUAL_EVAL_DEFAULTS` by src/test_continual_eval.py.
+  continual_eval: bool = False
+  continual_eval_launch_config: Optional[str] = None
+  continual_eval_user: Optional[str] = None
+  continual_eval_seed: int = 12345
+  continual_eval_max_samples: int = 1000
+  continual_eval_max_tokens: int = 250
+  continual_eval_evaluator_model: str = "gemini-2.5-flash"
+  continual_eval_use_gemini: bool = True
+  continual_eval_num_fewshot: int = 2
+  continual_eval_autorater_num_samples: int = 1
+  continual_eval_threshold: float = 0.1025
+  continual_eval_run_reward_hacking: bool = True
+  continual_eval_reward_hacking_model: Optional[str] = None
+  continual_eval_reward_hacking_num_fewshot: int = 2
+  continual_eval_reward_hacking_threshold: float = 0.6
+  continual_eval_max_workers: int = 32
+  continual_eval_batch_size: int = 32
+  continual_eval_compute_bertscore: bool = True
+  continual_eval_compute_perplexity: bool = False
+  continual_eval_max_model_len: Optional[int] = None
+  # Wall-clock budget (minutes) of each continual-evaluation phase
+  # (generation, scoring); not positive disables it. Kept equal to
+  # `src.continual_eval.CONTINUAL_EVAL_TIMEOUT_MINUTES` by
+  # src/test_continual_eval.py.
+  continual_eval_timeout_minutes: float = 180.0
 
 
 
@@ -714,6 +754,42 @@ class EvalArguments:
               " Kept separate from --scores_checkpoint_path: the two judges"
               " produce different payloads and resuming one from the other's"
               " file would silently discard every rubric verdict."
+          )
+      },
+  )
+
+  wandb_run_id: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Optional existing WandB run ID to attach evaluation metrics to"
+              " (used by continual evaluation during PE-RL to log directly to"
+              " the training run's WandB panes)."
+          )
+      },
+  )
+
+  wandb_entity: Optional[str] = field(
+      default=None,
+      metadata={"help": "Optional WandB entity/team name."},
+  )
+
+  eval_step: Optional[int] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Optional training global step associated with the evaluated"
+              " checkpoint, logged as train/global_step in WandB."
+          )
+      },
+  )
+
+  continual_eval_history_path: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Optional JSON file path tracking continual evaluation metrics"
+              " across steps for computing and logging Pareto frontiers."
           )
       },
   )
@@ -1450,7 +1526,23 @@ def looks_like_rl_checkpoint(model_ref: Optional[str]) -> bool:
   Returns:
       bool: True when the reference looks like an RL/DPO checkpoint.
   """
-  name = normalize_model_ref(model_ref).split("/")[-1].casefold()
+  normalized = normalize_model_ref(model_ref)
+  if not normalized:
+    return False
+  parts = [p for p in normalized.split("/") if p and p != "."]
+  if not parts:
+    return False
+  name = parts[-1].casefold()
+  if re.fullmatch(r"checkpoint-\d+|best|last", name) and len(parts) >= 2:
+    for parent in reversed(parts[-3:-1]):
+      parent_cf = parent.casefold()
+      if parent_cf in ("new_perl", "src", "users", "cloud"):
+        continue
+      if "sft" in parent_cf:
+        return False
+      if any(marker in parent_cf for marker in _RL_CHECKPOINT_MARKERS):
+        return True
+    return False
   if not name or "sft" in name:
     return False
   return any(marker in name for marker in _RL_CHECKPOINT_MARKERS)
@@ -1530,7 +1622,14 @@ def build_eval_dataset_repo_id(
   if f"{user}/" in cleaned_path:
     model_name = cleaned_path.split(f"{user}/", 1)[1]
   elif "/" in cleaned_path:
-    model_name = cleaned_path.split("/")[-1]
+    parts = [p for p in cleaned_path.split("/") if p and p != "."]
+    if (
+        len(parts) >= 2
+        and re.fullmatch(r"checkpoint-\d+|best|last", parts[-1].casefold())
+    ):
+      model_name = f"{parts[-2]}_{parts[-1]}"
+    else:
+      model_name = parts[-1] if parts else cleaned_path
   else:
     model_name = cleaned_path
 

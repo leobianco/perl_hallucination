@@ -2,7 +2,9 @@
 
 The orchestrator never ships a checkpoint produced by a sweep: every
 ``scripts/sweep_*.yaml`` runs with ``--save_strategy=no``, so a trial writes no
-weights at all. Selecting a winner therefore selects a *configuration*, which
+weights to keep. (A PE-RL trial runs with continual evaluation, which saves a
+checkpoint at each evaluation step to score it; those are scored and thrown
+away.) Selecting a winner therefore selects a *configuration*, which
 ``ModelManager.materialize_and_push`` then retrains from scratch. That is only
 sound while the retraining command is the trial's command: a single flag that
 the sweep pins and the retraining forgets means the published model was trained
@@ -43,10 +45,11 @@ _NON_FLAG_TOKENS = frozenset(
 #: Anything not listed here is a bug: the retraining must reproduce the trial.
 SWEEP_ONLY = {
     "--save_only_model": (
-        "A no-op in the sweep, which saves nothing at all "
-        "(--save_strategy=no). The retraining does save, and keeping the "
-        "optimizer state is what lets a materialization that crashed halfway "
-        "resume instead of restarting."
+        "A no-op in the sweep, which saves nothing to keep "
+        "(--save_strategy=no); a PE-RL trial's continual evaluation turns it "
+        "off for its pause checkpoints anyway. The retraining does save, and "
+        "keeping the optimizer state is what lets a materialization that "
+        "crashed halfway resume instead of restarting."
     ),
 }
 
@@ -59,8 +62,15 @@ MATERIALIZATION_ONLY = {
     "--push_to_hub": "Trials publish nothing; the winner is published.",
     "--hub_model_id": "Destination repository of the published winner.",
     # Checkpointing: the whole reason a retraining exists.
-    "--save_steps": "Trials save nothing (--save_strategy=no).",
-    "--save_total_limit": "Trials save nothing.",
+    "--save_steps": (
+        "Trials save nothing to keep (--save_strategy=no). A PE-RL trial's "
+        "continual evaluation saves at its --eval_steps instead."
+    ),
+    "--save_total_limit": (
+        "Trials save nothing to keep. A PE-RL trial's continual-evaluation "
+        "checkpoints get the same budget from PerlStage "
+        "(SWEEP_TRIAL_CHECKPOINT_FLAGS), not from the sweep file."
+    ),
     "--load_best_model_at_end": "Chooses which checkpoint the repo serves.",
     "--metric_for_best_model": "Ranks checkpoints inside the retraining.",
     "--greater_is_better": "Direction of --metric_for_best_model.",
@@ -83,8 +93,9 @@ MATERIALIZATION_ONLY = {
 VALUE_MAY_DIFFER = {
     "--save_strategy": (
         "'no' in the sweep, because a trial is scored from its W&B history "
-        "and its weights are thrown away; the retraining exists precisely to "
-        "produce a checkpoint."
+        "and its weights are thrown away (a PE-RL trial's continual "
+        "evaluation saves at each evaluation step only to score it); the "
+        "retraining exists precisely to produce a checkpoint."
     ),
     "--sft_model_path": (
         "A placeholder in the YAML; the orchestrator injects the checkpoint "

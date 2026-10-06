@@ -45,11 +45,48 @@ NUM_FEWSHOT=0
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-8}"
 REWARD_PENALTY_ALPHA="${REWARD_PENALTY_ALPHA:-1.0}"
 SAVE_STRATEGY="steps"
-SAVE_STEPS=25
+# Evaluate (and save) every 50 optimizer steps. With CONTINUAL_EVAL=True every
+# evaluation step pauses training, and TRL does not checkpoint its rollout
+# buffer, so a pause must fall on an RLOO generation boundary:
+# EVAL_STEPS x GRADIENT_ACCUMULATION_STEPS must be a multiple of
+# STEPS_PER_GENERATION x NUM_ITERATIONS (50 x 8 = 400 = 25 x 16; it stays
+# aligned when the orchestrator doubles the accumulation for >= 6B models).
+# 50 is also the PE-RL cadence of the orchestrator (scripts/sweep_perl.yaml and
+# the materialization run), so hand-run and orchestrated curves line up.
+SAVE_STEPS=50
 DO_EVAL=True
 EVAL_STRATEGY="steps"
-EVAL_STEPS=25
+EVAL_STEPS=50
 EVAL_ON_START=True
+
+# Continual Autorater Evaluation Parameters (Stop -> Generate & Score -> Resume)
+# Off by default; enable with `CONTINUAL_EVAL=True ./perl.sh <task>`. (The
+# orchestrator enables it for its own PE-RL runs and passes its own judge
+# settings.) With CONTINUAL_EVAL=True this script starts a GPU-free coordinator
+# (src/continual_eval.py) instead of `accelerate launch`: it launches every
+# training segment with `accelerate launch --config_file $DEEPSPEED_CONFIG`
+# itself and scores each evaluation checkpoint in between. Every evaluation
+# step costs one vLLM generation pass plus Gemini judge calls.
+# The judge settings below match the final evaluation (scripts/evaluator.sh);
+# completions are sampled at the PE-RL rollout TEMPERATURE.
+CONTINUAL_EVAL="${CONTINUAL_EVAL:-False}"
+CONTINUAL_EVAL_SEED="${CONTINUAL_EVAL_SEED:-12345}"
+CONTINUAL_EVAL_MAX_SAMPLES="${CONTINUAL_EVAL_MAX_SAMPLES:-1000}"
+CONTINUAL_EVAL_MAX_TOKENS="${CONTINUAL_EVAL_MAX_TOKENS:-250}"
+CONTINUAL_EVAL_EVALUATOR_MODEL="${CONTINUAL_EVAL_EVALUATOR_MODEL:-gemini-2.5-flash}"
+CONTINUAL_EVAL_USE_GEMINI="${CONTINUAL_EVAL_USE_GEMINI:-True}"
+CONTINUAL_EVAL_NUM_FEWSHOT="${CONTINUAL_EVAL_NUM_FEWSHOT:-2}"
+CONTINUAL_EVAL_AUTORATER_NUM_SAMPLES="${CONTINUAL_EVAL_AUTORATER_NUM_SAMPLES:-1}"
+CONTINUAL_EVAL_THRESHOLD="${CONTINUAL_EVAL_THRESHOLD:-0.1025}"
+CONTINUAL_EVAL_RUN_REWARD_HACKING="${CONTINUAL_EVAL_RUN_REWARD_HACKING:-True}"
+CONTINUAL_EVAL_REWARD_HACKING_NUM_FEWSHOT="${CONTINUAL_EVAL_REWARD_HACKING_NUM_FEWSHOT:-2}"
+CONTINUAL_EVAL_REWARD_HACKING_THRESHOLD="${CONTINUAL_EVAL_REWARD_HACKING_THRESHOLD:-0.6}"
+CONTINUAL_EVAL_MAX_WORKERS="${CONTINUAL_EVAL_MAX_WORKERS:-32}"
+CONTINUAL_EVAL_BATCH_SIZE="${CONTINUAL_EVAL_BATCH_SIZE:-32}"
+CONTINUAL_EVAL_COMPUTE_BERTSCORE="${CONTINUAL_EVAL_COMPUTE_BERTSCORE:-True}"
+# Off by default: it reloads the base model at every evaluation step and is on
+# neither Pareto frontier.
+CONTINUAL_EVAL_COMPUTE_PERPLEXITY="${CONTINUAL_EVAL_COMPUTE_PERPLEXITY:-False}"
 
 # Infrastructure Parameters
 # Override for a large policy, e.g.
@@ -111,9 +148,37 @@ if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" !
     exit 1
 fi
 
-accelerate launch \
-  --config_file="${DEEPSPEED_CONFIG}" \
-  src/perl.py \
+# CONTINUAL_EVAL=True: a single GPU-free coordinator (python3 -m src.perl)
+# launches each training segment with `accelerate launch` itself and runs the
+# autorater evaluation between segments. Otherwise PE-RL trains in a single
+# `accelerate launch`.
+if [[ "${CONTINUAL_EVAL,,}" == "true" ]]; then
+    LAUNCHER=(python3 -m src.perl)
+    EXTRA_ARGS+=(
+        --continual_eval True
+        --continual_eval_launch_config "$DEEPSPEED_CONFIG"
+        --continual_eval_user "$USER"
+        --continual_eval_seed "$CONTINUAL_EVAL_SEED"
+        --continual_eval_max_samples "$CONTINUAL_EVAL_MAX_SAMPLES"
+        --continual_eval_max_tokens "$CONTINUAL_EVAL_MAX_TOKENS"
+        --continual_eval_evaluator_model "$CONTINUAL_EVAL_EVALUATOR_MODEL"
+        --continual_eval_use_gemini "$CONTINUAL_EVAL_USE_GEMINI"
+        --continual_eval_num_fewshot "$CONTINUAL_EVAL_NUM_FEWSHOT"
+        --continual_eval_autorater_num_samples "$CONTINUAL_EVAL_AUTORATER_NUM_SAMPLES"
+        --continual_eval_threshold "$CONTINUAL_EVAL_THRESHOLD"
+        --continual_eval_run_reward_hacking "$CONTINUAL_EVAL_RUN_REWARD_HACKING"
+        --continual_eval_reward_hacking_num_fewshot "$CONTINUAL_EVAL_REWARD_HACKING_NUM_FEWSHOT"
+        --continual_eval_reward_hacking_threshold "$CONTINUAL_EVAL_REWARD_HACKING_THRESHOLD"
+        --continual_eval_max_workers "$CONTINUAL_EVAL_MAX_WORKERS"
+        --continual_eval_batch_size "$CONTINUAL_EVAL_BATCH_SIZE"
+        --continual_eval_compute_bertscore "$CONTINUAL_EVAL_COMPUTE_BERTSCORE"
+        --continual_eval_compute_perplexity "$CONTINUAL_EVAL_COMPUTE_PERPLEXITY"
+    )
+else
+    LAUNCHER=(accelerate launch --config_file="${DEEPSPEED_CONFIG}" src/perl.py)
+fi
+
+"${LAUNCHER[@]}" \
   --task_name "$TASK_NAME" \
   --seed "$SEED" \
   --report_to "wandb" \

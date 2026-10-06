@@ -1,6 +1,7 @@
 """Unit tests for checkpoint and WandB run resumption."""
 
 import contextlib
+import io
 import json
 import os
 import shutil
@@ -163,6 +164,8 @@ if "torch" not in sys.modules or not hasattr(sys.modules["torch"], "__path__"):
   sys.modules["torch"] = torch_mod
   sys.modules["torch.nn"] = torch_mod.nn
 
+from src.continual_eval import ContinualEvalStatus
+from src.continual_eval import PAUSED_SUMMARY_KEY
 from src.pipelines import (
     DPOPipeline,
     PERLPipeline,
@@ -170,6 +173,8 @@ from src.pipelines import (
     RewardModelPipeline,
     SFTPipeline,
     WandbResumptionCallback,
+    _checkpoint_has_weights,
+    _is_untrained_step_zero_checkpoint,
     _push_to_hub_with_retry,
     parse_hf_repo_reference,
 )
@@ -1631,6 +1636,741 @@ class TestPublishBestAndLast(unittest.TestCase):
       mock_api.return_value.upload_folder.assert_not_called()
 
 
+class _FakeWandbCallback:
+  """Stands in for ``transformers.integrations.WandbCallback``."""
+
+  def __init__(self, wandb_module: Any, run: Any):
+    self._initialized = False
+    self._wandb_module = wandb_module
+    self._run = run
+    self.setup_calls = []
+
+  def setup(self, args, state, model, **kwargs):
+    del kwargs
+    self.setup_calls.append((args, state, model))
+    self._wandb_module.run = self._run
+    self._initialized = True
+
+
+def _write_adapter_checkpoint(
+    checkpoint_dir: str, trainer_state: bool = False
+) -> str:
+  """Writes the files of a saved LoRA adapter (and optionally trainer state)."""
+  os.makedirs(checkpoint_dir, exist_ok=True)
+  names = ["adapter_config.json", "adapter_model.safetensors"]
+  if trainer_state:
+    names.append("trainer_state.json")
+  for name in names:
+    with open(os.path.join(checkpoint_dir, name), "w") as f:
+      f.write("{}")
+  return checkpoint_dir
+
+
+def _fake_deepspeed(events: list[Any]) -> types.ModuleType:
+  """Returns a ``deepspeed`` stand-in that records parameter gathering."""
+
+  @contextlib.contextmanager
+  def gathered_parameters(params, modifier_rank=None):
+    events.append(("gather", list(params), modifier_rank))
+    yield
+    events.append(("release",))
+
+  module = types.ModuleType("deepspeed")
+  module.zero = types.SimpleNamespace(GatheredParameters=gathered_parameters)
+  return module
+
+
+class TestPerlContinualEvaluation(unittest.TestCase):
+  """Tests PERLPipeline continual evaluation stop-evaluate-resume lifecycle."""
+
+  def setUp(self):
+    super().setUp()
+    self.temp_dir = tempfile.mkdtemp()
+
+  def tearDown(self):
+    shutil.rmtree(self.temp_dir, ignore_errors=True)
+    super().tearDown()
+
+  def _make_perl_pipeline(self, eval_on_start=True):
+    pipeline = PERLPipeline()
+    pipeline.args = MagicMock()
+    pipeline.args.continual_eval = True
+    pipeline.args.task_name = "npov"
+
+    t_args = MagicMock()
+    t_args.do_train = True
+    t_args.output_dir = self.temp_dir
+    t_args.push_to_hub = True
+    t_args.hub_model_id = "leobianco/npov_PERL"
+    t_args.eval_on_start = eval_on_start
+    t_args.resume_from_checkpoint = True
+    t_args.load_best_model_at_end = True
+    t_args.save_strategy = "steps"
+    t_args.save_total_limit = 2
+    t_args.temperature = 0.7
+    pipeline.training_args = t_args
+
+    trainer = MagicMock()
+    trainer.args = t_args
+    trainer.state = MagicMock()
+    trainer.state.is_world_process_zero = True
+    trainer.state.global_step = 0
+    trainer.state.max_steps = 50
+    pipeline.trainer = trainer
+    return pipeline
+
+  def _mock_untrained_policy(self, pipeline, events=None):
+    """Makes ``accelerator.unwrap_model`` return a policy saving an adapter."""
+    model = MagicMock()
+    model.parameters.return_value = []
+
+    def fake_save_pretrained(dest):
+      if events is not None:
+        events.append(("save", dest))
+      _write_adapter_checkpoint(dest)
+
+    model.save_pretrained.side_effect = fake_save_pretrained
+    pipeline.trainer.accelerator.unwrap_model.return_value = model
+    return model
+
+  def test_step_zero_pauses_before_training_and_saves_checkpoint_0(self):
+    pipeline = self._make_perl_pipeline(eval_on_start=True)
+    model = self._mock_untrained_policy(pipeline)
+    mock_wandb = MagicMock()
+    mock_wandb.run = None
+    run = types.SimpleNamespace(
+        id="run_step0_id",
+        project="perl_project",
+        entity="perl_entity",
+        name="npov_PERL_run",
+        summary={},
+    )
+    wandb_callback = _FakeWandbCallback(mock_wandb, run)
+    pipeline.trainer.callback_handler.callbacks = [MagicMock(), wandb_callback]
+
+    with patch("src.pipelines.wandb", mock_wandb), patch(
+        "transformers.integrations.WandbCallback",
+        _FakeWandbCallback,
+        create=True,
+    ), patch.object(pipeline, "_resolve_resume_checkpoint", return_value=None):
+      pipeline.run_and_save()
+
+    # No training, and no trainer call that would set DeepSpeed up outside of
+    # training or push the untrained adapter to the Hub.
+    pipeline.trainer.train.assert_not_called()
+    pipeline.trainer.evaluate.assert_not_called()
+    pipeline.trainer.save_model.assert_not_called()
+    pipeline.trainer.push_to_hub.assert_not_called()
+
+    ckpt_0 = os.path.join(self.temp_dir, "checkpoint-0")
+    model.save_pretrained.assert_called_once_with(ckpt_0)
+    pipeline.trainer.processing_class.save_pretrained.assert_called_once_with(
+        ckpt_0
+    )
+    self.assertTrue(
+        os.path.isfile(os.path.join(ckpt_0, "adapter_model.safetensors"))
+    )
+    # No trainer state: no later segment may resume from it.
+    self.assertFalse(
+        os.path.exists(os.path.join(ckpt_0, "trainer_state.json"))
+    )
+
+    # The WandB run is created the way `train()` would create it, then closed
+    # so that the scorer can attach to it.
+    trainer = pipeline.trainer
+    self.assertEqual(
+        wandb_callback.setup_calls,
+        [(trainer.args, trainer.state, trainer.model)],
+    )
+    mock_wandb.finish.assert_called_once()
+    # W&B now reports the run as finished: the flag says training is paused.
+    self.assertIs(run.summary[PAUSED_SUMMARY_KEY], True)
+
+    status = ContinualEvalStatus.load(self.temp_dir)
+    self.assertTrue(status.paused_for_eval)
+    self.assertFalse(status.training_completed)
+    self.assertEqual(status.current_step, 0)
+    self.assertEqual(status.checkpoint_dir, ckpt_0)
+    self.assertEqual(status.wandb_run_id, "run_step0_id")
+    self.assertEqual(status.wandb_project, "perl_project")
+    self.assertEqual(status.wandb_entity, "perl_entity")
+    self.assertEqual(status.wandb_run_name, "npov_PERL_run")
+    self.assertEqual(status.rollout_temperature, 0.7)
+
+  def test_step_zero_without_wandb_records_no_run(self):
+    pipeline = self._make_perl_pipeline(eval_on_start=True)
+    self._mock_untrained_policy(pipeline)
+    pipeline.trainer.callback_handler.callbacks = [MagicMock()]
+    mock_wandb = MagicMock()
+    mock_wandb.run = None
+
+    with patch("src.pipelines.wandb", mock_wandb), patch(
+        "transformers.integrations.WandbCallback",
+        _FakeWandbCallback,
+        create=True,
+    ), patch.object(
+        pipeline, "_resolve_resume_checkpoint", return_value=None
+    ), patch.dict(os.environ, {"WANDB_RUN_ID": "stale_run"}):
+      pipeline.run_and_save()
+
+    status = ContinualEvalStatus.load(self.temp_dir)
+    self.assertTrue(status.paused_for_eval)
+    # Only the live run is trusted, not a stale id in the environment.
+    self.assertIsNone(status.wandb_run_id)
+    mock_wandb.finish.assert_not_called()
+
+  def test_step_zero_on_other_ranks_saves_nothing(self):
+    pipeline = self._make_perl_pipeline(eval_on_start=True)
+    pipeline.trainer.state.is_world_process_zero = False
+    model = self._mock_untrained_policy(pipeline)
+
+    with patch.object(
+        pipeline, "_resolve_resume_checkpoint", return_value=None
+    ):
+      pipeline.run_and_save()
+
+    pipeline.trainer.train.assert_not_called()
+    model.save_pretrained.assert_not_called()
+    self.assertFalse(
+        os.path.exists(ContinualEvalStatus.status_path(self.temp_dir))
+    )
+
+  def test_step_zero_gathers_partitioned_adapter_weights_on_every_rank(self):
+    trainable = types.SimpleNamespace(requires_grad=True, ds_id=1)
+    frozen = types.SimpleNamespace(requires_grad=False, ds_id=2)
+    replicated = types.SimpleNamespace(requires_grad=True)
+    ckpt_0 = os.path.join(self.temp_dir, "checkpoint-0")
+    for is_main_process in (True, False):
+      with self.subTest(is_main_process=is_main_process):
+        events = []
+        pipeline = self._make_perl_pipeline(eval_on_start=True)
+        pipeline.trainer.state.is_world_process_zero = is_main_process
+        pipeline.trainer.callback_handler.callbacks = []
+        model = self._mock_untrained_policy(pipeline, events=events)
+        model.parameters.return_value = [trainable, frozen, replicated]
+
+        with patch.dict(
+            sys.modules, {"deepspeed": _fake_deepspeed(events)}
+        ), patch("src.pipelines.wandb", None), patch(
+            "transformers.integrations.WandbCallback",
+            _FakeWandbCallback,
+            create=True,
+        ), patch.object(
+            pipeline, "_resolve_resume_checkpoint", return_value=None
+        ):
+          pipeline.run_and_save()
+
+        # Gathering is collective: every rank enters it, rank 0 saves inside.
+        expected = [("gather", [trainable], None)]
+        if is_main_process:
+          expected.append(("save", ckpt_0))
+        expected.append(("release",))
+        self.assertEqual(events, expected)
+
+  def test_second_segment_trains_from_scratch_after_step_zero_evaluation(self):
+    ckpt_0 = _write_adapter_checkpoint(
+        os.path.join(self.temp_dir, "checkpoint-0")
+    )
+    ContinualEvalStatus(
+        current_step=0,
+        checkpoint_dir=ckpt_0,
+        evaluated_steps=[0],
+        wandb_run_id="run_step0_id",
+    ).save(self.temp_dir)
+    pipeline = self._make_perl_pipeline(eval_on_start=True)
+    pipeline.training_args.push_to_hub = False
+
+    # `--resume_from_checkpoint True` picks the highest checkpoint-N, which is
+    # checkpoint-0 until the first real save.
+    with patch(
+        "src.pipelines.get_last_checkpoint", return_value=ckpt_0
+    ), patch.object(pipeline, "_pause_before_first_step") as pause:
+      pipeline.run_and_save()
+
+    pause.assert_not_called()
+    pipeline.trainer.train.assert_called_once_with(resume_from_checkpoint=None)
+    # The trainer's own step-0 evaluation (eval_on_start) runs in this segment.
+    self.assertTrue(pipeline.training_args.eval_on_start)
+
+  def test_step_zero_checkpoint_is_not_resumed_without_continual_eval(self):
+    ckpt_0 = _write_adapter_checkpoint(
+        os.path.join(self.temp_dir, "checkpoint-0")
+    )
+    pipeline = self._make_perl_pipeline(eval_on_start=True)
+    pipeline.args.continual_eval = False
+    pipeline.training_args.push_to_hub = False
+
+    with patch("src.pipelines.get_last_checkpoint", return_value=ckpt_0):
+      pipeline.run_and_save()
+
+    pipeline.trainer.train.assert_called_once_with(resume_from_checkpoint=None)
+    self.assertTrue(pipeline.training_args.eval_on_start)
+    self.assertFalse(
+        os.path.exists(ContinualEvalStatus.status_path(self.temp_dir))
+    )
+
+  def test_resumed_segment_does_not_evaluate_the_resumed_step_again(self):
+    ckpt_25 = _write_adapter_checkpoint(
+        os.path.join(self.temp_dir, "checkpoint-25"), trainer_state=True
+    )
+    for continual_eval in (True, False):
+      with self.subTest(continual_eval=continual_eval):
+        pipeline = self._make_perl_pipeline(eval_on_start=True)
+        pipeline.args.continual_eval = continual_eval
+        pipeline.training_args.push_to_hub = False
+        pipeline.trainer.args = MagicMock(eval_on_start=True)
+
+        with patch.object(
+            pipeline, "_resolve_resume_checkpoint", return_value=ckpt_25
+        ):
+          pipeline.run_and_save()
+
+        pipeline.trainer.train.assert_called_once_with(
+            resume_from_checkpoint=ckpt_25
+        )
+        # Each continual-eval pause directly follows the evaluation of its
+        # step; other resumed runs keep their eval_on_start setting.
+        self.assertEqual(
+            pipeline.training_args.eval_on_start, not continual_eval
+        )
+        self.assertEqual(
+            pipeline.trainer.args.eval_on_start, not continual_eval
+        )
+
+  def test_intermediate_step_pause_skips_best_model_reload_and_hub_push(self):
+    # Simulate Step 0 already evaluated
+    init_status = ContinualEvalStatus(
+        paused_for_eval=False,
+        training_completed=False,
+        current_step=0,
+        checkpoint_dir=os.path.join(self.temp_dir, "checkpoint-0"),
+        evaluated_steps=[0],
+        wandb_run_id="run_step0_id",
+    )
+    init_status.save(self.temp_dir)
+
+    pipeline = self._make_perl_pipeline(eval_on_start=True)
+    callbacks = pipeline._training_callbacks()
+    self.assertIsNotNone(pipeline._continual_stop_callback)
+    self.assertEqual(
+        pipeline._continual_stop_callback.evaluated_steps, {0}
+    )
+
+    orig_load_best = MagicMock()
+    pipeline.trainer._load_best_model = orig_load_best
+    pipeline._configure_best_and_last_checkpoint_saving()
+
+    def fake_train(resume_from_checkpoint=None):
+      del resume_from_checkpoint
+      pipeline.trainer.state.global_step = 0
+      control = MagicMock()
+      control.should_training_stop = False
+      for cb in callbacks:
+        if hasattr(cb, "on_train_begin"):
+          cb.on_train_begin(
+              pipeline.training_args, pipeline.trainer.state, control
+          )
+      # Simulate Trainer reaching step 25 and firing on_save
+      ckpt_25 = os.path.join(self.temp_dir, "checkpoint-25")
+      _write_adapter_checkpoint(ckpt_25, trainer_state=True)
+      with open(os.path.join(ckpt_25, "optimizer.pt"), "w") as f:
+        f.write("opt")
+      pipeline.trainer.state.global_step = 25
+      for cb in callbacks:
+        if hasattr(cb, "on_save"):
+          cb.on_save(pipeline.training_args, pipeline.trainer.state, control)
+      self.assertTrue(control.should_training_stop)
+      # Trainer calls _load_best_model when exiting _inner_training_loop
+      pipeline.trainer._load_best_model()
+
+    mock_wandb = MagicMock()
+    mock_wandb.run = types.SimpleNamespace(
+        id="run_step0_id",
+        project="perl_project",
+        entity="perl_entity",
+        name="npov_PERL_run",
+        summary={},
+    )
+    pipeline.trainer.train.side_effect = fake_train
+    with patch("src.pipelines.wandb", mock_wandb), patch(
+        "src.pipelines.HfApi"
+    ), patch.object(pipeline, "_resolve_resume_checkpoint", return_value=None):
+      pipeline.run_and_save()
+
+    # Because this was an intermediate continual-eval pause, _load_best_model
+    # and push_to_hub must NOT have executed, nor the final model save.
+    orig_load_best.assert_not_called()
+    pipeline.trainer.push_to_hub.assert_not_called()
+    pipeline.trainer.save_model.assert_not_called()
+    # The run is closed so that the scorer and the next segment can resume it.
+    mock_wandb.finish.assert_called_once()
+    self.assertIs(mock_wandb.run.summary[PAUSED_SUMMARY_KEY], True)
+
+    status = ContinualEvalStatus.load(self.temp_dir)
+    self.assertIsNotNone(status)
+    self.assertTrue(status.paused_for_eval)
+    self.assertFalse(status.training_completed)
+    self.assertEqual(status.current_step, 25)
+    self.assertEqual(
+        status.checkpoint_dir, os.path.join(self.temp_dir, "checkpoint-25")
+    )
+    self.assertEqual(status.evaluated_steps, [0])
+    self.assertEqual(status.wandb_run_id, "run_step0_id")
+    self.assertEqual(status.wandb_project, "perl_project")
+    self.assertEqual(status.rollout_temperature, 0.7)
+
+  def test_final_step_completion_pushes_to_hub_and_requests_final_eval(self):
+    ckpt_25 = os.path.join(self.temp_dir, "checkpoint-25")
+    _write_adapter_checkpoint(ckpt_25, trainer_state=True)
+    with open(os.path.join(ckpt_25, "optimizer.pt"), "w") as f:
+      f.write("opt")
+
+    init_status = ContinualEvalStatus(
+        paused_for_eval=False,
+        training_completed=False,
+        current_step=25,
+        checkpoint_dir=ckpt_25,
+        evaluated_steps=[0, 25],
+        wandb_run_id="run_step0_id",
+    )
+    init_status.save(self.temp_dir)
+
+    pipeline = self._make_perl_pipeline(eval_on_start=True)
+    callbacks = pipeline._training_callbacks()
+
+    def fake_save_model(dest):
+      _write_adapter_checkpoint(dest)
+
+    pipeline.trainer.save_model.side_effect = fake_save_model
+
+    def fake_train(resume_from_checkpoint=None):
+      self.assertEqual(resume_from_checkpoint, ckpt_25)
+      pipeline.trainer.state.global_step = 25
+      control = MagicMock()
+      control.should_training_stop = False
+      for cb in callbacks:
+        if hasattr(cb, "on_train_begin"):
+          cb.on_train_begin(
+              pipeline.training_args, pipeline.trainer.state, control
+          )
+      # Reach final step 50 == max_steps
+      pipeline.trainer.state.global_step = 50
+      ckpt_50 = os.path.join(self.temp_dir, "checkpoint-50")
+      _write_adapter_checkpoint(ckpt_50, trainer_state=True)
+      for cb in callbacks:
+        if hasattr(cb, "on_save"):
+          cb.on_save(pipeline.training_args, pipeline.trainer.state, control)
+      self.assertFalse(control.should_training_stop)
+
+    pipeline.trainer.train.side_effect = fake_train
+    mock_wandb = MagicMock()
+    # Resumed from a pause, so the run summary still says "paused".
+    mock_wandb.run = types.SimpleNamespace(
+        id="run_step0_id",
+        project="perl_project",
+        entity="perl_entity",
+        name="npov_PERL_run",
+        summary={PAUSED_SUMMARY_KEY: True},
+    )
+    with patch("src.pipelines.get_last_checkpoint", return_value=ckpt_25):
+      with patch("src.pipelines.HfApi"):
+        with patch("src.pipelines.wandb", mock_wandb):
+          pipeline.run_and_save()
+
+    # Training completed: the orchestrator may count and rank this trial.
+    self.assertIs(mock_wandb.run.summary[PAUSED_SUMMARY_KEY], False)
+    mock_wandb.finish.assert_called_once()
+    pipeline.trainer.push_to_hub.assert_called_once()
+    # Only the regular end-of-training save; no fallback save under the name
+    # of the final checkpoint.
+    pipeline.trainer.save_model.assert_called_once_with(self.temp_dir)
+    # Resuming from checkpoint-25 must not evaluate step 25 a second time.
+    self.assertFalse(pipeline.training_args.eval_on_start)
+    status = ContinualEvalStatus.load(self.temp_dir)
+    self.assertIsNotNone(status)
+    self.assertTrue(status.training_completed)
+    self.assertTrue(status.paused_for_eval)
+    self.assertEqual(status.current_step, 50)
+    self.assertEqual(
+        status.checkpoint_dir, os.path.join(self.temp_dir, "checkpoint-50")
+    )
+
+  def test_final_checkpoint_without_weights_is_not_scored(self):
+    ckpt_25 = _write_adapter_checkpoint(
+        os.path.join(self.temp_dir, "checkpoint-25"), trainer_state=True
+    )
+    ContinualEvalStatus(
+        current_step=25, checkpoint_dir=ckpt_25, evaluated_steps=[0, 25]
+    ).save(self.temp_dir)
+    pipeline = self._make_perl_pipeline(eval_on_start=True)
+    pipeline.training_args.push_to_hub = False
+    pipeline._training_callbacks()
+
+    def fake_train(resume_from_checkpoint=None):
+      del resume_from_checkpoint
+      # checkpoint-50 was never saved (e.g. save_strategy changed mid-run).
+      pipeline.trainer.state.global_step = 50
+
+    pipeline.trainer.train.side_effect = fake_train
+    with patch.object(
+        pipeline, "_resolve_resume_checkpoint", return_value=ckpt_25
+    ):
+      pipeline.run_and_save()
+
+    # The model in memory may be the best checkpoint (load_best_model_at_end),
+    # so it is not saved under the final step's name.
+    pipeline.trainer.save_model.assert_called_once_with(self.temp_dir)
+    self.assertFalse(
+        os.path.exists(os.path.join(self.temp_dir, "checkpoint-50"))
+    )
+    status = ContinualEvalStatus.load(self.temp_dir)
+    self.assertTrue(status.training_completed)
+    self.assertFalse(status.paused_for_eval)
+    self.assertIsNone(status.checkpoint_dir)
+    self.assertEqual(status.current_step, 50)
+    self.assertEqual(status.evaluated_steps, [0, 25])
+
+  def _finish_and_capture_flag(self, training_completed):
+    """Runs ``_finish_wandb_run``; returns the flag seen by ``finish()``."""
+    mock_wandb = MagicMock()
+    mock_wandb.run = types.SimpleNamespace(summary={})
+    seen = []
+    mock_wandb.finish.side_effect = lambda: seen.append(
+        dict(mock_wandb.run.summary)
+    )
+    with patch("src.pipelines.wandb", mock_wandb):
+      PERLPipeline._finish_wandb_run(training_completed=training_completed)
+    mock_wandb.finish.assert_called_once()
+    return seen[0].get(PAUSED_SUMMARY_KEY, "unset")
+
+  def test_a_pause_flags_the_wandb_run_before_finishing_it(self):
+    self.assertIs(self._finish_and_capture_flag(False), True)
+
+  def test_training_completion_clears_the_wandb_pause_flag(self):
+    self.assertIs(self._finish_and_capture_flag(True), False)
+
+  def test_a_failure_to_flag_the_run_still_finishes_it(self):
+    mock_wandb = MagicMock()
+    mock_wandb.run = types.SimpleNamespace()  # No summary attribute.
+    with patch("src.pipelines.wandb", mock_wandb):
+      PERLPipeline._finish_wandb_run(training_completed=False)
+    mock_wandb.finish.assert_called_once()
+
+  def test_paused_checkpoint_keeps_the_form_of_a_relative_output_dir(self):
+    # perl.sh and the orchestrator pass a relative output_dir. The completions
+    # dataset is named after the recorded path, which an absolute path through
+    # '<hf_user>/' (e.g. /home/<hf_user>/...) would make illegible.
+    cwd = os.getcwd()
+    os.chdir(self.temp_dir)
+    self.addCleanup(os.chdir, cwd)
+    output_dir = os.path.join(".", "checkpoints", "npov", "perl", "run")
+    pipeline = self._make_perl_pipeline(eval_on_start=True)
+    pipeline.training_args.output_dir = output_dir
+
+    with patch("src.pipelines.wandb", None):
+      pipeline._pause_for_continual_eval(25)
+
+    status = ContinualEvalStatus.load(output_dir)
+    self.assertTrue(status.paused_for_eval)
+    self.assertEqual(
+        status.checkpoint_dir, os.path.join(output_dir, "checkpoint-25")
+    )
+
+  def test_checkpoint_helpers(self):
+    ckpt_0 = _write_adapter_checkpoint(
+        os.path.join(self.temp_dir, "checkpoint-0")
+    )
+    self.assertTrue(_is_untrained_step_zero_checkpoint(ckpt_0))
+    self.assertTrue(_is_untrained_step_zero_checkpoint(ckpt_0 + os.sep))
+    self.assertFalse(_is_untrained_step_zero_checkpoint(None))
+    self.assertFalse(
+        _is_untrained_step_zero_checkpoint(
+            os.path.join(self.temp_dir, "checkpoint-25")
+        )
+    )
+    with open(os.path.join(ckpt_0, "trainer_state.json"), "w") as f:
+      f.write("{}")
+    self.assertFalse(_is_untrained_step_zero_checkpoint(ckpt_0))
+
+    self.assertTrue(_checkpoint_has_weights(ckpt_0))
+    self.assertFalse(_checkpoint_has_weights(None))
+    self.assertFalse(
+        _checkpoint_has_weights(os.path.join(self.temp_dir, "missing"))
+    )
+    config_only = os.path.join(self.temp_dir, "checkpoint-50")
+    os.makedirs(config_only)
+    with open(os.path.join(config_only, "adapter_config.json"), "w") as f:
+      f.write("{}")
+    self.assertFalse(_checkpoint_has_weights(config_only))
+
+  def test_wandb_run_info_reads_the_live_run_only(self):
+    run = types.SimpleNamespace(id="abc", project="proj", entity="", name=None)
+    with patch("src.pipelines.wandb", types.SimpleNamespace(run=run)):
+      self.assertEqual(
+          PERLPipeline._wandb_run_info(),
+          {"wandb_run_id": "abc", "wandb_project": "proj"},
+      )
+    with patch("src.pipelines.wandb", types.SimpleNamespace(run=None)):
+      self.assertEqual(PERLPipeline._wandb_run_info(), {})
+    with patch("src.pipelines.wandb", None):
+      self.assertEqual(PERLPipeline._wandb_run_info(), {})
+
+
+class TestWandbResumptionCallbackFinalSave(unittest.TestCase):
+  """The step at which training stops is evaluated and saved exactly once."""
+
+  def _args(self, **overrides):
+    args = types.SimpleNamespace(
+        save_strategy="steps",
+        do_eval=True,
+        eval_strategy="steps",
+        num_train_epochs=1,
+        load_best_model_at_end=False,
+        save_total_limit=2,
+        output_dir=None,
+        push_to_hub=False,
+        hub_model_id=None,
+    )
+    vars(args).update(overrides)
+    return args
+
+  def _control(self):
+    return types.SimpleNamespace(
+        should_evaluate=False, should_save=False, should_training_stop=False
+    )
+
+  def _state(self, global_step):
+    return types.SimpleNamespace(
+        global_step=global_step,
+        max_steps=100,
+        epoch=global_step / 100,
+        is_world_process_zero=True,
+    )
+
+  def test_pause_right_after_an_evaluated_and_saved_step_is_not_repeated(self):
+    cb = WandbResumptionCallback()
+    args = self._args()
+    state = self._state(0)
+    with patch("src.pipelines.wandb", None):
+      cb.on_train_begin(args, state, self._control())
+      state.global_step = 25
+      control = self._control()
+      cb.on_evaluate(args, state, control)
+      cb.on_save(args, state, control)
+      # ContinualEvalStopCallback.on_save requested the pause. Hugging Face
+      # calls on_epoch_end and _maybe_log_save_evaluate once more after the
+      # training loop breaks.
+      control.should_training_stop = True
+      cb.on_step_end(args, state, control)
+      cb.on_epoch_end(args, state, control)
+    self.assertFalse(control.should_evaluate)
+    self.assertFalse(control.should_save)
+
+  def test_unsaved_final_step_is_evaluated_and_saved(self):
+    cb = WandbResumptionCallback()
+    args = self._args()
+    state = self._state(75)
+    with patch("src.pipelines.wandb", None):
+      cb.on_train_begin(args, state, self._control())
+      control = self._control()
+      cb.on_evaluate(args, state, control)
+      cb.on_save(args, state, control)
+      state.global_step = 100
+      cb.on_step_end(args, state, control)
+    self.assertTrue(control.should_evaluate)
+    self.assertTrue(control.should_save)
+
+  def test_final_step_is_saved_without_evaluation_when_eval_is_off(self):
+    cb = WandbResumptionCallback()
+    args = self._args(do_eval=False, eval_strategy="no")
+    state = self._state(0)
+    with patch("src.pipelines.wandb", None):
+      cb.on_train_begin(args, state, self._control())
+      state.global_step = 100
+      control = self._control()
+      cb.on_step_end(args, state, control)
+    self.assertFalse(control.should_evaluate)
+    self.assertTrue(control.should_save)
+
+
+class TestContinualEvalCheckpointingSetup(unittest.TestCase):
+  """--continual_eval makes every pause leave a resumable checkpoint."""
+
+  def _pipeline(self, **overrides):
+    pipeline = PERLPipeline()
+    args = types.SimpleNamespace(
+        save_only_model=True,
+        save_strategy="no",
+        save_steps=500,
+        eval_steps=25,
+        save_total_limit=1,
+        gradient_accumulation_steps=8,
+        steps_per_generation=16,
+        num_iterations=1,
+        resume_from_checkpoint=None,
+    )
+    vars(args).update(overrides)
+    pipeline.training_args = args
+    return pipeline
+
+  def test_every_pause_saves_a_resumable_checkpoint(self):
+    pipeline = self._pipeline()
+    with contextlib.redirect_stdout(io.StringIO()):
+      pipeline._configure_continual_eval_checkpointing()
+    args = pipeline.training_args
+    self.assertFalse(args.save_only_model)
+    self.assertEqual(args.save_strategy, "steps")
+    self.assertEqual(args.save_steps, 25)
+    # save_total_limit == 1 would delete the pause checkpoint at the end of
+    # the segment (Trainer._finalize_training keeps only the best one).
+    self.assertEqual(args.save_total_limit, 2)
+    # Resumption is driven by the coordinator's explicit
+    # --resume_from_checkpoint, never forced here.
+    self.assertIsNone(args.resume_from_checkpoint)
+
+  def test_warns_when_pauses_split_an_rloo_generation_cycle(self):
+    # 25 steps x 8 micro-batches = 200, not a multiple of 16 x 1.
+    for eval_steps, expect_warning in ((25, True), (24, False)):
+      with self.subTest(eval_steps=eval_steps):
+        pipeline = self._pipeline(eval_steps=eval_steps, save_strategy="steps")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+          pipeline._configure_continual_eval_checkpointing()
+        self.assertEqual("generation cycle" in out.getvalue(), expect_warning)
+
+  def test_setup_arguments_configures_without_forcing_resumption(self):
+    pipeline = PERLPipeline()
+    script_args = MagicMock(
+        task_name="npov", continual_eval=True, reward_penalty_alpha=1.0
+    )
+    training_args = MagicMock(
+        seed=130104,
+        learning_rate=2e-5,
+        beta=0.05,
+        temperature=0.7,
+        num_train_epochs=1.0,
+        run_name="npov_run",
+        gradient_accumulation_steps=8,
+        steps_per_generation=16,
+        num_iterations=1,
+        save_only_model=True,
+        save_strategy="steps",
+        save_steps=500,
+        eval_steps=25,
+        save_total_limit=2,
+        resume_from_checkpoint=None,
+    )
+    with patch("src.pipelines.HfArgumentParser") as parser_cls:
+      parser_cls.return_value.parse_args_into_dataclasses.return_value = (
+          script_args,
+          training_args,
+      )
+      with contextlib.redirect_stdout(io.StringIO()):
+        pipeline.setup_arguments("--task_name=npov", "--continual_eval=True")
+    self.assertIsNone(training_args.resume_from_checkpoint)
+    self.assertFalse(training_args.save_only_model)
+    self.assertEqual(training_args.save_steps, 25)
+
+
 if __name__ == "__main__":
   unittest.main()
-

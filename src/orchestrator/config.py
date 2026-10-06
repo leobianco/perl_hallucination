@@ -31,7 +31,9 @@ VALID_STAGES: List[str] = ["autorater", "sft", "rm", "perl", "eval"]
 
 #: Rough per-trial wall-clock estimates (minutes) for each sweep stage. These
 #: feed both the wizard's ETA preview and the sweep timeout budgets, so the two
-#: can never drift apart.
+#: can never drift apart. The PE-RL timeout also covers the continual
+#: evaluation of each trial (:func:`continual_eval_minutes_per_trial`), which
+#: the ETA preview leaves out.
 MINUTES_PER_TRIAL: Dict[str, float] = {"sft": 12.0, "rm": 8.0, "perl": 35.0}
 
 #: Headroom applied on top of the estimate when sizing a sweep timeout. The
@@ -42,8 +44,53 @@ TIMEOUT_SAFETY_FACTOR = 1.5
 #: No sweep is ever given a smaller budget than this.
 MIN_TIMEOUT_MINUTES = 240
 
+#: Checkpoints continual evaluation scores in each PE-RL trial: the step-0
+#: baseline (``--eval_on_start``) and the final one. A 0.2-epoch trial logs a
+#: few dozen steps, fewer than one ``--eval_steps`` interval (50).
+CONTINUAL_EVAL_POINTS_PER_TRIAL = 2
 
-def sweep_timeout_minutes(stage: str, max_runs: int) -> int:
+#: Minutes each extra training segment costs: a continual-evaluation pause
+#: ends the segment, and the next one reloads the policy, reference and reward
+#: models and restores the optimizer state.
+CONTINUAL_EVAL_RELAUNCH_MINUTES = 5.0
+
+
+def eval_pass_minutes(eval_samples: Optional[int]) -> float:
+  """Estimates one generation-plus-autorating pass over ``eval_samples``.
+
+  The wizard's ETA preview estimates each evaluation target the same way
+  (``wizard.estimate_runtime``); a continual evaluation does the same work.
+
+  Args:
+    eval_samples: Prompts generated for and scored (``eval.max_eval_samples``).
+
+  Returns:
+    The estimate in minutes.
+  """
+  return 15.0 + max(0, int(eval_samples or 0)) / 100.0 * 2.0
+
+
+def continual_eval_minutes_per_trial(eval_samples: Optional[int]) -> float:
+  """Estimates the wall-clock continual evaluation adds to one PE-RL trial.
+
+  Args:
+    eval_samples: Prompts each evaluation scores (``eval.max_eval_samples``).
+
+  Returns:
+    The estimate in minutes: one pass per scored checkpoint, plus a training
+    relaunch after every pause.
+  """
+  points = CONTINUAL_EVAL_POINTS_PER_TRIAL
+  relaunches = points - 1
+  return (
+      points * eval_pass_minutes(eval_samples)
+      + relaunches * CONTINUAL_EVAL_RELAUNCH_MINUTES
+  )
+
+
+def sweep_timeout_minutes(
+    stage: str, max_runs: int, eval_samples: Optional[int] = None
+) -> int:
   """Sizes the wall-clock budget of a sweep from its trial count.
 
   A fixed budget silently truncates large sweeps: the agent is killed, the
@@ -54,11 +101,20 @@ def sweep_timeout_minutes(stage: str, max_runs: int) -> int:
   Args:
     stage: Sweep stage name ('sft', 'rm' or 'perl').
     max_runs: Number of trials the sweep is asked to run.
+    eval_samples: PE-RL only: prompts each continual evaluation of a trial
+      scores (``eval.max_eval_samples``). None means the
+      :class:`EvalStageConfig` default.
 
   Returns:
     The timeout in minutes.
   """
   per_trial = MINUTES_PER_TRIAL.get(stage, 10.0)
+  if stage == "perl":
+    # Every PE-RL trial of a campaign runs with continual evaluation
+    # (PerlStage.continual_eval_flags).
+    if eval_samples is None:
+      eval_samples = EvalStageConfig.max_eval_samples
+    per_trial += continual_eval_minutes_per_trial(eval_samples)
   estimate = max(0, int(max_runs)) * per_trial * TIMEOUT_SAFETY_FACTOR
   return int(max(MIN_TIMEOUT_MINUTES, math.ceil(estimate)))
 

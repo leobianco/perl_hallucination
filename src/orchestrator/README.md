@@ -183,6 +183,33 @@ Costs and caveats:
 A one-point grid (`temperature_grid: [0.0]`) with matching off reproduces a
 campaign from before the grid: same passes, same metric keys, no `@t` labels.
 
+### 4d. Continual evaluation during PE-RL
+
+Every PE-RL run of a campaign - each sweep trial and the winner's retraining -
+is scored by the autorater while it trains. At step 0 and at every evaluation
+step (`--eval_steps`, 50) training pauses, the checkpoint's completions
+(sampled at the rollout temperature) are judged as in the final evaluation
+(same judges, few-shot counts, `max_eval_samples` and threshold), and
+training resumes. Each run's own W&B page gets the scores
+(`eval/hallucination_rate`, `eval/reward_hacking_rate`, ... against
+`train/global_step`) and the Pareto frontiers (`eval/continual_pareto_table`
+plus charts). The dashboard and the final evaluation are unchanged.
+
+* **Cost: one generation + judging pass per scored checkpoint.** A 0.2-epoch
+  trial is scored twice (step 0 and its final step). The PE-RL sweep timeout
+  includes this (10 trials at 1000 samples: 1650 min instead of 525), and a
+  resumed campaign whose saved timeout predates it gets the larger budget at
+  runtime. The wizard's estimate leaves it out: add about 75 min per trial
+  and for the retraining at 1000 samples.
+* **Stopping.** A pause finishes the W&B run, so a trial stopped while it is
+  being evaluated can show as `finished`; its summary then has
+  `continual_eval/paused: true`, and it is neither counted toward `max_runs`
+  nor ranked as a finished trial. `wandb agent` runs with `--forward-signals`
+  when it supports it (wandb >= 0.24), so `[a]`, `[s]`, `[x]` and timeouts
+  stop the trial in flight instead of leaving it on the GPUs.
+* **Outside the orchestrator** `scripts/perl.sh` leaves it off; enable it with
+  `CONTINUAL_EVAL=True ./scripts/perl.sh <task>`.
+
 ### 5. Choosing the reward model's training dataset
 
 The reward model can be trained on human-labelled hallucinations
@@ -601,6 +628,9 @@ always restored on exit.
 "Finishes the current stage" means the *stage*, not the trial you are watching.
 `[a]` and `[s]` terminate the sweep agent on the next poll, so the trial in
 flight dies and is recorded `killed` by W&B. Only `[p]` lets it finish.
+(A PE-RL trial stopped during a continual evaluation can show `finished`
+instead; its `continual_eval/paused: true` summary keeps it out of the
+`max_runs` count, and it is ranked only if no trial finished - see section 4d.)
 
 | | `[p]` | `[a]` | `[s]` | `[x]` |
 | :--- | :---: | :---: | :---: | :---: |

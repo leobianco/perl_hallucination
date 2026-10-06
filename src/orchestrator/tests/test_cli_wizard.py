@@ -16,6 +16,7 @@ from unittest import mock
 
 from src.orchestrator.cli import console as console_mod
 from src.orchestrator.cli import theme as theme_mod
+from src.orchestrator import config as config_mod
 from src.orchestrator import flavors
 from src.orchestrator.cli import wizard
 from src.orchestrator.config import CampaignConfig
@@ -118,6 +119,22 @@ class EstimateTest(unittest.TestCase):
   def test_format_estimate_switches_unit(self):
     self.assertIn("min", wizard.format_estimate(0.1, 0.4))
     self.assertIn("h", wizard.format_estimate(2.0, 5.0))
+
+  def test_an_evaluation_pass_costs_what_the_sweep_timeout_assumes(self):
+    # config.eval_pass_minutes prices each continual evaluation inside the
+    # PE-RL sweep timeout; it must agree with this preview's evaluation pass.
+    for samples in (20, 1000, 2000):
+      with self.subTest(samples=samples):
+        config = CampaignConfig.create_default(task_name="npov")
+        config.stages = ["eval"]
+        config.eval.temperature_grid = [0.0]
+        config.eval.max_eval_samples = samples
+        low, _ = wizard.estimate_runtime(config)
+        # One pass for SFT plus one per PE-RL branch; the low end is 0.6x.
+        passes = 1 + len(flavors.campaign_flavors(config))
+        self.assertAlmostEqual(
+            low * 60.0 / 0.6 / passes, config_mod.eval_pass_minutes(samples)
+        )
 
 
 class EquivalentCommandTest(unittest.TestCase):
