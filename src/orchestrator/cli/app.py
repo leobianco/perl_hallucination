@@ -20,6 +20,7 @@ import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from src.orchestrator import accel
+from src.orchestrator import config as config_mod
 from src.orchestrator import flavors
 from src.orchestrator import shutdown
 from src.orchestrator.cli import renderables
@@ -182,6 +183,17 @@ def build_parser() -> argparse.ArgumentParser:
           + ",".join(flavors.RM_DATASET_FLAVORS)
           + ". Naming two runs an RM and a PE-RL sweep for each, then "
           "scores both policies in one evaluation."
+      ),
+  )
+  run_parser.add_argument(
+      "--continual-eval-adapters",
+      default=None,
+      help=(
+          "Comma-separated adapter stacking mode(s) scored during PE-RL "
+          "continual evaluation: "
+          + ",".join(config_mod.CONTINUAL_EVAL_ADAPTER_MODES)
+          + " (or 'both'). Selecting both logs SFT + PE-RL under eval/* and "
+          "PE-RL adapter only (without SFT) under eval_perl_only/*."
       ),
   )
   run_parser.add_argument("--dry-run", action="store_true",
@@ -695,6 +707,13 @@ def cmd_run(args: argparse.Namespace, console: UiConsole) -> int:
     config.rm_dataset_flavors = flavors.normalize_flavors(
         args.rm_datasets.split(",")
     )
+  if getattr(args, "continual_eval_adapters", None) is not None:
+    raw_adapters = args.continual_eval_adapters.strip()
+    config.eval.continual_eval_adapter_modes = (
+        config_mod.normalize_continual_eval_adapter_modes(raw_adapters)
+        if raw_adapters
+        else []
+    )
   # Applied outside the `--config` branch on purpose: the cap depends on the
   # GPU the campaign lands on, not on the experiment, so it has to be
   # overridable on a YAML that was written for a different machine.
@@ -717,6 +736,18 @@ def cmd_run(args: argparse.Namespace, console: UiConsole) -> int:
   except ValueError as exc:
     console.error(str(exc))
     return EXIT_USAGE
+
+  if not args.config or getattr(args, "continual_eval_adapters", None) is not None:
+    scaled_perl_timeout = config_mod.sweep_timeout_minutes(
+        "perl",
+        config.perl.max_runs,
+        config.eval.max_eval_samples,
+        num_adapter_modes=len(
+            config_mod.continual_eval_adapter_modes(config)
+        ),
+    )
+    if not args.config or config.perl.timeout_minutes < scaled_perl_timeout:
+      config.perl.timeout_minutes = scaled_perl_timeout
 
   missing = _missing_upstream_checkpoints(config)
   if missing:

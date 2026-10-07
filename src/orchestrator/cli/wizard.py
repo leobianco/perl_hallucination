@@ -57,6 +57,23 @@ RM_FLAVOR_DESCRIPTIONS: Dict[str, str] = {
         "Hallucinations injected by structured perturbation of the answers",
 }
 
+#: Default continual-evaluation adapter mode(s) when the user does not specify.
+DEFAULT_CONTINUAL_EVAL_ADAPTER_MODES: List[str] = list(
+    config_mod.DEFAULT_CONTINUAL_EVAL_ADAPTER_MODES
+)
+
+#: One-line descriptions of the PE-RL continual-evaluation adapter stacking
+#: modes, shown in the interactive wizard picker.
+CONTINUAL_EVAL_ADAPTER_DESCRIPTIONS: Dict[str, str] = {
+    config_mod.ADAPTER_MODE_SFT_AND_PERL: (
+        "Base model + SFT adapter + PE-RL adapter (logged under eval/*)"
+    ),
+    config_mod.ADAPTER_MODE_PERL_ONLY: (
+        "Base model + PE-RL adapter directly without SFT "
+        "(logged under eval_perl_only/*)"
+    ),
+}
+
 #: Budget presets. Values are (sft_runs, rm_runs, perl_runs, eval_samples).
 PRESETS: Dict[str, Tuple[int, int, int, int]] = {
     "smoke": (1, 1, 1, 20),
@@ -200,6 +217,19 @@ def estimate_runtime(config: CampaignConfig) -> Tuple[float, float]:
     runs = int(getattr(stage_cfg, "max_runs", 0) or 0)
     repeats = branches if stage in flavors.BRANCHED_KINDS else 1
     minutes += repeats * runs * MINUTES_PER_TRIAL.get(stage, 10.0)
+    if stage == "perl":
+      extra_modes = max(
+          0, len(config_mod.continual_eval_adapter_modes(config)) - 1
+      )
+      if extra_modes > 0:
+        continual_samples = config.eval.continual_eval_samples()
+        minutes += (
+            repeats
+            * runs
+            * extra_modes
+            * config_mod.CONTINUAL_EVAL_POINTS_PER_TRIAL
+            * config_mod.eval_pass_minutes(continual_samples)
+        )
   if config.dry_run:
     return (0.02, 0.05)
   return (minutes / 60.0 * 0.6, (minutes + optimistic_extra) / 60.0 * 1.5)
@@ -239,6 +269,11 @@ def equivalent_command(config: CampaignConfig) -> str:
   campaign_flavors = flavors.campaign_flavors(config)
   if campaign_flavors != [flavors.ORGANIC]:
     parts.append(f"--rm-datasets {','.join(campaign_flavors)}")
+  continual_adapters = config_mod.continual_eval_adapter_modes(config)
+  if continual_adapters != list(config_mod.DEFAULT_CONTINUAL_EVAL_ADAPTER_MODES):
+    parts.append(
+        f"--continual-eval-adapters {','.join(continual_adapters)}"
+    )
   if config.eval.max_eval_samples != 1000:
     parts.append(f"--eval-samples {config.eval.max_eval_samples}")
   if config.dry_run:
@@ -329,6 +364,12 @@ def config_summary_lines(config: CampaignConfig, theme: theme_mod.Theme) -> List
           )
       )
   if "perl" in stages:
+    rows.append((
+        "Continual eval",
+        config_mod.describe_continual_eval_adapter_modes(
+            config_mod.continual_eval_adapter_modes(config)
+        ),
+    ))
     if config.perl.sft_model_path and config.perl.sft_model_path != "auto":
       rows.append(("SFT checkpoint", config.perl.sft_model_path))
     if config.perl.reward_model_path and config.perl.reward_model_path != "auto":
@@ -378,6 +419,9 @@ class WizardAnswers:
   rm_dataset_flavors: List[str] = field(
       default_factory=lambda: [flavors.ORGANIC]
   )
+  continual_eval_adapter_modes: List[str] = field(
+      default_factory=lambda: list(DEFAULT_CONTINUAL_EVAL_ADAPTER_MODES)
+  )
   dry_run: bool = False
 
   def to_dict(self) -> Dict[str, Any]:
@@ -393,6 +437,7 @@ def build_config(answers: WizardAnswers) -> CampaignConfig:
       perl_runs=answers.perl_runs,
       dry_run=answers.dry_run,
       rm_dataset_flavors=answers.rm_dataset_flavors,
+      continual_eval_adapter_modes=answers.continual_eval_adapter_modes,
   )
   config.stages = theme_mod.iter_stage_names(answers.stages)
   # Applied after create_default rather than threaded through it: an empty
@@ -405,7 +450,16 @@ def build_config(answers: WizardAnswers) -> CampaignConfig:
   config.perl.sft_model_path = answers.sft_model or "auto"
   config.perl.reward_model_path = answers.reward_model or "auto"
   config.eval.max_eval_samples = int(answers.eval_samples)
+  config.eval.continual_eval_adapter_modes = list(
+      answers.continual_eval_adapter_modes
+  )
   config.validate()
+  config.perl.timeout_minutes = config_mod.sweep_timeout_minutes(
+      "perl",
+      config.perl.max_runs,
+      config.eval.max_eval_samples,
+      num_adapter_modes=len(config_mod.continual_eval_adapter_modes(config)),
+  )
   return config
 
 
@@ -746,6 +800,39 @@ def run_setup_wizard(
           "Two datasets selected: the campaign will run one RM sweep and "
           "one PE-RL sweep per dataset, then score both policies in a "
           "single evaluation."
+      )
+
+  # 2c. PE-RL continual-evaluation adapter mode(s) ---------------------
+  if "perl" in stages:
+    picked_adapters = prompter.checkbox(
+        "Which adapter configuration(s) should PE-RL continual evaluation score?",
+        [
+            (
+                mode,
+                f"{config_mod.CONTINUAL_EVAL_ADAPTER_TITLES.get(mode, mode):<30} "
+                f"{CONTINUAL_EVAL_ADAPTER_DESCRIPTIONS.get(mode, '')}",
+                mode == config_mod.ADAPTER_MODE_SFT_AND_PERL,
+            )
+            for mode in config_mod.CONTINUAL_EVAL_ADAPTER_MODES
+        ],
+    )
+    if picked_adapters is None:
+      return _cancelled(console)
+    picked_adapters = config_mod.normalize_continual_eval_adapter_modes(
+        picked_adapters
+    )
+    if not picked_adapters:
+      console.error(
+          "No continual-evaluation adapter mode selected - choose at least one."
+      )
+      return None
+    answers.continual_eval_adapter_modes = picked_adapters
+    if len(picked_adapters) > 1:
+      console.hint(
+          "Both adapter modes selected: each continual-evaluation checkpoint "
+          "pause will score SFT + PE-RL (logged under eval/*) and PE-RL "
+          "adapter only without SFT (logged under eval_perl_only/*) in the "
+          "same W&B run."
       )
 
   # 3. Budget ----------------------------------------------------------

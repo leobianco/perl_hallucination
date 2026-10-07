@@ -909,6 +909,8 @@ class GenerationMetricsEvaluator:
       wandb_entity: Optional[str] = None,
       eval_step: Optional[int] = None,
       continual_eval_history_path: Optional[str] = None,
+      wandb_metric_prefix: str = "eval",
+      wandb_plot_title_suffix: Optional[str] = None,
   ) -> str:
     """Saves evaluation summary locally and logs rich dashboards to WandB.
 
@@ -930,6 +932,10 @@ class GenerationMetricsEvaluator:
           checkpoint.
         continual_eval_history_path: Optional path to the JSON file tracking
           continual evaluation history across steps for Pareto frontier plots.
+        wandb_metric_prefix: WandB pane/metric prefix (default: 'eval', or
+          'eval_perl_only' when scoring PE-RL adapter without SFT).
+        wandb_plot_title_suffix: Optional suffix appended to Pareto scatter
+          plot and figure titles to distinguish adapter stacking modes.
 
     Returns:
         Path to the saved local summary JSON file.
@@ -981,6 +987,9 @@ class GenerationMetricsEvaluator:
 
     if log_to_wandb and wandb is not None:
       try:
+        metric_prefix = (
+            (wandb_metric_prefix or "eval").strip().rstrip("/") or "eval"
+        )
         is_wandb_active = wandb.run is not None
         if not is_wandb_active:
           init_kwargs: dict[str, Any] = {"project": wandb_project}
@@ -1005,16 +1014,18 @@ class GenerationMetricsEvaluator:
         if eval_step is not None and hasattr(wandb, "define_metric"):
           try:
             wandb.define_metric("train/global_step")
-            wandb.define_metric("eval/*", step_metric="train/global_step")
+            wandb.define_metric(
+                f"{metric_prefix}/*", step_metric="train/global_step"
+            )
           except Exception:
             pass
 
-        wandb_metrics = {f"eval/{k}": v for k, v in summary.items()}
+        wandb_metrics = {f"{metric_prefix}/{k}": v for k, v in summary.items()}
         if eval_step is not None:
           wandb_metrics["train/global_step"] = int(eval_step)
         wandb.log(wandb_metrics)
         for k, v in summary.items():
-          wandb.summary[f"eval/{k}"] = v
+          wandb.summary[f"{metric_prefix}/{k}"] = v
 
         table_cols = [
             "prompt",
@@ -1071,12 +1082,14 @@ class GenerationMetricsEvaluator:
           table_data.append(row)
 
         eval_table = wandb.Table(columns=table_cols, data=table_data)
-        table_payload: dict[str, Any] = {"eval/generations_table": eval_table}
+        table_payload: dict[str, Any] = {
+            f"{metric_prefix}/generations_table": eval_table
+        }
         if eval_step is not None:
           table_payload["train/global_step"] = int(eval_step)
-          table_payload[f"eval/generations_table_step_{int(eval_step)}"] = (
-              eval_table
-          )
+          table_payload[
+              f"{metric_prefix}/generations_table_step_{int(eval_step)}"
+          ] = eval_table
         wandb.log(table_payload)
 
         if continual_history is not None:
@@ -1090,6 +1103,8 @@ class GenerationMetricsEvaluator:
               output_dir=os.path.dirname(
                   os.path.abspath(continual_eval_history_path)
               ),
+              metric_prefix=metric_prefix,
+              title_suffix=wandb_plot_title_suffix,
           )
 
         if not is_wandb_active and wandb_run_id and hasattr(wandb, "finish"):

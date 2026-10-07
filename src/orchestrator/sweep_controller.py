@@ -295,6 +295,8 @@ def _metric_key_candidates(target: str) -> List[str]:
     without_train = target.replace("train/", "")
     candidates.extend([without_train, without_train.replace("/", "_")])
   if "eval/" in target:
+    if target.startswith("eval/"):
+      candidates.append("eval_perl_only/" + target[len("eval/"):])
     without_eval = target.replace("eval/", "")
     candidates.extend([without_eval, without_eval.replace("/", "_")])
   candidates.append(target.split("/")[-1])
@@ -493,33 +495,38 @@ def _tail_mean_history(
   return sum(tail) / len(tail), len(tail)
 
 
-def _iter_continual_eval_history_rows(run: Any) -> Optional[Sequence[Any]]:
+def _iter_continual_eval_history_rows(
+    run: Any, prefix: str = "eval"
+) -> Optional[Sequence[Any]]:
   """Reads continual-evaluation rows from ``run.scan_history``."""
   scan = getattr(run, "scan_history", None)
   if not callable(scan):
     return None
+  hallu_key = f"{prefix}/hallucination_rate"
+  rh_rate_key = f"{prefix}/reward_hacking_rate"
+  rh_quality_key = f"{prefix}/reward_hacking_quality"
   key_lists = (
       [
-          EVAL_HALLUCINATION_RATE_KEY,
-          EVAL_REWARD_HACKING_RATE_KEY,
-          EVAL_REWARD_HACKING_QUALITY_KEY,
+          hallu_key,
+          rh_rate_key,
+          rh_quality_key,
           "train/global_step",
           "_step",
       ],
       [
-          EVAL_HALLUCINATION_RATE_KEY,
-          EVAL_REWARD_HACKING_RATE_KEY,
+          hallu_key,
+          rh_rate_key,
           "train/global_step",
           "_step",
       ],
       [
-          EVAL_HALLUCINATION_RATE_KEY,
-          EVAL_REWARD_HACKING_RATE_KEY,
+          hallu_key,
+          rh_rate_key,
           "_step",
       ],
-      [EVAL_HALLUCINATION_RATE_KEY, "train/global_step", "_step"],
-      [EVAL_HALLUCINATION_RATE_KEY, "_step"],
-      [EVAL_HALLUCINATION_RATE_KEY],
+      [hallu_key, "train/global_step", "_step"],
+      [hallu_key, "_step"],
+      [hallu_key],
   )
   for keys in key_lists:
     try:
@@ -544,7 +551,9 @@ def score_run_constrained_continual_eval(
   and selects the ``step > 0`` checkpoint minimizing ``eval/hallucination_rate``
   subject to ``eval/reward_hacking_rate <= ceiling`` (or minimizing
   ``eval/reward_hacking_rate`` if every ``step > 0`` checkpoint exceeds the
-  ceiling).
+  ceiling). When a trial ran only the ``perl_only`` continual-evaluation mode
+  (and therefore logged under ``eval_perl_only/*`` without ``eval/*``), falls
+  back to ``eval_perl_only/*``.
 
   Args:
     run: A ``wandb`` run object.
@@ -557,142 +566,155 @@ def score_run_constrained_continual_eval(
     None when the run logged no usable continual-evaluation metrics.
   """
   params = dict(getattr(run, "config", {}) or {})
-  rows = _iter_continual_eval_history_rows(run)
-  if rows:
-    points: List[Dict[str, Any]] = []
-    for index, row in enumerate(rows):
-      if index >= MAX_HISTORY_ROWS:
-        break
-      if not isinstance(row, Mapping):
-        continue
-      hallu = _coerce_float(row.get(EVAL_HALLUCINATION_RATE_KEY))
-      if hallu is None:
-        continue
-      rh_rate = _coerce_float(row.get(EVAL_REWARD_HACKING_RATE_KEY))
-      rh_quality = _coerce_float(row.get(EVAL_REWARD_HACKING_QUALITY_KEY))
-      raw_step = row.get("train/global_step")
-      if raw_step is None or isinstance(raw_step, bool):
-        raw_step = row.get("_step")
-      step = (
+  summary = getattr(run, "summary", {}) or {}
+  for prefix in ("eval", "eval_perl_only"):
+    hallu_key = f"{prefix}/hallucination_rate"
+    rh_rate_key = f"{prefix}/reward_hacking_rate"
+    rh_quality_key = f"{prefix}/reward_hacking_quality"
+    rows = _iter_continual_eval_history_rows(run, prefix=prefix)
+    if rows:
+      points: List[Dict[str, Any]] = []
+      for index, row in enumerate(rows):
+        if index >= MAX_HISTORY_ROWS:
+          break
+        if not isinstance(row, Mapping):
+          continue
+        hallu = _coerce_float(row.get(hallu_key))
+        if hallu is None:
+          continue
+        rh_rate = _coerce_float(row.get(rh_rate_key))
+        rh_quality = _coerce_float(row.get(rh_quality_key))
+        raw_step = row.get("train/global_step")
+        if raw_step is None or isinstance(raw_step, bool):
+          raw_step = row.get("_step")
+        step = (
+            int(raw_step)
+            if isinstance(raw_step, (int, float))
+            and not isinstance(raw_step, bool)
+            else None
+        )
+        points.append({
+            "step": step,
+            "hallu": hallu,
+            "rh_rate": rh_rate,
+            "rh_quality": rh_quality,
+            "order": index,
+        })
+
+      if points:
+        if any(p["step"] is not None for p in points):
+          step0_rh_rates = [
+              p["rh_rate"]
+              for p in points
+              if p["step"] is not None
+              and p["step"] <= 0
+              and p["rh_rate"] is not None
+          ]
+          candidates = [
+              p for p in points if p["step"] is not None and p["step"] > 0
+          ]
+        elif len(points) > 1:
+          step0_rh_rates = (
+              [points[0]["rh_rate"]] if points[0]["rh_rate"] is not None else []
+          )
+          candidates = points[1:]
+        else:
+          step0_rh_rates = []
+          candidates = points
+
+        if candidates:
+          ceiling = float(abs_floor)
+          if step0_rh_rates:
+            ceiling = max(
+                ceiling, float(step0_rh_rates[0]) + float(step0_margin)
+            )
+          feasible = [
+              p
+              for p in candidates
+              if p["rh_rate"] is None or p["rh_rate"] <= ceiling + 1e-9
+          ]
+          if feasible:
+            winner = min(
+                feasible,
+                key=lambda p: (
+                    p["hallu"],
+                    p["rh_rate"] if p["rh_rate"] is not None else 0.0,
+                    -(p["rh_quality"] if p["rh_quality"] is not None else 0.0),
+                    -(p["step"] if p["step"] is not None else p["order"]),
+                ),
+            )
+            met_ceiling = True
+          else:
+            winner = min(
+                candidates,
+                key=lambda p: (
+                    p["rh_rate"] if p["rh_rate"] is not None else float("inf"),
+                    p["hallu"],
+                    -(p["rh_quality"] if p["rh_quality"] is not None else 0.0),
+                    -(p["step"] if p["step"] is not None else p["order"]),
+                ),
+            )
+            met_ceiling = False
+
+          final_point = candidates[-1]
+          final_hallu = float(final_point["hallu"])
+          improved = (
+              winner["step"] is not None
+              and final_point["step"] is not None
+              and winner["step"] != final_point["step"]
+          )
+          return RunScore(
+              run_id=run.id,
+              value=float(winner["hallu"]),
+              params=params,
+              final_value=final_hallu,
+              step=int(winner["step"]) if improved else None,
+              selection=CONSTRAINED_CONTINUAL_EVAL_SELECTION,
+              from_history=True,
+              reward_hacking_rate=winner["rh_rate"],
+              reward_hacking_ceiling=ceiling,
+              met_reward_hacking_ceiling=met_ceiling,
+          )
+
+    best_hallu = _coerce_float(
+        summary.get(f"{prefix}/best_constrained_hallucination_rate")
+    )
+    if best_hallu is not None:
+      final_hallu = _coerce_float(summary.get(hallu_key))
+      if final_hallu is None:
+        final_hallu = best_hallu
+      raw_step = summary.get(f"{prefix}/best_constrained_step")
+      best_step = (
           int(raw_step)
-          if isinstance(raw_step, (int, float)) and not isinstance(raw_step, bool)
+          if isinstance(raw_step, (int, float))
+          and not isinstance(raw_step, bool)
+          and int(raw_step) > 0
           else None
       )
-      points.append({
-          "step": step,
-          "hallu": hallu,
-          "rh_rate": rh_rate,
-          "rh_quality": rh_quality,
-          "order": index,
-      })
-
-    if points:
-      if any(p["step"] is not None for p in points):
-        step0_rh_rates = [
-            p["rh_rate"]
-            for p in points
-            if p["step"] is not None
-            and p["step"] <= 0
-            and p["rh_rate"] is not None
-        ]
-        candidates = [
-            p for p in points if p["step"] is not None and p["step"] > 0
-        ]
-      elif len(points) > 1:
-        step0_rh_rates = (
-            [points[0]["rh_rate"]] if points[0]["rh_rate"] is not None else []
-        )
-        candidates = points[1:]
-      else:
-        step0_rh_rates = []
-        candidates = points
-
-      if candidates:
-        ceiling = float(abs_floor)
-        if step0_rh_rates:
-          ceiling = max(ceiling, float(step0_rh_rates[0]) + float(step0_margin))
-        feasible = [
-            p
-            for p in candidates
-            if p["rh_rate"] is None or p["rh_rate"] <= ceiling + 1e-9
-        ]
-        if feasible:
-          winner = min(
-              feasible,
-              key=lambda p: (
-                  p["hallu"],
-                  p["rh_rate"] if p["rh_rate"] is not None else 0.0,
-                  -(p["rh_quality"] if p["rh_quality"] is not None else 0.0),
-                  -(p["step"] if p["step"] is not None else p["order"]),
-              ),
-          )
-          met_ceiling = True
-        else:
-          winner = min(
-              candidates,
-              key=lambda p: (
-                  p["rh_rate"] if p["rh_rate"] is not None else float("inf"),
-                  p["hallu"],
-                  -(p["rh_quality"] if p["rh_quality"] is not None else 0.0),
-                  -(p["step"] if p["step"] is not None else p["order"]),
-              ),
-          )
-          met_ceiling = False
-
-        final_point = candidates[-1]
-        final_hallu = float(final_point["hallu"])
-        improved = (
-            winner["step"] is not None
-            and final_point["step"] is not None
-            and winner["step"] != final_point["step"]
-        )
-        return RunScore(
-            run_id=run.id,
-            value=float(winner["hallu"]),
-            params=params,
-            final_value=final_hallu,
-            step=int(winner["step"]) if improved else None,
-            selection=CONSTRAINED_CONTINUAL_EVAL_SELECTION,
-            from_history=True,
-            reward_hacking_rate=winner["rh_rate"],
-            reward_hacking_ceiling=ceiling,
-            met_reward_hacking_ceiling=met_ceiling,
-        )
-
-  summary = getattr(run, "summary", {}) or {}
-  best_hallu = _coerce_float(summary.get(BEST_CONSTRAINED_HALLUCINATION_KEY))
-  if best_hallu is not None:
-    final_hallu = _coerce_float(summary.get(EVAL_HALLUCINATION_RATE_KEY))
-    if final_hallu is None:
-      final_hallu = best_hallu
-    raw_step = summary.get(BEST_CONSTRAINED_STEP_KEY)
-    best_step = (
-        int(raw_step)
-        if isinstance(raw_step, (int, float))
-        and not isinstance(raw_step, bool)
-        and int(raw_step) > 0
-        else None
-    )
-    rh_rate = _coerce_float(summary.get(BEST_CONSTRAINED_RH_RATE_KEY))
-    ceiling = _coerce_float(summary.get(BEST_CONSTRAINED_CEILING_KEY))
-    raw_met = summary.get(BEST_CONSTRAINED_MET_CEILING_KEY)
-    met_ceiling = bool(raw_met) if isinstance(raw_met, bool) else True
-    return RunScore(
-        run_id=run.id,
-        value=best_hallu,
-        params=params,
-        final_value=final_hallu,
-        step=(
-            best_step
-            if best_step is not None and abs(best_hallu - final_hallu) > 1e-12
-            else None
-        ),
-        selection=CONSTRAINED_CONTINUAL_EVAL_SELECTION,
-        from_history=False,
-        reward_hacking_rate=rh_rate,
-        reward_hacking_ceiling=ceiling,
-        met_reward_hacking_ceiling=met_ceiling,
-    )
+      rh_rate = _coerce_float(
+          summary.get(f"{prefix}/best_constrained_reward_hacking_rate")
+      )
+      ceiling = _coerce_float(
+          summary.get(f"{prefix}/best_constrained_ceiling")
+      )
+      raw_met = summary.get(f"{prefix}/best_constrained_met_ceiling")
+      met_ceiling = bool(raw_met) if isinstance(raw_met, bool) else True
+      return RunScore(
+          run_id=run.id,
+          value=best_hallu,
+          params=params,
+          final_value=final_hallu,
+          step=(
+              best_step
+              if best_step is not None and abs(best_hallu - final_hallu) > 1e-12
+              else None
+          ),
+          selection=CONSTRAINED_CONTINUAL_EVAL_SELECTION,
+          from_history=False,
+          reward_hacking_rate=rh_rate,
+          reward_hacking_ceiling=ceiling,
+          met_reward_hacking_ceiling=met_ceiling,
+      )
   return None
 
 

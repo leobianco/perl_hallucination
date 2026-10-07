@@ -84,6 +84,11 @@ class PerlStage(BaseStage):
         # The final evaluation's per-phase budget. Nothing else bounds an
         # evaluation that wedges during the winner's retraining.
         "continual_eval_timeout_minutes": str(cfg.timeout_minutes),
+        "continual_eval_adapter_modes": (
+            config_lib.format_continual_eval_adapter_modes(
+                cfg.continual_eval_adapter_modes
+            )
+        ),
     }
     # Omitted when unset, as in the final evaluation: the rubric judge then
     # falls back to the hallucination judge, and vLLM keeps its own context.
@@ -124,7 +129,12 @@ class PerlStage(BaseStage):
     cfg = self.config.perl
     configured = int(cfg.timeout_minutes or 0)
     estimate = config_lib.sweep_timeout_minutes(
-        self.kind, cfg.max_runs, self.config.eval.max_eval_samples
+        self.kind,
+        cfg.max_runs,
+        self.config.eval.max_eval_samples,
+        num_adapter_modes=len(
+            config_lib.continual_eval_adapter_modes(self.config)
+        ),
     )
     if configured >= estimate:
       return configured

@@ -6446,6 +6446,10 @@ class EvaluationScoringPipeline(EvaluationPipeline):
           continual_eval_history_path=getattr(
               self.args, "continual_eval_history_path", None
           ),
+          wandb_metric_prefix=getattr(self.args, "wandb_metric_prefix", "eval"),
+          wandb_plot_title_suffix=getattr(
+              self.args, "wandb_plot_title_suffix", None
+          ),
       )
 
     if self.is_subsampled:

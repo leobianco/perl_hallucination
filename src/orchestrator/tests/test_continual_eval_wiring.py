@@ -465,6 +465,92 @@ class ContinualEvalSampleFractionAndTrialRankingTest(unittest.TestCase):
     self.assertEqual(winner.step, 24)
     self.assertTrue(winner.met_reward_hacking_ceiling)
 
+  def test_adapter_modes_propagate_to_sweep_and_retraining_and_scale_timeout(
+      self,
+  ):
+    config = CampaignConfig.create_default(task_name="npov", dry_run=True)
+    config.perl.timeout_minutes = 525
+    config.eval.continual_eval_adapter_modes = ["sft_and_perl", "perl_only"]
+    state = CampaignState(campaign_id="c", task_name="npov")
+    stage = PerlStage(
+        CampaignContext(
+            config=config,
+            state=state,
+            sweep_controller=mock.MagicMock(),
+            model_manager=mock.MagicMock(),
+        )
+    )
+    self.assertEqual(
+        stage.continual_eval_flags()["continual_eval_adapter_modes"],
+        "sft_and_perl,perl_only",
+    )
+    # 10 * (35 training + (5 * 2 * 14 + 5) evaluation) * 1.5 = 2700
+    self.assertEqual(stage.sweep_agent_timeout_minutes(), 2700)
+
+  def test_sweep_controller_ranks_perl_only_trials_via_eval_perl_only_prefix(
+      self,
+  ):
+    import sys  # pylint: disable=g-import-not-at-top
+    import types  # pylint: disable=g-import-top
+    from src.orchestrator.sweep_controller import SweepController  # pylint: disable=g-import-not-at-top
+
+    class _Run:
+
+      def __init__(self, run_id, history, reward_final):
+        self.id = run_id
+        self.state = "finished"
+        self.config = {"learning_rate": 1e-5}
+        self._history = history
+        self.summary = {
+            "train/rewards/reward_fn/mean": reward_final,
+            "eval_perl_only/hallucination_rate": history[-1][
+                "eval_perl_only/hallucination_rate"
+            ],
+        }
+
+      def scan_history(self, keys=None):
+        if not keys:
+          return list(self._history)
+        return [row for row in self._history if all(k in row for k in keys)]
+
+    trial_a = _Run(
+        "trial_a",
+        [
+            {
+                "_step": 24,
+                "eval_perl_only/hallucination_rate": 0.19,
+                "eval_perl_only/reward_hacking_rate": 0.05,
+            },
+        ],
+        reward_final=0.9,
+    )
+    trial_b = _Run(
+        "trial_b",
+        [
+            {
+                "_step": 24,
+                "eval_perl_only/hallucination_rate": 0.09,
+                "eval_perl_only/reward_hacking_rate": 0.04,
+            },
+        ],
+        reward_final=0.7,
+    )
+    fake_wandb = types.ModuleType("wandb")
+    fake_sweep = types.SimpleNamespace(runs=[trial_a, trial_b])
+    fake_wandb.Api = lambda: types.SimpleNamespace(sweep=lambda _p: fake_sweep)
+    with mock.patch.dict(sys.modules, {"wandb": fake_wandb}):
+      ctrl = SweepController(entity="e", project="p", dry_run=False)
+      winner = ctrl.fetch_best_run_details(
+          "s",
+          "train/rewards/reward_fn/mean",
+          goal="maximize",
+          selection="final_window",
+          window=10,
+      )
+    self.assertEqual(winner.run_id, "trial_b")
+    self.assertEqual(winner.selection, "constrained_continual_eval")
+    self.assertAlmostEqual(winner.value, 0.09)
+
 
 if __name__ == "__main__":
   unittest.main()

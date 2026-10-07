@@ -2301,5 +2301,276 @@ class TestPerlEntryPoint(unittest.TestCase):
     )
 
 
+class TestContinualEvalAdapterModes(unittest.TestCase):
+  """Tests continual evaluation with SFT+PE-RL adapter, PE-RL adapter only, or both."""
+
+  def setUp(self):
+    super().setUp()
+    self.temp_dir = tempfile.mkdtemp()
+
+  def tearDown(self):
+    shutil.rmtree(self.temp_dir, ignore_errors=True)
+    super().tearDown()
+
+  def test_constants_match_orchestrator_config(self):
+    from src.orchestrator import config as orch_config  # pylint: disable=g-import-not-at-top
+
+    self.assertEqual(
+        continual_eval_mod.ADAPTER_MODE_SFT_AND_PERL,
+        orch_config.ADAPTER_MODE_SFT_AND_PERL,
+    )
+    self.assertEqual(
+        continual_eval_mod.ADAPTER_MODE_PERL_ONLY,
+        orch_config.ADAPTER_MODE_PERL_ONLY,
+    )
+    self.assertEqual(
+        continual_eval_mod.VALID_CONTINUAL_EVAL_ADAPTER_MODES,
+        orch_config.CONTINUAL_EVAL_ADAPTER_MODES,
+    )
+    self.assertEqual(
+        continual_eval_mod.DEFAULT_CONTINUAL_EVAL_ADAPTER_MODES,
+        orch_config.DEFAULT_CONTINUAL_EVAL_ADAPTER_MODES,
+    )
+
+  def test_parse_continual_eval_adapter_modes(self):
+    parse = continual_eval_mod.parse_continual_eval_adapter_modes
+    self.assertEqual(parse(None), ["sft_and_perl"])
+    self.assertEqual(parse(""), ["sft_and_perl"])
+    self.assertEqual(parse("sft_and_perl"), ["sft_and_perl"])
+    self.assertEqual(parse("perl_only"), ["perl_only"])
+    self.assertEqual(parse("both"), ["sft_and_perl", "perl_only"])
+    self.assertEqual(
+        parse("perl_only, sft_and_perl"), ["sft_and_perl", "perl_only"]
+    )
+    with self.assertRaises(ValueError):
+      parse("unknown_mode")
+
+  def test_build_commands_for_sft_and_perl_perl_only_and_both(self):
+    ckpt_dir = os.path.join(self.temp_dir, "checkpoint-24")
+    status = ContinualEvalStatus(
+        paused_for_eval=True,
+        current_step=24,
+        checkpoint_dir=ckpt_dir,
+        wandb_run_id="run123",
+    )
+    base_flags = {
+        "task_name": "npov",
+        "model_repo_id": "google/gemma-4-E4B-it",
+        "sft_model_path": "leobianco/npov_SFT",
+    }
+
+    # 1. Default single mode: sft_and_perl
+    cmds_sft = continual_eval_mod.build_all_continual_eval_commands(
+        flags=base_flags,
+        status=status,
+        output_dir=self.temp_dir,
+    )
+    self.assertEqual(len(cmds_sft), 1)
+    mode, gen_cmd, score_cmd = cmds_sft[0]
+    self.assertEqual(mode, "sft_and_perl")
+    self.assertIn("--sft_model_path", gen_cmd)
+    self.assertNotIn("--allow_missing_sft_adapter", gen_cmd)
+    self.assertNotIn("--wandb_metric_prefix", score_cmd)
+    self.assertNotIn("--wandb_plot_title_suffix", score_cmd)
+
+    # 2. Single mode: perl_only
+    flags_perl_only = {
+        **base_flags,
+        "continual_eval_adapter_modes": "perl_only",
+    }
+    cmds_po = continual_eval_mod.build_all_continual_eval_commands(
+        flags=flags_perl_only,
+        status=status,
+        output_dir=self.temp_dir,
+    )
+    self.assertEqual(len(cmds_po), 1)
+    mode_po, gen_po, score_po = cmds_po[0]
+    self.assertEqual(mode_po, "perl_only")
+    self.assertNotIn("--sft_model_path", gen_po)
+    self.assertEqual(
+        gen_po[gen_po.index("--allow_missing_sft_adapter") + 1], "True"
+    )
+    self.assertEqual(
+        score_po[score_po.index("--wandb_metric_prefix") + 1],
+        "eval_perl_only",
+    )
+    self.assertEqual(
+        score_po[score_po.index("--wandb_plot_title_suffix") + 1],
+        continual_eval_mod.PERL_ONLY_TITLE_SUFFIX,
+    )
+    # When only perl_only runs, history goes to continual_eval_history.json so
+    # checkpoint promotion works seamlessly.
+    self.assertEqual(
+        score_po[score_po.index("--continual_eval_history_path") + 1],
+        os.path.join(self.temp_dir, "continual_eval_history.json"),
+    )
+
+    # 3. Both modes enabled
+    flags_both = {
+        **base_flags,
+        "continual_eval_adapter_modes": "sft_and_perl,perl_only",
+    }
+    cmds_both = continual_eval_mod.build_all_continual_eval_commands(
+        flags=flags_both,
+        status=status,
+        output_dir=self.temp_dir,
+    )
+    self.assertEqual([m for m, _, _ in cmds_both], ["sft_and_perl", "perl_only"])
+    _, _, score_both_sft = cmds_both[0]
+    _, gen_both_po, score_both_po = cmds_both[1]
+    self.assertEqual(
+        score_both_sft[score_both_sft.index("--wandb_plot_title_suffix") + 1],
+        continual_eval_mod.SFT_AND_PERL_TITLE_SUFFIX,
+    )
+    self.assertEqual(
+        score_both_sft[
+            score_both_sft.index("--continual_eval_history_path") + 1
+        ],
+        os.path.join(self.temp_dir, "continual_eval_history.json"),
+    )
+    self.assertNotIn("--sft_model_path", gen_both_po)
+    self.assertEqual(
+        gen_both_po[gen_both_po.index("--allow_missing_sft_adapter") + 1],
+        "True",
+    )
+    self.assertEqual(
+        score_both_po[score_both_po.index("--wandb_metric_prefix") + 1],
+        "eval_perl_only",
+    )
+    self.assertEqual(
+        score_both_po[
+            score_both_po.index("--continual_eval_history_path") + 1
+        ],
+        os.path.join(self.temp_dir, "continual_eval_history_perl_only.json"),
+    )
+
+  @patch("src.metrics.wandb")
+  def test_save_and_log_results_logs_perl_only_to_separate_wandb_pane(
+      self, mock_wandb
+  ):
+    mock_wandb.run = None
+    mock_wandb.summary = {}
+    mock_wandb.Table = MagicMock(return_value="mock_table")
+    mock_wandb.Image = MagicMock(return_value="mock_image")
+    mock_wandb.plot = MagicMock()
+    mock_wandb.plot.scatter = MagicMock(return_value="mock_scatter")
+
+    dataset = MockDataset({
+        "prompt": ["Prompt 1", "Prompt 2"],
+        "completion": ["Completion 1", "Completion 2"],
+        "token_length": [12, 15],
+        "distinct_2": [0.9, 0.85],
+        "repetition_rate": [0.05, 0.1],
+    })
+    summary = {
+        "reward_hacking_rate": 0.14,
+        "reward_hacking_quality": 0.81,
+    }
+    history_path = os.path.join(
+        self.temp_dir, "continual_eval_history_perl_only.json"
+    )
+
+    evaluator = GenerationMetricsEvaluator(
+        compute_bertscore_metric=False,
+        compute_perplexity_metric=False,
+    )
+    evaluator.save_and_log_results(
+        dataset,
+        summary,
+        output_dir=self.temp_dir,
+        dataset_name="continual_step_24_perl_only",
+        autorater_scores=[0.9, 0.2],
+        threshold=0.5,
+        log_to_wandb=True,
+        wandb_project="perl_proj",
+        wandb_run_id="perl_run_123",
+        eval_step=24,
+        continual_eval_history_path=history_path,
+        wandb_metric_prefix="eval_perl_only",
+        wandb_plot_title_suffix=" (PE-RL Adapter Only - No SFT)",
+    )
+
+    mock_wandb.define_metric.assert_any_call(
+        "eval_perl_only/*", step_metric="train/global_step"
+    )
+    logged_keys = set()
+    for call in mock_wandb.log.call_args_list:
+      logged_keys.update(call[0][0].keys())
+    self.assertIn("eval_perl_only/hallucination_rate", logged_keys)
+    self.assertIn("eval_perl_only/reward_hacking_rate", logged_keys)
+    self.assertIn(
+        "eval_perl_only/pareto_hallucination_vs_reward_hacking_rate",
+        logged_keys,
+    )
+    self.assertNotIn("eval/hallucination_rate", logged_keys)
+    scatter_titles = [
+        call.kwargs.get("title", "")
+        for call in mock_wandb.plot.scatter.call_args_list
+    ]
+    self.assertTrue(
+        any("(PE-RL Adapter Only - No SFT)" in t for t in scatter_titles)
+    )
+
+  def test_coordinator_runs_both_adapter_modes_and_resumes_partial_step(self):
+    ckpt_dir = os.path.join(self.temp_dir, "checkpoint-24")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    status = ContinualEvalStatus(
+        paused_for_eval=True,
+        current_step=24,
+        checkpoint_dir=ckpt_dir,
+        wandb_run_id="run123",
+    )
+    flags = {
+        "task_name": "npov",
+        "model_repo_id": "google/gemma-4-E4B-it",
+        "sft_model_path": "leobianco/npov_SFT",
+        "continual_eval_adapter_modes": "both",
+    }
+
+    # Simulate failure on the 3rd subprocess (perl_only generation) after
+    # sft_and_perl completed (subprocesses 1 & 2).
+    calls = []
+
+    def runner_fail_on_third(cmd, _env):
+      calls.append(cmd)
+      return 1 if len(calls) == 3 else 0
+
+    with self.assertRaises(RuntimeError):
+      continual_eval_mod._run_pending_evaluation(
+          flags=flags,
+          status=status,
+          output_dir=self.temp_dir,
+          base_env={},
+          cmd_runner=runner_fail_on_third,
+      )
+    # sft_and_perl was recorded as completed for step 24, but step 24 is not
+    # fully evaluated yet!
+    self.assertEqual(status.evaluated_step_modes.get("24"), ["sft_and_perl"])
+    self.assertNotIn(24, status.evaluated_steps)
+
+    # Now resume: only perl_only (2 subprocesses) should run!
+    resumed_calls = []
+
+    def runner_ok(cmd, _env):
+      resumed_calls.append(cmd)
+      return 0
+
+    continual_eval_mod._run_pending_evaluation(
+        flags=flags,
+        status=status,
+        output_dir=self.temp_dir,
+        base_env={},
+        cmd_runner=runner_ok,
+    )
+    self.assertEqual(len(resumed_calls), 2)
+    self.assertIn("--allow_missing_sft_adapter", resumed_calls[0])
+    self.assertIn("eval_perl_only", resumed_calls[1])
+    self.assertIn(24, status.evaluated_steps)
+    self.assertEqual(
+        status.evaluated_step_modes.get("24"),
+        ["sft_and_perl", "perl_only"],
+    )
+
+
 if __name__ == "__main__":
   unittest.main()

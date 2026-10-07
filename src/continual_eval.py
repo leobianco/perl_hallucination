@@ -73,7 +73,29 @@ except Exception:  # pylint: disable=broad-exception-caught
 
 CONTINUAL_EVAL_STATUS_FILENAME = "continual_eval_status.json"
 CONTINUAL_EVAL_HISTORY_FILENAME = "continual_eval_history.json"
+CONTINUAL_EVAL_PERL_ONLY_HISTORY_FILENAME = (
+    "continual_eval_history_perl_only.json"
+)
 CONTINUAL_WORKER_ENV = "PERL_CONTINUAL_EVAL_WORKER"
+
+#: Selectable adapter stacking modes for continual evaluation during PE-RL:
+#: - ``sft_and_perl``: base model + SFT adapter + PE-RL adapter (default).
+#: - ``perl_only``: base model + PE-RL adapter directly (without SFT adapter).
+ADAPTER_MODE_SFT_AND_PERL = "sft_and_perl"
+ADAPTER_MODE_PERL_ONLY = "perl_only"
+VALID_CONTINUAL_EVAL_ADAPTER_MODES: tuple[str, ...] = (
+    ADAPTER_MODE_SFT_AND_PERL,
+    ADAPTER_MODE_PERL_ONLY,
+)
+DEFAULT_CONTINUAL_EVAL_ADAPTER_MODES: tuple[str, ...] = (
+    ADAPTER_MODE_SFT_AND_PERL,
+)
+
+#: WandB metric pane prefix and plot title suffixes for distinguishing
+#: continual evaluation adapter configurations in the same WandB run.
+PERL_ONLY_WANDB_PREFIX = "eval_perl_only"
+SFT_AND_PERL_TITLE_SUFFIX = "SFT + PE-RL Adapter"
+PERL_ONLY_TITLE_SUFFIX = "PE-RL Adapter Only - No SFT"
 
 #: Fraction of the full evaluation sample budget scored at each continual
 #: evaluation step. Using the same deterministic shuffle seed as the final
@@ -225,6 +247,8 @@ class ContinualEvalStatus:
     current_step: ``global_step`` of the latest pause or of the final step.
     checkpoint_dir: Checkpoint saved at ``current_step``.
     evaluated_steps: Steps whose autorater scores have been logged.
+    evaluated_step_modes: Per-step adapter modes already scored at a pause, so
+      retrying a multi-mode step does not re-run an already-scored mode.
     wandb_run_id: Id of the PE-RL WandB run (None if WandB is off).
     wandb_project: Project of that run.
     wandb_entity: Entity of that run.
@@ -239,6 +263,7 @@ class ContinualEvalStatus:
   current_step: Optional[int] = None
   checkpoint_dir: Optional[str] = None
   evaluated_steps: List[int] = field(default_factory=list)
+  evaluated_step_modes: Dict[str, List[str]] = field(default_factory=dict)
   wandb_run_id: Optional[str] = None
   wandb_project: Optional[str] = None
   wandb_entity: Optional[str] = None
@@ -254,6 +279,25 @@ class ContinualEvalStatus:
   @classmethod
   def history_path(cls, output_dir: str) -> str:
     return os.path.join(output_dir, CONTINUAL_EVAL_HISTORY_FILENAME)
+
+  @classmethod
+  def history_path_for_mode(
+      cls,
+      output_dir: str,
+      adapter_mode: str = ADAPTER_MODE_SFT_AND_PERL,
+      total_modes: int = 1,
+  ) -> str:
+    """Returns the JSON history path for ``adapter_mode``.
+
+    When both ``sft_and_perl`` and ``perl_only`` run, ``sft_and_perl`` writes
+    to ``continual_eval_history.json`` (driving constrained checkpoint
+    selection) while ``perl_only`` writes to
+    ``continual_eval_history_perl_only.json``. When only a single mode runs, it
+    writes to ``continual_eval_history.json``.
+    """
+    if adapter_mode == ADAPTER_MODE_PERL_ONLY and int(total_modes or 1) > 1:
+      return os.path.join(output_dir, CONTINUAL_EVAL_PERL_ONLY_HISTORY_FILENAME)
+    return cls.history_path(output_dir)
 
   @classmethod
   def load(cls, output_dir: str) -> "ContinualEvalStatus":
@@ -274,6 +318,16 @@ class ContinualEvalStatus:
         filtered["evaluated_steps"] = [
             int(s) for s in filtered["evaluated_steps"] if s is not None
         ]
+      if "evaluated_step_modes" in filtered:
+        raw_modes = filtered["evaluated_step_modes"]
+        if isinstance(raw_modes, dict):
+          filtered["evaluated_step_modes"] = {
+              str(k): [str(m) for m in v if m]
+              for k, v in raw_modes.items()
+              if isinstance(v, list)
+          }
+        else:
+          filtered.pop("evaluated_step_modes", None)
       return cls(**filtered)
     except (OSError, ValueError, TypeError):
       return cls()
@@ -840,6 +894,8 @@ def log_pareto_frontiers_to_wandb(
     output_dir: str = "logs/eval",
     step: Optional[int] = None,
     eval_step: Optional[int] = None,
+    metric_prefix: str = "eval",
+    title_suffix: Optional[str] = None,
 ) -> Dict[str, Any]:
   """Logs the Pareto frontier table, scatter plots, and images to WandB.
 
@@ -853,12 +909,20 @@ def log_pareto_frontiers_to_wandb(
     output_dir: Directory where rendered PNG plots are saved.
     step: Optional current ``train/global_step`` to include in the payload.
     eval_step: Alias for ``step``.
+    metric_prefix: WandB pane/metric prefix (default: ``'eval'``, or
+      ``'eval_perl_only'`` for PE-RL adapter-only evaluation without SFT).
+    title_suffix: Optional label appended to scatter plot and PNG figure titles
+      (e.g. ``'SFT + PE-RL Adapter'`` or ``'PE-RL Adapter Only - No SFT'``).
 
   Returns:
     Dictionary of WandB log keys and values that were logged.
   """
   if wandb_mod is None or not history:
     return {}
+
+  prefix = (metric_prefix or "eval").strip().rstrip("/") or "eval"
+  clean_suffix = str(title_suffix or "").strip()
+  formatted_suffix = f" ({clean_suffix})" if clean_suffix else ""
 
   resolved_step = step if step is not None else eval_step
   payload: Dict[str, Any] = {}
@@ -897,42 +961,46 @@ def log_pareto_frontiers_to_wandb(
 
   try:
     table = wandb_mod.Table(columns=columns, data=rows)
-    payload["eval/continual_pareto_table"] = table
+    payload[f"{prefix}/continual_pareto_table"] = table
     plot_mod = getattr(wandb_mod, "plot", None)
     if plot_mod is not None and callable(getattr(plot_mod, "scatter", None)):
-      payload["eval/pareto_hallucination_vs_reward_hacking_rate"] = (
+      payload[f"{prefix}/pareto_hallucination_vs_reward_hacking_rate"] = (
           plot_mod.scatter(
               table,
               "hallucination_rate",
               "reward_hacking_rate",
               title=(
                   "Pareto Frontier: Hallucination Rate vs Reward Hacking Rate "
-                  "(lower is better)"
+                  f"(lower is better){formatted_suffix}"
               ),
           )
       )
-      payload["eval/pareto_hallucination_vs_reward_hacking_quality"] = (
+      payload[f"{prefix}/pareto_hallucination_vs_reward_hacking_quality"] = (
           plot_mod.scatter(
               table,
               "hallucination_rate",
               "reward_hacking_quality",
               title=(
                   "Pareto Frontier: Hallucination Rate (min) vs Reward Hacking "
-                  "Quality (max)"
+                  f"Quality (max){formatted_suffix}"
               ),
           )
       )
   except Exception as exc:  # pylint: disable=broad-exception-caught
     print(f"[ContinualEval] Warning: could not build WandB Pareto table: {exc}")
 
-  plots_dir = os.path.join(output_dir, "pareto_plots")
+  plots_subdir = "pareto_plots" if prefix == "eval" else f"pareto_plots_{prefix}"
+  plots_dir = os.path.join(output_dir, plots_subdir)
   rate_png = render_pareto_frontier_figure(
       history,
       x_key="hallucination_rate",
       y_key="reward_hacking_rate",
       minimize_x=True,
       minimize_y=True,
-      title="PE-RL Continual Eval: Hallucination Rate vs. Reward Hacking Rate",
+      title=(
+          "PE-RL Continual Eval: Hallucination Rate vs. Reward Hacking Rate"
+          f"{formatted_suffix}"
+      ),
       x_label="Hallucination Rate (lower is better)",
       y_label="Reward Hacking Rate (lower is better)",
       output_path=os.path.join(
@@ -941,9 +1009,9 @@ def log_pareto_frontiers_to_wandb(
   )
   if rate_png and callable(getattr(wandb_mod, "Image", None)):
     try:
-      payload["eval/pareto_frontier_hallucination_vs_reward_hacking_rate"] = (
-          wandb_mod.Image(rate_png)
-      )
+      payload[
+          f"{prefix}/pareto_frontier_hallucination_vs_reward_hacking_rate"
+      ] = wandb_mod.Image(rate_png)
     except Exception:  # pylint: disable=broad-exception-caught
       pass
 
@@ -955,6 +1023,7 @@ def log_pareto_frontiers_to_wandb(
       minimize_y=False,
       title=(
           "PE-RL Continual Eval: Hallucination Rate vs. Reward Hacking Quality"
+          f"{formatted_suffix}"
       ),
       x_label="Hallucination Rate (lower is better)",
       y_label="Reward Hacking Quality (higher is better)",
@@ -965,7 +1034,7 @@ def log_pareto_frontiers_to_wandb(
   if quality_png and callable(getattr(wandb_mod, "Image", None)):
     try:
       payload[
-          "eval/pareto_frontier_hallucination_vs_reward_hacking_quality"
+          f"{prefix}/pareto_frontier_hallucination_vs_reward_hacking_quality"
       ] = wandb_mod.Image(quality_png)
     except Exception:  # pylint: disable=broad-exception-caught
       pass
@@ -985,8 +1054,8 @@ def log_pareto_frontiers_to_wandb(
       minimize_x=True,
       minimize_y=False,
   )
-  payload["eval/pareto_rate_frontier_count"] = len(frontier_rate)
-  payload["eval/pareto_quality_frontier_count"] = len(frontier_quality)
+  payload[f"{prefix}/pareto_rate_frontier_count"] = len(frontier_rate)
+  payload[f"{prefix}/pareto_quality_frontier_count"] = len(frontier_quality)
 
   valid_hallu = [
       float(p["hallucination_rate"])
@@ -994,30 +1063,35 @@ def log_pareto_frontiers_to_wandb(
       if _is_finite_number(p.get("hallucination_rate"))
   ]
   if valid_hallu:
-    payload["eval/pareto_best_hallucination_rate"] = min(valid_hallu)
+    payload[f"{prefix}/pareto_best_hallucination_rate"] = min(valid_hallu)
   valid_rh_rate = [
       float(p["reward_hacking_rate"])
       for p in history
       if _is_finite_number(p.get("reward_hacking_rate"))
   ]
   if valid_rh_rate:
-    payload["eval/pareto_best_reward_hacking_rate"] = min(valid_rh_rate)
+    payload[f"{prefix}/pareto_best_reward_hacking_rate"] = min(valid_rh_rate)
   valid_rh_qual = [
       float(p["reward_hacking_quality"])
       for p in history
       if _is_finite_number(p.get("reward_hacking_quality"))
   ]
   if valid_rh_qual:
-    payload["eval/pareto_best_reward_hacking_quality"] = max(valid_rh_qual)
+    payload[f"{prefix}/pareto_best_reward_hacking_quality"] = max(valid_rh_qual)
 
   selection = select_best_continual_checkpoint(history)
+  best_hallu_key = f"{prefix}/best_constrained_hallucination_rate"
+  best_step_key = f"{prefix}/best_constrained_step"
+  best_ceiling_key = f"{prefix}/best_constrained_ceiling"
+  best_met_key = f"{prefix}/best_constrained_met_ceiling"
+  best_rh_key = f"{prefix}/best_constrained_reward_hacking_rate"
   if selection is not None:
-    payload[BEST_CONSTRAINED_HALLUCINATION_KEY] = selection.hallucination_rate
-    payload[BEST_CONSTRAINED_STEP_KEY] = selection.step
-    payload[BEST_CONSTRAINED_CEILING_KEY] = selection.ceiling
-    payload[BEST_CONSTRAINED_MET_CEILING_KEY] = selection.met_ceiling
+    payload[best_hallu_key] = selection.hallucination_rate
+    payload[best_step_key] = selection.step
+    payload[best_ceiling_key] = selection.ceiling
+    payload[best_met_key] = selection.met_ceiling
     if selection.reward_hacking_rate is not None:
-      payload[BEST_CONSTRAINED_RH_RATE_KEY] = selection.reward_hacking_rate
+      payload[best_rh_key] = selection.reward_hacking_rate
 
   try:
     for summary_target in (
@@ -1026,25 +1100,19 @@ def log_pareto_frontiers_to_wandb(
     ):
       if summary_target is None:
         continue
-      summary_target["eval/pareto_rate_steps"] = [
+      summary_target[f"{prefix}/pareto_rate_steps"] = [
           int(p["step"]) for p in frontier_rate if "step" in p
       ]
-      summary_target["eval/pareto_quality_steps"] = [
+      summary_target[f"{prefix}/pareto_quality_steps"] = [
           int(p["step"]) for p in frontier_quality if "step" in p
       ]
       if selection is not None:
-        summary_target[BEST_CONSTRAINED_HALLUCINATION_KEY] = (
-            selection.hallucination_rate
-        )
-        summary_target[BEST_CONSTRAINED_STEP_KEY] = selection.step
-        summary_target[BEST_CONSTRAINED_CEILING_KEY] = selection.ceiling
-        summary_target[BEST_CONSTRAINED_MET_CEILING_KEY] = (
-            selection.met_ceiling
-        )
+        summary_target[best_hallu_key] = selection.hallucination_rate
+        summary_target[best_step_key] = selection.step
+        summary_target[best_ceiling_key] = selection.ceiling
+        summary_target[best_met_key] = selection.met_ceiling
         if selection.reward_hacking_rate is not None:
-          summary_target[BEST_CONSTRAINED_RH_RATE_KEY] = (
-              selection.reward_hacking_rate
-          )
+          summary_target[best_rh_key] = selection.reward_hacking_rate
   except Exception:  # pylint: disable=broad-exception-caught
     pass
 
@@ -1226,36 +1294,142 @@ def _wandb_logging_args(
   return args
 
 
+_ADAPTER_MODE_ALIASES: Dict[str, tuple[str, ...]] = {
+    ADAPTER_MODE_SFT_AND_PERL: (ADAPTER_MODE_SFT_AND_PERL,),
+    "sft+perl": (ADAPTER_MODE_SFT_AND_PERL,),
+    "with_sft": (ADAPTER_MODE_SFT_AND_PERL,),
+    ADAPTER_MODE_PERL_ONLY: (ADAPTER_MODE_PERL_ONLY,),
+    "no_sft": (ADAPTER_MODE_PERL_ONLY,),
+    "without_sft": (ADAPTER_MODE_PERL_ONLY,),
+    "both": (ADAPTER_MODE_SFT_AND_PERL, ADAPTER_MODE_PERL_ONLY),
+    "all": (ADAPTER_MODE_SFT_AND_PERL, ADAPTER_MODE_PERL_ONLY),
+}
+
+
+def parse_continual_eval_adapter_modes(
+    raw: Any = None,
+    *,
+    allow_empty: bool = False,
+) -> List[str]:
+  """Parses and normalizes continual-evaluation adapter mode(s).
+
+  Accepts ``None``, a comma-separated string (``'sft_and_perl'``,
+  ``'perl_only'``, ``'both'``, ``'sft_and_perl,perl_only'``), or a sequence of
+  strings, and returns canonical mode names ordered as
+  ``['sft_and_perl', 'perl_only']``.
+
+  Args:
+    raw: Raw mode specification.
+    allow_empty: When True, an explicitly empty sequence returns ``[]`` instead
+      of defaulting to ``['sft_and_perl']`` (used by the interactive wizard and
+      config validator).
+
+  Returns:
+    Ordered list of canonical adapter modes.
+
+  Raises:
+    ValueError: If any token is not a recognized continual-eval adapter mode.
+  """
+  if raw is None:
+    return [] if allow_empty else list(DEFAULT_CONTINUAL_EVAL_ADAPTER_MODES)
+
+  if isinstance(raw, str):
+    stripped = raw.strip()
+    if not stripped:
+      return [] if allow_empty else list(DEFAULT_CONTINUAL_EVAL_ADAPTER_MODES)
+    tokens = [part.strip() for part in stripped.split(",") if part.strip()]
+  elif isinstance(raw, Sequence):
+    tokens = []
+    for item in raw:
+      for part in str(item or "").split(","):
+        if part.strip():
+          tokens.append(part.strip())
+  else:
+    raise ValueError(
+        f"Invalid continual_eval_adapter_modes {raw!r}; expected one of "
+        f"{list(VALID_CONTINUAL_EVAL_ADAPTER_MODES)} or 'both'."
+    )
+
+  if not tokens:
+    return [] if allow_empty else list(DEFAULT_CONTINUAL_EVAL_ADAPTER_MODES)
+
+  seen: set[str] = set()
+  for token in tokens:
+    key = token.lower()
+    expanded = _ADAPTER_MODE_ALIASES.get(key)
+    if expanded is None:
+      raise ValueError(
+          f"Unknown continual evaluation adapter mode {token!r}. Must be one "
+          f"of {list(VALID_CONTINUAL_EVAL_ADAPTER_MODES)} or 'both'."
+      )
+    seen.update(expanded)
+
+  return [mode for mode in VALID_CONTINUAL_EVAL_ADAPTER_MODES if mode in seen]
+
+
+def format_continual_eval_adapter_modes(raw: Any = None) -> str:
+  """Formats continual-evaluation adapter mode(s) as a canonical CLI string."""
+  return ",".join(parse_continual_eval_adapter_modes(raw))
+
+
+def resolve_continual_eval_adapter_modes(flags: Dict[str, str]) -> List[str]:
+  """Resolves ``--continual_eval_adapter_modes`` from parsed CLI ``flags``."""
+  return parse_continual_eval_adapter_modes(
+      flags.get("continual_eval_adapter_modes")
+  )
+
+
 def build_continual_eval_commands(
     flags: Dict[str, str],
     status: ContinualEvalStatus,
     output_dir: str,
     env: Optional[Dict[str, str]] = None,
+    adapter_mode: Optional[str] = None,
+    total_modes: Optional[int] = None,
 ) -> tuple[List[str], List[str]]:
   """Builds the ``(generate_cmd, score_cmd)`` vectors for a paused checkpoint.
 
   Evaluates ``status.checkpoint_dir`` on ``{user}/{task_name}_final_test_set``
-  at the PE-RL rollout temperature, stacking ``--sft_model_path`` when present
-  so the RL LoRA delta is combined with the SFT adapter weights just as it was
-  during training. Judge settings default to ``CONTINUAL_EVAL_DEFAULTS`` and
-  are overridden by the ``--continual_eval_*`` flags.
+  at the PE-RL rollout temperature. In ``sft_and_perl`` mode (the default),
+  ``--sft_model_path`` is stacked when present so the RL LoRA delta is combined
+  with the SFT adapter weights just as it was during training. In ``perl_only``
+  mode, the PE-RL adapter is evaluated directly on top of the base model
+  without the SFT adapter (``--allow_missing_sft_adapter True``) and logged to
+  the separate ``eval_perl_only`` WandB pane. Judge settings default to
+  ``CONTINUAL_EVAL_DEFAULTS`` and are overridden by the ``--continual_eval_*``
+  flags.
 
   Args:
     flags: Parsed CLI flags passed to ``src/perl.py``.
     status: Current ``ContinualEvalStatus`` with checkpoint & WandB metadata.
     output_dir: The PE-RL training output directory.
     env: Environment of the coordinator (defaults to ``os.environ``).
+    adapter_mode: Optional explicit adapter mode (``'sft_and_perl'`` or
+      ``'perl_only'``). When omitted, uses the first configured mode in
+      ``flags``.
+    total_modes: Optional total number of adapter modes running at this step.
 
   Returns:
     A ``(generate_cmd, score_cmd)`` tuple of argument lists.
 
   Raises:
-    ValueError: If ``status`` has no checkpoint to evaluate.
+    ValueError: If ``status`` has no checkpoint to evaluate or ``adapter_mode``
+      is invalid.
   """
   environ = env if env is not None else os.environ
   checkpoint_dir = status.checkpoint_dir
   if not checkpoint_dir:
     raise ValueError("The continual-eval status has no checkpoint to evaluate.")
+
+  configured_modes = resolve_continual_eval_adapter_modes(flags)
+  resolved_mode = (
+      parse_continual_eval_adapter_modes([adapter_mode])[0]
+      if adapter_mode is not None
+      else configured_modes[0]
+  )
+  resolved_total = (
+      int(total_modes) if total_modes is not None else len(configured_modes)
+  )
 
   task_name = flags.get("task_name", "npov")
   dataset_repo = flags.get("dataset_repo_id", "")
@@ -1276,11 +1450,14 @@ def build_continual_eval_commands(
   temperature = resolve_rollout_temperature(flags, status)
   # The policy is evaluated with the prompt format it was trained on.
   writer_fewshot = str(flags.get("num_fewshot") or "0")
-  sft_args = (
-      ["--sft_model_path", sft_path]
-      if has_valid_sft
-      else ["--allow_missing_sft_adapter", "True"]
-  )
+  if resolved_mode == ADAPTER_MODE_PERL_ONLY:
+    sft_args = ["--allow_missing_sft_adapter", "True"]
+  else:
+    sft_args = (
+        ["--sft_model_path", sft_path]
+        if has_valid_sft
+        else ["--allow_missing_sft_adapter", "True"]
+    )
 
   gen_cmd: List[str] = [
       sys.executable,
@@ -1320,7 +1497,9 @@ def build_continual_eval_commands(
   if max_model_len and str(max_model_len).lower() not in _FALSY_STRINGS:
     gen_cmd.extend(["--max_model_len", str(max_model_len)])
 
-  history_path = ContinualEvalStatus.history_path(output_dir)
+  history_path = ContinualEvalStatus.history_path_for_mode(
+      output_dir, adapter_mode=resolved_mode, total_modes=resolved_total
+  )
   score_cmd: List[str] = [
       sys.executable,
       "-m",
@@ -1384,6 +1563,20 @@ def build_continual_eval_commands(
       "--continual_eval_history_path",
       history_path,
   ]
+  if resolved_mode == ADAPTER_MODE_PERL_ONLY:
+    score_cmd.extend([
+        "--wandb_metric_prefix",
+        PERL_ONLY_WANDB_PREFIX,
+        "--wandb_plot_title_suffix",
+        PERL_ONLY_TITLE_SUFFIX,
+    ])
+  elif resolved_total > 1:
+    score_cmd.extend([
+        "--wandb_metric_prefix",
+        "eval",
+        "--wandb_plot_title_suffix",
+        SFT_AND_PERL_TITLE_SUFFIX,
+    ])
   rh_model = str(flags.get("continual_eval_reward_hacking_model") or "").strip()
   if rh_model and rh_model.lower() not in _FALSY_STRINGS:
     score_cmd.extend(["--reward_hacking_model", rh_model])
@@ -1392,6 +1585,31 @@ def build_continual_eval_commands(
   # Gemini credentials (GEMINI_API_KEY, Vertex AI settings) are inherited
   # through the environment, never passed on argv where `ps` can read them.
   return gen_cmd, score_cmd
+
+
+def build_all_continual_eval_commands(
+    flags: Dict[str, str],
+    status: ContinualEvalStatus,
+    output_dir: str,
+    env: Optional[Dict[str, str]] = None,
+) -> List[tuple[str, List[str], List[str]]]:
+  """Builds ``(adapter_mode, generate_cmd, score_cmd)`` for every enabled mode."""
+  modes = resolve_continual_eval_adapter_modes(flags)
+  total = len(modes)
+  return [
+      (
+          mode,
+          *build_continual_eval_commands(
+              flags=flags,
+              status=status,
+              output_dir=output_dir,
+              env=env,
+              adapter_mode=mode,
+              total_modes=total,
+          ),
+      )
+      for mode in modes
+  ]
 
 
 def _pick_free_port(fallback: int = 29505) -> int:
@@ -1630,11 +1848,12 @@ def _run_pending_evaluation(
     base_env: Dict[str, str],
     cmd_runner: Callable[[List[str], Dict[str, str]], int],
 ) -> None:
-  """Generates and scores the paused checkpoint, then records the step.
+  """Generates and scores the paused checkpoint across all enabled adapter modes.
 
   On failure, the status keeps ``paused_for_eval=True`` and records
   ``eval_error``, so re-running the coordinator retries this evaluation
-  before any further training.
+  before any further training. Modes that already completed at ``step`` are
+  recorded in ``status.evaluated_step_modes`` so a retry skips them.
 
   Args:
     flags: Parsed CLI flags passed to ``src/perl.py``.
@@ -1658,34 +1877,44 @@ def _run_pending_evaluation(
     status.save(output_dir)
     raise RuntimeError(status.eval_error)
 
-  print(
-      f"\n[ContinualEval] === Autorater evaluation of step {step} "
-      f"({checkpoint_dir}) at T={resolve_rollout_temperature(flags, status)} "
-      "===",
-      flush=True,
-  )
-  gen_cmd, score_cmd = build_continual_eval_commands(
+  mode_commands = build_all_continual_eval_commands(
       flags=flags, status=status, output_dir=output_dir, env=base_env
   )
   eval_env = _eval_subprocess_env(base_env)
-  for stage, cmd in (("generation", gen_cmd), ("scoring", score_cmd)):
-    try:
-      rc = cmd_runner(cmd, eval_env)
-    except subprocess.TimeoutExpired as e:
-      status.eval_error = (
-          f"Continual eval {stage} timed out at step {step} after "
-          f"{e.timeout / 60.0:.0f} minutes (--continual_eval_timeout_minutes). "
-          "Re-run the same command to retry it."
-      )
-      status.save(output_dir)
-      raise RuntimeError(status.eval_error) from e
-    if rc != 0:
-      status.eval_error = (
-          f"Continual eval {stage} failed at step {step} with exit code {rc}. "
-          "Re-run the same command to retry it."
-      )
-      status.save(output_dir)
-      raise RuntimeError(status.eval_error)
+  step_key = str(step)
+  completed_for_step = list(status.evaluated_step_modes.get(step_key, []))
+
+  for mode, gen_cmd, score_cmd in mode_commands:
+    if mode in completed_for_step:
+      continue
+    mode_banner = f" [{mode}]" if len(mode_commands) > 1 else ""
+    print(
+        f"\n[ContinualEval] === Autorater evaluation{mode_banner} of step "
+        f"{step} ({checkpoint_dir}) at "
+        f"T={resolve_rollout_temperature(flags, status)} ===",
+        flush=True,
+    )
+    for stage, cmd in (("generation", gen_cmd), ("scoring", score_cmd)):
+      try:
+        rc = cmd_runner(cmd, eval_env)
+      except subprocess.TimeoutExpired as e:
+        status.eval_error = (
+            f"Continual eval {stage} timed out at step {step} after "
+            f"{e.timeout / 60.0:.0f} minutes (--continual_eval_timeout_minutes). "
+            "Re-run the same command to retry it."
+        )
+        status.save(output_dir)
+        raise RuntimeError(status.eval_error) from e
+      if rc != 0:
+        status.eval_error = (
+            f"Continual eval {stage} failed at step {step} with exit code {rc}. "
+            "Re-run the same command to retry it."
+        )
+        status.save(output_dir)
+        raise RuntimeError(status.eval_error)
+    completed_for_step.append(mode)
+    status.evaluated_step_modes[step_key] = list(completed_for_step)
+    status.save(output_dir)
 
   status.evaluated_steps = sorted(
       {int(s) for s in status.evaluated_steps} | {step}
@@ -2064,6 +2293,7 @@ def run_perl_with_continual_eval(
   """
   base_env = dict(os.environ if env is None else env)
   flags = parse_cli_flag_map(argv)
+  resolve_continual_eval_adapter_modes(flags)
   injected_runner = run_cmd_fn or runner
   cmd_runner = injected_runner or _run_subprocess
   eval_runner = injected_runner or functools.partial(

@@ -57,6 +57,9 @@ class ScriptArguments:
       continual_eval_timeout_minutes (float): Wall-clock budget of each
         evaluation phase (generation, scoring), as for the final evaluation;
         a value that is not positive disables it.
+      continual_eval_adapter_modes (str): Adapter stacking mode(s) to run at
+        each continual evaluation step ('sft_and_perl', 'perl_only', 'both',
+        or a comma-separated list).
       continual_eval_* (judge settings): Defaults match the final evaluation
         (``scripts/evaluator.sh``), except ``compute_perplexity``; they mirror
         ``src.continual_eval.CONTINUAL_EVAL_DEFAULTS``.
@@ -104,6 +107,11 @@ class ScriptArguments:
   # `src.continual_eval.CONTINUAL_EVAL_TIMEOUT_MINUTES` by
   # src/test_continual_eval.py.
   continual_eval_timeout_minutes: float = 180.0
+  # Adapter stacking configuration(s) evaluated at each continual-eval step:
+  # 'sft_and_perl' (base + SFT + PE-RL), 'perl_only' (base + PE-RL without
+  # SFT), or 'sft_and_perl,perl_only' / 'both' to run both and log to
+  # separate WandB panes.
+  continual_eval_adapter_modes: str = "sft_and_perl"
 
 
 
@@ -790,6 +798,29 @@ class EvalArguments:
           "help": (
               "Optional JSON file path tracking continual evaluation metrics"
               " across steps for computing and logging Pareto frontiers."
+          )
+      },
+  )
+
+  wandb_metric_prefix: str = field(
+      default="eval",
+      metadata={
+          "help": (
+              "WandB metric namespace/pane prefix (default: 'eval'). For PE-RL"
+              " adapter-only continual evaluation without the SFT adapter, set"
+              " to 'eval_perl_only' so metrics and plots are grouped into a"
+              " separate filterable WandB pane."
+          )
+      },
+  )
+
+  wandb_plot_title_suffix: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Optional label appended to WandB scatter plot and Pareto"
+              " frontier figure titles to distinguish evaluation variants"
+              " (e.g. 'SFT + PE-RL Adapter' vs 'PE-RL Adapter Only - No SFT')."
           )
       },
   )

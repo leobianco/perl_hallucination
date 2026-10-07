@@ -88,6 +88,9 @@ CONTINUAL_EVAL_COMPUTE_BERTSCORE="${CONTINUAL_EVAL_COMPUTE_BERTSCORE:-True}"
 # Off by default: it reloads the base model at every evaluation step and is on
 # neither Pareto frontier.
 CONTINUAL_EVAL_COMPUTE_PERPLEXITY="${CONTINUAL_EVAL_COMPUTE_PERPLEXITY:-False}"
+# Adapter configuration(s) evaluated at each continual-evaluation step:
+# "sft_and_perl" (default), "perl_only", or "sft_and_perl,perl_only" / "both".
+CONTINUAL_EVAL_ADAPTER_MODES="${CONTINUAL_EVAL_ADAPTER_MODES:-sft_and_perl}"
 
 # Infrastructure Parameters
 # Override for a large policy, e.g.
@@ -174,6 +177,7 @@ if [[ "${CONTINUAL_EVAL,,}" == "true" ]]; then
         --continual_eval_batch_size "$CONTINUAL_EVAL_BATCH_SIZE"
         --continual_eval_compute_bertscore "$CONTINUAL_EVAL_COMPUTE_BERTSCORE"
         --continual_eval_compute_perplexity "$CONTINUAL_EVAL_COMPUTE_PERPLEXITY"
+        --continual_eval_adapter_modes "$CONTINUAL_EVAL_ADAPTER_MODES"
     )
 else
     LAUNCHER=(accelerate launch --config_file="${DEEPSPEED_CONFIG}" src/perl.py)

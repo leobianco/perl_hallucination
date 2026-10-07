@@ -646,6 +646,35 @@ class RunCommandTest(CommandTestBase):
     self.run_cli(["run", "--dry-run", "--yes"])
     self.assertIsNone(self.executed["config"].eval.max_model_len)
 
+  def test_continual_eval_adapters_flag_reaches_the_eval_config(self):
+    code = self.run_cli(
+        [
+            "run",
+            "--continual-eval-adapters",
+            "both",
+            "--dry-run",
+            "--yes",
+        ]
+    )
+    self.assertEqual(code, app.EXIT_OK)
+    self.assertEqual(
+        self.executed["config"].eval.continual_eval_adapter_modes,
+        ["sft_and_perl", "perl_only"],
+    )
+
+  def test_invalid_continual_eval_adapters_flag_is_rejected(self):
+    code = self.run_cli(
+        [
+            "run",
+            "--continual-eval-adapters",
+            "not_an_adapter_mode",
+            "--dry-run",
+            "--yes",
+        ]
+    )
+    self.assertEqual(code, app.EXIT_USAGE)
+    self.assertIn("continual_eval_adapter_modes", self.output)
+
   def test_stage_subset_is_normalized(self):
     self.run_cli(
         [

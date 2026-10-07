@@ -353,14 +353,24 @@ class WizardFlowTest(unittest.TestCase):
   def run_wizard(self, answers, save_yaml=False, raw=False):
     """Drives the wizard with ``answers``.
 
-    The base-model question sits between "task" and "stages". Every existing
-    flow predates it and does not care about the model, so unless ``raw`` is
-    set the default answer is spliced in for them; that keeps this helper the
-    single place that knows the question order.
+    The base-model question sits between "task" and "stages", and the
+    continual-evaluation adapter mode question sits after "stages" (and after
+    "rm_dataset_flavors" when "rm" is selected) whenever "perl" is in stages.
+    Unless ``raw`` is set the default answers are spliced in for them; that
+    keeps this helper the single place that knows the question order.
     """
     if not raw:
       answers = list(answers)
       answers.insert(1, wizard.DEFAULT_BASE_MODEL)
+      if (
+          len(answers) > 2
+          and isinstance(answers[2], list)
+          and "perl" in answers[2]
+      ):
+        adapter_idx = 4 if "rm" in answers[2] else 3
+        answers.insert(
+            adapter_idx, list(wizard.DEFAULT_CONTINUAL_EVAL_ADAPTER_MODES)
+        )
     prompter = wizard.ScriptedPrompter(answers)
     config = wizard.run_setup_wizard(
         console=self.console, prompter=prompter, save_yaml=save_yaml
@@ -771,6 +781,143 @@ class BaseModelQuestionTest(unittest.TestCase):
         CampaignConfig.create_default(task_name="npov").base_model,
     )
 
+
+class ContinualEvalAdaptersQuestionTest(unittest.TestCase):
+  """Wizard configuration of continual-evaluation adapter stacking modes."""
+
+  def setUp(self):
+    super().setUp()
+    self.console = make_console()
+
+  def run_wizard(self, answers):
+    prompter = wizard.ScriptedPrompter(answers)
+    config = wizard.run_setup_wizard(
+        console=self.console, prompter=prompter, save_yaml=False
+    )
+    return config, prompter
+
+  def test_question_is_asked_when_perl_runs(self):
+    _, prompter = self.run_wizard(
+        [
+            "npov",
+            wizard.DEFAULT_BASE_MODEL,
+            ["perl"],
+            ["sft_and_perl"],
+            "smoke",
+            "leobianco/npov_SFT_x",
+            "leobianco/npov_RM_x",
+            True,
+            True,
+        ]
+    )
+    self.assertIn(
+        "pe-rl continual evaluation",
+        " ".join(prompter.asked).lower(),
+    )
+
+  def test_question_is_skipped_when_perl_does_not_run(self):
+    _, prompter = self.run_wizard([
+        "npov",
+        wizard.DEFAULT_BASE_MODEL,
+        ["sft", "eval"],
+        "smoke",
+        True,
+        True,
+    ])
+    self.assertNotIn(
+        "pe-rl continual evaluation",
+        " ".join(prompter.asked).lower(),
+    )
+
+  def test_selecting_perl_only_reaches_the_config(self):
+    config, _ = self.run_wizard(
+        [
+            "npov",
+            wizard.DEFAULT_BASE_MODEL,
+            ["perl"],
+            ["perl_only"],
+            "smoke",
+            "leobianco/npov_SFT_x",
+            "leobianco/npov_RM_x",
+            True,
+            True,
+        ]
+    )
+    self.assertEqual(
+        config.eval.continual_eval_adapter_modes, ["perl_only"]
+    )
+
+  def test_selecting_both_adapters_normalises_order_and_scales_timeout(self):
+    single, _ = self.run_wizard(
+        [
+            "npov",
+            wizard.DEFAULT_BASE_MODEL,
+            ["perl"],
+            ["sft_and_perl"],
+            "quick",
+            "leobianco/npov_SFT_x",
+            "leobianco/npov_RM_x",
+            True,
+            True,
+        ]
+    )
+    both, _ = self.run_wizard(
+        [
+            "npov",
+            wizard.DEFAULT_BASE_MODEL,
+            ["perl"],
+            ["perl_only", "sft_and_perl"],
+            "quick",
+            "leobianco/npov_SFT_x",
+            "leobianco/npov_RM_x",
+            True,
+            True,
+        ]
+    )
+    self.assertEqual(
+        both.eval.continual_eval_adapter_modes,
+        ["sft_and_perl", "perl_only"],
+    )
+    self.assertGreater(both.perl.timeout_minutes, single.perl.timeout_minutes)
+    single.dry_run = False
+    both.dry_run = False
+    self.assertGreater(
+        wizard.estimate_runtime(both)[1],
+        wizard.estimate_runtime(single)[1],
+    )
+
+  def test_empty_adapter_selection_aborts(self):
+    config, _ = self.run_wizard(
+        ["npov", wizard.DEFAULT_BASE_MODEL, ["perl"], []]
+    )
+    self.assertIsNone(config)
+    self.assertIn(
+        "No continual-evaluation adapter mode selected",
+        self.console.file.getvalue(),
+    )
+
+  def test_cancelling_adapter_selection_aborts(self):
+    config, _ = self.run_wizard(
+        ["npov", wizard.DEFAULT_BASE_MODEL, ["perl"], None]
+    )
+    self.assertIsNone(config)
+    self.assertIn("cancelled", self.console.file.getvalue())
+
+  def test_equivalent_command_and_review_summary_reflect_adapter_modes(self):
+    config = CampaignConfig.create_default(task_name="npov")
+    self.assertNotIn(
+        "--continual-eval-adapters", wizard.equivalent_command(config)
+    )
+    config.eval.continual_eval_adapter_modes = ["sft_and_perl", "perl_only"]
+    cmd = wizard.equivalent_command(config)
+    self.assertIn(
+        "--continual-eval-adapters sft_and_perl,perl_only", cmd
+    )
+    theme = theme_mod.detect_theme(force_color=False, force_ascii=True)
+    summary = "\n".join(wizard.config_summary_lines(config, theme))
+    self.assertIn("Continual eval", summary)
+    self.assertIn("SFT + PE-RL adapter", summary)
+    self.assertIn("PE-RL adapter only (no SFT)", summary)
 
 
 if __name__ == "__main__":
