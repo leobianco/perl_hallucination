@@ -359,7 +359,7 @@ def target_title(target_label: str) -> str:
   return f"{base} ({', '.join(qualifiers)})" if qualifiers else base
 
 
-def _target_sort_key(target_label: str) -> Tuple[int, float, int, str]:
+def _target_sort_key(target_label: str) -> Tuple[int, float, int, str, int]:
   """Orders SFT rows first (untagged, then by temperature), then PE-RL.
 
   Args:
@@ -367,7 +367,8 @@ def _target_sort_key(target_label: str) -> Tuple[int, float, int, str]:
 
   Returns:
     A sort key placing every baseline ahead of every policy, the untagged
-    baseline ahead of its warmer siblings, and the branches in flavor order.
+    baseline ahead of its warmer siblings, and the branches in flavor order
+    (with stacked SFT+PE-RL ahead of PE-RL-only ``:nosft`` for the same branch).
   """
   stage_id, temperature = split_target_label(target_label)
   kind, flavor = flavors.split_stage_id(stage_id)
@@ -375,11 +376,13 @@ def _target_sort_key(target_label: str) -> Tuple[int, float, int, str]:
   # The untagged row is the campaign's nominal baseline and leads the table;
   # -1.0 sorts it ahead of any real temperature, including 0.0.
   temperature_rank = -1.0 if temperature is None else float(temperature)
-  if flavor in flavors.RM_DATASET_FLAVORS:
-    flavor_rank = flavors.RM_DATASET_FLAVORS.index(flavor)
+  base_flavor = flavors.strip_nosft_qualifier(flavor)
+  is_nosft = 1 if (flavor and base_flavor != flavor) else 0
+  if base_flavor in flavors.RM_DATASET_FLAVORS:
+    flavor_rank = flavors.RM_DATASET_FLAVORS.index(base_flavor)
   else:
     flavor_rank = len(flavors.RM_DATASET_FLAVORS)
-  return (kind_rank, temperature_rank, flavor_rank, flavor or "")
+  return (kind_rank, temperature_rank, flavor_rank, base_flavor or "", is_nosft)
 
 
 def target_labels(metrics: Dict[str, Any]) -> List[str]:

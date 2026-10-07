@@ -189,6 +189,21 @@ class PerlStageContinualEvalTest(unittest.TestCase):
     PerlStage.add_flags_to_sweep_command(command, {"continual_eval": "True"})
     self.assertEqual(command, ["launch", "--continual_eval=True"])
 
+  def test_continual_eval_disabled_omits_flags_and_sizes_timeout_for_training_only(
+      self,
+  ):
+    def disable_continual_eval(config):
+      config.eval.continual_eval_enabled = False
+      config.perl.timeout_minutes = 525
+
+    stage, command, push = self._execute(configure=disable_continual_eval)
+    self.assertEqual(stage.continual_eval_flags(), {})
+    self.assertEqual(push["continual_eval_flags"], {})
+    self.assertEqual(_flag_values(command, "continual_eval"), [])
+    self.assertEqual(_flag_values(command, "save_total_limit"), [])
+    # 10 trials * 35 min/trial * 1.5 = 525 minutes (no continual-eval padding).
+    self.assertEqual(self._agent_timeout(stage), 525)
+
 
 class MaterializationCommandTest(unittest.TestCase):
   """The winner's retraining carries the continual-evaluation flags."""

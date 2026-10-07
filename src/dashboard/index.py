@@ -806,6 +806,8 @@ def _extract_eval_targets(
     if target.is_delta:
       continue
     owner = stage_by_kind.get(target.base_label)
+    if owner is None and target.base_label.endswith(":nosft"):
+      owner = stage_by_kind.get(target.base_label[: -len(":nosft")])
     if owner is not None:
       target.model_repo_id = owner.model_repo_id
 

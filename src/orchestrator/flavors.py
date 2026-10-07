@@ -64,6 +64,22 @@ BRANCHED_KINDS: Tuple[str, ...] = ("rm", "perl")
 #: Separates the kind from the flavor in a branched stage id.
 SEPARATOR = ":"
 
+#: Qualifier appended to an evaluation target stage id when scoring a PE-RL
+#: adapter directly on top of the base model without stacking the SFT adapter.
+NOSFT_QUALIFIER = "nosft"
+
+
+def strip_nosft_qualifier(value: Optional[str]) -> str:
+  """Removes a trailing ``:nosft`` or bare ``nosft`` adapter-mode tag."""
+  if not value:
+    return ""
+  if value == NOSFT_QUALIFIER:
+    return ""
+  suffix = f"{SEPARATOR}{NOSFT_QUALIFIER}"
+  if value.endswith(suffix):
+    return value[: -len(suffix)]
+  return value
+
 
 def normalize_flavors(raw: Any) -> List[str]:
   """Cleans a user-supplied flavor list into canonical execution order.
@@ -130,6 +146,11 @@ def flavor_title(flavor: Optional[str]) -> str:
   """Returns the human-readable name for ``flavor``."""
   if not flavor:
     return ""
+  if SEPARATOR in flavor:
+    parts = [flavor_title(part) for part in flavor.split(SEPARATOR) if part]
+    return ", ".join(p for p in parts if p)
+  if flavor == NOSFT_QUALIFIER:
+    return "no SFT"
   return FLAVOR_TITLES.get(flavor, flavor.replace("_", " ").title())
 
 

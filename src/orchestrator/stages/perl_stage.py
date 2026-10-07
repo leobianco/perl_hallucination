@@ -44,9 +44,12 @@ class PerlStage(BaseStage):
     ``src/perl.py`` records itself.
 
     Returns:
-      ``flag -> value`` without the leading dashes, in a stable order.
+      ``flag -> value`` without the leading dashes, in a stable order, or
+      an empty dict when continual evaluation is disabled.
     """
     cfg = self.config.eval
+    if not getattr(cfg, "continual_eval_enabled", True):
+      return {}
     flags = {
         "continual_eval": "True",
         # Rank 0 of the `accelerate launch` that starts the run becomes a
@@ -128,6 +131,9 @@ class PerlStage(BaseStage):
     """
     cfg = self.config.perl
     configured = int(cfg.timeout_minutes or 0)
+    continual_enabled = bool(
+        getattr(self.config.eval, "continual_eval_enabled", True)
+    )
     estimate = config_lib.sweep_timeout_minutes(
         self.kind,
         cfg.max_runs,
@@ -135,6 +141,7 @@ class PerlStage(BaseStage):
         num_adapter_modes=len(
             config_lib.continual_eval_adapter_modes(self.config)
         ),
+        continual_eval_enabled=continual_enabled,
     )
     if configured >= estimate:
       return configured
@@ -295,17 +302,25 @@ class PerlStage(BaseStage):
     # below gets the same flags. Logged to the campaign log only: the TUI is
     # deliberately unchanged, the scores go to each run's W&B page.
     continual_eval_flags = self.continual_eval_flags()
-    if isinstance(sweep_dict.get("command"), list):
-      self.add_flags_to_sweep_command(
-          sweep_dict["command"],
-          {**continual_eval_flags, **self.SWEEP_TRIAL_CHECKPOINT_FLAGS},
+    if continual_eval_flags:
+      if isinstance(sweep_dict.get("command"), list):
+        self.add_flags_to_sweep_command(
+            sweep_dict["command"],
+            {**continual_eval_flags, **self.SWEEP_TRIAL_CHECKPOINT_FLAGS},
+        )
+      logger.info(
+          "Continual evaluation: every PE-RL run is scored by %s at each "
+          "evaluation step (threshold %s); scores are logged to its W&B run.",
+          continual_eval_flags["continual_eval_evaluator_model"],
+          continual_eval_flags["continual_eval_threshold"],
       )
-    logger.info(
-        "Continual evaluation: every PE-RL run is scored by %s at each "
-        "evaluation step (threshold %s); scores are logged to its W&B run.",
-        continual_eval_flags["continual_eval_evaluator_model"],
-        continual_eval_flags["continual_eval_threshold"],
-    )
+    else:
+      logger.info(
+          "Continual evaluation is disabled for PE-RL: trials will run "
+          "uninterrupted and rank by %s (%s).",
+          cfg.metric,
+          cfg.selection_strategy,
+      )
 
     # Apply parameter search overrides if specified
     if cfg.parameter_overrides and "parameters" in sweep_dict:

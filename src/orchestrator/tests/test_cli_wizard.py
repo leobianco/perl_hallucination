@@ -353,24 +353,27 @@ class WizardFlowTest(unittest.TestCase):
   def run_wizard(self, answers, save_yaml=False, raw=False):
     """Drives the wizard with ``answers``.
 
-    The base-model question sits between "task" and "stages", and the
+    The base-model question sits between "task" and "stages", the
     continual-evaluation adapter mode question sits after "stages" (and after
-    "rm_dataset_flavors" when "rm" is selected) whenever "perl" is in stages.
-    Unless ``raw`` is set the default answers are spliced in for them; that
-    keeps this helper the single place that knows the question order.
+    "rm_dataset_flavors" when "rm" is selected) whenever "perl" is in stages,
+    and the final-evaluation adapter mode question follows whenever "eval" is
+    in stages. Unless ``raw`` is set the default answers are spliced in for
+    them; that keeps this helper the single place that knows the question
+    order.
     """
     if not raw:
       answers = list(answers)
       answers.insert(1, wizard.DEFAULT_BASE_MODEL)
-      if (
-          len(answers) > 2
-          and isinstance(answers[2], list)
-          and "perl" in answers[2]
-      ):
-        adapter_idx = 4 if "rm" in answers[2] else 3
-        answers.insert(
-            adapter_idx, list(wizard.DEFAULT_CONTINUAL_EVAL_ADAPTER_MODES)
-        )
+      if len(answers) > 2 and isinstance(answers[2], list):
+        stages_list = answers[2]
+        insert_idx = 4 if "rm" in stages_list else 3
+        if "perl" in stages_list:
+          answers.insert(
+              insert_idx, list(wizard.DEFAULT_CONTINUAL_EVAL_ADAPTER_MODES)
+          )
+          insert_idx += 1
+        if "eval" in stages_list:
+          answers.insert(insert_idx, list(wizard.DEFAULT_EVAL_ADAPTER_MODES))
     prompter = wizard.ScriptedPrompter(answers)
     config = wizard.run_setup_wizard(
         console=self.console, prompter=prompter, save_yaml=save_yaml
@@ -783,7 +786,7 @@ class BaseModelQuestionTest(unittest.TestCase):
 
 
 class ContinualEvalAdaptersQuestionTest(unittest.TestCase):
-  """Wizard configuration of continual-evaluation adapter stacking modes."""
+  """Wizard configuration of continual-evaluation and final-evaluation adapter stacking modes."""
 
   def setUp(self):
     super().setUp()
@@ -820,6 +823,7 @@ class ContinualEvalAdaptersQuestionTest(unittest.TestCase):
         "npov",
         wizard.DEFAULT_BASE_MODEL,
         ["sft", "eval"],
+        ["sft_and_perl"],
         "smoke",
         True,
         True,
@@ -828,6 +832,38 @@ class ContinualEvalAdaptersQuestionTest(unittest.TestCase):
         "pe-rl continual evaluation",
         " ".join(prompter.asked).lower(),
     )
+    self.assertIn(
+        "final evaluation score",
+        " ".join(prompter.asked).lower(),
+    )
+
+  def test_disabling_continual_eval_while_scoring_both_in_final_eval(self):
+    config, _ = self.run_wizard(
+        [
+            "npov",
+            wizard.DEFAULT_BASE_MODEL,
+            ["perl", "eval"],
+            ["none"],
+            ["perl_only", "sft_and_perl"],
+            "standard",
+            "leobianco/npov_SFT_x",
+            "leobianco/npov_RM_x",
+            True,
+            True,
+        ]
+    )
+    self.assertFalse(config.eval.continual_eval_enabled)
+    self.assertEqual(config.perl.timeout_minutes, 525)
+    self.assertEqual(
+        config.eval.eval_adapter_modes, ["sft_and_perl", "perl_only"]
+    )
+    cmd = wizard.equivalent_command(config)
+    self.assertIn("--no-continual-eval", cmd)
+    self.assertIn("--eval-adapters sft_and_perl,perl_only", cmd)
+    theme = theme_mod.detect_theme(force_color=False, force_ascii=True)
+    summary = "\n".join(wizard.config_summary_lines(config, theme))
+    self.assertIn("disabled (rank by training reward)", summary)
+    self.assertIn("Eval adapters", summary)
 
   def test_selecting_perl_only_reaches_the_config(self):
     config, _ = self.run_wizard(

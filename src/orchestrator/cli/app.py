@@ -185,15 +185,54 @@ def build_parser() -> argparse.ArgumentParser:
           "scores both policies in one evaluation."
       ),
   )
+  continual_eval_group = run_parser.add_mutually_exclusive_group()
+  continual_eval_group.add_argument(
+      "--continual-eval",
+      dest="continual_eval",
+      action="store_true",
+      default=None,
+      help=(
+          "Enable intermediate vLLM + Gemini autorating pauses during PE-RL "
+          "training (default: enabled)."
+      ),
+  )
+  continual_eval_group.add_argument(
+      "--no-continual-eval",
+      dest="continual_eval",
+      action="store_false",
+      default=None,
+      help=(
+          "Disable continual evaluation during PE-RL training; trials run "
+          "uninterrupted and rank by training reward."
+      ),
+  )
   run_parser.add_argument(
       "--continual-eval-adapters",
+      "--continual-eval-adapter-modes",
+      dest="continual_eval_adapters",
       default=None,
       help=(
           "Comma-separated adapter stacking mode(s) scored during PE-RL "
           "continual evaluation: "
           + ",".join(config_mod.CONTINUAL_EVAL_ADAPTER_MODES)
-          + " (or 'both'). Selecting both logs SFT + PE-RL under eval/* and "
-          "PE-RL adapter only (without SFT) under eval_perl_only/*."
+          + " (or 'both', or 'none' to disable continual evaluation). "
+          "Selecting both logs SFT + PE-RL under eval/* and PE-RL adapter "
+          "only (without SFT) under eval_perl_only/*."
+      ),
+  )
+  run_parser.add_argument(
+      "--eval-adapters",
+      "--eval-adapter-modes",
+      dest="eval_adapters",
+      default=None,
+      help=(
+          "Comma-separated PE-RL adapter stacking mode(s) scored in the "
+          "final evaluation stage ('eval'), independent of continual "
+          "evaluation: "
+          + ",".join(config_mod.EVAL_ADAPTER_MODES)
+          + " (or 'both'). Selecting both evaluates each PE-RL policy both "
+          "with the SFT adapter stacked (perl) and directly on top of the "
+          "base model without SFT (perl:nosft)."
       ),
   )
   run_parser.add_argument("--dry-run", action="store_true",
@@ -707,11 +746,25 @@ def cmd_run(args: argparse.Namespace, console: UiConsole) -> int:
     config.rm_dataset_flavors = flavors.normalize_flavors(
         args.rm_datasets.split(",")
     )
+  if getattr(args, "continual_eval", None) is not None:
+    config.eval.continual_eval_enabled = bool(args.continual_eval)
   if getattr(args, "continual_eval_adapters", None) is not None:
     raw_adapters = args.continual_eval_adapters.strip()
-    config.eval.continual_eval_adapter_modes = (
-        config_mod.normalize_continual_eval_adapter_modes(raw_adapters)
-        if raw_adapters
+    if raw_adapters.lower() in ("none", "off", "false", "disabled", "disable"):
+      config.eval.continual_eval_enabled = False
+    else:
+      config.eval.continual_eval_adapter_modes = (
+          config_mod.normalize_continual_eval_adapter_modes(raw_adapters)
+          if raw_adapters
+          else []
+      )
+      if getattr(args, "continual_eval", None) is None:
+        config.eval.continual_eval_enabled = True
+  if getattr(args, "eval_adapters", None) is not None:
+    raw_eval_adapters = args.eval_adapters.strip()
+    config.eval.eval_adapter_modes = (
+        config_mod.normalize_eval_adapter_modes(raw_eval_adapters)
+        if raw_eval_adapters
         else []
     )
   # Applied outside the `--config` branch on purpose: the cap depends on the
@@ -737,7 +790,11 @@ def cmd_run(args: argparse.Namespace, console: UiConsole) -> int:
     console.error(str(exc))
     return EXIT_USAGE
 
-  if not args.config or getattr(args, "continual_eval_adapters", None) is not None:
+  continual_flag_set = (
+      getattr(args, "continual_eval", None) is not None
+      or getattr(args, "continual_eval_adapters", None) is not None
+  )
+  if not args.config or continual_flag_set:
     scaled_perl_timeout = config_mod.sweep_timeout_minutes(
         "perl",
         config.perl.max_runs,
@@ -745,8 +802,13 @@ def cmd_run(args: argparse.Namespace, console: UiConsole) -> int:
         num_adapter_modes=len(
             config_mod.continual_eval_adapter_modes(config)
         ),
+        continual_eval_enabled=config.eval.continual_eval_enabled,
     )
-    if not args.config or config.perl.timeout_minutes < scaled_perl_timeout:
+    if (
+        not args.config
+        or not config.eval.continual_eval_enabled
+        or config.perl.timeout_minutes < scaled_perl_timeout
+    ):
       config.perl.timeout_minutes = scaled_perl_timeout
 
   missing = _missing_upstream_checkpoints(config)

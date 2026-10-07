@@ -30,6 +30,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from src.orchestrator.process import stream_subprocess
 from src.orchestrator.retry import run_with_retries
+from src.orchestrator import config as config_lib
 from src.orchestrator import eval_metrics
 from src.orchestrator import flavors
 from src.orchestrator.stages.base import BaseStage
@@ -70,12 +71,16 @@ class EvalTarget:
     rollout_temperature: For a PE-RL policy, the temperature its winning trial
       sampled rollouts at, when recorded. Written alongside the metrics so a
       plot can mark the training regime; None for SFT.
+    stack_sft: Whether the campaign's SFT adapter should be merged into the
+      base model underneath ``model_repo_id`` (`True` for ``sft_and_perl``,
+      `False` for ``perl_only``).
   """
 
   label: str
   model_repo_id: str
   temperature: float
   rollout_temperature: Optional[float] = None
+  stack_sft: bool = True
 
 
 class EvalStage(BaseStage):
@@ -260,6 +265,7 @@ class EvalStage(BaseStage):
             )
         )
 
+    adapter_modes = config_lib.eval_adapter_modes(self.config)
     policies: List[EvalTarget] = []
     for stage_id, repo_id, rollout in branches:
       own = list(grid)
@@ -267,15 +273,25 @@ class EvalStage(BaseStage):
         token = eval_metrics.format_temperature(rollout)
         if token in extras:
           own.append(extras[token])
-      for temperature in sorted(own):
-        policies.append(
-            EvalTarget(
-                label=_label(stage_id, temperature),
-                model_repo_id=repo_id,
-                temperature=temperature,
-                rollout_temperature=rollout,
-            )
-        )
+      for mode in adapter_modes:
+        if mode == config_lib.ADAPTER_MODE_PERL_ONLY:
+          mode_stage_id = (
+              f"{stage_id}{flavors.SEPARATOR}{flavors.NOSFT_QUALIFIER}"
+          )
+          stack_sft = False
+        else:
+          mode_stage_id = stage_id
+          stack_sft = True
+        for temperature in sorted(own):
+          policies.append(
+              EvalTarget(
+                  label=_label(mode_stage_id, temperature),
+                  model_repo_id=repo_id,
+                  temperature=temperature,
+                  rollout_temperature=rollout,
+                  stack_sft=stack_sft,
+              )
+          )
 
     targets = baselines + policies
     if not targets:
@@ -304,8 +320,9 @@ class EvalStage(BaseStage):
     policy_ids = []
     for target in policies:
       stage_id, _ = eval_metrics.split_target_label(target.label)
-      if stage_id not in policy_ids:
-        policy_ids.append(stage_id)
+      base_stage_id = flavors.strip_nosft_qualifier(stage_id)
+      if base_stage_id not in policy_ids:
+        policy_ids.append(base_stage_id)
     notes = [
         f"Temperature grid {grid_text}: every policy (SFT and "
         f"{len(policy_ids)} PE-RL branch(es)) is scored at each, "
@@ -395,7 +412,10 @@ class EvalStage(BaseStage):
           f"{model_repo_id} at temperature {target.temperature}"
       )
 
-    gen_cmd = self._generation_command(model_repo_id, target.temperature)
+    stack_kwargs = {} if target.stack_sft else {"stack_sft": False}
+    gen_cmd = self._generation_command(
+        model_repo_id, target.temperature, **stack_kwargs
+    )
     run_with_retries(
         lambda: self._run_subprocess(
             gen_cmd, live_line_callback, stop_requested_callback
@@ -413,7 +433,9 @@ class EvalStage(BaseStage):
           "+ BertScore + perplexity"
       )
 
-    score_cmd = self._scoring_command(model_repo_id, target.temperature)
+    score_cmd = self._scoring_command(
+        model_repo_id, target.temperature, **stack_kwargs
+    )
     captured = run_with_retries(
         lambda: self._run_subprocess(
             score_cmd, live_line_callback, stop_requested_callback
@@ -425,7 +447,9 @@ class EvalStage(BaseStage):
         stop_requested=stop_requested_callback,
     )
 
-    summary = self._load_summary(model_repo_id, target.temperature)
+    summary = self._load_summary(
+        model_repo_id, target.temperature, **stack_kwargs
+    )
     captured.update(summary)
     # Recorded per target, not per campaign: with matching on, different rows
     # of the same table were sampled differently, and the report has to be
@@ -438,7 +462,10 @@ class EvalStage(BaseStage):
     return {f"{label}/{key}": value for key, value in captured.items()}
 
   def _summary_path(
-      self, model_repo_id: str, temperature: Optional[float] = None
+      self,
+      model_repo_id: str,
+      temperature: Optional[float] = None,
+      stack_sft: bool = True,
   ) -> Tuple[str, str]:
     """Returns the (completions repo id, summary json path) for a target.
 
@@ -448,6 +475,7 @@ class EvalStage(BaseStage):
         to ``eval.temperature``. Part of the repo name, so the SFT baseline's
         greedy and matched runs resolve to different datasets instead of
         overwriting one another.
+      stack_sft: Whether the SFT adapter was stacked beneath ``model_repo_id``.
 
     Returns:
       The completions repo id and the path of the summary JSON.
@@ -464,14 +492,18 @@ class EvalStage(BaseStage):
         # Must mirror `_generation_command`: the completions repo name encodes
         # whether the SFT adapter was stacked, so passing a different value
         # here would send the stage looking for another run's dataset.
-        sft_model_path=self._stacked_sft_repo_id(model_repo_id),
+        sft_model_path=self._stacked_sft_repo_id(
+            model_repo_id, stack_sft=stack_sft
+        ),
         seed=cfg.seed,
         max_tokens=cfg.max_tokens,
     )
     name = repo.split("/")[-1]
     return repo, os.path.join("logs", "eval", f"{name}_summary.json")
 
-  def _stacked_sft_repo_id(self, model_repo_id: str) -> Optional[str]:
+  def _stacked_sft_repo_id(
+      self, model_repo_id: str, stack_sft: bool = True
+  ) -> Optional[str]:
     """Returns the SFT adapter stacked under ``model_repo_id``, if any.
 
     Evaluating the SFT checkpoint itself stacks nothing: it is already the
@@ -479,23 +511,31 @@ class EvalStage(BaseStage):
 
     Args:
       model_repo_id: The adapter being evaluated.
+      stack_sft: When False, explicitly suppresses SFT stacking even for a
+        PE-RL adapter (`perl_only` evaluation mode).
 
     Returns:
       The SFT repo ID, or None when nothing is stacked.
     """
+    if not stack_sft:
+      return None
     sft_repo = self.context.sft_model_repo_id
     if sft_repo and model_repo_id != sft_repo:
       return sft_repo
     return None
 
   def _load_summary(
-      self, model_repo_id: str, temperature: float
+      self,
+      model_repo_id: str,
+      temperature: float,
+      stack_sft: bool = True,
   ) -> Dict[str, Any]:
     """Loads the metrics JSON written by the scoring pipeline.
 
     Args:
       model_repo_id: The evaluated adapter.
       temperature: The temperature its completions were sampled at.
+      stack_sft: Whether the SFT adapter was stacked beneath ``model_repo_id``.
 
     Returns:
       The parsed metrics dictionary.
@@ -505,7 +545,9 @@ class EvalStage(BaseStage):
         empty metric table as a success is the one outcome an overnight run
         cannot afford.
     """
-    repo, summary_file = self._summary_path(model_repo_id, temperature)
+    repo, summary_file = self._summary_path(
+        model_repo_id, temperature, stack_sft=stack_sft
+    )
     if not os.path.isfile(summary_file):
       raise RuntimeError(
           "Scoring finished but no evaluation summary was written to "
@@ -528,7 +570,10 @@ class EvalStage(BaseStage):
   # --- Command construction ---------------------------------------------
 
   def _generation_command(
-      self, model_repo_id: str, temperature: Optional[float] = None
+      self,
+      model_repo_id: str,
+      temperature: Optional[float] = None,
+      stack_sft: bool = True,
   ) -> List[str]:
     """Builds the ``--mode generate`` invocation for one policy.
 
@@ -537,6 +582,7 @@ class EvalStage(BaseStage):
       temperature: Sampling temperature. Defaults to ``eval.temperature``.
         Part of the completions repo name, so ``_scoring_command`` and
         ``_summary_path`` must be given the same value.
+      stack_sft: Whether to stack the SFT adapter beneath ``model_repo_id``.
 
     Returns:
       The argument vector.
@@ -571,9 +617,11 @@ class EvalStage(BaseStage):
         "--writer_model_lora",
         model_repo_id,
     ]
-    sft_repo = self._stacked_sft_repo_id(model_repo_id)
+    sft_repo = self._stacked_sft_repo_id(model_repo_id, stack_sft=stack_sft)
     if sft_repo:
       cmd.extend(["--sft_model_path", sft_repo])
+    elif not stack_sft and model_repo_id != self.context.sft_model_repo_id:
+      cmd.extend(["--allow_missing_sft_adapter", "True"])
     cmd.extend([
         "--max_tokens",
         str(cfg.max_tokens),
@@ -595,7 +643,10 @@ class EvalStage(BaseStage):
     return cmd
 
   def _scoring_command(
-      self, model_repo_id: str, temperature: Optional[float] = None
+      self,
+      model_repo_id: str,
+      temperature: Optional[float] = None,
+      stack_sft: bool = True,
   ) -> List[str]:
     """Builds the ``--mode score`` invocation for one policy.
 
@@ -605,6 +656,7 @@ class EvalStage(BaseStage):
         to ``eval.temperature``; it is part of the completions repo name, so
         it must match what generation used or scoring reads another run's
         dataset.
+      stack_sft: Whether the SFT adapter was stacked beneath ``model_repo_id``.
 
     Returns:
       The argument vector.
@@ -642,9 +694,11 @@ class EvalStage(BaseStage):
     # Scoring derives the completions repo from the same inputs as generation,
     # SFT stacking included; without this flag it would load the '_nosft'
     # dataset of the same checkpoint.
-    sft_repo = self._stacked_sft_repo_id(model_repo_id)
+    sft_repo = self._stacked_sft_repo_id(model_repo_id, stack_sft=stack_sft)
     if sft_repo:
       cmd.extend(["--sft_model_path", sft_repo])
+    elif not stack_sft and model_repo_id != self.context.sft_model_repo_id:
+      cmd.extend(["--allow_missing_sft_adapter", "True"])
     cmd.extend([
         # Part of the completions repo name, so scoring must be told the same
         # value generation used; the pipeline default (128) is not it.

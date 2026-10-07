@@ -69,6 +69,10 @@ CONTINUAL_EVAL_ADAPTER_MODES: tuple[str, ...] = (
 DEFAULT_CONTINUAL_EVAL_ADAPTER_MODES: tuple[str, ...] = (
     ADAPTER_MODE_SFT_AND_PERL,
 )
+EVAL_ADAPTER_MODES: tuple[str, ...] = CONTINUAL_EVAL_ADAPTER_MODES
+DEFAULT_EVAL_ADAPTER_MODES: tuple[str, ...] = (
+    ADAPTER_MODE_SFT_AND_PERL,
+)
 
 CONTINUAL_EVAL_ADAPTER_TITLES: Dict[str, str] = {
     ADAPTER_MODE_SFT_AND_PERL: "SFT + PE-RL adapter",
@@ -139,6 +143,19 @@ def continual_eval_adapter_modes(config: Any) -> List[str]:
   return known or list(DEFAULT_CONTINUAL_EVAL_ADAPTER_MODES)
 
 
+def eval_adapter_modes(config: Any) -> List[str]:
+  """Returns the final-eval adapter modes of ``config``, never empty."""
+  eval_cfg = getattr(config, "eval", config)
+  modes = normalize_continual_eval_adapter_modes(
+      getattr(eval_cfg, "eval_adapter_modes", None)
+  )
+  known = [m for m in modes if m in CONTINUAL_EVAL_ADAPTER_MODES]
+  return known or list(DEFAULT_EVAL_ADAPTER_MODES)
+
+
+normalize_eval_adapter_modes = normalize_continual_eval_adapter_modes
+
+
 def format_continual_eval_adapter_modes(raw: Any) -> str:
   """Formats adapter modes into the canonical comma-separated CLI value."""
   modes = [
@@ -151,6 +168,9 @@ def format_continual_eval_adapter_modes(raw: Any) -> str:
   return ",".join(modes)
 
 
+format_eval_adapter_modes = format_continual_eval_adapter_modes
+
+
 def describe_continual_eval_adapter_modes(modes: Any) -> str:
   """Returns a human-readable summary of continual-eval adapter modes."""
   normalized = normalize_continual_eval_adapter_modes(modes)
@@ -160,6 +180,9 @@ def describe_continual_eval_adapter_modes(modes: Any) -> str:
       CONTINUAL_EVAL_ADAPTER_TITLES.get(m, m) for m in normalized
   ]
   return " + ".join(titles)
+
+
+describe_eval_adapter_modes = describe_continual_eval_adapter_modes
 
 
 def eval_pass_minutes(eval_samples: Optional[int]) -> float:
@@ -205,6 +228,7 @@ def sweep_timeout_minutes(
     max_runs: int,
     eval_samples: Optional[int] = None,
     num_adapter_modes: int = 1,
+    continual_eval_enabled: bool = True,
 ) -> int:
   """Sizes the wall-clock budget of a sweep from its trial count.
 
@@ -221,14 +245,16 @@ def sweep_timeout_minutes(
       :class:`EvalStageConfig` default.
     num_adapter_modes: PE-RL only: number of adapter stacking configurations
       evaluated at each continual-eval checkpoint pause.
+    continual_eval_enabled: PE-RL only: whether continual evaluation runs
+      during PE-RL trials. When False, timeout is sized for training only.
 
   Returns:
     The timeout in minutes.
   """
   per_trial = MINUTES_PER_TRIAL.get(stage, 10.0)
-  if stage == "perl":
+  if stage == "perl" and continual_eval_enabled:
     # Every PE-RL trial of a campaign runs with continual evaluation
-    # (PerlStage.continual_eval_flags).
+    # (PerlStage.continual_eval_flags) unless disabled.
     if eval_samples is None:
       eval_samples = EvalStageConfig.max_eval_samples
     per_trial += continual_eval_minutes_per_trial(
@@ -351,6 +377,11 @@ class EvalStageConfig:
   #: the same deterministic shuffle ``seed``, this is the first 1/4 prefix of
   #: the evaluation set, leaving 3/4 unseen during checkpoint/trial selection.
   continual_eval_sample_fraction: float = 0.25
+  #: Whether PE-RL trials pause at step 0 and every ``--eval_steps`` to run
+  #: vLLM generation + Gemini autorating on the validation prefix. When False,
+  #: PE-RL runs uninterrupted training and trials are ranked on the training
+  #: reward (``perl.selection_strategy``).
+  continual_eval_enabled: bool = True
   #: Adapter stacking mode(s) scored at each continual-evaluation pause during
   #: PE-RL training:
   #: - ``sft_and_perl``: base model + SFT adapter + PE-RL adapter (default,
@@ -360,6 +391,16 @@ class EvalStageConfig:
   #: Selecting both runs two generation + autorating passes at each checkpoint
   #: pause and uploads their graphs into separate filterable W&B panes.
   continual_eval_adapter_modes: List[str] = field(
+      default_factory=lambda: [ADAPTER_MODE_SFT_AND_PERL]
+  )
+  #: Adapter stacking mode(s) scored for each PE-RL policy in the final
+  #: evaluation stage (`eval`), independent of whether continual evaluation
+  #: ran during PE-RL training or which adapter modes it used:
+  #: - ``sft_and_perl``: base model + SFT adapter + PE-RL adapter (default,
+  #:   evaluated as ``perl`` / ``perl:<flavor>``).
+  #: - ``perl_only``: base model + PE-RL adapter directly on top of the base
+  #:   model without SFT (evaluated as ``perl:nosft`` / ``perl:<flavor>:nosft``).
+  eval_adapter_modes: List[str] = field(
       default_factory=lambda: [ADAPTER_MODE_SFT_AND_PERL]
   )
   eval_batch_size: int = 32
@@ -843,6 +884,27 @@ class CampaignConfig:
       )
     self.eval.continual_eval_adapter_modes = selected_adapter_modes
 
+    selected_eval_adapter_modes = normalize_continual_eval_adapter_modes(
+        self.eval.eval_adapter_modes
+    )
+    if not selected_eval_adapter_modes:
+      raise ValueError(
+          "eval.eval_adapter_modes must name at least one adapter "
+          f"mode; valid values are {list(CONTINUAL_EVAL_ADAPTER_MODES)}."
+      )
+    unknown_eval_adapter_modes = [
+        m
+        for m in selected_eval_adapter_modes
+        if m not in CONTINUAL_EVAL_ADAPTER_MODES
+    ]
+    if unknown_eval_adapter_modes:
+      raise ValueError(
+          f"Unknown eval.eval_adapter_modes "
+          f"{unknown_eval_adapter_modes}. Must be chosen from "
+          f"{list(CONTINUAL_EVAL_ADAPTER_MODES)}."
+      )
+    self.eval.eval_adapter_modes = selected_eval_adapter_modes
+
   def to_dict(self) -> Dict[str, Any]:
     """Converts the config dataclass to a nested dictionary."""
     return dataclasses.asdict(self)
@@ -908,11 +970,16 @@ class CampaignConfig:
       dry_run: bool = False,
       rm_dataset_flavors: Optional[List[str]] = None,
       continual_eval_adapter_modes: Optional[List[str]] = None,
+      continual_eval_enabled: bool = True,
+      eval_adapter_modes: Optional[List[str]] = None,
   ) -> CampaignConfig:
     """Creates a standard production-ready CampaignConfig for the given task."""
     resolved_adapter_modes = normalize_continual_eval_adapter_modes(
         continual_eval_adapter_modes
     ) or list(DEFAULT_CONTINUAL_EVAL_ADAPTER_MODES)
+    resolved_eval_adapter_modes = normalize_continual_eval_adapter_modes(
+        eval_adapter_modes
+    ) or list(DEFAULT_EVAL_ADAPTER_MODES)
     return cls(
         task_name=task_name,
         user=user,
@@ -962,6 +1029,7 @@ class CampaignConfig:
                 "perl",
                 perl_runs,
                 num_adapter_modes=len(resolved_adapter_modes),
+                continual_eval_enabled=continual_eval_enabled,
             ),
             metric="train/rewards/reward_fn/mean",
             goal="maximize",
@@ -1000,7 +1068,9 @@ class CampaignConfig:
             enabled=True,
             evaluator_model="gemini-2.5-flash",
             max_eval_samples=1000,
+            continual_eval_enabled=continual_eval_enabled,
             continual_eval_adapter_modes=resolved_adapter_modes,
+            eval_adapter_modes=resolved_eval_adapter_modes,
         ),
         reporting=ReportingConfig(
             generate_markdown=True,

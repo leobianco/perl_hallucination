@@ -245,9 +245,15 @@ def eval_dataset_repo_id(
       (s for s in campaign.stages_of_kind("sft") if s.model_repo_id), None
   )
   sft_repo = sft_stage.model_repo_id if sft_stage else None
-  # Mirrors `_stacked_sft_repo_id`: evaluating the SFT adapter itself stacks
-  # nothing, so the marker differs and so does the repo name.
-  stacked = sft_repo if sft_repo and sft_repo != target.model_repo_id else None
+  # Mirrors `_stacked_sft_repo_id`: evaluating the SFT adapter itself or a
+  # `:nosft` PE-RL-only target stacks nothing, so the marker differs and so
+  # does the repo name.
+  is_nosft = target.base_label.split(":")[-1] == "nosft"
+  stacked = (
+      sft_repo
+      if sft_repo and not is_nosft and sft_repo != target.model_repo_id
+      else None
+  )
 
   try:
     return build_eval_dataset_repo_id(

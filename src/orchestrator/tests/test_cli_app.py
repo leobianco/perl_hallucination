@@ -662,6 +662,55 @@ class RunCommandTest(CommandTestBase):
         ["sft_and_perl", "perl_only"],
     )
 
+  def test_no_continual_eval_flag_disables_continual_eval_and_shrinks_timeout(
+      self,
+  ):
+    code = self.run_cli(
+        [
+            "run",
+            "--no-continual-eval",
+            "--eval-adapters",
+            "both",
+            "--dry-run",
+            "--yes",
+        ]
+    )
+    self.assertEqual(code, app.EXIT_OK)
+    cfg = self.executed["config"]
+    self.assertFalse(cfg.eval.continual_eval_enabled)
+    # 10 trials * 35 min/trial * 1.5 = 525 min (no continual-eval padding).
+    self.assertEqual(cfg.perl.timeout_minutes, 525)
+    self.assertEqual(
+        cfg.eval.eval_adapter_modes, ["sft_and_perl", "perl_only"]
+    )
+
+  def test_continual_eval_adapters_none_disables_continual_eval(self):
+    code = self.run_cli(
+        [
+            "run",
+            "--continual-eval-adapters",
+            "none",
+            "--dry-run",
+            "--yes",
+        ]
+    )
+    self.assertEqual(code, app.EXIT_OK)
+    self.assertFalse(self.executed["config"].eval.continual_eval_enabled)
+    self.assertEqual(self.executed["config"].perl.timeout_minutes, 525)
+
+  def test_invalid_eval_adapters_flag_is_rejected(self):
+    code = self.run_cli(
+        [
+            "run",
+            "--eval-adapters",
+            "not_an_adapter_mode",
+            "--dry-run",
+            "--yes",
+        ]
+    )
+    self.assertEqual(code, app.EXIT_USAGE)
+    self.assertIn("eval_adapter_modes", self.output)
+
   def test_invalid_continual_eval_adapters_flag_is_rejected(self):
     code = self.run_cli(
         [

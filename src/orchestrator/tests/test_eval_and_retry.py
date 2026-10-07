@@ -130,6 +130,72 @@ class TestEvalTargets(unittest.TestCase):
           saved["stages"]["eval"]["metrics"]["sft/hallucination_rate"], 0.1
       )
 
+  def test_eval_adapter_modes_support_perl_only_and_both_independently_of_continual_eval(
+      self,
+  ):
+    stage, _ = self._stage(sft="u/sft_ckpt", perl="u/perl_ckpt")
+    stage.config.eval.continual_eval_enabled = False
+    stage.config.eval.eval_adapter_modes = ["sft_and_perl", "perl_only"]
+
+    targets = stage.resolve_targets()
+    self.assertEqual(
+        [(t.label, t.model_repo_id, t.stack_sft) for t in targets],
+        [
+            ("sft", "u/sft_ckpt", True),
+            ("perl", "u/perl_ckpt", True),
+            ("perl:nosft", "u/perl_ckpt", False),
+        ],
+    )
+
+    gen_stacked = stage._generation_command(
+        "u/perl_ckpt", 0.0, stack_sft=True
+    )
+    self.assertIn("--sft_model_path", gen_stacked)
+    self.assertEqual(
+        gen_stacked[gen_stacked.index("--sft_model_path") + 1], "u/sft_ckpt"
+    )
+    self.assertNotIn("--allow_missing_sft_adapter", gen_stacked)
+
+    gen_nosft = stage._generation_command(
+        "u/perl_ckpt", 0.0, stack_sft=False
+    )
+    self.assertNotIn("--sft_model_path", gen_nosft)
+    self.assertIn("--allow_missing_sft_adapter", gen_nosft)
+    self.assertEqual(
+        gen_nosft[gen_nosft.index("--allow_missing_sft_adapter") + 1], "True"
+    )
+
+    score_nosft = stage._scoring_command(
+        "u/perl_ckpt", 0.0, stack_sft=False
+    )
+    self.assertNotIn("--sft_model_path", score_nosft)
+    self.assertIn("--allow_missing_sft_adapter", score_nosft)
+
+    repo_stacked, _ = stage._summary_path(
+        "u/perl_ckpt", 0.0, stack_sft=True
+    )
+    repo_nosft, _ = stage._summary_path(
+        "u/perl_ckpt", 0.0, stack_sft=False
+    )
+    self.assertNotEqual(repo_stacked, repo_nosft)
+    self.assertIn("_nosft", repo_nosft)
+
+    # Dry-run produces metrics and separate delta namespaces for both modes
+    result = stage.execute()
+    self.assertIn("sft/hallucination_rate", result.metrics)
+    self.assertIn("perl/hallucination_rate", result.metrics)
+    self.assertIn("perl:nosft/hallucination_rate", result.metrics)
+    self.assertIn("delta/hallucination_rate", result.metrics)
+    self.assertIn("delta:nosft/hallucination_rate", result.metrics)
+    self.assertEqual(
+        eval_metrics.present_targets(result.metrics),
+        [
+            ("sft", "SFT"),
+            ("perl", "PE-RL"),
+            ("perl:nosft", "PE-RL (no SFT)"),
+        ],
+    )
+
 
 class TestDeltaSigns(unittest.TestCase):
   """A positive delta must always mean 'PE-RL is better'."""
