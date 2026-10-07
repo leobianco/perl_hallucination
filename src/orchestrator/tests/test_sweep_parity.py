@@ -259,6 +259,25 @@ class SweepMaterializationParityTest(unittest.TestCase):
     _, retrain_flags, _ = self._parity("perl")
     self.assertEqual(retrain_flags["--lr_scheduler_type"], "cosine")
     self.assertEqual(str(retrain_flags["--warmup_ratio"]), "0.1")
+    self.assertEqual(str(retrain_flags["--min_lr_ratio"]), "0.25")
+
+  def test_perl_min_lr_ratio_can_be_swept_and_materialized(self):
+    # When a campaign overrides min_lr_ratio in sweep parameters, the winning
+    # trial's value must replace the default 0.25 in materialization.
+    plan = self.manager.build_materialization_command(
+        stage_name="perl",
+        task_name=self.config.task_name,
+        base_model=self.config.base_model,
+        best_params={**self.best_params, "min_lr_ratio": 0.35},
+        seed=self.config.seed,
+        sft_model_path="leobianco/npov_SFT_winner",
+        reward_model_path="leobianco/npov_RM_winner",
+        tunable_keys={"learning_rate", "beta", "temperature", "min_lr_ratio"},
+        timestamp="2601010000",
+    )
+    retrain_flags = _command_flags(plan.command)
+    self.assertEqual(str(retrain_flags["--min_lr_ratio"]), "0.35")
+    self.assertEqual(plan.command.count("--min_lr_ratio"), 1)
 
   def test_every_stage_retrains_on_the_schedule_it_searched(self):
     for stage in STAGES:

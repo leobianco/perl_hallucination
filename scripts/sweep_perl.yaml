@@ -42,6 +42,7 @@ command:
   - --save_strategy=no
   - --lr_scheduler_type=cosine
   - --warmup_ratio=0.1
+  - --min_lr_ratio=0.25
   - --max_completion_length=256
   - --num_generations=8
   - --num_iterations=1

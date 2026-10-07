@@ -19,6 +19,7 @@ NUM_TRAIN_EPOCHS=1
 LEARNING_RATE=2e-5
 LR_SCHEDULER_TYPE="cosine"
 WARMUP_RATIO=0.1
+MIN_LR_RATIO="${MIN_LR_RATIO:-0.25}"
 BETA=1e-4
 MAX_COMPLETION_LENGTH=512
 
@@ -210,6 +211,7 @@ fi
   --learning_rate "$LEARNING_RATE" \
   --lr_scheduler_type "$LR_SCHEDULER_TYPE" \
   --warmup_ratio "$WARMUP_RATIO" \
+  --min_lr_ratio "$MIN_LR_RATIO" \
   --max_completion_length "$MAX_COMPLETION_LENGTH" \
   --reward_max_length "$REWARD_MAX_LENGTH" \
   --weight_decay 0.0 \

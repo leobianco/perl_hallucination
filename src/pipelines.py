@@ -205,6 +205,182 @@ def _resolve_reward_max_length(args: Any) -> int:
   return value
 
 
+# Default floor for the PE-RL cosine learning-rate schedule, expressed as a
+# fraction of the peak post-warmup learning rate (eta_min = 0.25 * peak_lr).
+# Decaying all the way to 0 at the end of the final epoch starves late-stage
+# policy updates; keeping a 25% floor preserves effective step sizes through
+# the end of training.
+_DEFAULT_PERL_MIN_LR_RATIO = 0.25
+
+
+def _resolve_min_lr_ratio(
+    args: Any, default: float = _DEFAULT_PERL_MIN_LR_RATIO
+) -> float:
+  """Returns the minimum LR ratio configured on ``args``, in ``[0.0, 1.0]``.
+
+  Absent or non-numeric values (such as a ``MagicMock`` test double) fall back
+  to ``default``. Explicit numeric values outside ``[0.0, 1.0]`` raise
+  ``ValueError`` so misconfigurations fail loudly rather than producing
+  negative or inverted learning-rate schedules.
+
+  Args:
+    args: A ``ScriptArguments`` instance, or any namespace-like object.
+    default: Stage default when ``args.min_lr_ratio`` is unset.
+
+  Returns:
+    The resolved minimum learning-rate ratio as a float in ``[0.0, 1.0]``.
+
+  Raises:
+    ValueError: If an explicit numeric value is outside ``[0.0, 1.0]`` or NaN.
+  """
+  value = getattr(args, "min_lr_ratio", None)
+  if value is None:
+    return float(default)
+  if isinstance(value, bool):
+    raise ValueError(
+        f"min_lr_ratio must be a float in [0.0, 1.0], got {value!r}."
+    )
+  if not isinstance(value, (int, float)):
+    return float(default)
+  ratio = float(value)
+  if math.isnan(ratio) or math.isinf(ratio) or not 0.0 <= ratio <= 1.0:
+    raise ValueError(
+        f"min_lr_ratio must be a float in [0.0, 1.0], got {value!r}."
+    )
+  return ratio
+
+
+def _is_cosine_scheduler_type(scheduler_type: Any) -> bool:
+  """Returns True when ``scheduler_type`` selects a cosine LR schedule."""
+  if scheduler_type is None:
+    return False
+  raw = getattr(scheduler_type, "value", scheduler_type)
+  if not isinstance(raw, str):
+    return False
+  normalized = raw.strip().lower()
+  return normalized in ("cosine", "cosine_with_min_lr")
+
+
+def _resolve_num_warmup_steps(
+    training_args: Any, num_training_steps: int
+) -> int:
+  """Resolves the warmup step count from ``training_args`` and total steps."""
+  warmup_steps = getattr(training_args, "warmup_steps", 0)
+  if (
+      not isinstance(warmup_steps, bool)
+      and isinstance(warmup_steps, (int, float))
+      and int(warmup_steps) > 0
+  ):
+    return int(warmup_steps)
+  get_warmup = getattr(training_args, "get_warmup_steps", None)
+  if callable(get_warmup):
+    try:
+      resolved = get_warmup(num_training_steps)
+      if not isinstance(resolved, bool) and isinstance(resolved, (int, float)):
+        return max(0, int(resolved))
+    except Exception:  # pylint: disable=broad-exception-caught
+      pass
+  warmup_ratio = getattr(training_args, "warmup_ratio", 0.0)
+  if (
+      not isinstance(warmup_ratio, bool)
+      and isinstance(warmup_ratio, (int, float))
+      and float(warmup_ratio) > 0.0
+  ):
+    return max(0, int(math.ceil(num_training_steps * float(warmup_ratio))))
+  return 0
+
+
+def _cosine_with_min_lr_lambda(
+    current_step: int,
+    *,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    min_lr_ratio: float,
+    num_cycles: float = 0.5,
+) -> float:
+  """Computes the multiplicative LR factor for warmup + cosine decay to a floor.
+
+  During the first ``num_warmup_steps`` steps the factor increases linearly
+  from ``0.0`` to ``1.0``. Over the remaining post-warmup steps it follows a
+  cosine curve from ``1.0`` down to ``min_lr_ratio`` at ``num_training_steps``
+  (equivalent to PyTorch's ``CosineAnnealingLR`` with
+  ``eta_min = min_lr_ratio * peak_lr``).
+
+  Args:
+    current_step: Current optimization step.
+    num_warmup_steps: Number of linear warmup steps.
+    num_training_steps: Total number of optimization steps.
+    min_lr_ratio: Floor multiplier in ``[0.0, 1.0]`` reached at the final step.
+    num_cycles: Number of cosine waves in the decay period (0.5 = half cosine).
+
+  Returns:
+    Multiplicative factor in ``[0.0, 1.0]`` applied to each param group's
+    initial learning rate.
+  """
+  if current_step < num_warmup_steps:
+    return float(current_step) / float(max(1, num_warmup_steps))
+  if num_training_steps <= num_warmup_steps:
+    return float(min_lr_ratio)
+  progress = float(current_step - num_warmup_steps) / float(
+      max(1, num_training_steps - num_warmup_steps)
+  )
+  progress = min(1.0, max(0.0, progress))
+  cosine_decay = 0.5 * (
+      1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)
+  )
+  return float(min_lr_ratio) + (1.0 - float(min_lr_ratio)) * cosine_decay
+
+
+def build_cosine_with_min_lr_scheduler(
+    optimizer: Any,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    min_lr_ratio: float = _DEFAULT_PERL_MIN_LR_RATIO,
+    num_cycles: float = 0.5,
+    last_epoch: int = -1,
+) -> Any:
+  """Builds a PyTorch ``LambdaLR`` scheduler with warmup and a cosine floor.
+
+  Using a plain function closure with :class:`torch.optim.lr_scheduler.LambdaLR`
+  ensures ``LambdaLR.state_dict()`` stores ``lr_lambdas: [None]`` (standard
+  PyTorch behavior for ``types.FunctionType``), making ``scheduler.pt``
+  checkpoints 100% compatible with ``torch.load(..., weights_only=True)`` across
+  continual-evaluation pauses and resumptions.
+
+  Args:
+    optimizer: PyTorch optimizer instance.
+    num_warmup_steps: Linear warmup step count.
+    num_training_steps: Total training step count.
+    min_lr_ratio: Final LR as a fraction of the post-warmup peak LR.
+    num_cycles: Number of cosine cycles during decay (default 0.5).
+    last_epoch: Index of last epoch/step (default -1).
+
+  Returns:
+    A ``torch.optim.lr_scheduler.LambdaLR`` instance.
+  """
+  ratio = float(min_lr_ratio)
+  if math.isnan(ratio) or math.isinf(ratio) or not 0.0 <= ratio <= 1.0:
+    raise ValueError(
+        f"min_lr_ratio must be a float in [0.0, 1.0], got {min_lr_ratio!r}."
+    )
+  warmup = max(0, int(num_warmup_steps))
+  total = max(0, int(num_training_steps))
+  cycles = float(num_cycles)
+
+  def lr_lambda(current_step: int) -> float:
+    return _cosine_with_min_lr_lambda(
+        current_step,
+        num_warmup_steps=warmup,
+        num_training_steps=total,
+        min_lr_ratio=ratio,
+        num_cycles=cycles,
+    )
+
+  return torch.optim.lr_scheduler.LambdaLR(
+      optimizer, lr_lambda, last_epoch=last_epoch
+  )
+
+
 def _load_sequence_classifier(
     model_ref: str,
     torch_dtype: Any,
@@ -678,6 +854,11 @@ class Pipeline(abc.ABC):
   the whole pipeline in order.
   """
 
+  #: Default floor for the cosine learning-rate schedule when
+  #: ``args.min_lr_ratio`` is unset. Overridden by :class:`PERLPipeline` to
+  #: :data:`_DEFAULT_PERL_MIN_LR_RATIO` (0.25).
+  _DEFAULT_MIN_LR_RATIO: float = 0.0
+
   def __init__(self):
     self.args = None
     self.training_args = None
@@ -771,6 +952,7 @@ class Pipeline(abc.ABC):
     self._configure_warmup_steps()
     self.setup_model()
     self.setup_trainer()
+    self._configure_lr_scheduler()
     self._configure_best_and_last_checkpoint_saving()
     self.run_and_save()
 
@@ -1413,6 +1595,63 @@ class Pipeline(abc.ABC):
       if hasattr(self.training_args, "warmup_ratio"):
         self.training_args.warmup_ratio = 0.0
 
+  def _configure_lr_scheduler(self) -> None:
+    """Configures a cosine learning-rate floor on ``self.trainer`` when requested.
+
+    Standard cosine decay drives the learning rate to ``0.0`` at the final
+    step, which makes late-epoch PE-RL policy updates vanishingly small. When
+    ``lr_scheduler_type`` is cosine and the resolved ``min_lr_ratio`` is
+    positive (defaulting to ``0.25`` for PE-RL, i.e. 25% of the post-warmup
+    peak learning rate), this wraps ``trainer.create_scheduler`` so that
+    Hugging Face ``Trainer`` / ``RLOOTrainer`` builds a PyTorch ``LambdaLR``
+    with linear warmup to peak LR and cosine decay to
+    ``min_lr_ratio * peak_lr``.
+    """
+    if self.trainer is None or self.training_args is None:
+      return
+    configured = getattr(self.trainer, "_cosine_min_lr_configured", False)
+    if isinstance(configured, bool) and configured:
+      return
+
+    min_lr_ratio = _resolve_min_lr_ratio(
+        self.args, default=self._DEFAULT_MIN_LR_RATIO
+    )
+    if min_lr_ratio <= 0.0:
+      return
+
+    sched_type = getattr(self.training_args, "lr_scheduler_type", None)
+    if not _is_cosine_scheduler_type(sched_type):
+      return
+
+    trainer_ref = self.trainer
+    training_args_ref = self.training_args
+
+    def _create_cosine_with_min_lr_scheduler(
+        num_training_steps: int, optimizer: Any = None
+    ) -> Any:
+      if getattr(trainer_ref, "lr_scheduler", None) is None:
+        opt = (
+            getattr(trainer_ref, "optimizer", None)
+            if optimizer is None
+            else optimizer
+        )
+        args_obj = getattr(trainer_ref, "args", None) or training_args_ref
+        num_warmup_steps = _resolve_num_warmup_steps(
+            args_obj, num_training_steps
+        )
+        trainer_ref.lr_scheduler = build_cosine_with_min_lr_scheduler(
+            optimizer=opt,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps,
+            min_lr_ratio=min_lr_ratio,
+        )
+        trainer_ref._created_lr_scheduler = True
+      return trainer_ref.lr_scheduler
+
+    self.trainer.create_scheduler = _create_cosine_with_min_lr_scheduler
+    self.trainer._cosine_min_lr_configured = True
+    self.trainer._min_lr_ratio = min_lr_ratio
+
   @abc.abstractmethod
   def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
     raise NotImplementedError()
@@ -1883,6 +2122,8 @@ class PERLPipeline(Pipeline):
   and uses RLOOTrainer with standard upstream TRL to run RL training.
   """
 
+  _DEFAULT_MIN_LR_RATIO: float = _DEFAULT_PERL_MIN_LR_RATIO
+
   def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
     clean_args = _clean_cli_args(cli_args)
     parser_lora = create_lora_argument_parser()
@@ -2335,6 +2576,7 @@ class PERLPipeline(Pipeline):
         processing_class=self.tokenizer,
         callbacks=self._training_callbacks(),
     )
+    self._configure_lr_scheduler()
 
   def _training_callbacks(self) -> list[Any]:
     callbacks = super()._training_callbacks()

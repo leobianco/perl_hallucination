@@ -314,6 +314,17 @@ class PerlStage(BaseStage):
           sweep_dict["parameters"][param_name] = {"values": param_spec}
         elif isinstance(param_spec, dict):
           sweep_dict["parameters"][param_name] = param_spec
+        elif not isinstance(param_spec, bool) and isinstance(
+            param_spec, (int, float, str)
+        ):
+          sweep_dict["parameters"][param_name] = {"value": param_spec}
+        if isinstance(sweep_dict.get("command"), list):
+          prefix = f"--{param_name}="
+          sweep_dict["command"] = [
+              arg
+              for arg in sweep_dict["command"]
+              if not (isinstance(arg, str) and arg.startswith(prefix))
+          ]
 
     # Align metric name with sweep YAML if not overridden
     yaml_metric = sweep_dict.get("metric", {}).get("name")

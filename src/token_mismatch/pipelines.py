@@ -437,3 +437,4 @@ class TokenMismatchPERLPipeline(PERLPipeline):
           processing_class=self.tokenizer,
           callbacks=[WandbResumptionCallback()],
       )
+      self._configure_lr_scheduler()

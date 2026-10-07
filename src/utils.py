@@ -8,6 +8,7 @@ including ROC analysis and histogram plotting.
 import argparse
 from dataclasses import dataclass, field
 import hashlib
+import math
 import os
 import re
 from typing import Any, Dict, Optional, Sequence, Union
@@ -47,6 +48,9 @@ class ScriptArguments:
       reward_max_length (int): Token budget used whenever the reward model
         scores a (prompt, completion) pair, both at reward-model training time
         and at PE-RL scoring time.
+      min_lr_ratio (Optional[float]): Minimum learning rate at the end of a
+        cosine schedule as a fraction of the peak post-warmup learning rate,
+        in [0.0, 1.0]. Defaults to 0.25 for PE-RL and 0.0 for other stages.
       continual_eval (bool): Pause PE-RL at every evaluation step to score the
         checkpoint with the autoraters (see ``src/continual_eval.py``).
       continual_eval_launch_config (Optional[str]): Accelerate config each
@@ -80,6 +84,20 @@ class ScriptArguments:
   # RLOO advantage is exactly zero, and only the KL term is optimized.
   # RAGTruth: 2048 covers ~p98 of prompt+response, 4096 covers all of it.
   reward_max_length: int = 2048
+  # Minimum learning rate at the end of a cosine schedule as a fraction of the
+  # peak post-warmup learning rate (eta_min = min_lr_ratio * peak_lr).
+  # None lets each pipeline pick its stage default (0.25 for PE-RL, 0.0 for
+  # SFT/RM/DPO).
+  min_lr_ratio: Optional[float] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Minimum learning rate at the end of a cosine schedule as a"
+              " fraction of the peak post-warmup learning rate, in [0.0, 1.0]."
+              " Defaults to 0.25 for PE-RL and 0.0 for other pipelines."
+          )
+      },
+  )
   # Continual autorater evaluation. These defaults are kept equal to
   # `src.continual_eval.CONTINUAL_EVAL_DEFAULTS` by src/test_continual_eval.py.
   continual_eval: bool = False
@@ -112,6 +130,21 @@ class ScriptArguments:
   # SFT), or 'sft_and_perl,perl_only' / 'both' to run both and log to
   # separate WandB panes.
   continual_eval_adapter_modes: str = "sft_and_perl"
+
+  def __post_init__(self) -> None:
+    if self.min_lr_ratio is not None:
+      if (
+          isinstance(self.min_lr_ratio, bool)
+          or not isinstance(self.min_lr_ratio, (int, float))
+          or math.isnan(self.min_lr_ratio)
+          or math.isinf(self.min_lr_ratio)
+          or not 0.0 <= float(self.min_lr_ratio) <= 1.0
+      ):
+        raise ValueError(
+            "min_lr_ratio must be a float in [0.0, 1.0], got "
+            f"{self.min_lr_ratio!r}."
+        )
+      self.min_lr_ratio = float(self.min_lr_ratio)
 
 
 

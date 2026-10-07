@@ -37,6 +37,7 @@ DEFAULT_TUNABLE_KEYS: Set[str] = {
     "weight_decay",
     "warmup_ratio",
     "lr_scheduler_type",
+    "min_lr_ratio",
     "lora_r",
     "lora_alpha",
     "lora_dropout",
@@ -69,6 +70,12 @@ REWARD_MAX_LENGTH: int = 2048
 #: this value, so the two cannot drift apart; a stale ``reward_penalty_alpha``
 #: in an older winner's W&B config is now ignored rather than replayed.
 REWARD_PENALTY_ALPHA: float = 1.0
+
+#: Default minimum learning rate at the end of the PE-RL cosine schedule, as a
+#: fraction of the post-warmup peak learning rate (25%). Matches
+#: ``--min_lr_ratio=0.25`` in ``scripts/sweep_perl.yaml`` and
+#: ``_DEFAULT_PERL_MIN_LR_RATIO`` in ``src/pipelines.py``.
+PERL_MIN_LR_RATIO: float = 0.25
 
 #: Batch geometry for PE-RL winner retraining.
 #:
@@ -658,6 +665,8 @@ class ModelManager:
           "cosine",
           "--warmup_ratio",
           "0.1",
+          "--min_lr_ratio",
+          str(PERL_MIN_LR_RATIO),
           "--max_completion_length",
           "256",
           "--reward_max_length",
@@ -719,6 +728,15 @@ class ModelManager:
         continue
       flag = f"--{key}"
       if flag in cmd:
+        if (
+            key == "min_lr_ratio"
+            and tunable_keys is not None
+            and key in allowed_keys
+        ):
+          idx = cmd.index(flag)
+          if idx + 1 < len(cmd):
+            cmd[idx + 1] = str(v)
+            injected[key] = v
         continue
       cmd.extend([flag, str(v)])
       injected[key] = v

@@ -45,8 +45,80 @@ if "torch" not in sys.modules or not hasattr(sys.modules["torch"], "__path__"):
     torch.long = "long"
     torch.bool = "bool"
     torch.bfloat16 = "bfloat16"
+
+    class _StubLambdaLR:
+      """Faithful stub of PyTorch's ``torch.optim.lr_scheduler.LambdaLR``."""
+
+      def __init__(self, optimizer, lr_lambda, last_epoch=-1):
+        self.optimizer = optimizer
+        if not isinstance(lr_lambda, (list, tuple)):
+          self.lr_lambdas = [lr_lambda]
+        else:
+          self.lr_lambdas = list(lr_lambda)
+        param_groups = getattr(optimizer, "param_groups", None)
+        if not isinstance(param_groups, list) or not param_groups:
+          param_groups = [{"lr": 1.0}]
+          if optimizer is not None:
+            optimizer.param_groups = param_groups
+        self.base_lrs = [
+            float(group.get("initial_lr", group.get("lr", 1.0)))
+            for group in param_groups
+        ]
+        for group, base_lr in zip(param_groups, self.base_lrs):
+          group.setdefault("initial_lr", base_lr)
+        self.last_epoch = last_epoch
+        self._step_count = 0
+        self._last_lr = []
+        self.step()
+
+      def get_lr(self):
+        return [
+            base_lr * lmbda(self.last_epoch)
+            for lmbda, base_lr in zip(self.lr_lambdas, self.base_lrs)
+        ]
+
+      def step(self, epoch=None):
+        self._step_count += 1
+        if epoch is None:
+          self.last_epoch += 1
+        else:
+          self.last_epoch = epoch
+        values = self.get_lr()
+        param_groups = getattr(self.optimizer, "param_groups", [])
+        for group, lr in zip(param_groups, values):
+          group["lr"] = lr
+        self._last_lr = list(values)
+
+      def get_last_lr(self):
+        return list(self._last_lr)
+
+      def state_dict(self):
+        state = {
+            key: value
+            for key, value in self.__dict__.items()
+            if key not in ("optimizer", "lr_lambdas")
+        }
+        state["lr_lambdas"] = [None] * len(self.lr_lambdas)
+        for idx, fn in enumerate(self.lr_lambdas):
+          if not isinstance(fn, types.FunctionType):
+            state["lr_lambdas"][idx] = fn.__dict__.copy()
+        return state
+
+      def load_state_dict(self, state_dict):
+        state_copy = dict(state_dict)
+        lr_lambdas = state_copy.pop("lr_lambdas")
+        self.__dict__.update(state_copy)
+        for idx, fn in enumerate(lr_lambdas):
+          if fn is not None:
+            self.lr_lambdas[idx].__dict__.update(fn)
+
+    torch.optim = types.ModuleType("torch.optim")
+    torch.optim.lr_scheduler = types.ModuleType("torch.optim.lr_scheduler")
+    torch.optim.lr_scheduler.LambdaLR = _StubLambdaLR
     sys.modules["torch"] = torch
     sys.modules["torch.nn"] = torch.nn
+    sys.modules["torch.optim"] = torch.optim
+    sys.modules["torch.optim.lr_scheduler"] = torch.optim.lr_scheduler
 
 # Ensure third-party modules are mocked if not installed in local environment
 if "transformers" not in sys.modules or not hasattr(
@@ -2372,5 +2444,213 @@ class TestContinualEvalCheckpointingSetup(unittest.TestCase):
     self.assertEqual(training_args.save_steps, 25)
 
 
+class TestCosineMinLrScheduler(unittest.TestCase):
+  """Tests for the cosine learning rate schedule with a non-zero final floor."""
+
+  def _make_optimizer(self, lr: float = 2e-4) -> types.SimpleNamespace:
+    return types.SimpleNamespace(param_groups=[{"lr": lr}])
+
+  def test_cosine_schedule_reaches_25_percent_of_peak_at_final_step(self):
+    from src.pipelines import build_cosine_with_min_lr_scheduler
+
+    peak_lr = 2e-4
+    optimizer = self._make_optimizer(lr=peak_lr)
+    scheduler = build_cosine_with_min_lr_scheduler(
+        optimizer=optimizer,
+        num_warmup_steps=10,
+        num_training_steps=110,
+        min_lr_ratio=0.25,
+    )
+
+    # Step 0 (start of linear warmup): LR = 0.0
+    self.assertAlmostEqual(scheduler.get_last_lr()[0], 0.0, places=12)
+
+    # Advance 5 steps into warmup (halfway through 10-step warmup): LR = 0.5 * peak
+    for _ in range(5):
+      scheduler.step()
+    self.assertAlmostEqual(scheduler.get_last_lr()[0], 0.5 * peak_lr, places=12)
+
+    # Advance to step 10 (end of warmup / peak LR): LR = 1.0 * peak
+    for _ in range(5):
+      scheduler.step()
+    self.assertAlmostEqual(scheduler.get_last_lr()[0], peak_lr, places=12)
+
+    # Advance 50 more steps (halfway through 100-step cosine decay, step 60):
+    # cosine_factor = 0.5 -> scale = 0.25 + 0.75 * 0.5 = 0.625
+    for _ in range(50):
+      scheduler.step()
+    self.assertAlmostEqual(
+        scheduler.get_last_lr()[0], 0.625 * peak_lr, places=12
+    )
+
+    # Advance 50 more steps to the final step (step 110):
+    # cosine_factor = 0.0 -> scale = 0.25 (25% of post-warmup peak LR)
+    for _ in range(50):
+      scheduler.step()
+    self.assertAlmostEqual(
+        scheduler.get_last_lr()[0], 0.25 * peak_lr, places=12
+    )
+
+    # Stepping past num_training_steps stays clamped at min_lr_ratio * peak_lr
+    scheduler.step()
+    self.assertAlmostEqual(
+        scheduler.get_last_lr()[0], 0.25 * peak_lr, places=12
+    )
+
+  def test_scheduler_state_dict_is_weights_only_safe_and_resumable(self):
+    from src.pipelines import build_cosine_with_min_lr_scheduler
+
+    peak_lr = 1e-4
+    opt1 = self._make_optimizer(lr=peak_lr)
+    sched1 = build_cosine_with_min_lr_scheduler(
+        optimizer=opt1,
+        num_warmup_steps=10,
+        num_training_steps=100,
+        min_lr_ratio=0.25,
+    )
+    for _ in range(37):
+      sched1.step()
+
+    state = sched1.state_dict()
+    # PyTorch LambdaLR stores [None] for plain function lambdas so scheduler.pt
+    # contains only primitives and can be loaded with weights_only=True.
+    self.assertEqual(state["lr_lambdas"], [None])
+
+    opt2 = self._make_optimizer(lr=peak_lr)
+    sched2 = build_cosine_with_min_lr_scheduler(
+        optimizer=opt2,
+        num_warmup_steps=10,
+        num_training_steps=100,
+        min_lr_ratio=0.25,
+    )
+    sched2.load_state_dict(state)
+    self.assertAlmostEqual(
+        sched1.get_last_lr()[0], sched2.get_last_lr()[0], places=12
+    )
+
+    # Continue both to the final step and verify identical trajectory and floor.
+    for _ in range(100 - 37):
+      sched1.step()
+      sched2.step()
+      self.assertAlmostEqual(
+          sched1.get_last_lr()[0], sched2.get_last_lr()[0], places=12
+      )
+    self.assertAlmostEqual(
+        sched2.get_last_lr()[0], 0.25 * peak_lr, places=12
+    )
+
+  def test_perl_pipeline_defaults_to_25_percent_min_lr_floor(self):
+    pipeline = PERLPipeline()
+    pipeline.args = types.SimpleNamespace(min_lr_ratio=None)
+    pipeline.training_args = types.SimpleNamespace(
+        lr_scheduler_type="cosine",
+        warmup_steps=0,
+        warmup_ratio=0.1,
+        get_warmup_steps=None,
+    )
+    trainer = types.SimpleNamespace(
+        optimizer=self._make_optimizer(lr=2e-4),
+        lr_scheduler=None,
+    )
+    pipeline.trainer = trainer
+
+    with contextlib.redirect_stdout(io.StringIO()):
+      pipeline._configure_lr_scheduler()
+
+    trainer.create_scheduler(num_training_steps=100)
+    self.assertIsNotNone(trainer.lr_scheduler)
+    # Warmup ends at step 10 -> peak LR = 2e-4
+    for _ in range(10):
+      trainer.lr_scheduler.step()
+    self.assertAlmostEqual(trainer.lr_scheduler.get_last_lr()[0], 2e-4)
+    # Final step 100 -> 25% of 2e-4 = 5e-5
+    for _ in range(90):
+      trainer.lr_scheduler.step()
+    self.assertAlmostEqual(trainer.lr_scheduler.get_last_lr()[0], 0.25 * 2e-4)
+
+  def test_custom_min_lr_ratio_and_zero_disable_override(self):
+    # Custom ratio (e.g. 0.4) is respected.
+    pipeline = PERLPipeline()
+    pipeline.args = types.SimpleNamespace(min_lr_ratio=0.4)
+    pipeline.training_args = types.SimpleNamespace(
+        lr_scheduler_type="cosine",
+        warmup_steps=10,
+        warmup_ratio=0.0,
+        get_warmup_steps=None,
+    )
+    trainer = types.SimpleNamespace(
+        optimizer=self._make_optimizer(lr=1e-4),
+        lr_scheduler=None,
+    )
+    pipeline.trainer = trainer
+    with contextlib.redirect_stdout(io.StringIO()):
+      pipeline._configure_lr_scheduler()
+    trainer.create_scheduler(num_training_steps=50)
+    for _ in range(50):
+      trainer.lr_scheduler.step()
+    self.assertAlmostEqual(trainer.lr_scheduler.get_last_lr()[0], 0.4 * 1e-4)
+
+    # Setting min_lr_ratio=0.0 leaves standard Trainer scheduler untouched.
+    pipeline_zero = PERLPipeline()
+    pipeline_zero.args = types.SimpleNamespace(min_lr_ratio=0.0)
+    pipeline_zero.training_args = types.SimpleNamespace(
+        lr_scheduler_type="cosine",
+        warmup_steps=10,
+        warmup_ratio=0.0,
+    )
+    sentinel_create = MagicMock()
+    pipeline_zero.trainer = types.SimpleNamespace(
+        create_scheduler=sentinel_create
+    )
+    pipeline_zero._configure_lr_scheduler()
+    self.assertIs(pipeline_zero.trainer.create_scheduler, sentinel_create)
+
+    # Non-cosine scheduler (e.g. "linear") is also left untouched.
+    pipeline_linear = PERLPipeline()
+    pipeline_linear.args = types.SimpleNamespace(min_lr_ratio=0.25)
+    pipeline_linear.training_args = types.SimpleNamespace(
+        lr_scheduler_type="linear",
+        warmup_steps=10,
+        warmup_ratio=0.0,
+    )
+    pipeline_linear.trainer = types.SimpleNamespace(
+        create_scheduler=sentinel_create
+    )
+    pipeline_linear._configure_lr_scheduler()
+    self.assertIs(pipeline_linear.trainer.create_scheduler, sentinel_create)
+
+    # SFTPipeline defaults to min_lr_ratio=0.0 unless explicitly configured.
+    sft = SFTPipeline()
+    sft.args = types.SimpleNamespace(min_lr_ratio=None)
+    sft.training_args = types.SimpleNamespace(lr_scheduler_type="cosine")
+    sft.trainer = types.SimpleNamespace(create_scheduler=sentinel_create)
+    sft._configure_lr_scheduler()
+    self.assertIs(sft.trainer.create_scheduler, sentinel_create)
+
+  def test_script_arguments_validates_min_lr_ratio_bounds(self):
+    from src.pipelines import _resolve_min_lr_ratio
+    from src.utils import ScriptArguments
+
+    req = dict(
+        task_name="npov",
+        dataset_repo_id="leobianco/npov",
+        model_repo_id="google/gemma-4-E4B-it",
+    )
+    default_args = ScriptArguments(**req)
+    self.assertIsNone(default_args.min_lr_ratio)
+
+    valid_args = ScriptArguments(**req, min_lr_ratio=0.25)
+    self.assertEqual(valid_args.min_lr_ratio, 0.25)
+
+    for invalid in (-0.1, 1.5, float("nan"), float("inf"), True):
+      with self.subTest(invalid=invalid):
+        with self.assertRaises(ValueError):
+          ScriptArguments(**req, min_lr_ratio=invalid)
+        with self.assertRaises(ValueError):
+          _resolve_min_lr_ratio(types.SimpleNamespace(min_lr_ratio=invalid))
+
+
 if __name__ == "__main__":
   unittest.main()
+
+
