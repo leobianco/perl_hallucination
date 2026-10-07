@@ -9,6 +9,7 @@ earlier policies.
 
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -550,6 +551,186 @@ class ContinualEvalSampleFractionAndTrialRankingTest(unittest.TestCase):
     self.assertEqual(winner.run_id, "trial_b")
     self.assertEqual(winner.selection, "constrained_continual_eval")
     self.assertAlmostEqual(winner.value, 0.09)
+
+
+class TestSkipPerlMaterializationFromSweepTrial(unittest.TestCase):
+  """PE-RL stage restores and uploads the winning trial's local adapter directly instead of retraining."""
+
+  def setUp(self):
+    super().setUp()
+    self.temp_dir = tempfile.mkdtemp(prefix="test_skip_perl_mat_")
+    self.mgr = ModelManager(user="u", dry_run=False)
+
+  def tearDown(self):
+    shutil.rmtree(self.temp_dir, ignore_errors=True)
+    super().tearDown()
+
+  def test_perl_stage_passes_winner_run_id_and_step_to_materialize_and_push(
+      self,
+  ):
+    config = CampaignConfig.create_default(task_name="npov", dry_run=True)
+    state = CampaignState(campaign_id="c", task_name="npov")
+    state.stages["sft"] = StageResult(
+        status=StageStatus.COMPLETED, model_repo_id="u/sft"
+    )
+    state.stages["rm"] = StageResult(
+        status=StageStatus.COMPLETED, model_repo_id="u/rm"
+    )
+    controller = mock.MagicMock()
+    controller.create_sweep.return_value = "sweep-x"
+    controller.sweep_exists.return_value = False
+    controller.count_finished_runs.return_value = 0
+    controller.run_sweep_agent.return_value = 0
+    controller.fetch_best_run_details.return_value = RunScore(
+        run_id="trial_winner_42",
+        value=0.11,
+        params={"learning_rate": 1e-5},
+        final_value=0.16,
+        selection="constrained_continual_eval",
+        step=24,
+    )
+    model_manager = mock.MagicMock()
+    model_manager.materialize_and_push.return_value = "u/out"
+    stage = PerlStage(
+        CampaignContext(
+            config=config,
+            state=state,
+            sweep_controller=controller,
+            model_manager=model_manager,
+        )
+    )
+    stage.execute()
+    kwargs = model_manager.materialize_and_push.call_args.kwargs
+    self.assertEqual(kwargs["winner_run_id"], "trial_winner_42")
+    self.assertEqual(kwargs["winner_step"], 24)
+
+  def test_materialize_and_push_restores_completed_local_trial_without_retraining(
+      self,
+  ):
+    trial_dir = os.path.join(self.temp_dir, "npov", "perl", "trial_win")
+    step24_dir = os.path.join(trial_dir, "adapters", "step-24")
+    last_dir = os.path.join(trial_dir, "last")
+    os.makedirs(step24_dir, exist_ok=True)
+    os.makedirs(last_dir, exist_ok=True)
+    with open(
+        os.path.join(step24_dir, "adapter_model.safetensors"), "wb"
+    ) as f:
+      f.write(b"step-24-adapter")
+    with open(os.path.join(last_dir, "adapter_model.safetensors"), "wb") as f:
+      f.write(b"step-48-adapter")
+    with open(
+        os.path.join(trial_dir, CONTINUAL_EVAL_STATUS_FILENAME),
+        "w",
+        encoding="utf-8",
+    ) as f:
+      json.dump(
+          {
+              "paused_for_eval": False,
+              "training_completed": True,
+              "current_step": 48,
+              "evaluated_steps": [0, 24, 48],
+              "wandb_run_id": "trial_win",
+          },
+          f,
+      )
+    with open(
+        os.path.join(trial_dir, "checkpoints.json"), "w", encoding="utf-8"
+    ) as f:
+      json.dump(
+          {
+              "default": "best",
+              "default_step": 48,
+              "checkpoints": {
+                  "best": {"step": 48, "subfolder": None, "available": True},
+                  "last": {"step": 48, "subfolder": "last", "available": True},
+              },
+          },
+          f,
+      )
+
+    with mock.patch(
+        "src.orchestrator.model_manager.stream_subprocess"
+    ) as subproc, mock.patch.object(
+        self.mgr, "upload_local_checkpoint", return_value="u/repo"
+    ) as upload:
+      repo = self.mgr.materialize_and_push(
+          stage_name="perl",
+          task_name="npov",
+          base_model="google/gemma-4-E4B-it",
+          best_params={"learning_rate": 1e-5},
+          sft_model_path="u/sft",
+          reward_model_path="u/rm",
+          winner_run_id="trial_win",
+          winner_step=24,
+          checkpoints_base_dir=self.temp_dir,
+      )
+
+    # No retraining subprocess was launched!
+    subproc.assert_not_called()
+    upload.assert_called_once()
+    uploaded_dir = upload.call_args.args[0]
+    self.assertEqual(uploaded_dir, trial_dir)
+    self.assertIn("ignore_patterns", upload.call_args.kwargs)
+    self.assertIn("adapters/*", upload.call_args.kwargs["ignore_patterns"])
+    self.assertIn("checkpoint-*", upload.call_args.kwargs["ignore_patterns"])
+    # Step 24 adapter was promoted to the root of trial_dir, and checkpoints.json updated
+    with open(
+        os.path.join(trial_dir, "adapter_model.safetensors"), "rb"
+    ) as f:
+      self.assertEqual(f.read(), b"step-24-adapter")
+    with open(
+        os.path.join(trial_dir, "checkpoints.json"), "r", encoding="utf-8"
+    ) as f:
+      manifest = json.load(f)
+    self.assertEqual(manifest["default_step"], 24)
+    self.assertEqual(manifest["checkpoints"]["best"]["step"], 24)
+    self.assertTrue(repo.startswith("u/"))
+
+  def test_paused_trial_directory_is_refused_and_falls_back_to_retraining(
+      self,
+  ):
+    trial_dir = os.path.join(self.temp_dir, "npov", "perl", "trial_paused")
+    os.makedirs(trial_dir, exist_ok=True)
+    with open(
+        os.path.join(trial_dir, "adapter_model.safetensors"), "wb"
+    ) as f:
+      f.write(b"half-trained")
+    with open(
+        os.path.join(trial_dir, CONTINUAL_EVAL_STATUS_FILENAME),
+        "w",
+        encoding="utf-8",
+    ) as f:
+      json.dump(
+          {
+              "paused_for_eval": True,
+              "training_completed": False,
+              "current_step": 24,
+          },
+          f,
+      )
+
+    with mock.patch(
+        "src.orchestrator.model_manager.stream_subprocess",
+        return_value=ProcessOutcome(returncode=0),
+    ) as subproc, mock.patch.object(
+        self.mgr, "upload_local_checkpoint"
+    ) as upload, mock.patch("os.makedirs"):
+      self.mgr.materialize_and_push(
+          stage_name="perl",
+          task_name="npov",
+          base_model="google/gemma-4-E4B-it",
+          best_params={"learning_rate": 1e-5},
+          sft_model_path="u/sft",
+          reward_model_path="u/rm",
+          winner_run_id="trial_paused",
+          winner_step=24,
+          checkpoints_base_dir=self.temp_dir,
+      )
+
+    # Because training_completed is False, direct upload is refused and
+    # materialization retraining runs instead.
+    upload.assert_not_called()
+    subproc.assert_called_once()
 
 
 if __name__ == "__main__":

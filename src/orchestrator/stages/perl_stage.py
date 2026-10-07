@@ -365,7 +365,8 @@ class PerlStage(BaseStage):
         live_line_callback=live_line_callback,
     )
 
-    # 4. Materialize and Push to Hugging Face Hub
+    # 4. Publish Best Policy to Hugging Face Hub (restoring from local sweep
+    # trial checkpoint when available to skip redundant retraining)
     # NOTE: the sweep-agent predicate is deliberately *not* reused here; see
     # BaseStage.materialization_stop_callback.
     if live_line_callback:
@@ -385,6 +386,8 @@ class PerlStage(BaseStage):
         deepspeed_config=self.config.deepspeed_config_for(self.kind),
         memory_flags=self.config.memory_flags_for(self.kind),
         continual_eval_flags=continual_eval_flags,
+        winner_run_id=winner.run_id,
+        winner_step=winner.step,
         **self.materialization_checkpoint_kwargs(cfg),
     )
 

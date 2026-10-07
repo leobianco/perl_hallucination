@@ -2188,6 +2188,21 @@ class PERLPipeline(Pipeline):
     if wandb is not None and getattr(wandb, "run", None) is not None:
       wandb.run.name = run_name
 
+    wandb_run_id = os.environ.get("WANDB_RUN_ID", "").strip()
+    has_explicit_output_dir = any(
+        str(a) == "--output_dir" or str(a).startswith("--output_dir=")
+        for a in clean_args
+    )
+    if (
+        not has_explicit_output_dir
+        and wandb_run_id
+        and getattr(self.training_args, "output_dir", None)
+        in (None, "", "trainer_output")
+    ):
+      self.training_args.output_dir = os.path.join(
+          ".", "checkpoints", task, "perl", wandb_run_id
+      )
+
     if getattr(script_args, "continual_eval", False):
       self._configure_continual_eval_checkpointing()
 

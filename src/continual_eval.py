@@ -114,6 +114,12 @@ DEFAULT_REWARD_HACKING_STEP0_MARGIN = 0.05
 BEST_CHECKPOINT_DIRNAME = "best_continual_eval_checkpoint"
 BEST_CHECKPOINT_META_FILENAME = "continual_eval_best_checkpoint.json"
 
+#: Directory under ``output_dir`` where lightweight publishable adapters for
+#: every evaluated step are archived as ``adapters/step-<N>`` so any evaluated
+#: checkpoint can be restored from disk without retaining multi-GB optimizer
+#: states.
+STEP_ADAPTERS_DIRNAME = "adapters"
+
 #: WandB log and summary keys for the constrained best continual-eval
 #: checkpoint (strictly t > 0).
 BEST_CONSTRAINED_HALLUCINATION_KEY = "eval/best_constrained_hallucination_rate"
@@ -1922,6 +1928,9 @@ def _run_pending_evaluation(
   status.paused_for_eval = False
   status.eval_error = None
   status.save(output_dir)
+  archive_step_adapter(
+      output_dir=output_dir, step=step, checkpoint_dir=checkpoint_dir
+  )
   preserve_best_continual_checkpoint(
       output_dir=output_dir, step=step, checkpoint_dir=checkpoint_dir
   )
@@ -1977,6 +1986,107 @@ def _copy_publishable_checkpoint_files(src_dir: str, dst_dir: str) -> None:
       shutil.copy2(src_path, dst_path)
 
 
+def step_adapter_dir(output_dir: str, step: int) -> str:
+  """Returns the lightweight adapter archive path for ``step``."""
+  return os.path.join(output_dir, STEP_ADAPTERS_DIRNAME, f"step-{int(step)}")
+
+
+def archive_step_adapter(
+    output_dir: str,
+    step: int,
+    checkpoint_dir: Optional[str] = None,
+) -> Optional[str]:
+  """Archives the lightweight publishable adapter for ``step`` under ``adapters/step-<step>``.
+
+  Copies only publishable adapter/tokenizer files (excluding multi-GB
+  DeepSpeed/AdamW optimizer states, scheduler states, and RNG dumps) so that
+  every evaluated step remains restorable from local disk even after
+  ``save_total_limit`` rotates ``checkpoint-*`` directories.
+
+  Args:
+    output_dir: The PE-RL training output directory.
+    step: Evaluated optimizer step.
+    checkpoint_dir: Optional source checkpoint directory (defaults to
+      ``<output_dir>/checkpoint-<step>``).
+
+  Returns:
+    The archive directory path when weights were archived, else None.
+  """
+  if not output_dir or not os.path.isdir(output_dir):
+    return None
+  src_dir = checkpoint_dir or os.path.join(output_dir, f"checkpoint-{int(step)}")
+  if not _dir_has_publishable_weights(src_dir):
+    return None
+
+  dst_dir = step_adapter_dir(output_dir, int(step))
+  tmp_dir = f"{dst_dir}.tmp.{os.getpid()}"
+  try:
+    os.makedirs(os.path.dirname(dst_dir), exist_ok=True)
+    if os.path.exists(tmp_dir):
+      shutil.rmtree(tmp_dir, ignore_errors=True)
+    _copy_publishable_checkpoint_files(src_dir, tmp_dir)
+    if os.path.exists(dst_dir):
+      shutil.rmtree(dst_dir, ignore_errors=True)
+    os.replace(tmp_dir, dst_dir)
+    return dst_dir
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    if os.path.exists(tmp_dir):
+      shutil.rmtree(tmp_dir, ignore_errors=True)
+    print(
+        "[ContinualEval] Warning: could not archive lightweight step adapter "
+        f"for step {step} from {src_dir}: {exc}",
+        flush=True,
+    )
+    return None
+
+
+def prune_continual_eval_optimizer_states(output_dir: str) -> int:
+  """Removes heavy optimizer/scheduler/RNG dumps from ``checkpoint-*`` after training completes.
+
+  Once a continual-evaluation trial finishes all training segments, its
+  ``checkpoint-*`` directories no longer need to be resumed from. Removing
+  ``global_step*`` DeepSpeed directories, ``optimizer.pt``, ``scheduler.pt``,
+  and ``rng_state*.pth`` reclaims multiple gigabytes per trial while keeping
+  the lightweight LoRA adapter weights intact on disk.
+
+  Args:
+    output_dir: The PE-RL training output directory.
+
+  Returns:
+    Number of files/directories removed across ``checkpoint-*`` folders.
+  """
+  if not output_dir or not os.path.isdir(output_dir):
+    return 0
+  removed = 0
+  try:
+    entries = os.listdir(output_dir)
+  except OSError:
+    return 0
+  for item in entries:
+    if not item.startswith("checkpoint-"):
+      continue
+    ckpt_dir = os.path.join(output_dir, item)
+    if not os.path.isdir(ckpt_dir):
+      continue
+    try:
+      ckpt_entries = os.listdir(ckpt_dir)
+    except OSError:
+      continue
+    for sub in ckpt_entries:
+      if not _is_ignored_checkpoint_entry(sub):
+        continue
+      sub_path = os.path.join(ckpt_dir, sub)
+      try:
+        if os.path.isdir(sub_path) and not os.path.islink(sub_path):
+          shutil.rmtree(sub_path, ignore_errors=True)
+        else:
+          os.remove(sub_path)
+        removed += 1
+      except OSError:
+        pass
+  return removed
+
+
 def preserve_best_continual_checkpoint(
     output_dir: str,
     step: Optional[int] = None,
@@ -2025,8 +2135,11 @@ def preserve_best_continual_checkpoint(
     src_dir = checkpoint_dir
   else:
     candidate = os.path.join(output_dir, f"checkpoint-{selection.step}")
+    adapter_cand = step_adapter_dir(output_dir, selection.step)
     if _dir_has_publishable_weights(candidate):
       src_dir = candidate
+    elif _dir_has_publishable_weights(adapter_cand):
+      src_dir = adapter_cand
     elif _dir_has_publishable_weights(archive_dir) and archived_step == selection.step:
       return selection
     else:
@@ -2093,22 +2206,29 @@ def finalize_continual_eval_checkpoints(
     enabled) serves the best constrained continual-eval checkpoint ($t^* > 0$);
   - ``output_dir/last`` (and ``hub_model_id:last``) serves the final-step
     checkpoint when $t^* \neq t_{\text{final}}$;
-  - ``checkpoints.json`` records both checkpoints and the selection metadata.
+  - ``checkpoints.json`` records both checkpoints and the selection metadata;
+  - heavy optimizer/scheduler/RNG files in ``checkpoint-*`` are pruned to
+    reclaim disk space while preserving all lightweight adapters.
   """
   if not output_dir or not os.path.isdir(output_dir):
     return None
 
   selection = preserve_best_continual_checkpoint(output_dir)
   if selection is None:
+    prune_continual_eval_optimizer_states(output_dir)
     return None
 
   archive_dir = os.path.join(output_dir, BEST_CHECKPOINT_DIRNAME)
   step_ckpt_dir = os.path.join(output_dir, f"checkpoint-{selection.step}")
+  step_arch_dir = step_adapter_dir(output_dir, selection.step)
   if _dir_has_publishable_weights(archive_dir):
     best_src_dir = archive_dir
   elif _dir_has_publishable_weights(step_ckpt_dir):
     best_src_dir = step_ckpt_dir
+  elif _dir_has_publishable_weights(step_arch_dir):
+    best_src_dir = step_arch_dir
   else:
+    prune_continual_eval_optimizer_states(output_dir)
     print(
         f"[ContinualEval] Warning: winning checkpoint for step {selection.step} "
         "is not available on disk; leaving output_dir root unchanged.",
@@ -2125,8 +2245,11 @@ def finalize_continual_eval_checkpoints(
       )
   )
   last_ckpt_candidate = os.path.join(output_dir, f"checkpoint-{last_step}")
+  last_arch_candidate = step_adapter_dir(output_dir, last_step)
   if _dir_has_publishable_weights(last_ckpt_candidate):
     last_src_dir: Optional[str] = last_ckpt_candidate
+  elif _dir_has_publishable_weights(last_arch_candidate):
+    last_src_dir = last_arch_candidate
   elif _dir_has_publishable_weights(output_dir):
     last_src_dir = output_dir
   else:
@@ -2142,6 +2265,7 @@ def finalize_continual_eval_checkpoints(
 
   # Promote the best constrained checkpoint to the root of output_dir.
   _copy_publishable_checkpoint_files(best_src_dir, output_dir)
+  prune_continual_eval_optimizer_states(output_dir)
 
   plan = checkpoint_publication.plan_publication(
       root_is_best=True,

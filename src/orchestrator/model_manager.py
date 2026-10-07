@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import fnmatch
 import json
 import logging
 import os
 import shutil
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-
+from src import checkpoint_publication
 from src.orchestrator import accel
 from src.orchestrator import flavors
 from src.orchestrator import naming
@@ -154,6 +155,80 @@ def perl_batch_geometry(
 #: ``src/test_continual_eval.py`` keeps the two in sync.
 CONTINUAL_EVAL_STATUS_FILENAME = "continual_eval_status.json"
 
+#: Lightweight per-step adapter archive directory inside a continual-eval trial.
+STEP_ADAPTERS_DIRNAME = "adapters"
+#: Preserved best constrained continual-eval checkpoint directory.
+BEST_CONTINUAL_CHECKPOINT_DIRNAME = "best_continual_eval_checkpoint"
+BEST_CONTINUAL_CHECKPOINT_META_FILENAME = (
+    "continual_eval_best_checkpoint.json"
+)
+
+#: Patterns excluded when uploading a completed sweep trial directory directly
+#: to Hugging Face Hub so only the promoted root adapter, ``last/`` adapter,
+#: ``checkpoints.json``, continual-eval history, and Pareto plots are pushed.
+TRIAL_CHECKPOINT_UPLOAD_IGNORE_PATTERNS: Tuple[str, ...] = tuple(
+    list(checkpoint_publication.CHECKPOINT_UPLOAD_IGNORE_PATTERNS)
+    + [
+        "checkpoint-*",
+        "checkpoint-*/*",
+        f"{STEP_ADAPTERS_DIRNAME}",
+        f"{STEP_ADAPTERS_DIRNAME}/*",
+        f"{BEST_CONTINUAL_CHECKPOINT_DIRNAME}",
+        f"{BEST_CONTINUAL_CHECKPOINT_DIRNAME}/*",
+        "_best_checkpoint",
+        "_best_checkpoint/*",
+        BEST_CONTINUAL_CHECKPOINT_META_FILENAME,
+        CONTINUAL_EVAL_STATUS_FILENAME,
+    ]
+)
+
+_PUBLISHABLE_WEIGHT_FILES = (
+    "adapter_config.json",
+    "config.json",
+    "adapter_model.safetensors",
+    "model.safetensors",
+    "pytorch_model.bin",
+)
+
+
+def _dir_has_publishable_weights(path: Optional[str]) -> bool:
+  """Returns True when ``path`` is a directory containing model/adapter files."""
+  if not path or not os.path.isdir(path):
+    return False
+  try:
+    files = os.listdir(path)
+  except OSError:
+    return False
+  return any(
+      f in _PUBLISHABLE_WEIGHT_FILES or f.endswith((".safetensors", ".bin"))
+      for f in files
+  )
+
+
+def _is_ignored_checkpoint_entry(name: str) -> bool:
+  """Returns True when ``name`` matches training-state ignore patterns."""
+  if name in ("ref", BEST_CONTINUAL_CHECKPOINT_META_FILENAME):
+    return True
+  for pattern in checkpoint_publication.CHECKPOINT_UPLOAD_IGNORE_PATTERNS:
+    clean_pat = pattern.split("/", 1)[0]
+    if fnmatch.fnmatch(name, clean_pat):
+      return True
+  return False
+
+
+def _copy_publishable_checkpoint_files(src_dir: str, dst_dir: str) -> None:
+  """Copies publishable model/tokenizer files from ``src_dir`` into ``dst_dir``."""
+  os.makedirs(dst_dir, exist_ok=True)
+  if os.path.abspath(src_dir) == os.path.abspath(dst_dir):
+    return
+  for entry in os.listdir(src_dir):
+    if _is_ignored_checkpoint_entry(entry):
+      continue
+    src_path = os.path.join(src_dir, entry)
+    dst_path = os.path.join(dst_dir, entry)
+    if os.path.isfile(src_path):
+      shutil.copy2(src_path, dst_path)
+
 
 def continual_eval_training_completed(output_dir: str) -> Optional[bool]:
   """Reads whether a run with continual evaluation has finished training.
@@ -239,6 +314,7 @@ class ModelManager:
       folder_path: str,
       repo_id: str,
       commit_message: str = "Auto-PERL automated checkpoint upload",
+      ignore_patterns: Optional[Sequence[str]] = None,
   ) -> str:
     """Pushes a local directory containing checkpoint weights directly to Hugging Face Hub."""
     if self.dry_run:
@@ -254,12 +330,15 @@ class ModelManager:
 
       api = HfApi()
       api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
-      api.upload_folder(
-          folder_path=folder_path,
-          repo_id=repo_id,
-          repo_type="model",
-          commit_message=commit_message,
-      )
+      upload_kwargs: Dict[str, Any] = {
+          "folder_path": folder_path,
+          "repo_id": repo_id,
+          "repo_type": "model",
+          "commit_message": commit_message,
+      }
+      if ignore_patterns is not None:
+        upload_kwargs["ignore_patterns"] = list(ignore_patterns)
+      api.upload_folder(**upload_kwargs)
       return repo_id
 
     try:
@@ -275,6 +354,233 @@ class ModelManager:
     except Exception as e:
       logger.error("Failed to upload folder to Hugging Face Hub: %s", e)
       raise
+
+  @staticmethod
+  def _trial_has_any_publishable_weights(trial_dir: str) -> bool:
+    """Returns True when ``trial_dir`` or one of its checkpoint archives has weights."""
+    if _dir_has_publishable_weights(trial_dir):
+      return True
+    if _dir_has_publishable_weights(
+        os.path.join(trial_dir, BEST_CONTINUAL_CHECKPOINT_DIRNAME)
+    ):
+      return True
+    adapters_root = os.path.join(trial_dir, STEP_ADAPTERS_DIRNAME)
+    if os.path.isdir(adapters_root):
+      try:
+        for entry in os.listdir(adapters_root):
+          if _dir_has_publishable_weights(os.path.join(adapters_root, entry)):
+            return True
+      except OSError:
+        pass
+    try:
+      for entry in os.listdir(trial_dir):
+        if entry.startswith("checkpoint-") and _dir_has_publishable_weights(
+            os.path.join(trial_dir, entry)
+        ):
+          return True
+    except OSError:
+      pass
+    return False
+
+  @staticmethod
+  def _trial_matches_run_id(trial_dir: str, run_id: str) -> bool:
+    """Returns True when ``trial_dir`` metadata records ``run_id``."""
+    status_path = os.path.join(trial_dir, CONTINUAL_EVAL_STATUS_FILENAME)
+    if os.path.isfile(status_path):
+      try:
+        with open(status_path, encoding="utf-8") as handle:
+          status = json.load(handle)
+        if isinstance(status, dict) and status.get("wandb_run_id") == run_id:
+          return True
+      except (OSError, ValueError):
+        pass
+    id_file = os.path.join(trial_dir, "wandb_run_id.txt")
+    if os.path.isfile(id_file):
+      try:
+        with open(id_file, encoding="utf-8") as handle:
+          if handle.read().strip() == run_id:
+            return True
+      except OSError:
+        pass
+    return False
+
+  def find_completed_trial_checkpoint(
+      self,
+      task_name: str,
+      stage_name: str,
+      run_id: Optional[str],
+      base_dir: str = "./checkpoints",
+  ) -> Optional[str]:
+    """Locates a completed local sweep trial checkpoint directory for ``run_id``.
+
+    Checks ``<base_dir>/<task_name>/<stage_name>/<run_id>`` first, then scans
+    sibling directories under ``<base_dir>/<task_name>/<stage_name>`` whose
+    ``continual_eval_status.json`` or ``wandb_run_id.txt`` matches ``run_id``.
+    Incomplete or paused continual-evaluation trials
+    (``continual_eval_training_completed(dir) is False``) are refused.
+
+    Args:
+      task_name: Task identifier (e.g. ``'npov'``).
+      stage_name: Stage name (e.g. ``'perl'``).
+      run_id: W&B run ID of the winning sweep trial.
+      base_dir: Root checkpoint directory (default ``'./checkpoints'``).
+
+    Returns:
+      Path to the completed trial checkpoint directory, or None if unavailable.
+    """
+    if not run_id or not str(run_id).strip():
+      return None
+    clean_run_id = str(run_id).strip()
+    stage_dir = os.path.join(base_dir, task_name, stage_name)
+    if not os.path.isdir(stage_dir):
+      return None
+
+    candidates: List[str] = []
+    direct = os.path.join(stage_dir, clean_run_id)
+    if os.path.isdir(direct):
+      candidates.append(direct)
+    try:
+      for entry in sorted(os.listdir(stage_dir)):
+        sub = os.path.join(stage_dir, entry)
+        if sub == direct or not os.path.isdir(sub):
+          continue
+        if self._trial_matches_run_id(sub, clean_run_id):
+          candidates.append(sub)
+    except OSError:
+      pass
+
+    for cand in candidates:
+      if continual_eval_training_completed(cand) is False:
+        logger.warning(
+            "Skipping local trial directory %s for run %s: continual "
+            "evaluation training is not completed.",
+            cand,
+            clean_run_id,
+        )
+        continue
+      if self._trial_has_any_publishable_weights(cand):
+        return cand
+    return None
+
+  def prepare_trial_checkpoint_for_upload(
+      self,
+      trial_dir: str,
+      winner_step: Optional[int] = None,
+  ) -> str:
+    """Ensures ``trial_dir`` root holds the selected step's publishable adapter weights.
+
+    When ``winner_step`` is provided and a matching per-step archive exists in
+    ``adapters/step-<winner_step>``, ``checkpoint-<winner_step>``, or
+    ``best_continual_eval_checkpoint``, promotes those publishable files to the
+    root of ``trial_dir`` and updates ``checkpoints.json`` if present. If the
+    root has no publishable weights yet, promotes from
+    ``best_continual_eval_checkpoint`` or the latest available step archive.
+
+    Args:
+      trial_dir: Completed trial checkpoint directory.
+      winner_step: Optional optimizer step selected by the sweep controller.
+
+    Returns:
+      ``trial_dir`` ready for upload.
+    """
+    target_step = checkpoint_publication.coerce_step(winner_step)
+    promoted_src: Optional[str] = None
+    promoted_step: Optional[int] = target_step
+
+    if target_step is not None:
+      step_adapter = os.path.join(
+          trial_dir, STEP_ADAPTERS_DIRNAME, f"step-{target_step}"
+      )
+      step_ckpt = os.path.join(trial_dir, f"checkpoint-{target_step}")
+      best_dir = os.path.join(trial_dir, BEST_CONTINUAL_CHECKPOINT_DIRNAME)
+      best_meta = os.path.join(best_dir, BEST_CONTINUAL_CHECKPOINT_META_FILENAME)
+      best_meta_step: Optional[int] = None
+      if os.path.isfile(best_meta):
+        try:
+          with open(best_meta, encoding="utf-8") as handle:
+            meta = json.load(handle)
+          if isinstance(meta, dict):
+            best_meta_step = checkpoint_publication.coerce_step(
+                meta.get("step")
+            )
+        except (OSError, ValueError):
+          best_meta_step = None
+
+      if _dir_has_publishable_weights(step_adapter):
+        promoted_src = step_adapter
+      elif _dir_has_publishable_weights(step_ckpt):
+        promoted_src = step_ckpt
+      elif (
+          best_meta_step == target_step
+          and _dir_has_publishable_weights(best_dir)
+      ):
+        promoted_src = best_dir
+
+    if promoted_src is None and not _dir_has_publishable_weights(trial_dir):
+      best_dir = os.path.join(trial_dir, BEST_CONTINUAL_CHECKPOINT_DIRNAME)
+      if _dir_has_publishable_weights(best_dir):
+        promoted_src = best_dir
+      else:
+        # Fall back to the highest-numbered step in adapters/ or checkpoint-*
+        best_found_step = -1
+        adapters_root = os.path.join(trial_dir, STEP_ADAPTERS_DIRNAME)
+        if os.path.isdir(adapters_root):
+          try:
+            for entry in os.listdir(adapters_root):
+              if entry.startswith("step-"):
+                s_val = checkpoint_publication.coerce_step(entry[5:])
+                cand = os.path.join(adapters_root, entry)
+                if (
+                    s_val is not None
+                    and s_val > best_found_step
+                    and _dir_has_publishable_weights(cand)
+                ):
+                  best_found_step = s_val
+                  promoted_src = cand
+                  promoted_step = s_val
+          except OSError:
+            pass
+        if promoted_src is None:
+          try:
+            for entry in os.listdir(trial_dir):
+              s_val = checkpoint_publication.step_from_checkpoint_dir(entry)
+              cand = os.path.join(trial_dir, entry)
+              if (
+                  s_val is not None
+                  and s_val > best_found_step
+                  and _dir_has_publishable_weights(cand)
+              ):
+                best_found_step = s_val
+                promoted_src = cand
+                promoted_step = s_val
+          except OSError:
+            pass
+
+    if promoted_src is not None:
+      _copy_publishable_checkpoint_files(promoted_src, trial_dir)
+
+    if promoted_step is not None:
+      manifest_path = os.path.join(
+          trial_dir, checkpoint_publication.CHECKPOINT_MANIFEST_FILENAME
+      )
+      if os.path.isfile(manifest_path):
+        try:
+          with open(manifest_path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+          if isinstance(manifest, dict):
+            manifest["default_step"] = int(promoted_step)
+            ckpts = manifest.get("checkpoints")
+            default_key = manifest.get("default") or "best"
+            if isinstance(ckpts, dict) and isinstance(
+                ckpts.get(default_key), dict
+            ):
+              ckpts[default_key]["step"] = int(promoted_step)
+            with open(manifest_path, "w", encoding="utf-8") as handle:
+              json.dump(manifest, handle, indent=2, sort_keys=True)
+        except (OSError, ValueError):
+          pass
+
+    return trial_dir
 
   def prune_inferior_checkpoints(
       self, base_dir: str, keep_run_dir: str
@@ -767,8 +1073,11 @@ class ModelManager:
       deepspeed_config: Optional[str] = None,
       memory_flags: Optional[Dict[str, str]] = None,
       continual_eval_flags: Optional[Dict[str, str]] = None,
+      winner_run_id: Optional[str] = None,
+      winner_step: Optional[int] = None,
+      checkpoints_base_dir: str = "./checkpoints",
   ) -> str:
-    """Executes a single training run with winning hyperparameters and pushes to HF Hub.
+    """Publishes the winning sweep trial to HF Hub, restoring from local disk when available or retraining.
 
     Args:
         stage_name: 'sft', 'rm', or 'perl'.
@@ -798,6 +1107,14 @@ class ModelManager:
         memory_flags: Size-derived training flags the sweep also passed.
         continual_eval_flags: Continual-evaluation flags the sweep also
           passed; see :meth:`build_materialization_command`.
+        winner_run_id: Optional W&B run ID of the winning sweep trial. When a
+          completed local checkpoint directory exists for this trial, its
+          adapter weights are promoted and uploaded directly to Hugging Face Hub
+          without launching a redundant retraining run.
+        winner_step: Optional optimizer step of the winning checkpoint within
+          the winning trial.
+        checkpoints_base_dir: Root directory where sweep trials store local
+          checkpoints (default ``'./checkpoints'``).
 
     Returns:
         The uploaded Hugging Face model repository ID.
@@ -836,6 +1153,58 @@ class ModelManager:
             f"[DRY-RUN] Checkpoint pushed to HuggingFace Hub: {repo_id}"
         )
       return repo_id
+
+    if winner_run_id:
+      trial_dir = self.find_completed_trial_checkpoint(
+          task_name=task_name,
+          stage_name=stage_name,
+          run_id=winner_run_id,
+          base_dir=checkpoints_base_dir,
+      )
+      if trial_dir is not None:
+        self.prepare_trial_checkpoint_for_upload(
+            trial_dir, winner_step=winner_step
+        )
+        coerced_step = checkpoint_publication.coerce_step(winner_step)
+        step_note = (
+            f" (step {coerced_step})" if coerced_step is not None else ""
+        )
+        logger.info(
+            "Restoring winning %s checkpoint from local sweep trial %s%s "
+            "at %s (skipping materialization retraining).",
+            stage_name,
+            winner_run_id,
+            step_note,
+            trial_dir,
+        )
+        if live_line_callback:
+          live_line_callback(
+              f"Restoring winning {stage_name} adapter from local trial "
+              f"{winner_run_id}{step_note} ({trial_dir}) — skipping "
+              "materialization retraining..."
+          )
+        commit_msg = (
+            f"Publish winning {stage_name} sweep trial {winner_run_id}"
+            f"{step_note}"
+        )
+        self.upload_local_checkpoint(
+            trial_dir,
+            repo_id,
+            commit_message=commit_msg,
+            ignore_patterns=TRIAL_CHECKPOINT_UPLOAD_IGNORE_PATTERNS,
+        )
+        logger.info(
+            "Successfully published restored %s trial checkpoint to: %s",
+            stage_name,
+            repo_id,
+        )
+        return repo_id
+      logger.info(
+          "No completed local checkpoint found for %s trial %s; falling back "
+          "to materialization retraining.",
+          stage_name,
+          winner_run_id,
+      )
 
     os.makedirs(output_dir, exist_ok=True)
 

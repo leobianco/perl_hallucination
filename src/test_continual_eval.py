@@ -2252,6 +2252,101 @@ class TestConstrainedCheckpointSelection(unittest.TestCase):
     self.assertEqual(manifest["checkpoints"]["last"]["subfolder"], "last")
     self.assertEqual(manifest["checkpoints"]["last"]["step"], 48)
 
+  def test_archive_step_adapter_and_prune_optimizer_states_on_finalize(self):
+    ckpt24 = os.path.join(self.temp_dir, "checkpoint-24")
+    os.makedirs(os.path.join(ckpt24, "global_step24"), exist_ok=True)
+    with open(os.path.join(ckpt24, "adapter_model.safetensors"), "wb") as f:
+      f.write(b"adapter-24")
+    with open(os.path.join(ckpt24, "optimizer.pt"), "wb") as f:
+      f.write(b"heavy-opt-24")
+    with open(
+        os.path.join(ckpt24, "global_step24", "mp_rank_00_model_states.pt"),
+        "wb",
+    ) as f:
+      f.write(b"ds-states-24")
+
+    archived = continual_eval_mod.archive_step_adapter(
+        self.temp_dir, step=24, checkpoint_dir=ckpt24
+    )
+    self.assertEqual(
+        archived, os.path.join(self.temp_dir, "adapters", "step-24")
+    )
+    self.assertTrue(
+        os.path.isfile(os.path.join(archived, "adapter_model.safetensors"))
+    )
+    self.assertFalse(os.path.exists(os.path.join(archived, "optimizer.pt")))
+    self.assertFalse(os.path.exists(os.path.join(archived, "global_step24")))
+
+    # Remove checkpoint-24 (simulating rotation) and create checkpoint-48 with
+    # heavy optimizer/scheduler/RNG files.
+    shutil.rmtree(ckpt24)
+    ckpt48 = os.path.join(self.temp_dir, "checkpoint-48")
+    os.makedirs(os.path.join(ckpt48, "global_step48"), exist_ok=True)
+    with open(os.path.join(ckpt48, "adapter_model.safetensors"), "wb") as f:
+      f.write(b"adapter-48")
+    with open(os.path.join(ckpt48, "optimizer.pt"), "wb") as f:
+      f.write(b"heavy-opt-48")
+    with open(os.path.join(ckpt48, "scheduler.pt"), "wb") as f:
+      f.write(b"sched-48")
+    with open(os.path.join(ckpt48, "rng_state_0.pth"), "wb") as f:
+      f.write(b"rng-48")
+    with open(
+        os.path.join(ckpt48, "global_step48", "zero_pp_rank_0.pt"), "wb"
+    ) as f:
+      f.write(b"ds-states-48")
+    continual_eval_mod.archive_step_adapter(
+        self.temp_dir, step=48, checkpoint_dir=ckpt48
+    )
+
+    history = [
+        {
+            "step": 24,
+            "hallucination_rate": 0.09,
+            "reward_hacking_rate": 0.04,
+            "reward_hacking_quality": 0.88,
+        },
+        {
+            "step": 48,
+            "hallucination_rate": 0.14,
+            "reward_hacking_rate": 0.05,
+            "reward_hacking_quality": 0.85,
+        },
+    ]
+    with open(
+        os.path.join(self.temp_dir, "continual_eval_history.json"),
+        "w",
+        encoding="utf-8",
+    ) as f:
+      json.dump(history, f)
+
+    status48 = ContinualEvalStatus(
+        paused_for_eval=False,
+        current_step=48,
+        checkpoint_dir=ckpt48,
+        evaluated_steps=[24, 48],
+        training_completed=True,
+    )
+    continual_eval_mod.finalize_continual_eval_checkpoints(
+        output_dir=self.temp_dir,
+        flags={"push_to_hub": "False"},
+        status=status48,
+    )
+
+    # Step 24 was restored from adapters/step-24 even after checkpoint-24 was rotated
+    with open(
+        os.path.join(self.temp_dir, "adapter_model.safetensors"), "rb"
+    ) as f:
+      self.assertEqual(f.read(), b"adapter-24")
+    # Heavy optimizer/scheduler/RNG files in checkpoint-48 were pruned while
+    # keeping the lightweight adapter weights.
+    self.assertTrue(
+        os.path.isfile(os.path.join(ckpt48, "adapter_model.safetensors"))
+    )
+    self.assertFalse(os.path.exists(os.path.join(ckpt48, "optimizer.pt")))
+    self.assertFalse(os.path.exists(os.path.join(ckpt48, "scheduler.pt")))
+    self.assertFalse(os.path.exists(os.path.join(ckpt48, "rng_state_0.pth")))
+    self.assertFalse(os.path.exists(os.path.join(ckpt48, "global_step48")))
+
 
 class TestPerlEntryPoint(unittest.TestCase):
   """src/perl.py dispatches to the coordinator or to a training segment."""
