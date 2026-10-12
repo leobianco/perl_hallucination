@@ -1,8 +1,145 @@
 import json
+import sys
+import types
 import unittest
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
-from datasets import Dataset, DatasetDict
+if "pandas" not in sys.modules:
+  try:
+    import pandas
+  except ImportError:
+    pandas_mock = types.ModuleType("pandas")
+    pandas_mock.DataFrame = MagicMock
+    pandas_mock.isna = lambda x: x is None
+    sys.modules["pandas"] = pandas_mock
+
+try:
+  from datasets import Dataset, DatasetDict
+except ImportError:
+
+  class _MockDataset:
+
+    def __init__(self, data):
+      if isinstance(data, list):
+        keys = []
+        for d in data:
+          for k in d.keys():
+            if k not in keys:
+              keys.append(k)
+        self._data = {k: [d.get(k) for d in data] for k in keys}
+      elif isinstance(data, dict):
+        self._data = dict(data)
+      else:
+        self._data = {}
+      self.column_names = list(self._data.keys())
+
+    def __getitem__(self, key):
+      if isinstance(key, int):
+        return {k: self._data[k][key] for k in self._data}
+      return self._data[key]
+
+    def __len__(self):
+      first_col = next(iter(self._data.values())) if self._data else []
+      return len(first_col)
+
+    def to_dict(self):
+      return dict(self._data)
+
+    def add_column(self, column_name, values):
+      new_data = dict(self._data)
+      new_data[column_name] = values
+      return _MockDataset(new_data)
+
+    def remove_columns(self, column_name):
+      new_data = {k: v for k, v in self._data.items() if k != column_name}
+      return _MockDataset(new_data)
+
+    def rename_column(self, original_column_name, new_column_name):
+      new_data = {
+          (new_column_name if k == original_column_name else k): v
+          for k, v in self._data.items()
+      }
+      return _MockDataset(new_data)
+
+    def select_columns(self, column_names):
+      new_data = {k: v for k, v in self._data.items() if k in column_names}
+      return _MockDataset(new_data)
+
+    def select(self, indices):
+      new_data = {k: [self._data[k][i] for i in indices] for k in self._data}
+      return _MockDataset(new_data)
+
+    def shuffle(self, seed=42):
+      return self
+
+    def filter(self, fn):
+      num_rows = len(self)
+      new_rows = []
+      for i in range(num_rows):
+        entry = {k: self._data[k][i] for k in self._data}
+        if fn(entry):
+          new_rows.append(entry)
+      if not new_rows:
+        return _MockDataset({k: [] for k in self._data})
+      new_data = {k: [row[k] for row in new_rows] for k in self._data}
+      return _MockDataset(new_data)
+
+    def map(self, fn, fn_kwargs=None):
+      kwargs = fn_kwargs or {}
+      num_rows = len(self)
+      new_rows = []
+      for i in range(num_rows):
+        entry = {k: self._data[k][i] for k in self._data}
+        res = fn(entry, **kwargs)
+        if isinstance(res, dict):
+          entry.update(res)
+        new_rows.append(entry)
+      if not new_rows:
+        return _MockDataset({k: [] for k in self._data})
+      all_keys = list(new_rows[0].keys())
+      new_data = {k: [row[k] for row in new_rows] for k in all_keys}
+      return _MockDataset(new_data)
+
+    def __iter__(self):
+      num_rows = len(self)
+      for i in range(num_rows):
+        yield {k: self._data[k][i] for k in self._data}
+
+  class Dataset:
+
+    @classmethod
+    def from_dict(cls, d):
+      return _MockDataset(d)
+
+    @classmethod
+    def from_list(cls, l):
+      return _MockDataset(l)
+
+  class DatasetDict(dict):
+
+    def map(self, fn, **kwargs):
+      return DatasetDict({k: v.map(fn, **kwargs) for k, v in self.items()})
+
+  datasets_mock = types.ModuleType("datasets")
+  datasets_mock.Dataset = Dataset
+  datasets_mock.DatasetDict = DatasetDict
+  datasets_mock.concatenate_datasets = lambda d_list: _MockDataset(
+      {k: [item for d in d_list for item in d._data[k]] for k in d_list[0]._data}
+  )
+  datasets_mock.load_dataset = MagicMock()
+  sys.modules["datasets"] = datasets_mock
+
+if "google" not in sys.modules:
+  google_mock = types.ModuleType("google")
+  genai_mock = types.ModuleType("genai")
+  genai_mock.Client = MagicMock
+  types_mock = types.ModuleType("types")
+  types_mock.GenerateContentConfig = MagicMock
+  genai_mock.types = types_mock
+  google_mock.genai = genai_mock
+  sys.modules["google"] = google_mock
+  sys.modules["google.genai"] = genai_mock
+  sys.modules["google.genai.types"] = types_mock
 
 from src.task_processors.npov_task_processor import NPOVTaskProcessor
 

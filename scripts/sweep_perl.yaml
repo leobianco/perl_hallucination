@@ -1,0 +1,92 @@
+# ==============================================================================
+# W&B Sweep Configuration: Parameter-Efficient Reinforcement Learning (PE-RL / RLOO)
+#
+# Launch Instructions:
+# 1. Initialize the sweep on W&B:
+#      wandb sweep scripts/sweep_perl.yaml
+#    This returns a sweep ID formatted as: <entity>/<project>/<sweep_id>
+#
+# 2. Start a sweep agent to execute runs:
+#      wandb agent <entity>/<project>/<sweep_id>
+#    (Optional: add --count <N> to run a fixed number of trials)
+# ==============================================================================
+
+program: src/perl.py
+method: bayes
+metric:
+  name: train/rewards/reward_fn/mean
+  goal: maximize
+
+command:
+  - ${env}
+  - accelerate
+  - launch
+  - --config_file=scripts/deepspeed_config.yaml
+  - ${program}
+  - --report_to=wandb
+  - --logging_steps=1
+  - --logging_strategy=steps
+  - --log_completions=True
+  - --task_name=npov
+  - --seed=130104
+  - --dataset_repo_id=leobianco/npov_perl
+  - --model_repo_id=google/gemma-4-E4B-it
+  - --sft_model_path=leobianco/
+  - --reward_model_path=leobianco/
+  - --do_train=True
+  - --do_eval=True
+  - --eval_strategy=steps
+  - --eval_steps=24
+  - --eval_on_start=True
+  - --save_only_model=True
+  - --save_strategy=no
+  - --lr_scheduler_type=cosine
+  - --warmup_ratio=0.1
+  - --min_lr_ratio=0.25
+  - --max_completion_length=256
+  - --num_generations=8
+  - --num_iterations=1
+  - --steps_per_generation=16
+  - --per_device_train_batch_size=4
+  - --per_device_eval_batch_size=16
+  - --auto_find_batch_size=False
+  - --gradient_accumulation_steps=8
+  # Pinned, NOT searched. This multiplies the negative part of
+  # rewards/reward_fn/mean - the metric this sweep maximizes - so a trial
+  # that drew a smaller alpha scored higher for free, and every trial was
+  # ranked on a different scale. With method: bayes that is worse than
+  # noise: the optimizer learns that the reliable way to raise the
+  # objective is to weaken the hallucination penalty, i.e. it optimizes
+  # away the thing the penalty exists to punish. Compare alphas across
+  # campaigns using the eval stage's hallucination rate, which does not
+  # depend on alpha, instead of inside one sweep.
+  - --reward_penalty_alpha=1.0
+
+  - ${args}
+
+parameters:
+  num_train_epochs:
+    values:
+      - 0.2
+  learning_rate:
+    distribution: log_uniform_values
+    min: 0.000005
+    max: 0.0001
+  beta:
+    distribution: log_uniform_values
+    min: 0.01
+    max: 0.2
+  # Rollout temperature. Deliberately the evaluation grid
+  # (EvalStageConfig.temperature_grid = 0.0, 0.7, 1.0, 1.25) minus greedy, so
+  # every winner is also scored at the temperature it was trained at. 0.0 is
+  # excluded because RLOO needs distinct rollouts: at greedy all
+  # num_generations samples of a prompt are identical, the leave-one-out
+  # advantage is exactly zero and only the KL term is optimized. The high end
+  # is kept on purpose - hallucinations are more frequent there, which is
+  # more reward signal, not less.
+  temperature:
+    values:
+      - 0.7
+      - 1.0
+      - 1.25
+

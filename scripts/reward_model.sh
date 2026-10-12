@@ -3,7 +3,9 @@
 # Core Parameters
 USER="leobianco"
 SEED=12345
-MODEL_REPO_ID="google/gemma-2-2b-it"
+# Overridable from the environment so that swapping the base model does
+# not require editing this script:  MODEL_REPO_ID=Qwen/Qwen3-4B-Instruct-2507 ./reward_model.sh
+MODEL_REPO_ID="${MODEL_REPO_ID:-google/gemma-4-E4B-it}"
 
 # Dataset Parameters
 ORGANIC=true
@@ -13,7 +15,9 @@ NUM_ORGANIC_HALLUS_TO_KEEP=0
 NUM_STRUCT_HALLUS_TO_KEEP=0
 
 # Training Parameters
-BATCH_SIZE=4
+BATCH_SIZE=16
+EVAL_BATCH_SIZE=32
+AUTO_FIND_BATCH_SIZE=True
 NUM_TRAIN_EPOCHS=3
 LEARNING_RATE=1e-3
 WEIGHT_DECAY=0.0
@@ -23,17 +27,61 @@ LORA_DROPOUT=0.0
 LR_SCHEDULER_TYPE="cosine"
 WARMUP_RATIO=0.1
 
+# Token budget for scoring (prompt + response) pairs.
+#
+# MUST be identical to REWARD_MAX_LENGTH in scripts/perl.sh. The reward model
+# is trained here and queried there; if the two disagree, the model is trained
+# on one view of the text and scored on another.
+#
+# It must comfortably exceed prompt + response. 2048 covers ~98th percentile of RAGTruth.
+REWARD_MAX_LENGTH="${REWARD_MAX_LENGTH:-2048}"
+
 # Infrastructure Parameters
 PRECISION="BF16"
-EVAL_STEPS=5
-DEEPSPEED_CONFIG="scripts/deepspeed_config.yaml"
+EVAL_STEPS=25
+# Override for a large policy, e.g.
+#   DEEPSPEED_CONFIG=scripts/deepspeed_config_zero3.yaml ./reward_model.sh
+# The orchestrator picks this automatically from the model size (see
+# src/orchestrator/accel.py); a hand-run script has to be told.
+DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-scripts/deepspeed_config.yaml}"
 
 # Parameters derived from above
 TASK_NAME="$1"
 DATASET_REPO_ID="${USER}/${TASK_NAME}_rm"
-MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
+# $NF, not $1: awk -F'/' '{print $1}' returns the *vendor* namespace, so every
+# run identifier said "google" instead of naming the model. Harmless while one
+# model was ever used; with two it makes runs of different models collide.
+MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $NF}')
 TIMESTAMP=$(date '+%y%m%d%H%M')
-RUN_IDENTIFIER="leobianco/${TASK_NAME}_RM_${MODEL_NAME}_S${SEED}_LLM_${SYN_HALL_LLM}_STRUCT_${SYN_HALL_STRUCT}_epo${NUM_TRAIN_EPOCHS}_lr${LEARNING_RATE}_r${LORA_RANK}_${TIMESTAMP}"
+FORMATTED_LR=$(python3 -c "import sys; lr=float('${LEARNING_RATE}'); print(f'{lr:.1e}')" 2>/dev/null || echo "$LEARNING_RATE")
+FORMATTED_EPOCHS=$(python3 -c "import sys; e=float('${NUM_TRAIN_EPOCHS}'); print(f'{e:.2g}')" 2>/dev/null || echo "$NUM_TRAIN_EPOCHS")
+RUN_IDENTIFIER="${USER}/${TASK_NAME}_RM_${MODEL_NAME}_S${SEED}_LLM_${SYN_HALL_LLM}_STRUCT_${SYN_HALL_STRUCT}_epo${FORMATTED_EPOCHS}_lr${FORMATTED_LR}_r${LORA_RANK}_${TIMESTAMP}"
+
+# Resumption configuration (can be passed via environment variable or second argument)
+RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
+if [ -n "$2" ] && [[ "$2" != --* ]]; then
+    RESUME_FROM_CHECKPOINT="$2"
+fi
+
+OUTPUT_DIR="./checkpoints/${TASK_NAME}/reward_model/${RUN_IDENTIFIER}"
+if [ -n "$RESUME_FROM_CHECKPOINT" ] && [ "$RESUME_FROM_CHECKPOINT" != "auto" ] && [ "$RESUME_FROM_CHECKPOINT" != "True" ] && [ "$RESUME_FROM_CHECKPOINT" != "true" ]; then
+    if [[ "$RESUME_FROM_CHECKPOINT" == *"checkpoint-"* ]] && [ -d "$RESUME_FROM_CHECKPOINT" ]; then
+        OUTPUT_DIR=$(dirname "$RESUME_FROM_CHECKPOINT")
+        RUN_IDENTIFIER=$(basename "$OUTPUT_DIR")
+    elif [ -d "$RESUME_FROM_CHECKPOINT" ]; then
+        OUTPUT_DIR="$RESUME_FROM_CHECKPOINT"
+        RUN_IDENTIFIER=$(basename "$OUTPUT_DIR")
+    elif [[ "$RESUME_FROM_CHECKPOINT" == *"/"* ]]; then
+        CLEANED_HF_REPO=$(echo "$RESUME_FROM_CHECKPOINT" | sed 's|https://huggingface.co/||g' | sed 's|http://huggingface.co/||g' | sed 's|hf://||g' | sed 's|hf.co/||g' | awk -F'[@:]' '{print $1}')
+        RUN_IDENTIFIER="$CLEANED_HF_REPO"
+        OUTPUT_DIR="./checkpoints/${TASK_NAME}/reward_model/${RUN_IDENTIFIER}"
+    fi
+fi
+
+EXTRA_ARGS=()
+if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
+    EXTRA_ARGS+=(--resume_from_checkpoint "$RESUME_FROM_CHECKPOINT")
+fi
 
 # Checks
 if [ "$PRECISION" = "FP16" ]; then
@@ -47,7 +95,7 @@ else
   exit 1
 fi
 
-if [ "$TASK_NAME" != "ragtruth" ] && [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ]; then
+if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ] && [ "$TASK_NAME" != "ragtruth-qa" ] && [ "$TASK_NAME" != "ragtruth-summarization" ]; then
     echo "Invalid task name"
     exit 1
 fi
@@ -70,14 +118,12 @@ fi
 accelerate launch \
   --config_file="${DEEPSPEED_CONFIG}" \
   src/reward_model.py \
-  -- \
   --task_name "$TASK_NAME" \
   --seed "$SEED" \
   --report_to "wandb" \
   --run_name "$RUN_IDENTIFIER" \
   --logging_steps 1 \
-  --output_dir "./checkpoints/${TASK_NAME}/reward_model/${RUN_IDENTIFIER}" \
-  --overwrite_output_dir True \
+  --output_dir "$OUTPUT_DIR" \
   --push_to_hub True \
   --hub_model_id "$RUN_IDENTIFIER" \
   --dataset_repo_id "${DATASET_REPO_ID}" \
@@ -87,22 +133,29 @@ accelerate launch \
   --do_train True \
   --fp16 "$FP16" \
   --bf16 "$BF16" \
-  --save_strategy "epoch" \
+  --save_strategy "steps" \
+  --save_steps "$EVAL_STEPS" \
+  --load_best_model_at_end True \
+  --metric_for_best_model "roc_auc" \
+  --greater_is_better True \
+  --save_total_limit 2 \
   --num_train_epochs "$NUM_TRAIN_EPOCHS" \
   --learning_rate "$LEARNING_RATE" \
   --lr_scheduler_type "$LR_SCHEDULER_TYPE" \
   --warmup_ratio "$WARMUP_RATIO" \
   --weight_decay "$WEIGHT_DECAY" \
   --per_device_train_batch_size "$BATCH_SIZE" \
+  --auto_find_batch_size "$AUTO_FIND_BATCH_SIZE" \
   --gradient_accumulation_steps 1 \
   --do_eval True \
   --eval_on_start True \
   --eval_strategy "steps" \
   --eval_steps "$EVAL_STEPS" \
-  --per_device_eval_batch_size "$BATCH_SIZE" \
-  --eval_accumulation_steps 1 \
+  --per_device_eval_batch_size "$EVAL_BATCH_SIZE" \
   --task_type "SEQ_CLS" \
   --peft_type "LORA" \
   --lora_r "$LORA_RANK" \
   --lora_alpha "$LORA_ALPHA" \
-  --lora_dropout "$LORA_DROPOUT" 
+  --lora_dropout "$LORA_DROPOUT" \
+  --reward_max_length "$REWARD_MAX_LENGTH" \
+  "${EXTRA_ARGS[@]}" 

@@ -1,0 +1,1492 @@
+"""Emission of the static dashboard site.
+
+Everything the browser ever sees is produced here, in one pass, from the
+campaign index. There is no server: ``scripts/dashboard.py serve`` hands the
+*same* directory to :mod:`http.server`, so a local preview and the published
+Space cannot drift apart.
+
+Layout of the emitted site::
+
+    site/
+      README.md            # HF Space configuration (sdk: static)
+      index.html           # campaign list, filtered client-side
+      campaign/<slug>.html # one page per campaign
+      campaign/<slug>.md   # its raw report, for copy-paste
+      data/index.json      # machine-readable index + snapshot timestamp
+
+The stylesheet and the script are inlined into every page rather than emitted
+as separate files; see :func:`_asset` for why.
+
+Two rules hold throughout:
+
+* **Every link is relative.** The site must work from a Space subpath, from
+  ``file://`` and from ``python3 -m http.server`` without reconfiguration.
+* **Every dynamic string is escaped.** Campaign ids, sweep names and model
+  repo ids all originate outside this module.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import datetime
+import hashlib
+import html
+import json
+import os
+import shutil
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from src.dashboard import charts as charts_mod
+from src.dashboard import index as index_mod
+from src.dashboard import links as links_mod
+from src.dashboard import render as render_mod
+from src.orchestrator import eval_metrics
+
+#: A campaign still marked in-progress whose last update predates the
+#: snapshot by more than this is shown as stale rather than live. Publishing
+#: happens at most every minute, so anything this old means the writer is
+#: gone: the VM powered off, or the process died.
+STALE_AFTER_SECONDS = 15 * 60
+
+_STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+#: Read once per process, then reused by every page.
+_ASSET_CACHE: Dict[str, str] = {}
+
+
+def _asset(name: str) -> str:
+  """Reads a file from ``static/``, caching it for the rest of the build.
+
+  The stylesheet and the script are *inlined* into every page rather than
+  linked. Linking them costs two extra requests per page, and on a private
+  Hugging Face Space those requests are the ones that fail: the document is
+  fetched with the credentials the browser already has for the Space, but a
+  subresource on the same host is not guaranteed to inherit them, and a
+  stylesheet that 401s leaves you staring at unstyled HTML with no error
+  anywhere. Inlining removes the failure mode instead of hedging against it,
+  and 15 KB per page is nothing next to the reports these pages carry.
+
+  Args:
+    name: Filename inside ``static/``.
+
+  Returns:
+    The file's contents, or an empty string if it is missing.
+  """
+  if name not in _ASSET_CACHE:
+    try:
+      with open(os.path.join(_STATIC_DIR, name), encoding="utf-8") as handle:
+        _ASSET_CACHE[name] = handle.read()
+    except OSError:
+      _ASSET_CACHE[name] = ""
+  return _ASSET_CACHE[name]
+
+
+#: Files whose contents determine what the HTML looks like, as opposed to
+#: what it says. Folded into the content hash so that a template, stylesheet
+#: or script change republishes on its own: without this, editing the CSS
+#: produced a site that was visibly different and a hash that was not, and
+#: the publisher correctly - and uselessly - skipped it.
+_RENDERER_SOURCES = ("style.css", "app.js")
+
+
+def _renderer_fingerprint() -> str:
+  """Hashes the code and assets that shape the emitted HTML.
+
+  Returns:
+    A short hex digest, stable across runs and across the clock.
+  """
+  digest = hashlib.sha256()
+  for name in _RENDERER_SOURCES:
+    digest.update(_asset(name).encode("utf-8"))
+  for module in (__file__, render_mod.__file__, links_mod.__file__):
+    try:
+      with open(module, "rb") as handle:
+        digest.update(handle.read())
+    except OSError:
+      # A frozen or zipped deployment: the campaign data still fingerprints.
+      continue
+  return digest.hexdigest()[:16]
+
+
+#: Hoisted out of the f-strings that use them: a backslash escape inside an
+#: f-string *expression* is a syntax error before Python 3.12, and the VM's
+#: interpreter is not guaranteed to be newer than that.
+_DASH = "\u2014"
+_MIDDOT = " \u00b7 "
+
+#: Marks a link whose target was recomputed from a naming convention rather
+#: than read from the state file, so a convention change is visible in the UI
+#: and not only in a 404.
+_DERIVED_BADGE = (
+    '<span class="derived" title="Recomputed from the naming convention">'
+    "derived</span>"
+)
+
+_SPACE_README = """---
+title: Auto-PERL Campaigns
+emoji: 🧪
+colorFrom: indigo
+colorTo: purple
+sdk: static
+app_file: index.html
+pinned: false
+---
+
+# Auto-PERL campaign dashboard
+
+A published snapshot of the PE-RL campaigns run by the Auto-PERL orchestrator.
+Generated by `src/dashboard`; do not edit by hand, every publish overwrites it.
+
+Snapshot: {generated_at}
+"""
+
+
+@dataclass
+class BuildResult:
+  """What a build produced, for the CLI and the watcher to report."""
+
+  out_dir: str
+  generated_at: str
+  campaign_count: int
+  page_count: int
+  #: Fingerprint of the *content*, excluding the snapshot timestamp. Two
+  #: builds of an unchanged repository share a hash, which is what lets the
+  #: publisher skip uploading a snapshot that differs only in its clock.
+  content_hash: str = ""
+  in_progress: int = 0
+  stale: int = 0
+  degraded_markdown: bool = False
+  written: List[str] = field(default_factory=list)
+
+
+def _e(value: Any) -> str:
+  """HTML-escapes any value, rendering None as an em dash.
+
+  Args:
+    value: Value to escape.
+
+  Returns:
+    An escaped string safe to interpolate into markup.
+  """
+  if value is None or value == "":
+    return "\u2014"
+  return html.escape(str(value), quote=True)
+
+
+def _attr(value: Any) -> str:
+  """Escapes a value for use inside a double-quoted HTML attribute.
+
+  Args:
+    value: Value to escape.
+
+  Returns:
+    An escaped string, empty when the value is None.
+  """
+  if value is None:
+    return ""
+  return html.escape(str(value), quote=True)
+
+
+def format_timestamp(value: Optional[str]) -> str:
+  """Renders an ISO timestamp as ``YYYY-MM-DD HH:MM``.
+
+  Args:
+    value: ISO timestamp, or None.
+
+  Returns:
+    A compact human timestamp, or an em dash.
+  """
+  parsed = index_mod._parse_iso(value)  # pylint: disable=protected-access
+  if parsed is None:
+    return "\u2014"
+  return parsed.strftime("%Y-%m-%d %H:%M")
+
+
+def format_duration(seconds: Optional[float]) -> str:
+  """Renders a duration in the orchestrator's compact style.
+
+  Args:
+    seconds: Duration in seconds, or None.
+
+  Returns:
+    Strings like ``42s``, ``7m12s`` or ``3h04m``, or an em dash.
+  """
+  if seconds is None:
+    return "\u2014"
+  seconds = int(seconds)
+  if seconds < 60:
+    return f"{seconds}s"
+  if seconds < 3600:
+    return f"{seconds // 60}m{seconds % 60:02d}s"
+  return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+def format_metric(value: Optional[float], places: int = 4) -> str:
+  """Renders a metric value at a fixed precision.
+
+  Args:
+    value: The metric, or None.
+    places: Decimal places.
+
+  Returns:
+    The formatted number, or an em dash. Non-numeric values are stringified
+    rather than dropped, because the eval stage records booleans too.
+  """
+  if value is None:
+    return "\u2014"
+  if isinstance(value, bool):
+    return "yes" if value else "no"
+  if isinstance(value, (int, float)):
+    return f"{value:.{places}f}".rstrip("0").rstrip(".") or "0"
+  return str(value)
+
+
+def format_relative(value: Optional[float]) -> str:
+  """Renders a relative change as a signed percentage.
+
+  Args:
+    value: The change as a fraction of its baseline, or None.
+
+  Returns:
+    A signed percentage, or an em dash. The sign follows the delta it was
+    derived from, so ``+41.0%`` means the policy removed 41% of whatever the
+    baseline was doing wrong - not that the metric itself rose.
+  """
+  if not isinstance(value, (int, float)) or isinstance(value, bool):
+    return "\u2014"
+  return f"{value * 100:+.1f}%"
+
+
+def _chip(text: str, kind: Optional[str] = None) -> str:
+  """Renders a status chip.
+
+  Args:
+    text: Chip label.
+    kind: CSS modifier; defaults to the lowercased label.
+
+  Returns:
+    An HTML snippet.
+  """
+  css = (kind or str(text)).lower().replace("_", "-").replace(" ", "-")
+  return f'<span class="chip chip-{_attr(css)}">{_e(text)}</span>'
+
+
+def _is_stale(
+    campaign: index_mod.CampaignSummary, generated: datetime.datetime
+) -> bool:
+  """Whether a campaign claims to be running but has stopped being written.
+
+  Args:
+    campaign: The campaign.
+    generated: Snapshot time.
+
+  Returns:
+    True when the campaign is non-terminal and its last update is older than
+    :data:`STALE_AFTER_SECONDS`.
+  """
+  if campaign.is_terminal or campaign.status in index_mod.ATTENDED_STATUSES:
+    return False
+  # pylint: disable-next=protected-access
+  updated = index_mod._parse_iso(campaign.updated_at)
+  if updated is None:
+    return True
+  if updated.tzinfo is None and generated.tzinfo is not None:
+    generated = generated.replace(tzinfo=None)
+  return (generated - updated).total_seconds() > STALE_AFTER_SECONDS
+
+
+def _page(
+    title: str,
+    body: str,
+    generated_at: str,
+    depth: int,
+    index_url: str,
+) -> str:
+  """Wraps page content in the shared HTML shell.
+
+  Args:
+    title: Document title.
+    body: Inner HTML of ``.wrap``.
+    generated_at: Snapshot timestamp, exposed to the poller as a meta tag.
+    depth: Directory depth of the page, to build relative asset paths.
+    index_url: Relative URL of ``data/index.json``.
+
+  Returns:
+    A complete HTML document.
+  """
+  up = "../" * depth
+  return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="generated-at" content="{_attr(generated_at)}">
+<title>{_e(title)}</title>
+<style>
+{_asset("style.css")}
+</style>
+</head>
+<body data-index-url="{_attr(index_url)}">
+<div class="masthead"><div class="wrap">
+<h1><a href="{up}index.html">Auto-PERL campaigns</a></h1>
+<div class="tagline">PE-RL experiment campaigns, published from the research VM.</div>
+</div></div>
+<div class="wrap">
+{body}
+<footer>
+Snapshot {_e(generated_at)} &middot; generated by <code>src/dashboard</code> &middot;
+this page is static: numbers change only when the VM publishes a new snapshot.
+</footer>
+</div>
+<script>
+{_asset("app.js")}
+</script>
+</body>
+</html>
+"""
+
+
+def _freshness_bar(
+    generated_at: str, in_progress: int, stale: int
+) -> str:
+  """Renders the snapshot banner shown at the top of the list.
+
+  Args:
+    generated_at: Snapshot timestamp.
+    in_progress: Campaigns that were running when the snapshot was taken.
+    stale: How many of those had stopped being written.
+
+  Returns:
+    An HTML snippet.
+  """
+  dot = "dot stale" if stale else "dot"
+  parts = [f'<span><span class="{dot}"></span>Snapshot {_e(generated_at)}</span>']
+  if in_progress:
+    parts.append(
+        f"<span>{in_progress} campaign(s) in progress at snapshot time</span>"
+    )
+  if stale:
+    parts.append(
+        f"<span>{stale} not updated for over "
+        f"{STALE_AFTER_SECONDS // 60} min \u2014 the VM may be off</span>"
+    )
+  parts.append(
+      '<button id="refresh-pill" type="button">New snapshot \u2014 reload</button>'
+  )
+  return f'<div class="freshness">{"".join(parts)}</div>'
+
+
+def _options(values: Iterable[str], label: str) -> str:
+  """Renders ``<option>`` tags with an "all" placeholder.
+
+  Args:
+    values: Distinct values to offer.
+    label: Placeholder label, e.g. ``"All tasks"``.
+
+  Returns:
+    An HTML snippet.
+  """
+  out = [f'<option value="">{_e(label)}</option>']
+  for value in sorted({v for v in values if v}):
+    out.append(f'<option value="{_attr(value)}">{_e(value)}</option>')
+  return "".join(out)
+
+
+def _filter_bar(campaigns: Sequence[index_mod.CampaignSummary]) -> str:
+  """Renders the faceted filter controls.
+
+  Args:
+    campaigns: Every campaign in the index, used to populate the facets.
+
+  Returns:
+    An HTML snippet.
+  """
+  flavors = {
+      flavor for campaign in campaigns for flavor in campaign.rm_dataset_flavors
+  }
+  return f"""<div class="filters">
+<select id="f-task">{_options((c.task for c in campaigns), "All tasks")}</select>
+<select id="f-status">{_options((c.status for c in campaigns), "Any status")}</select>
+<select id="f-model">{_options((c.base_model or "" for c in campaigns), "Any base model")}</select>
+<select id="f-flavor">{_options(flavors, "Any RM dataset")}</select>
+<input type="search" id="f-search" placeholder="Search id, model, sweep\u2026">
+<label class="toggle"><input type="checkbox" id="f-completed"> Completed only</label>
+<label class="toggle"><input type="checkbox" id="f-real"> Hide dry runs</label>
+<label class="toggle"><input type="checkbox" id="f-archived"> Show archived</label>
+<button type="button" id="f-reset" class="chip chip-pending">Reset</button>
+<span class="spacer"></span>
+<span class="count" id="f-count"></span>
+</div>"""
+
+
+def _haystack(campaign: index_mod.CampaignSummary) -> str:
+  """Builds the lowercase blob the client-side search matches against.
+
+  Args:
+    campaign: The campaign.
+
+  Returns:
+    A space-joined lowercase string of everything worth searching.
+  """
+  parts = [
+      campaign.campaign_id,
+      campaign.task,
+      campaign.status,
+      campaign.base_model or "",
+      " ".join(campaign.rm_dataset_flavors),
+      " ".join(stage.sweep_name or "" for stage in campaign.stages),
+      " ".join(stage.model_repo_id or "" for stage in campaign.stages),
+  ]
+  return " ".join(parts).lower()
+
+
+def _campaign_row(
+    campaign: index_mod.CampaignSummary, stale: bool
+) -> str:
+  """Renders one row of the campaign list.
+
+  Args:
+    campaign: The campaign.
+    stale: Whether it is claiming to run but no longer being written.
+
+  Returns:
+    An HTML ``<tr>``.
+  """
+  progress = ""
+  if not campaign.is_terminal and campaign.current_stage:
+    stage = campaign.stage(campaign.current_stage)
+    label = index_mod.stage_title(campaign.current_stage)
+    counter = f" {stage.progress_label}" if stage and stage.is_sweep else ""
+    progress = f'<span class="sub">{_e(label)}{_e(counter)}</span>'
+
+  chips = [_chip(campaign.status)]
+  if stale:
+    chips.append(_chip("stale"))
+  if campaign.is_dry_run:
+    chips.append(_chip("dry run"))
+  if campaign.is_archived:
+    chips.append(_chip("archived"))
+
+  return f"""<tr data-task="{_attr(campaign.task)}"
+ data-status="{_attr(campaign.status)}"
+ data-model="{_attr(campaign.base_model or '')}"
+ data-flavors="{_attr(','.join(campaign.rm_dataset_flavors))}"
+ data-archived="{'1' if campaign.is_archived else '0'}"
+ data-dryrun="{'1' if campaign.is_dry_run else '0'}"
+ data-haystack="{_attr(_haystack(campaign))}">
+<td><a href="campaign/{_attr(campaign.slug)}.html">{_e(campaign.campaign_id)}</a></td>
+<td>{_e(campaign.task)}</td>
+<td class="model">{_e(campaign.base_model)}</td>
+<td>{" ".join(chips)}{progress}</td>
+<td class="hide-narrow">{_e(", ".join(campaign.rm_dataset_flavors) or None)}</td>
+</tr>"""
+
+
+def render_list_page(
+    campaigns: Sequence[index_mod.CampaignSummary],
+    generated_at: str,
+    stale_slugs: Sequence[str],
+) -> str:
+  """Renders ``index.html``.
+
+  Args:
+    campaigns: Campaigns, already ordered newest-first.
+    generated_at: Snapshot timestamp.
+    stale_slugs: Slugs of campaigns to mark stale.
+
+  Returns:
+    A complete HTML document.
+  """
+  stale = set(stale_slugs)
+  in_progress = sum(1 for c in campaigns if not c.is_terminal)
+  rows = "\n".join(
+      _campaign_row(campaign, campaign.slug in stale) for campaign in campaigns
+  )
+  if not rows:
+    rows = '<tr><td colspan="5" class="empty">No campaigns found.</td></tr>'
+
+  body = f"""{_freshness_bar(generated_at, in_progress, len(stale))}
+{_filter_bar(campaigns)}
+<table class="campaigns">
+<thead><tr>
+<th>Campaign</th><th>Task</th><th>Model</th><th>Status</th>
+<th class="hide-narrow">RM dataset</th>
+</tr></thead>
+<tbody>
+{rows}
+</tbody>
+</table>"""
+  return _page(
+      title="Auto-PERL campaigns",
+      body=body,
+      generated_at=generated_at,
+      depth=0,
+      index_url="data/index.json",
+  )
+
+
+def _stage_table(campaign: index_mod.CampaignSummary) -> str:
+  """Renders the per-stage table of a campaign.
+
+  Args:
+    campaign: The campaign.
+
+  Returns:
+    An HTML snippet.
+  """
+  rows = []
+  for stage in campaign.stages:
+    metric = format_metric(stage.best_metric_val, places=5)
+    provenance = []
+    if stage.metric_name:
+      provenance.append(stage.metric_name)
+    if stage.selection_strategy:
+      provenance.append(f"by {stage.selection_strategy}")
+    if stage.selection_step is not None:
+      provenance.append(f"step {stage.selection_step}")
+    if stage.sweep_outcome and stage.sweep_outcome != "complete":
+      provenance.append(f"sweep {stage.sweep_outcome}")
+    sub = (
+        f'<span class="sub">{_e(_MIDDOT.join(provenance))}</span>'
+        if provenance
+        else ""
+    )
+    model = (
+        f"<code>{_e(stage.model_repo_id)}</code>"
+        if stage.model_repo_id
+        else _DASH
+    )
+    rows.append(
+        f"""<tr>
+<td>{_e(stage.title)}</td>
+<td>{_chip(stage.status)}</td>
+<td class="num">{_e(stage.progress_label)}</td>
+<td class="num">{_e(metric)}{sub}</td>
+<td class="num">{_e(format_duration(stage.elapsed_seconds))}</td>
+<td>{model}</td>
+</tr>"""
+    )
+  if not rows:
+    return '<p class="empty">This campaign recorded no stages.</p>'
+  return f"""<table>
+<thead><tr>
+<th>Stage</th><th>Status</th><th class="num">Trials</th>
+<th class="num">Best</th><th class="num">Elapsed</th><th>Published model</th>
+</tr></thead>
+<tbody>{"".join(rows)}</tbody>
+</table>"""
+
+
+def _metric_rows(
+    campaign: index_mod.CampaignSummary,
+    names: Sequence[str],
+    targets: Optional[Sequence[index_mod.EvalTarget]] = None,
+) -> str:
+  """Renders one table row per metric, one column per evaluated target.
+
+  Args:
+    campaign: The campaign.
+    names: Bare metric names to render, in order.
+    targets: The columns to render; defaults to every eval target.
+
+  Returns:
+    The concatenated ``<tr>`` elements.
+  """
+  if targets is None:
+    targets = campaign.eval_targets
+  rows = []
+  for name in names:
+    cells = "".join(_metric_cell(target, name) for target in targets)
+    rows.append(f"<tr><td>{_e(_metric_title(name))}</td>{cells}</tr>")
+  return "".join(rows)
+
+
+def _metric_cell(target: index_mod.EvalTarget, name: str) -> str:
+  """Renders one metric cell, with the relative change under a delta.
+
+  The absolute delta stays the headline number because it is the one that
+  composes with the policy column beside it. The ratio goes underneath in
+  small type because it answers a different question - how much of the
+  baseline's failures were removed - and a reader who wants it wants it for
+  every row at once, not one column over.
+
+  Args:
+    target: The column's evaluated target.
+    name: The bare metric name.
+
+  Returns:
+    A ``<td>`` element.
+  """
+  value = _e(format_metric(target.metrics.get(name)))
+  ratio = target.metric_ratios.get(name)
+  if ratio is None:
+    interval = (
+        None
+        if target.is_delta
+        else eval_metrics.confidence_interval(target.metrics, name)
+    )
+    if interval is not None:
+      low, high = (format_metric(bound) for bound in interval)
+      sub = (
+          '<span class="sub ci" title="95% confidence interval">'
+          f"[{_e(low)}, {_e(high)}]</span>"
+      )
+      return f'<td class="num">{value}{sub}</td>'
+    return f'<td class="num">{value}</td>'
+  sub = f'<span class="sub">{_e(format_relative(ratio))}</span>'
+  return f'<td class="num">{value}{sub}</td>'
+
+
+def _metric_title(name: str) -> str:
+  """Renders a metric key as a column label.
+
+  Args:
+    name: The bare metric name.
+
+  Returns:
+    A human-readable label. The ``_mean`` suffix is dropped because every
+    unqualified number in the table is a mean; ``_std`` is kept because it
+    is the one that would otherwise be mistaken for one.
+  """
+  if name.endswith("_mean"):
+    name = name[: -len("_mean")]
+  return name.replace("_", " ")
+
+
+def _eval_table(campaign: index_mod.CampaignSummary) -> str:
+  """Renders the evaluation comparison, one column per target.
+
+  Only the curated metrics get a row. The eval stage records upwards of
+  forty keys per target - every generation statistic in mean/std/median
+  form, every ROUGE variant in F1/precision/recall form - and rendering all
+  of them produced a table too wide to read, which is the opposite of what a
+  summary is for. The rest stay one click away.
+
+  Args:
+    campaign: The campaign.
+
+  Returns:
+    An HTML snippet, or an empty string when the campaign has no evaluation.
+  """
+  if not campaign.eval_targets or not campaign.eval_metric_names:
+    return ""
+  legend = _eval_legend(campaign)
+  if not index_mod.is_temperature_grid(campaign.eval_targets):
+    return f"{_eval_table_block(campaign, campaign.eval_targets)}{legend}"
+  blocks = []
+  for temperature, group in index_mod.temperature_groups(
+      campaign.eval_targets
+  ):
+    heading = (
+        "Unknown decoding temperature"
+        if temperature is None
+        else f"Decoding temperature T = "
+        f"{eval_metrics.format_temperature(temperature)}"
+    )
+    blocks.append(
+        f'<h4 class="temperature-heading">{_e(heading)}</h4>'
+        f"{_eval_table_block(campaign, group)}"
+    )
+  return "\n".join(blocks) + legend
+
+
+def _eval_table_block(
+    campaign: index_mod.CampaignSummary,
+    targets: Sequence[index_mod.EvalTarget],
+) -> str:
+  """Renders the headline table and the collapsed secondary one.
+
+  Args:
+    campaign: The campaign.
+    targets: The columns to render.
+
+  Returns:
+    An HTML snippet.
+  """
+  header = "".join(
+      f'<th class="num">{_e(target.label)}</th>' for target in targets
+  )
+  head = f"<thead><tr><th>Metric</th>{header}</tr></thead>"
+  main = f"""<table class="eval">
+{head}
+<tbody>{_metric_rows(campaign, campaign.headline_metric_names, targets)}</tbody>
+</table>"""
+
+  secondary = campaign.secondary_metric_names
+  if not secondary:
+    return main
+  count = len(secondary)
+  return f"""{main}
+<details class="more-metrics">
+<summary>{count} more metric(s) recorded for each target</summary>
+<table class="eval">
+{head}
+<tbody>{_metric_rows(campaign, secondary, targets)}</tbody>
+</table>
+</details>"""
+
+
+#: Legend text for the star/ring drawn at a policy's own rollout temperature.
+_ROLLOUT_NOTE = (
+    "\u2605 / ring: the temperature this PE-RL policy was trained with "
+    "(selected by the sweep, so that cell is favoured by construction)."
+)
+
+
+def _policy_series(
+    campaign: index_mod.CampaignSummary,
+) -> Tuple[List[str], List[Tuple[str, Dict[str, index_mod.EvalTarget]]]]:
+  """Arranges non-delta eval targets as policy x temperature.
+
+  Args:
+    campaign: The campaign.
+
+  Returns:
+    ``(temperature_tokens, [(base_label, {token: target})])`` with tokens
+    sorted coldest first and policies in display order (SFT first).
+  """
+  temperatures: Dict[str, float] = {}
+  by_policy: Dict[str, Dict[str, index_mod.EvalTarget]] = {}
+  for target in campaign.eval_targets:
+    if target.is_delta or target.temperature is None:
+      continue
+    token = eval_metrics.format_temperature(target.temperature)
+    temperatures[token] = target.temperature
+    by_policy.setdefault(target.base_label, {})[token] = target
+  tokens = sorted(temperatures, key=temperatures.get)
+  return tokens, list(by_policy.items())
+
+
+def _is_rollout_cell(target: index_mod.EvalTarget) -> bool:
+  """Whether the target was scored at its own training rollout temperature."""
+  rollout = target.metrics.get(eval_metrics.ROLLOUT_TEMPERATURE_KEY)
+  if not isinstance(rollout, (int, float)) or target.temperature is None:
+    return False
+  return eval_metrics.format_temperature(
+      rollout
+  ) == eval_metrics.format_temperature(target.temperature)
+
+
+def _bar_chart(
+    title: str,
+    tokens: List[str],
+    policies: List[Tuple[str, Dict[str, index_mod.EvalTarget]]],
+    name: str,
+    y_label: str,
+    percent: bool,
+) -> str:
+  """Renders one metric as grouped bars: temperature x policy."""
+  series = []
+  for index, (base_label, cells) in enumerate(policies):
+    values, intervals, marked = [], [], []
+    for token in tokens:
+      target = cells.get(token)
+      value = target.metrics.get(name) if target else None
+      values.append(value if isinstance(value, (int, float)) else None)
+      intervals.append(
+          eval_metrics.confidence_interval(target.metrics, name)
+          if target
+          else None
+      )
+      marked.append(bool(target) and _is_rollout_cell(target))
+    if any(v is not None for v in values):
+      series.append(
+          charts_mod.BarSeries(
+              name=eval_metrics.target_title(base_label),
+              color=charts_mod.series_color(base_label, index),
+              values=values,
+              intervals=intervals,
+              marked=marked,
+          )
+      )
+  return charts_mod.grouped_bar_chart(
+      title,
+      [f"T = {token}" for token in tokens],
+      series,
+      y_label,
+      percent=percent,
+      marker_note=_ROLLOUT_NOTE,
+  )
+
+
+def _standard_error(
+    target: index_mod.EvalTarget, name: str
+) -> Optional[float]:
+  interval = eval_metrics.confidence_interval(target.metrics, name)
+  if interval is None:
+    return None
+  return (interval[1] - interval[0]) / (2 * eval_metrics.Z_95)
+
+
+def _reduction_chart(
+    tokens: List[str],
+    policies: List[Tuple[str, Dict[str, index_mod.EvalTarget]]],
+) -> str:
+  """Renders SFT-minus-policy hallucination rate per temperature.
+
+  The interval treats the two samples as independent, which overstates the
+  uncertainty when both were scored on the same prompts: it is conservative,
+  never optimistic.
+  """
+  baseline = dict(policies).get(eval_metrics.BASELINE_LABEL)
+  if not baseline:
+    return ""
+  name = "hallucination_rate"
+  series = []
+  for index, (base_label, cells) in enumerate(policies):
+    if base_label == eval_metrics.BASELINE_LABEL:
+      continue
+    values, intervals, marked = [], [], []
+    for token in tokens:
+      policy, sft = cells.get(token), baseline.get(token)
+      p_value = policy.metrics.get(name) if policy else None
+      s_value = sft.metrics.get(name) if sft else None
+      if not isinstance(p_value, (int, float)) or not isinstance(
+          s_value, (int, float)
+      ):
+        values.append(None)
+        intervals.append(None)
+        marked.append(False)
+        continue
+      reduction = s_value - p_value
+      values.append(reduction)
+      p_se, s_se = _standard_error(policy, name), _standard_error(sft, name)
+      if p_se is None or s_se is None:
+        intervals.append(None)
+      else:
+        half = eval_metrics.Z_95 * (p_se**2 + s_se**2) ** 0.5
+        intervals.append((reduction - half, reduction + half))
+      marked.append(_is_rollout_cell(policy))
+    if any(v is not None for v in values):
+      series.append(
+          charts_mod.BarSeries(
+              name=eval_metrics.target_title(base_label),
+              color=charts_mod.series_color(base_label, index),
+              values=values,
+              intervals=intervals,
+              marked=marked,
+          )
+      )
+  return charts_mod.grouped_bar_chart(
+      "Hallucination-rate reduction vs. SFT at the same temperature",
+      [f"T = {token}" for token in tokens],
+      series,
+      "SFT rate \u2212 policy rate (higher is better)",
+      percent=True,
+      marker_note=_ROLLOUT_NOTE,
+  )
+
+
+def _pareto_chart(
+    tokens: List[str],
+    policies: List[Tuple[str, Dict[str, index_mod.EvalTarget]]],
+) -> str:
+  """Renders quality vs. faithfulness, one trajectory per policy."""
+  series = []
+  for index, (base_label, cells) in enumerate(policies):
+    points = []
+    for token in tokens:
+      target = cells.get(token)
+      if target is None:
+        continue
+      x = target.metrics.get("reward_hacking_quality")
+      y = target.metrics.get("faithfulness_rate")
+      if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+        continue
+      points.append(
+          charts_mod.TrajectoryPoint(
+              x=x,
+              y=y,
+              label=token,
+              x_interval=eval_metrics.confidence_interval(
+                  target.metrics, "reward_hacking_quality"
+              ),
+              y_interval=eval_metrics.confidence_interval(
+                  target.metrics, "faithfulness_rate"
+              ),
+              marked=_is_rollout_cell(target),
+          )
+      )
+    if points:
+      series.append(
+          charts_mod.TrajectorySeries(
+              name=eval_metrics.target_title(base_label),
+              color=charts_mod.series_color(base_label, index),
+              points=points,
+          )
+      )
+  return charts_mod.trajectory_plot(
+      "Quality vs. faithfulness across temperatures (up and right is better)",
+      series,
+      "Reward-hacking audit quality",
+      "Faithfulness rate",
+      y_percent=True,
+      marker_note="Ring: the policy's own rollout temperature. "
+      "Points are labelled with T.",
+  )
+
+
+def _perplexity_key(
+    policies: List[Tuple[str, Dict[str, index_mod.EvalTarget]]],
+) -> str:
+  """Returns whichever perplexity spelling the campaign recorded.
+
+  Summaries write ``perplexity_mean``; older states (and the dry-run mock)
+  hold the bare ``perplexity``. Both carry ``perplexity_std`` beside them.
+  """
+  for _, cells in policies:
+    for target in cells.values():
+      if "perplexity_mean" in target.metrics:
+        return "perplexity_mean"
+  return "perplexity"
+
+
+def _eval_charts(campaign: index_mod.CampaignSummary) -> str:
+  """Renders the temperature-sweep charts above the evaluation tables.
+
+  Only temperature-grid campaigns get charts: an older campaign scored each
+  policy at a single temperature, so every chart would be one bar wide.
+
+  Args:
+    campaign: The campaign.
+
+  Returns:
+    An HTML snippet, or an empty string when there is nothing to plot.
+  """
+  if not index_mod.is_temperature_grid(campaign.eval_targets):
+    return ""
+  tokens, policies = _policy_series(campaign)
+  if len(tokens) < 2 or not policies:
+    return ""
+  figures = [
+      _bar_chart(
+          "Hallucination rate by decoding temperature (lower is better)",
+          tokens,
+          policies,
+          "hallucination_rate",
+          "Hallucination rate",
+          percent=True,
+      ),
+      _bar_chart(
+          "Reward-hacking audit quality by decoding temperature "
+          "(higher is better)",
+          tokens,
+          policies,
+          "reward_hacking_quality",
+          "Audit quality",
+          percent=False,
+      ),
+      _pareto_chart(tokens, policies),
+      _reduction_chart(tokens, policies),
+      _bar_chart(
+          "Perplexity by decoding temperature (lower is better)",
+          tokens,
+          policies,
+          _perplexity_key(policies),
+          "Perplexity",
+          percent=False,
+      ),
+  ]
+  figures = [figure for figure in figures if figure]
+  if not figures:
+    return ""
+  note = (
+      '<p class="subtitle">Error bars are 95% confidence intervals: Wilson '
+      "score intervals for rates, normal approximations (mean \u00b1 1.96 "
+      "\u00b7 std / \u221an) for means. Intervals are unpaired, so they are "
+      "conservative for comparisons between policies scored on the same "
+      "prompts.</p>"
+  )
+  return f'<div class="chart-grid">{"".join(figures)}</div>{note}'
+
+
+def _eval_legend(campaign: index_mod.CampaignSummary) -> str:
+  """Explains the small number printed under each delta.
+
+  Said once below the table rather than as a per-cell qualifier, which at
+  three delta columns would have repeated the same six words forty times.
+
+  Args:
+    campaign: The campaign.
+
+  Returns:
+    A one-line note, or an empty string when no column has a ratio to
+    explain - an older campaign, or one whose baselines were all zero.
+  """
+  if not any(target.metric_ratios for target in campaign.eval_targets):
+    return ""
+  return (
+      '\n<p class="subtitle">Under each delta: the same improvement as a '
+      "share of the baseline it was measured against, so +50% means half "
+      "of what the baseline was doing is gone.</p>"
+  )
+
+
+def _links_panel(campaign: index_mod.CampaignSummary) -> str:
+  """Renders the grouped outbound links.
+
+  Args:
+    campaign: The campaign.
+
+  Returns:
+    An HTML snippet.
+  """
+  groups = links_mod.link_groups(campaign)
+  if not groups:
+    return (
+        '<p class="empty">No sweeps registered and nothing published yet, '
+        "so there is nothing to link to.</p>"
+    )
+  blocks = []
+  for group in groups:
+    items = []
+    for link in group.links:
+      note = f'<span class="note">{_e(link.note)}</span>' if link.note else ""
+      derived = _DERIVED_BADGE if link.derived else ""
+      items.append(
+          f'<li><a href="{_attr(link.url)}" target="_blank" rel="noopener">'
+          f"{_e(link.label)}</a>{note}{derived}</li>"
+      )
+    blocks.append(
+        f'<div class="links-group"><h4>{_e(group.title)}</h4>'
+        f'<ul>{"".join(items)}</ul></div>'
+    )
+  return f'<div class="links-grid">{"".join(blocks)}</div>'
+
+
+def _notices(
+    campaign: index_mod.CampaignSummary, stale: bool
+) -> str:
+  """Renders warning and error banners above the fold.
+
+  Args:
+    campaign: The campaign.
+    stale: Whether it looks abandoned rather than live.
+
+  Returns:
+    An HTML snippet, possibly empty.
+  """
+  out = []
+  if campaign.is_dry_run:
+    out.append(
+        '<div class="banner banner-info"><strong>Dry run.</strong> This '
+        "campaign was a rehearsal: the orchestrator walked the stage graph "
+        "without training anything, so the sweep and run ids below are the "
+        "mock ids it generated and the W&amp;B links will not resolve. The "
+        "model and dataset links follow the real naming convention, but "
+        "nothing was pushed under those names.</div>"
+    )
+  if stale:
+    out.append(
+        '<div class="banner banner-warn">This campaign is recorded as '
+        f"<strong>{_e(campaign.status)}</strong> but has not been written to "
+        "since the timestamp below. It is not progressing in this snapshot - "
+        "the VM is most likely powered off.</div>"
+    )
+  if campaign.errors:
+    items = "".join(f"<li>{_e(error)}</li>" for error in campaign.errors)
+    out.append(
+        '<div class="banner banner-bad"><strong>Errors</strong>'
+        f"<ul>{items}</ul></div>"
+    )
+  if campaign.warnings:
+    items = "".join(f"<li>{_e(warning)}</li>" for warning in campaign.warnings)
+    out.append(
+        '<div class="banner banner-warn"><strong>Degradations</strong>'
+        f"<ul>{items}</ul></div>"
+    )
+  return "".join(out)
+
+
+def _subtitle(campaign: index_mod.CampaignSummary) -> str:
+  """Renders the one-line identity strip under the page title.
+
+  Args:
+    campaign: The campaign.
+
+  Returns:
+    An HTML snippet.
+  """
+  bits = [campaign.task]
+  if campaign.base_model:
+    bits.append(campaign.base_model)
+  if campaign.seed is not None:
+    bits.append(f"seed {campaign.seed}")
+  if campaign.rm_dataset_flavors:
+    bits.append(", ".join(campaign.rm_dataset_flavors))
+  return f'<div class="subtitle">{_e(_MIDDOT.join(bits))}</div>'
+
+
+def format_rate(value: Optional[float]) -> str:
+  """Renders a rate in [0, 1] as a percentage.
+
+  Args:
+    value: The rate, or None.
+
+  Returns:
+    ``6.2%``, or an em dash.
+  """
+  if not isinstance(value, (int, float)) or isinstance(value, bool):
+    return _DASH
+  return f"{float(value) * 100:.1f}%"
+
+
+def _kpi(label: str, value: str, tone: str = "", note: str = "") -> str:
+  """Renders one headline card.
+
+  Args:
+    label: Small uppercase caption.
+    value: The number itself.
+    tone: ``good``, ``bad`` or empty.
+    note: Optional muted line under the value.
+
+  Returns:
+    An HTML snippet.
+  """
+  sub = f'<div class="kpi-note">{note}</div>' if note else ""
+  return (
+      f'<div class="kpi"><div class="kpi-label">{_e(label)}</div>'
+      f'<div class="kpi-value {tone}">{value}</div>{sub}</div>'
+  )
+
+
+def _kpis(campaign: index_mod.CampaignSummary) -> str:
+  """Renders the headline numbers as cards above the fold.
+
+  One pair of cards per trained policy: what it hallucinates, and how that
+  compares with the SFT baseline sampled at the same temperature. A branched
+  campaign trains one policy per reward-model dataset flavor, and collapsing
+  them into a single "the" rate would hide exactly the comparison the branch
+  exists to make.
+
+  The comparison is expressed as the *change in the hallucination rate*, so
+  it reads the way the metric does: fewer hallucinations is a negative
+  number, and it is green. The eval stage stores the opposite sign - it
+  signs every delta so that positive means improvement, whichever direction
+  the underlying metric runs in - so the value is negated on the way in.
+
+  Args:
+    campaign: The campaign.
+
+  Returns:
+    An HTML snippet, empty when the campaign never evaluated.
+  """
+  policies = [
+      target
+      for target in campaign.eval_targets
+      if not target.is_delta and target.base_label.startswith("perl")
+  ]
+  if not policies:
+    return ""
+
+  deltas = {
+      target.base_label.partition(":")[2]: target
+      for target in campaign.eval_targets
+      if target.is_delta
+  }
+
+  cards = []
+  for target in policies:
+    flavor = target.base_label.partition(":")[2]
+    suffix = f" ({flavor})" if flavor else ""
+    rate = target.metrics.get("hallucination_rate")
+    if rate is None:
+      continue
+    cards.append(_kpi(f"PE-RL hallucination rate{suffix}", format_rate(rate)))
+
+    delta_target = deltas.get(flavor)
+    improvement = (
+        delta_target.metrics.get("hallucination_rate")
+        if delta_target is not None
+        else None
+    )
+    if not isinstance(improvement, (int, float)) or isinstance(
+        improvement, bool
+    ):
+      continue
+    # Stored positive-is-better; shown as the change in the rate itself.
+    change = -float(improvement)
+    tone = "good" if change < 0 else ("bad" if change > 0 else "")
+    sign = "+" if change > 0 else ""
+    baseline = None
+    if isinstance(rate, (int, float)):
+      baseline = float(rate) - change
+    note = (
+        f"{_e(format_rate(baseline))} \u2192 {_e(format_rate(rate))} vs SFT"
+        if baseline is not None
+        else ""
+    )
+    cards.append(
+        _kpi(
+            f"Change vs SFT{suffix}",
+            f"{sign}{format_rate(change)}",
+            tone=tone,
+            note=note,
+        )
+    )
+
+  if not cards:
+    return ""
+  return f'<div class="kpis">{"".join(cards)}</div>'
+
+
+def _meta_grid(campaign: index_mod.CampaignSummary) -> str:
+  """Renders the campaign's identity block.
+
+  Task, base model and seed are deliberately absent: they are in the subtitle
+  right above, and repeating them here pushed everything else below the fold.
+
+  Args:
+    campaign: The campaign.
+
+  Returns:
+    An HTML snippet.
+  """
+  fields = [
+      ("Stages requested", ", ".join(campaign.requested_stages) or None),
+      ("Created", format_timestamp(campaign.created_at)),
+      ("Updated", format_timestamp(campaign.updated_at)),
+      ("Elapsed", format_duration(campaign.elapsed_seconds)),
+      ("State file", campaign.state_path),
+  ]
+  cells = "".join(
+      f"<div><dt>{_e(label)}</dt><dd>{_e(value)}</dd></div>"
+      for label, value in fields
+  )
+  return f'<dl class="meta-grid">{cells}</dl>'
+
+
+def _toc(headings: Sequence[render_mod.Heading]) -> str:
+  """Renders a collapsible table of contents for a long report.
+
+  Args:
+    headings: Headings extracted from the rendered report.
+
+  Returns:
+    An HTML snippet, empty for short reports.
+  """
+  usable = [h for h in headings if 2 <= h.level <= 4]
+  if len(usable) < 4:
+    return ""
+  items = "".join(
+      f'<li class="level-{h.level}">'
+      f'<a href="#{_attr(h.anchor)}">{_e(h.text)}</a></li>'
+      for h in usable
+  )
+  return (
+      '<details class="toc"><summary>Contents</summary>'
+      f"<ul>{items}</ul></details>"
+  )
+
+
+def render_campaign_page(
+    campaign: index_mod.CampaignSummary,
+    generated_at: str,
+    report: render_mod.RenderedMarkdown,
+    raw_report_name: Optional[str],
+    notices: str = "",
+) -> str:
+  """Renders one campaign's detail page.
+
+  Args:
+    campaign: The campaign.
+    generated_at: Snapshot timestamp.
+    report: Its rendered markdown report, possibly empty.
+    raw_report_name: Filename of the copied raw report, if one was copied.
+    notices: Pre-rendered banner HTML shown above the identity block.
+
+  Returns:
+    A complete HTML document.
+  """
+  chips = [_chip(campaign.status)]
+  if campaign.is_dry_run:
+    chips.append(_chip("dry run"))
+  if campaign.is_archived:
+    chips.append(_chip("archived"))
+
+  eval_table = _eval_table(campaign)
+  eval_section = (
+      f"<section><h3>Evaluation</h3>{_eval_charts(campaign)}"
+      f"{eval_table}</section>"
+      if eval_table
+      else ""
+  )
+
+  if report.is_empty:
+    report_body = (
+        '<p class="empty">No markdown report yet. Reports are written when a '
+        "campaign finishes; everything above is read live from the campaign's "
+        "state file.</p>"
+    )
+  else:
+    raw = (
+        f' &middot; <a href="{_attr(raw_report_name)}">raw markdown</a>'
+        if raw_report_name
+        else ""
+    )
+    degraded = (
+        '<div class="banner banner-info">Rendered without '
+        "<code>markdown-it-py</code>, so the report is shown verbatim.</div>"
+        if report.degraded
+        else ""
+    )
+    report_body = (
+        f'<div class="crumb">{_e(campaign.report_path)}{raw}</div>'
+        f"{degraded}{_toc(report.headings)}"
+        f'<article class="report">{report.html}</article>'
+    )
+
+  config_json = json.dumps(campaign.config, indent=2, sort_keys=True)
+  body = f"""<div class="crumb"><a href="../index.html">&larr; All campaigns</a></div>
+<div class="page-head">
+<h2 class="page-title">{_e(campaign.campaign_id)}</h2>
+<div class="page-chips">{" ".join(chips)}</div>
+</div>
+{_subtitle(campaign)}
+{notices}
+{_kpis(campaign)}
+{_meta_grid(campaign)}
+<section><h3>Stages</h3>{_stage_table(campaign)}</section>
+{eval_section}
+<section><h3>Links</h3>{_links_panel(campaign)}</section>
+<section><h3>Report</h3>{report_body}</section>
+<section><h3>Configuration</h3>
+<details class="config"><summary>Campaign configuration as launched</summary>
+<pre>{_e(config_json)}</pre></details>
+</section>"""
+  return _page(
+      title=f"{campaign.campaign_id} \u2014 Auto-PERL",
+      body=body,
+      generated_at=generated_at,
+      depth=1,
+      index_url="../data/index.json",
+  )
+
+
+def _write(path: str, content: str, written: List[str]) -> None:
+  """Writes a UTF-8 file, creating parent directories.
+
+  Args:
+    path: Destination path.
+    content: File contents.
+    written: Accumulator of written paths, for the build report.
+  """
+  os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+  with open(path, "w", encoding="utf-8") as handle:
+    handle.write(content)
+  written.append(path)
+
+
+def build_site(
+    root: str = ".",
+    out_dir: str = "site",
+    include_archived: bool = True,
+    generated_at: Optional[datetime.datetime] = None,
+    campaigns: Optional[Sequence[index_mod.CampaignSummary]] = None,
+) -> BuildResult:
+  """Builds the whole static site into ``out_dir``.
+
+  The output directory is emptied first: a stale page for a campaign that was
+  archived away is worse than no page, because it keeps answering.
+
+  Args:
+    root: Repository root to index.
+    out_dir: Destination directory, created if absent.
+    include_archived: Whether to include archived campaigns.
+    generated_at: Snapshot time; defaults to now, with the local offset.
+    campaigns: Pre-loaded campaigns, mainly for tests.
+
+  Returns:
+    A :class:`BuildResult` describing the snapshot.
+  """
+  moment = generated_at or datetime.datetime.now().astimezone()
+  stamp = moment.strftime("%Y-%m-%d %H:%M %Z").strip()
+  iso = moment.isoformat()
+
+  if campaigns is None:
+    campaigns = index_mod.build_index(root, include_archived=include_archived)
+
+  if os.path.isdir(out_dir):
+    shutil.rmtree(out_dir)
+  # Created up front because the raw-report copy below runs before any
+  # `_write` has had a chance to create it; without this the *first*
+  # campaign silently lost its markdown copy while every later one kept
+  # theirs, which is exactly the kind of bug nobody notices.
+  os.makedirs(os.path.join(out_dir, "campaign"), exist_ok=True)
+
+  written: List[str] = []
+  stale_slugs = [c.slug for c in campaigns if _is_stale(c, moment)]
+  degraded = False
+
+  for campaign in campaigns:
+    report = render_mod.RenderedMarkdown(html="", headings=[])
+    raw_name: Optional[str] = None
+    if campaign.report_path:
+      source = os.path.join(root, campaign.report_path)
+      report = render_mod.render_report_file(source)
+      degraded = degraded or report.degraded
+      if not report.is_empty:
+        raw_name = f"{campaign.slug}.md"
+        try:
+          shutil.copyfile(source, os.path.join(out_dir, "campaign", raw_name))
+          written.append(os.path.join(out_dir, "campaign", raw_name))
+        except OSError:
+          raw_name = None
+    page = render_campaign_page(
+        campaign,
+        stamp,
+        report,
+        raw_name,
+        notices=_notices(campaign, campaign.slug in stale_slugs),
+    )
+    _write(
+        os.path.join(out_dir, "campaign", f"{campaign.slug}.html"),
+        page,
+        written,
+    )
+
+  _write(
+      os.path.join(out_dir, "index.html"),
+      render_list_page(campaigns, stamp, stale_slugs),
+      written,
+  )
+
+  serialized = [c.to_dict() for c in campaigns]
+  content_hash = hashlib.sha256(
+      json.dumps(serialized, sort_keys=True).encode("utf-8")
+      + _renderer_fingerprint().encode("utf-8")
+  ).hexdigest()
+  payload: Dict[str, Any] = {
+      "generated_at": iso,
+      "generated_at_label": stamp,
+      "content_hash": content_hash,
+      "campaign_count": len(campaigns),
+      "in_progress": sum(1 for c in campaigns if not c.is_terminal),
+      "stale": stale_slugs,
+      "campaigns": serialized,
+  }
+  _write(
+      os.path.join(out_dir, "data", "index.json"),
+      json.dumps(payload, indent=1, sort_keys=False),
+      written,
+  )
+
+  # No `static/` directory is emitted: `_page` inlines the stylesheet and the
+  # script into every document, so there is nothing left to link to.
+  _write(
+      os.path.join(out_dir, "README.md"),
+      _SPACE_README.format(generated_at=stamp),
+      written,
+  )
+
+  return BuildResult(
+      out_dir=out_dir,
+      generated_at=iso,
+      campaign_count=len(campaigns),
+      page_count=len(campaigns) + 1,
+      content_hash=content_hash,
+      in_progress=payload["in_progress"],
+      stale=len(stale_slugs),
+      degraded_markdown=degraded,
+      written=written,
+  )

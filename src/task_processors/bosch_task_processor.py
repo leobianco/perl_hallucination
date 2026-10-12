@@ -1,4 +1,6 @@
+import collections
 import random
+import re
 from typing import Any, Callable, Optional, Tuple
 
 import evaluate
@@ -9,11 +11,85 @@ from google.genai import types
 
 from src.task_processors.base_task_processor import BaseTaskProcessor
 
-# Ensure punkt_tab tokenizer is available
-nltk.download("punkt_tab")
+# Ensure punkt and punkt_tab tokenizers are available
+nltk.download("punkt_tab", quiet=True)
+nltk.download("punkt", quiet=True)
+
+
+class _PurePythonRougeScorer:
+    """Pure-Python in-memory ROUGE-1 F1 scorer with zero network or filesystem overhead."""
+
+    def __init__(self, use_stemmer: bool = True):
+        self.stemmer = None
+        if use_stemmer:
+            try:
+                import nltk
+                from nltk.stem import PorterStemmer
+
+                self.stemmer = PorterStemmer()
+            except Exception:
+                self.stemmer = None
+
+    def _tokenize_and_stem(self, text: str) -> list[str]:
+        tokens = re.findall(r"\b\w+\b", text.lower())
+        stemmer = self.stemmer
+        if stemmer is not None:
+            try:
+                return [stemmer.stem(t) for t in tokens]
+            except Exception:
+                return tokens
+        return tokens
+
+    def score(self, target: str, prediction: str) -> dict[str, Any]:
+        """Compute ROUGE-1 F1 between target (reference) and prediction."""
+        ref_tokens = self._tokenize_and_stem(target)
+        pred_tokens = self._tokenize_and_stem(prediction)
+
+        ScoreType = collections.namedtuple(
+            "Score", ["precision", "recall", "fmeasure"]
+        )
+        if not ref_tokens or not pred_tokens:
+            return {
+                "rouge1": ScoreType(precision=0.0, recall=0.0, fmeasure=0.0)
+            }
+
+        ref_counts = collections.Counter(ref_tokens)
+        pred_counts = collections.Counter(pred_tokens)
+
+        overlap = sum(
+            min(count, pred_counts[token])
+            for token, count in ref_counts.items()
+        )
+        precision = overlap / len(pred_tokens) if pred_tokens else 0.0
+        recall = overlap / len(ref_tokens) if ref_tokens else 0.0
+
+        if precision + recall > 0.0:
+            fmeasure = 2.0 * (precision * recall) / (precision + recall)
+        else:
+            fmeasure = 0.0
+
+        return {
+            "rouge1": ScoreType(
+                precision=precision, recall=recall, fmeasure=fmeasure
+            )
+        }
 
 
 class BoschTaskProcessor(BaseTaskProcessor):
+    @staticmethod
+    def _get_rouge_scorer() -> Any:
+        """Return an in-memory ROUGE-1 scorer.
+
+        Prefers google-research's official `rouge_score.rouge_scorer.RougeScorer`
+        for fast, in-memory computation (~0.05ms per pair).
+        Falls back to `_PurePythonRougeScorer` if `rouge_score` is not installed.
+        """
+        try:
+            from rouge_score import rouge_scorer
+
+            return rouge_scorer.RougeScorer(["rouge1"], use_stemmer=True)
+        except ImportError:
+            return _PurePythonRougeScorer(use_stemmer=True)
     def _load_data(self) -> DatasetDict:
         data = load_dataset(
             self.args.hf_repo,
@@ -48,7 +124,7 @@ class BoschTaskProcessor(BaseTaskProcessor):
         data = data.map(
             lambda entry: {
                 "prompt": (
-                    "You are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information giver. Do not add to your answer any information other than those present in the manual excerpt.\n"
+                    "You are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information given. Do not add to your answer any information other than those present in the manual excerpt.\n"
                     + "User question:\n"
                     + entry["Question"]
                     + "\nManual information:\n"
@@ -102,52 +178,261 @@ class BoschTaskProcessor(BaseTaskProcessor):
     def _make_structured_hallucinations_data(
         self, data: DatasetDict
     ) -> DatasetDict:
-        """Create structured synthetic hallucinations data for reward model training."""
+        """Create structured synthetic hallucinations data for reward model training.
 
+        Implements three synthetic data generation schemas:
+        - Idea 1: Non-hallucinated samples by removing context sentences that do
+          not match any sentence in the generation (low ROUGE overlap).
+        - Idea 2: Hallucinated samples by removing top-k matching context
+          sentences (rank 1, 2, 3...) above a relevance threshold.
+        - Idea 3: Non-hallucinated samples by removing sentences from the
+          generation (introducing coverage reduction without hallucination).
+
+        Also maintains rough balancing between hallucinated (label 0) and
+        non-hallucinated (label 1) classes.
+        """
         args = self.args
-        # Use validation split for both non-hallucinated and hallucinated (TO BE CORRECTED).
-        to_become_hallus, non_hallucinated_data_rest = (
-            self._split_nonhallucinated_for_synthetic(
-                data["validation"], args.num_synth_hallus, args.seed
+        seed = getattr(args, "seed", 12345)
+        num_synth_hallus = getattr(args, "num_synth_hallus", 0)
+        top_k = getattr(args, "synth_struct_top_k", 3)
+        hallu_threshold = getattr(args, "synth_struct_hallu_threshold", 0.40)
+        irrelevant_threshold = getattr(
+            args, "synth_struct_irrelevant_threshold", 0.15
+        )
+        max_nonhall_per_entry = getattr(
+            args, "synth_struct_max_nonhall_per_entry", 2
+        )
+        balance_ratio = getattr(args, "synth_struct_balance_ratio", 1.25)
+
+        # Source pool: non-hallucinated validation samples
+        non_hallucinated_data = data["validation"].filter(
+            lambda entry: entry["class_hall"] == "No"
+        )
+        shuffled_source = non_hallucinated_data.shuffle(seed=seed)
+
+        # If num_synth_hallus is -1 or exceeds source length, use all available samples
+        use_all = (
+            num_synth_hallus is None
+            or num_synth_hallus == -1
+            or num_synth_hallus >= len(shuffled_source)
+        )
+        if not use_all and num_synth_hallus > 0:
+            source_pool = shuffled_source.select(range(num_synth_hallus))
+            rest_pool = shuffled_source.select(
+                range(num_synth_hallus, len(shuffled_source))
             )
-        )
-        # Build RM prompts for the non-hallucinated data.
-        non_hallucinated_data_rest = non_hallucinated_data_rest.map(
-            self._rm_prompt
-        )
-        # Apply the map that creates structured hallucinations.
-        rouge_metric = evaluate.load("rouge")
+        else:
+            source_pool = shuffled_source
+            rest_pool = None
 
-        synthetic_hallucinations_struct = to_become_hallus.map(
-            self._synthetic_hall_structured,
-            fn_kwargs=dict(rouge_metric=rouge_metric),
+        rouge_metric = self._get_rouge_scorer()
+
+        hallucinations: list[dict[str, Any]] = []
+        non_hallucinations: list[dict[str, Any]] = []
+
+        total_source = len(source_pool)
+        print(
+            f"[Structured Synth] Generating synthetic hallucinations from {total_source} validation samples..."
         )
 
-        # Write the RM prompts with the modified entries.
-        synthetic_hallucinations_struct = synthetic_hallucinations_struct.map(
-            self._rm_prompt
+        for entry_idx, entry in enumerate(source_pool):
+            if (entry_idx + 1) % 10 == 0 or (entry_idx + 1) == total_source:
+                print(
+                    f"[Structured Synth] Processing sample {entry_idx + 1}/{total_source}..."
+                )
+            question = entry.get("Question", "")
+            context = entry.get("Context", "")
+            response = entry.get("response", "")
+
+            sentences_context = (
+                nltk.sent_tokenize(context) if context else []
+            )
+            sentences_response = (
+                nltk.sent_tokenize(response) if response else []
+            )
+
+            if not sentences_context or not sentences_response:
+                continue
+
+            # Pairwise sentence ROUGE scoring
+            scores = self._compute_sentence_rouge_scores(
+                sentences_context=sentences_context,
+                sentences_response=sentences_response,
+                rouge_metric=rouge_metric,
+            )
+
+            entry_hallus: list[dict[str, Any]] = []
+            entry_nonhallus: list[dict[str, Any]] = []
+
+            # Idea 2: Generate hallucinated samples (top-k context removal)
+            if len(sentences_context) >= 2:
+                entry_hallus = self._generate_hallucinations_top_k(
+                    question=question,
+                    sentences_context=sentences_context,
+                    response=response,
+                    scores=scores,
+                    top_k=top_k,
+                    hallu_threshold=hallu_threshold,
+                )
+
+            # Idea 1: Generate non-hallucinated samples (irrelevant context removal)
+            if len(sentences_context) >= 2:
+                irrelevant_samples = (
+                    self._generate_nonhallucinations_irrelevant_context(
+                        question=question,
+                        sentences_context=sentences_context,
+                        response=response,
+                        scores=scores,
+                        irrelevant_threshold=irrelevant_threshold,
+                        max_candidates=max_nonhall_per_entry,
+                    )
+                )
+                entry_nonhallus.extend(irrelevant_samples)
+
+            # Idea 3: Generate non-hallucinated samples (response sentence removal)
+            if len(sentences_response) >= 2:
+                resp_drops = self._generate_nonhallucinations_response_removal(
+                    question=question,
+                    context=context,
+                    sentences_response=sentences_response,
+                    max_drops=max_nonhall_per_entry,
+                )
+                entry_nonhallus.extend(resp_drops)
+
+            # Original grounded non-hallucinated entry
+            base_prompt = self._format_prompt(question, context)
+            orig_grounded = {
+                "Question": question,
+                "Context": context,
+                "response": response,
+                "prompt": base_prompt + response,
+                "class_hall": "No",
+                "label": 1,
+                "synthetic_strategy": "original_non_hallucinated",
+                "erased_context": "",
+                "erased_response": "",
+                "rouge1_score": 0.0,
+            }
+            entry_nonhallus.append(orig_grounded)
+
+            # Propagate common optional metadata keys
+            for optional_key in ("sample_id", "uid", "Answerable"):
+                if optional_key in entry:
+                    orig_grounded[optional_key] = entry[optional_key]
+                    for s in entry_hallus:
+                        s[optional_key] = entry[optional_key]
+                    for s in entry_nonhallus:
+                        s[optional_key] = entry[optional_key]
+
+            hallucinations.extend(entry_hallus)
+            non_hallucinations.extend(entry_nonhallus)
+
+        print(
+            f"[Structured Synth] Generated {len(hallucinations)} hallucinated and "
+            f"{len(non_hallucinations)} non-hallucinated candidates before balancing."
         )
-        # Add the non-hallucinated examples and shuffle.
-        synthetic_hallucinations_struct_train_data = concatenate_datasets(
-            [synthetic_hallucinations_struct, non_hallucinated_data_rest]
-        ).shuffle(seed=args.seed)
-        # Create dataset with same test split as organic.
-        # TODO: take the change of splits into account!
+
+        # Include remaining unedited non-hallucinated samples if split
+        if rest_pool is not None:
+            for entry in rest_pool:
+                q = entry.get("Question", "")
+                c = entry.get("Context", "")
+                r = entry.get("response", "")
+                base_p = self._format_prompt(q, c)
+                item = {
+                    "Question": q,
+                    "Context": c,
+                    "response": r,
+                    "prompt": base_p + r,
+                    "class_hall": "No",
+                    "label": 1,
+                    "synthetic_strategy": "original_non_hallucinated",
+                    "erased_context": "",
+                    "erased_response": "",
+                    "rouge1_score": 0.0,
+                }
+                for optional_key in ("sample_id", "uid", "Answerable"):
+                    if optional_key in entry:
+                        item[optional_key] = entry[optional_key]
+                non_hallucinations.append(item)
+
+        # Rough balancing between hallucinated (label 0) and non-hallucinated (label 1)
+        rng = random.Random(seed)
+        n_hall = len(hallucinations)
+        n_non_hall = len(non_hallucinations)
+
+        if n_hall > 0 and n_non_hall > 0:
+            if n_hall > n_non_hall * balance_ratio:
+                target_hall = max(1, int(n_non_hall * balance_ratio))
+                hallucinations = rng.sample(hallucinations, target_hall)
+            elif n_non_hall > n_hall * balance_ratio:
+                target_non_hall = max(1, int(n_hall * balance_ratio))
+                non_hallucinations = rng.sample(
+                    non_hallucinations, target_non_hall
+                )
+
+        combined_train = hallucinations + non_hallucinations
+        rng.shuffle(combined_train)
+
+        print(
+            f"[Structured Synth] Balanced dataset: {len(hallucinations)} hallucinated and "
+            f"{len(non_hallucinations)} non-hallucinated samples (total train: {len(combined_train)})."
+        )
+
+        train_dataset = Dataset.from_list(combined_train)
+
+        # Create test split matching organic test split with aligned columns
         organic = self._make_organic_hallucinations_data(data)
         organic_test_split = organic["test"]
-        # Add placeholder columns so that in the train split you can store
-        # information about what sentence in context was erased
-        organic_test_split = organic_test_split.add_column(
-            "erased_context", [""] * len(organic_test_split)
-        )
-        organic_test_split = organic_test_split.add_column(
-            "rouge1_score", [0.0] * len(organic_test_split)
-        )
+
+        test_len = len(organic_test_split)
+        if "synthetic_strategy" not in organic_test_split.column_names:
+            organic_test_split = organic_test_split.add_column(
+                "synthetic_strategy", ["organic"] * test_len
+            )
+        if "erased_context" not in organic_test_split.column_names:
+            organic_test_split = organic_test_split.add_column(
+                "erased_context", [""] * test_len
+            )
+        if "erased_response" not in organic_test_split.column_names:
+            organic_test_split = organic_test_split.add_column(
+                "erased_response", [""] * test_len
+            )
+        if "rouge1_score" not in organic_test_split.column_names:
+            organic_test_split = organic_test_split.add_column(
+                "rouge1_score", [0.0] * test_len
+            )
+
+        test_rows = []
+        train_cols = train_dataset.column_names
+        for entry in organic_test_split:
+            row = {}
+            for col in train_cols:
+                val = entry.get(col)
+                if val is None:
+                    if col == "rouge1_score":
+                        val = 0.0
+                    elif col == "label":
+                        val = 1
+                    else:
+                        val = ""
+                row[col] = val
+            test_rows.append(row)
+
+        try:
+            if hasattr(train_dataset, "features") and train_dataset.features:
+                test_dataset = Dataset.from_list(
+                    test_rows, features=train_dataset.features
+                )
+            else:
+                test_dataset = Dataset.from_list(test_rows)
+        except TypeError:
+            test_dataset = Dataset.from_list(test_rows)
 
         synthetic_hallucinations_struct_data = DatasetDict(
             {
-                "train": synthetic_hallucinations_struct_train_data,
-                "test": organic_test_split,
+                "train": train_dataset,
+                "test": test_dataset,
             }
         )
 
@@ -179,7 +464,7 @@ class BoschTaskProcessor(BaseTaskProcessor):
         ).select(range(n_fewshot_examples_synth_llm))
 
         client = genai.Client(api_key=args.gemini_api_key)
-        gemini_model = "gemini-2.0-flash-001"
+        gemini_model = "gemini-3.5-flash"
         generation_config = types.GenerateContentConfig(
             temperature=args.synth_llm_temperature,
             seed=args.seed,
@@ -265,6 +550,7 @@ class BoschTaskProcessor(BaseTaskProcessor):
         autorater_dataset = concatenate_datasets(
             [data["train"], data["validation"], data["test"]]
         )
+        autorater_dataset = autorater_dataset.map(self._rm_prompt)
 
         return autorater_dataset
 
@@ -362,12 +648,20 @@ class BoschTaskProcessor(BaseTaskProcessor):
         non_hallucinated_data = data_split.filter(
             lambda entry: entry["class_hall"] == "No"
         )
-        to_become_hallus = non_hallucinated_data.shuffle(seed=seed).select(
-            range(num_synth_hallus)
+        shuffled = non_hallucinated_data.shuffle(seed=seed)
+        use_all = (
+            num_synth_hallus is None
+            or num_synth_hallus == -1
+            or num_synth_hallus >= len(shuffled)
         )
-        non_hallucinated_data_rest = non_hallucinated_data.filter(
-            lambda x: x not in to_become_hallus
-        )
+        if not use_all and num_synth_hallus > 0:
+            to_become_hallus = shuffled.select(range(num_synth_hallus))
+            non_hallucinated_data_rest = shuffled.select(
+                range(num_synth_hallus, len(shuffled))
+            )
+        else:
+            to_become_hallus = shuffled
+            non_hallucinated_data_rest = shuffled.select([])
 
         return to_become_hallus, non_hallucinated_data_rest
 
@@ -501,6 +795,23 @@ class BoschTaskProcessor(BaseTaskProcessor):
 
         return bosch_evaluator_prompt
 
+    @classmethod
+    def format_writer_fewshot_example(cls, example: dict) -> str:
+        """Format a single few-shot demonstration for the Bosch writer model.
+
+        Ensures the demonstration includes both the prompt (question/context)
+        and the ground-truth response answer.
+        """
+        prompt = example.get("prompt", "")
+        response = example.get("response") or example.get("Answer") or ""
+        if not prompt and "Question" in example and "Context" in example:
+            prompt = cls._format_prompt(example["Question"], example["Context"])
+        if response and not prompt.rstrip().endswith(str(response).strip()):
+            if not prompt.endswith("\n"):
+                prompt += "\n"
+            prompt += str(response).strip()
+        return prompt
+
     @staticmethod
     def _synthetic_hall_structured(entry: dict, rouge_metric: Any) -> dict:
         """Create a structured synthetic hallucination in Bosch data by removing sentences from the context.
@@ -523,15 +834,27 @@ class BoschTaskProcessor(BaseTaskProcessor):
         # Compute the ROUGE-1 score between this and sentences in context
         # and pick sentence in context with maximal ROUGE-1 score to erase
         best_idx = 0
-        max_rouge = 0
+        max_rouge = 0.0
+        has_score_method = hasattr(rouge_metric, "score")
         for idx_context, sentence_context in enumerate(sentences_context):
-            rouge_results = rouge_metric.compute(
-                predictions=random_sentence_response,
-                references=[sentence_context],
-            )
-            if rouge_results["rouge1"] > max_rouge:
+            if has_score_method:
+                res = rouge_metric.score(
+                    target=sentence_context,
+                    prediction=random_sentence_response[0]
+                    if random_sentence_response
+                    else "",
+                )
+                val = res.get("rouge1", 0.0)
+                r1 = float(val.fmeasure if hasattr(val, "fmeasure") else val)
+            else:
+                rouge_results = rouge_metric.compute(
+                    predictions=random_sentence_response,
+                    references=[sentence_context],
+                )
+                r1 = float(rouge_results.get("rouge1", 0.0))
+            if r1 > max_rouge:
                 best_idx = idx_context
-                max_rouge = rouge_results["rouge1"]
+                max_rouge = r1
 
         # Store information about erased sentence
         entry["erased_context"] = sentences_context[best_idx]
@@ -544,7 +867,7 @@ class BoschTaskProcessor(BaseTaskProcessor):
         entry["class_hall"] = "Yes"
         entry["label"] = 0
         entry["prompt"] = (
-            "You are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information giver. Do not add to your answer any information other than those present in the manual excerpt.\n"
+            "You are a helpful assistant to car related questions. You will be given an user's question, and the relevant part of the car manual. Your task is to answer the user's question using the information given. Do not add to your answer any information other than those present in the manual excerpt.\n"
             + "User question:\n"
             + entry["Question"]
             + "\nManual information:\n"
@@ -554,3 +877,185 @@ class BoschTaskProcessor(BaseTaskProcessor):
 
         # Important: you need to retokenize these later!
         return entry
+
+    @staticmethod
+    def _format_prompt(question: str, context: str) -> str:
+        """Format the standard prompt for Bosch car manual QA."""
+        return (
+            "You are a helpful assistant to car related questions. You will be"
+            " given an user's question, and the relevant part of the car"
+            " manual. Your task is to answer the user's question using the"
+            " information given. Do not add to your answer any information"
+            " other than those present in the manual excerpt.\n"
+            f"User question:\n{question}\nManual information:\n{context}\nAnswer"
+            " to user's question:\n"
+        )
+
+    @staticmethod
+    def _compute_sentence_rouge_scores(
+        sentences_context: list[str],
+        sentences_response: list[str],
+        rouge_metric: Any,
+    ) -> list[dict[str, Any]]:
+        """Compute peak ROUGE-1 score for each context sentence against all response sentences."""
+        scores = []
+        has_score_method = hasattr(rouge_metric, "score")
+        for ctx_idx, c_sent in enumerate(sentences_context):
+            max_rouge = 0.0
+            best_resp_idx = 0
+            for resp_idx, r_sent in enumerate(sentences_response):
+                if has_score_method:
+                    res = rouge_metric.score(target=c_sent, prediction=r_sent)
+                    val = res.get("rouge1", 0.0)
+                    r1 = float(
+                        val.fmeasure if hasattr(val, "fmeasure") else val
+                    )
+                else:
+                    res = rouge_metric.compute(
+                        predictions=[r_sent],
+                        references=[c_sent],
+                    )
+                    r1 = float(res.get("rouge1", 0.0))
+                if r1 > max_rouge:
+                    max_rouge = r1
+                    best_resp_idx = resp_idx
+            scores.append({
+                "context_idx": ctx_idx,
+                "context_sentence": c_sent,
+                "max_rouge": max_rouge,
+                "best_response_idx": best_resp_idx,
+            })
+        return scores
+
+    @classmethod
+    def _generate_hallucinations_top_k(
+        cls,
+        question: str,
+        sentences_context: list[str],
+        response: str,
+        scores: list[dict[str, Any]],
+        top_k: int = 3,
+        hallu_threshold: float = 0.40,
+    ) -> list[dict[str, Any]]:
+        """Idea 2: Remove top-k matching context sentences individually to induce hallucinations."""
+        if len(sentences_context) < 2:
+            return []
+
+        sorted_scores = sorted(
+            scores, key=lambda x: x["max_rouge"], reverse=True
+        )
+        hallucinations = []
+
+        for rank_idx in range(min(top_k, len(sorted_scores))):
+            item = sorted_scores[rank_idx]
+            if item["max_rouge"] < hallu_threshold:
+                continue
+
+            erase_idx = item["context_idx"]
+            remaining_ctx = [
+                s for idx, s in enumerate(sentences_context) if idx != erase_idx
+            ]
+            new_context = " ".join(remaining_ctx)
+            base_prompt = cls._format_prompt(question, new_context)
+
+            hallucinations.append({
+                "Question": question,
+                "Context": new_context,
+                "response": response,
+                "prompt": base_prompt + response,
+                "class_hall": "Yes",
+                "label": 0,
+                "synthetic_strategy": f"context_erasure_top_{rank_idx + 1}",
+                "erased_context": item["context_sentence"],
+                "erased_response": "",
+                "rouge1_score": item["max_rouge"],
+            })
+
+        return hallucinations
+
+    @classmethod
+    def _generate_nonhallucinations_irrelevant_context(
+        cls,
+        question: str,
+        sentences_context: list[str],
+        response: str,
+        scores: list[dict[str, Any]],
+        irrelevant_threshold: float = 0.15,
+        max_candidates: int = 1,
+    ) -> list[dict[str, Any]]:
+        """Idea 1: Remove irrelevant context sentences (low ROUGE overlap) preserving grounding."""
+        if len(sentences_context) < 2:
+            return []
+
+        irrelevant_candidates = [
+            item for item in scores if item["max_rouge"] <= irrelevant_threshold
+        ]
+        if not irrelevant_candidates:
+            return []
+
+        # Sort by lowest ROUGE score first
+        irrelevant_candidates.sort(key=lambda x: x["max_rouge"])
+        non_hallucinations = []
+
+        for item in irrelevant_candidates[:max_candidates]:
+            erase_idx = item["context_idx"]
+            remaining_ctx = [
+                s for idx, s in enumerate(sentences_context) if idx != erase_idx
+            ]
+            new_context = " ".join(remaining_ctx)
+            base_prompt = cls._format_prompt(question, new_context)
+
+            non_hallucinations.append({
+                "Question": question,
+                "Context": new_context,
+                "response": response,
+                "prompt": base_prompt + response,
+                "class_hall": "No",
+                "label": 1,
+                "synthetic_strategy": "context_erasure_irrelevant",
+                "erased_context": item["context_sentence"],
+                "erased_response": "",
+                "rouge1_score": item["max_rouge"],
+            })
+
+        return non_hallucinations
+
+    @classmethod
+    def _generate_nonhallucinations_response_removal(
+        cls,
+        question: str,
+        context: str,
+        sentences_response: list[str],
+        max_drops: int = 1,
+    ) -> list[dict[str, Any]]:
+        """Idea 3: Remove sentences from generation (coverage reduction without hallucination)."""
+        if len(sentences_response) < 2:
+            return []
+
+        non_hallucinations = []
+        base_prompt = cls._format_prompt(question, context)
+
+        for drop_idx in range(min(max_drops, len(sentences_response))):
+            remaining_resp = [
+                r
+                for idx, r in enumerate(sentences_response)
+                if idx != drop_idx
+            ]
+            new_response = " ".join(remaining_resp).strip()
+            if not new_response:
+                continue
+
+            non_hallucinations.append({
+                "Question": question,
+                "Context": context,
+                "response": new_response,
+                "prompt": base_prompt + new_response,
+                "class_hall": "No",
+                "label": 1,
+                "synthetic_strategy": "response_sentence_removal",
+                "erased_context": "",
+                "erased_response": sentences_response[drop_idx],
+                "rouge1_score": 0.0,
+            })
+
+        return non_hallucinations

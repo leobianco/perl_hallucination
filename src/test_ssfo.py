@@ -1,0 +1,571 @@
+"""Unit tests for the SSFO baseline implementation."""
+
+import sys
+import types
+from typing import Any
+import unittest
+from unittest.mock import MagicMock, patch
+
+if "torch" not in sys.modules:
+  try:
+    import torch
+  except ImportError:
+    import contextlib
+
+    torch = types.ModuleType("torch")
+    torch.__path__ = []
+    torch.nn = types.ModuleType("torch.nn")
+    torch.nn.Module = object
+    torch.nn.Linear = MagicMock()
+    torch.nn.Identity = MagicMock()
+    torch.nn.BCEWithLogitsLoss = object
+    torch.nn.CrossEntropyLoss = object
+    torch.nn.MSELoss = object
+    torch.no_grad = contextlib.nullcontext
+    torch.device = lambda x: x
+    torch.tensor = lambda x, **kw: MagicMock()
+    torch.randn = lambda *x: MagicMock()
+    torch.bernoulli = lambda x: MagicMock()
+    torch.softmax = lambda x, **kw: MagicMock()
+    torch.zeros_like = lambda x: MagicMock()
+    torch.sort = lambda x, **kw: (MagicMock(), MagicMock())
+    torch.cumsum = lambda x, **kw: MagicMock()
+    torch.multinomial = lambda x, **kw: MagicMock()
+    torch.full = lambda *x, **kw: MagicMock()
+    torch.ones = lambda *x, **kw: MagicMock()
+    torch.zeros = lambda *x, **kw: MagicMock()
+    torch.where = lambda *x: MagicMock()
+    torch.stack = lambda *x, **kw: MagicMock(
+        tolist=lambda: [[10, 11], [12, 13]]
+    )
+    torch.long = "long"
+    torch.bool = "bool"
+    torch.bfloat16 = "bfloat16"
+    sys.modules["torch"] = torch
+    sys.modules["torch.nn"] = torch.nn
+
+if "transformers" not in sys.modules or not hasattr(
+    sys.modules["transformers"], "__path__"
+):
+  transformers_mod = types.ModuleType("transformers")
+  transformers_mod.__path__ = []
+  transformers_mod.TrainerCallback = object
+  transformers_mod.TrainerControl = object
+  transformers_mod.TrainerState = object
+  transformers_mod.TrainingArguments = object
+  transformers_mod.Trainer = object
+  transformers_mod.AutoModelForCausalLM = MagicMock()
+  transformers_mod.AutoModelForSequenceClassification = MagicMock()
+  transformers_mod.AutoConfig = MagicMock()
+  transformers_mod.AutoTokenizer = MagicMock()
+  transformers_mod.PretrainedConfig = MagicMock()
+  transformers_mod.PreTrainedModel = object
+  transformers_mod.DataCollatorWithPadding = MagicMock()
+  transformers_mod.HfArgumentParser = MagicMock()
+  transformers_mod.set_seed = MagicMock()
+  transformers_mod.LogitsProcessor = object
+  transformers_mod.LogitsProcessorList = list
+  sys.modules["transformers"] = transformers_mod
+  sys.modules["transformers.trainer_utils"] = types.ModuleType(
+      "transformers.trainer_utils"
+  )
+  sys.modules["transformers.trainer_utils"].get_last_checkpoint = MagicMock(
+      return_value=None
+  )
+
+for mod_name in [
+    "transformers.configuration_utils",
+    "transformers.integrations",
+    "transformers.integrations.heterogeneity",
+    "transformers.integrations.heterogeneity.configuration_utils",
+    "trl",
+    "peft",
+    "vllm",
+    "vllm.lora",
+    "vllm.lora.request",
+    "evaluate",
+    "scipy",
+    "scipy.special",
+    "sklearn",
+    "sklearn.metrics",
+    "google",
+    "google.genai",
+    "google.genai.types",
+    "huggingface_hub",
+    "matplotlib",
+    "matplotlib.pyplot",
+    "numpy",
+    "pandas",
+    "nltk",
+    "tqdm",
+]:
+  if mod_name not in sys.modules:
+    sys.modules[mod_name] = MagicMock()
+
+import torch
+
+
+class _TestMockDataset:
+
+  def __init__(self, data: dict[str, list[Any]]):
+    self._data = dict(data)
+    self.column_names = list(data.keys())
+
+  def __getitem__(self, key: str):
+    return self._data[key]
+
+  def __len__(self):
+    first_col = next(iter(self._data.values()))
+    return len(first_col)
+
+  def select(self, indices):
+    new_data = {k: [self._data[k][i] for i in indices] for k in self._data}
+    return _TestMockDataset(new_data)
+
+  def shuffle(self, seed=None):
+    return self
+
+  def train_test_split(self, test_size=0.1, seed=None):
+    n = len(self)
+    n_test = max(1, int(n * test_size)) if n > 1 else 0
+    train_indices = list(range(n - n_test))
+    test_indices = list(range(n - n_test, n)) if n_test > 0 else list(range(n))
+    return {
+        "train": self.select(train_indices),
+        "test": self.select(test_indices),
+    }
+
+
+class DatasetDict(dict):
+
+  def push_to_hub(self, repo_id, **kwargs):
+    pass
+
+  def save_to_disk(self, path, **kwargs):
+    pass
+
+
+class Dataset:
+
+  @classmethod
+  def from_dict(cls, d):
+    return _TestMockDataset(d)
+
+
+datasets_mod = types.ModuleType("datasets")
+datasets_mod.Dataset = Dataset
+datasets_mod.DatasetDict = DatasetDict
+datasets_mod.Value = MagicMock()
+datasets_mod.load_dataset = MagicMock()
+datasets_mod.concatenate_datasets = MagicMock()
+sys.modules["datasets"] = datasets_mod
+
+from src.pipelines import SSFODataGenerationPipeline
+from src.utils import SsfoDataGenArguments
+
+
+class _FakeChatTokenizer:
+  """Tokenizer double that renders a chat template.
+
+  ``_extract_prompts`` no longer hardcodes Gemma's turn markers; it asks the
+  tokenizer for the model's own conversational framing. The tests therefore
+  have to supply a tokenizer for the expected strings to mean anything, and
+  the ``style`` switch lets the same tests prove the behaviour is not
+  Gemma-specific.
+  """
+
+  def __init__(self, style="gemma"):
+    self.style = style
+    self.chat_template = "<present>"
+    self.bos_token = "<bos>" if style == "gemma" else None
+
+  def apply_chat_template(
+      self, messages, tokenize=False, add_generation_prompt=False
+  ):
+    del tokenize
+    content = messages[-1]["content"]
+    if self.style == "chatml":
+      out = f"<|im_start|>user\n{content}<|im_end|>\n"
+      if add_generation_prompt:
+        out += "<|im_start|>assistant\n"
+      return out
+    # Gemma renders a leading BOS, which `chat_wrap_user` must strip.
+    out = f"{self.bos_token}<start_of_turn>user\n{content}<end_of_turn>\n"
+    if add_generation_prompt:
+      out += "<start_of_turn>model\n"
+    return out
+
+
+class TestSSFODataGeneration(unittest.TestCase):
+  """Test suite for SSFO synthetic preference data generation."""
+
+  def setUp(self):
+    self.pipeline = SSFODataGenerationPipeline()
+    self.pipeline.args = SsfoDataGenArguments(
+        task_name="npov",
+        dataset_repo_id="test_user/test_sft",
+        model_repo_id="google/gemma-4-E4B",
+        sft_model_path="test_user/test_sft_model",
+        temperature=0.7,
+        top_p=0.9,
+        top_k=50,
+        max_new_tokens=10,
+        batch_size=2,
+        seed=42,
+        use_ground_truth_chosen=False,
+        push_to_hub=False,
+    )
+    self.pipeline.device = torch.device("cpu")
+    self.pipeline.tokenizer = _FakeChatTokenizer()
+    self.pipeline.enable_lora = False
+    self.pipeline.lora_path = None
+    self.pipeline.vllm_model = self.pipeline.args.model_repo_id
+
+  def test_extract_prompts_npov(self):
+    """Test prompt extraction with and without context for NPOV."""
+    self.pipeline.args.task_name = "npov"
+    entry = {
+        "user_query": "Is coffee healthy?",
+        "perspective_1_name": "Pro-coffee",
+        "perspective_1": "Coffee has antioxidants.",
+        "perspective_2_name": "Anti-coffee",
+        "perspective_2": "Excess caffeine causes anxiety.",
+        "npov_response": "Coffee has both antioxidants and caffeine effects.",
+    }
+    prompt_ctx, prompt_no_ctx, gt = self.pipeline._extract_prompts(entry)
+
+    # Check that context prompt includes perspectives
+    self.assertIn("Coffee has antioxidants.", prompt_ctx)
+    self.assertIn("Excess caffeine causes anxiety.", prompt_ctx)
+    self.assertIn("Is coffee healthy?", prompt_ctx)
+
+    # Check that context-free prompt includes only query wrapped in control tokens
+    self.assertEqual(
+        prompt_no_ctx,
+        "<start_of_turn>user\nIs coffee healthy?<end_of_turn>\n<start_of_turn>model\n",
+    )
+    self.assertNotIn("Coffee has antioxidants.", prompt_no_ctx)
+    self.assertNotIn("Excess caffeine causes anxiety.", prompt_no_ctx)
+    self.assertEqual(gt, "Coffee has both antioxidants and caffeine effects.")
+
+  def test_extract_prompts_bosch(self):
+    """Test prompt extraction with and without context for Bosch."""
+    self.pipeline.args.task_name = "bosch"
+    entry = {
+        "Question": "How do I check tire pressure?",
+        "Context": "Use the gauge located in the glove compartment.",
+        "response": "Locate the gauge in the glove compartment to check.",
+    }
+    prompt_ctx, prompt_no_ctx, gt = self.pipeline._extract_prompts(entry)
+
+    # Check that context prompt contains manual excerpt
+    self.assertIn("Use the gauge located in the glove compartment.", prompt_ctx)
+    self.assertIn("How do I check tire pressure?", prompt_ctx)
+
+    # Check that context-free prompt strips the manual excerpt
+    self.assertNotIn(
+        "Use the gauge located in the glove compartment.", prompt_no_ctx
+    )
+    self.assertEqual(
+        prompt_no_ctx,
+        "<start_of_turn>user\nHow do I check tire pressure?<end_of_turn>\n<start_of_turn>model\n",
+    )
+    self.assertEqual(gt, "Locate the gauge in the glove compartment to check.")
+
+  def test_setup_model_resolves_lora(self):
+    """Test setup_model correctly resolves LoRA and vllm model."""
+    self.pipeline.args.sft_model_path = "test_user/sft_adapter"
+    self.pipeline.args.model_repo_id = "google/gemma-4-E4B-it"
+    with patch.object(
+        self.pipeline,
+        "_resolve_lora_adapter_path",
+        return_value=(True, "/resolved/lora/path"),
+    ):
+      self.pipeline.setup_model()
+      self.assertTrue(self.pipeline.enable_lora)
+      self.assertEqual(self.pipeline.lora_path, "/resolved/lora/path")
+      self.assertEqual(self.pipeline.vllm_model, "google/gemma-4-E4B-it")
+
+  def test_extract_prompts_ragtruth(self):
+    """Test _extract_prompts for ragtruth task with context."""
+    self.pipeline.args.task_name = "ragtruth"
+    entry = {
+        "user_query": "What causes earthquakes?",
+        "passage": "Tectonic plates shift along faults.",
+        "completion": "Tectonic plate movements cause earthquakes.",
+    }
+    prompt_ctx, prompt_no_ctx, gt = self.pipeline._extract_prompts(entry)
+    self.assertIn("Context: Tectonic plates shift along faults.", prompt_ctx)
+    self.assertIn("Question: What causes earthquakes?", prompt_ctx)
+    self.assertEqual(
+        prompt_no_ctx,
+        "<start_of_turn>user\nWhat causes earthquakes?<end_of_turn>\n<start_of_turn>model\n",
+    )
+    self.assertEqual(gt, "Tectonic plate movements cause earthquakes.")
+
+  def test_extract_prompts_ragtruth_subtasks(self):
+    """Test _extract_prompts for ragtruth-qa and ragtruth-summarization."""
+    # QA subtask
+    self.pipeline.args.task_name = "ragtruth-qa"
+    entry_qa = {
+        "user_query": "What causes earthquakes?",
+        "passage": "Tectonic plates shift along faults.",
+        "completion": "Tectonic plate movements cause earthquakes.",
+    }
+    prompt_ctx, prompt_no_ctx, gt = self.pipeline._extract_prompts(entry_qa)
+    self.assertIn("Context: Tectonic plates shift along faults.", prompt_ctx)
+    self.assertIn("Question: What causes earthquakes?", prompt_ctx)
+    self.assertEqual(
+        prompt_no_ctx,
+        "<start_of_turn>user\nWhat causes earthquakes?<end_of_turn>\n<start_of_turn>model\n",
+    )
+    self.assertEqual(gt, "Tectonic plate movements cause earthquakes.")
+
+    # Summarization subtask
+    self.pipeline.args.task_name = "ragtruth-summarization"
+    entry_sum = {
+        "user_query": "Summarize the above document.",
+        "context": "Solar energy is harnessed using photovoltaic cells.",
+        "completion": "Solar cells capture sunlight for energy.",
+    }
+    prompt_ctx, prompt_no_ctx, gt = self.pipeline._extract_prompts(entry_sum)
+    self.assertIn("Context: Solar energy is harnessed using photovoltaic cells.", prompt_ctx)
+    self.assertIn("Question: Summarize the above document.", prompt_ctx)
+    self.assertEqual(
+        prompt_no_ctx,
+        "<start_of_turn>user\nSummarize the above document.<end_of_turn>\n<start_of_turn>model\n",
+    )
+    self.assertEqual(gt, "Solar cells capture sunlight for energy.")
+
+  def test_ssfo_output_dataset_repo_id_formatting(self):
+    """Test default preference dataset repo ID construction contains model and timestamp."""
+    self.pipeline.args.output_dataset_repo_id = None
+    self.pipeline.train_split = []
+    self.pipeline.raw_dataset = {"train": []}
+    self.pipeline.args.push_to_hub = True
+
+    with patch("src.pipelines.DatasetDict.push_to_hub") as mock_push:
+      self.pipeline.run_and_save()
+      mock_push.assert_called_once()
+      pushed_repo = mock_push.call_args[0][0]
+      self.assertIn("npov_ssfo_preference", pushed_repo)
+      self.assertIn("gemma-4-E4B", pushed_repo)
+      self.assertTrue(pushed_repo.startswith("test_user/"))
+
+  def test_ssfo_output_dataset_repo_id_with_max_samples(self):
+    """Test default preference dataset repo ID construction contains max_samples tag."""
+    self.pipeline.args.output_dataset_repo_id = None
+    self.pipeline.args.max_samples = 250
+    self.pipeline.train_split = []
+    self.pipeline.raw_dataset = {"train": []}
+    self.pipeline.args.push_to_hub = True
+
+    with patch("src.pipelines.DatasetDict.push_to_hub") as mock_push:
+      self.pipeline.run_and_save()
+      mock_push.assert_called_once()
+      pushed_repo = mock_push.call_args[0][0]
+      self.assertIn("_n250_", pushed_repo)
+
+  def test_run_and_save_with_vllm(self):
+    """Test SSFO data generation using mocked vLLM engine with base model for rejected."""
+    self.pipeline.use_vllm = True
+    self.pipeline.enable_lora = True
+    self.pipeline.lora_path = "mock/lora/path"
+    mock_llm = MagicMock()
+    mock_out_1 = MagicMock(outputs=[MagicMock(text="Chosen completion 1")])
+    mock_out_2 = MagicMock(outputs=[MagicMock(text="Chosen completion 2")])
+    mock_out_3 = MagicMock(outputs=[MagicMock(text="Rejected completion 1")])
+    mock_out_4 = MagicMock(outputs=[MagicMock(text="Rejected completion 2")])
+    mock_llm.generate.side_effect = [
+        [mock_out_1, mock_out_2],
+        [mock_out_3, mock_out_4],
+    ]
+    self.pipeline.llm = mock_llm
+    self.pipeline.train_split = [
+        {
+            "user_query": "q1",
+            "perspective_1_name": "Pro",
+            "perspective_1": "arg1",
+            "perspective_2_name": "Con",
+            "perspective_2": "arg2",
+            "npov_response": "gt1",
+        },
+        {
+            "user_query": "q2",
+            "perspective_1_name": "Pro",
+            "perspective_1": "arg1",
+            "perspective_2_name": "Con",
+            "perspective_2": "arg2",
+            "npov_response": "gt2",
+        },
+    ]
+    self.pipeline.raw_dataset = {"train": self.pipeline.train_split}
+    self.pipeline.args.push_to_hub = False
+    self.pipeline.args.use_ground_truth_chosen = False
+    self.pipeline.args.use_base_model_for_rejected = True
+
+    with patch("src.pipelines.DatasetDict.save_to_disk"):
+      self.pipeline.run_and_save()
+      self.assertEqual(mock_llm.generate.call_count, 2)
+      ctx_args = mock_llm.generate.call_args_list[0][0][0]
+      no_ctx_args = mock_llm.generate.call_args_list[1][0][0]
+      ctx_kwargs = mock_llm.generate.call_args_list[0][1]
+      no_ctx_kwargs = mock_llm.generate.call_args_list[1][1]
+      self.assertEqual(len(ctx_args), 2)
+      self.assertEqual(len(no_ctx_args), 2)
+      self.assertIn("lora_request", ctx_kwargs)
+      self.assertIsNotNone(ctx_kwargs["lora_request"])
+      # Base model for rejected should not pass lora_request
+      self.assertNotIn("lora_request", no_ctx_kwargs)
+
+  def test_run_and_save_with_sft_adapter_for_rejected(self):
+    """Test SSFO data generation with use_base_model_for_rejected=False passes lora_request."""
+    self.pipeline.use_vllm = True
+    self.pipeline.enable_lora = True
+    self.pipeline.lora_path = "mock/lora/path"
+    mock_llm = MagicMock()
+    mock_out_1 = MagicMock(outputs=[MagicMock(text="Chosen completion")])
+    mock_out_2 = MagicMock(outputs=[MagicMock(text="Rejected completion")])
+    mock_llm.generate.side_effect = [[mock_out_1], [mock_out_2]]
+    self.pipeline.llm = mock_llm
+    entry = {
+        "user_query": "q1",
+        "perspective_1_name": "Pro",
+        "perspective_1": "arg1",
+        "perspective_2_name": "Con",
+        "perspective_2": "arg2",
+        "npov_response": "gt1",
+    }
+    self.pipeline.train_split = [entry]
+    self.pipeline.raw_dataset = {"train": [entry]}
+    self.pipeline.args.push_to_hub = False
+    self.pipeline.args.use_ground_truth_chosen = False
+    self.pipeline.args.use_base_model_for_rejected = False
+
+    with patch("src.pipelines.DatasetDict.save_to_disk"):
+      self.pipeline.run_and_save()
+      self.assertEqual(mock_llm.generate.call_count, 2)
+      ctx_kwargs = mock_llm.generate.call_args_list[0][1]
+      no_ctx_kwargs = mock_llm.generate.call_args_list[1][1]
+      self.assertIn("lora_request", ctx_kwargs)
+      self.assertIn("lora_request", no_ctx_kwargs)
+      self.assertIsNotNone(no_ctx_kwargs["lora_request"])
+
+  def test_setup_arguments_cleaning(self):
+    """Test that setup_arguments correctly cleans CLI arguments with double dash."""
+    with patch("src.pipelines.HfArgumentParser") as mock_parser_cls:
+      mock_parser = MagicMock()
+      mock_parser.parse_args_into_dataclasses.return_value = [
+          SsfoDataGenArguments(
+              task_name="npov",
+              dataset_repo_id="user/dataset",
+              model_repo_id="google/gemma-4-E4B",
+              sft_model_path="user/sft",
+              use_base_model_for_rejected=True,
+          )
+      ]
+      mock_parser_cls.return_value = mock_parser
+
+      test_pipeline = SSFODataGenerationPipeline()
+      test_pipeline.setup_arguments(
+          "--",
+          "--task_name",
+          "npov",
+          "--dataset_repo_id",
+          "user/dataset",
+          "--model_repo_id",
+          "google/gemma-4-E4B",
+          "--sft_model_path",
+          "user/sft",
+          "--use_base_model_for_rejected",
+          "True",
+      )
+      called_args = mock_parser.parse_args_into_dataclasses.call_args[0][0]
+      self.assertNotIn("--", called_args)
+      self.assertEqual(test_pipeline.args.task_name, "npov")
+      self.assertEqual(test_pipeline.args.dataset_repo_id, "user/dataset")
+      self.assertEqual(test_pipeline.args.model_repo_id, "google/gemma-4-E4B")
+      self.assertTrue(test_pipeline.args.use_base_model_for_rejected)
+
+  def test_train_and_test_split_schema_match(self):
+    """Test that train and test splits have identical column names in preference_dataset."""
+    self.pipeline.use_vllm = True
+    mock_llm = MagicMock()
+    mock_llm.generate.return_value = [
+        MagicMock(outputs=[MagicMock(text="gen1")])
+    ]
+    self.pipeline.llm = mock_llm
+    entry = {
+        "user_query": "q1",
+        "perspective_1_name": "Pro",
+        "perspective_1": "arg1",
+        "perspective_2_name": "Con",
+        "perspective_2": "arg2",
+        "npov_response": "gt1",
+        "topic": "topic1",
+        "extra_meta": "meta1",
+    }
+    self.pipeline.train_split = [entry]
+    self.pipeline.raw_dataset = {"train": [entry], "test": [entry]}
+    with patch("src.pipelines.DatasetDict") as mock_ds_dict:
+      self.pipeline.run_and_save()
+      mock_ds_dict.assert_called()
+      splits_dict = mock_ds_dict.call_args[0][0]
+      self.assertIn("train", splits_dict)
+      self.assertIn("test", splits_dict)
+      self.assertEqual(
+          splits_dict["train"].column_names, splits_dict["test"].column_names
+      )
+      self.assertEqual(
+          splits_dict["train"].column_names, ["prompt", "chosen", "rejected"]
+      )
+
+
+class TestSSFOChatTemplateAgnosticism(unittest.TestCase):
+  """The "no context" prompt must follow the policy's own chat template."""
+
+  def _pipeline(self, tokenizer):
+    pipeline = SSFODataGenerationPipeline()
+    pipeline.args = SsfoDataGenArguments(
+        task_name="npov",
+        dataset_repo_id="test_user/test_sft",
+        model_repo_id="acme/some-model",
+        sft_model_path="test_user/test_sft_model",
+    )
+    pipeline.tokenizer = tokenizer
+    return pipeline
+
+  def test_chatml_family_gets_chatml_markers(self):
+    pipeline = self._pipeline(_FakeChatTokenizer(style="chatml"))
+    _, prompt_no_ctx, _ = pipeline._extract_prompts(
+        {"user_query": "Is coffee healthy?", "npov_response": "Maybe."}
+    )
+    self.assertEqual(
+        prompt_no_ctx,
+        "<|im_start|>user\nIs coffee healthy?<|im_end|>\n"
+        "<|im_start|>assistant\n",
+    )
+    self.assertNotIn("<start_of_turn>", prompt_no_ctx)
+
+  def test_gemma_template_bos_is_not_duplicated(self):
+    pipeline = self._pipeline(_FakeChatTokenizer(style="gemma"))
+    _, prompt_no_ctx, _ = pipeline._extract_prompts(
+        {"user_query": "Is coffee healthy?", "npov_response": "Maybe."}
+    )
+    # The template emits a BOS; it must be dropped, because the prompt is
+    # re-tokenized downstream with add_special_tokens=True.
+    self.assertFalse(prompt_no_ctx.startswith("<bos>"))
+    self.assertTrue(prompt_no_ctx.startswith("<start_of_turn>user"))
+
+  def test_base_model_without_chat_template_gets_raw_text(self):
+    tokenizer = _FakeChatTokenizer()
+    tokenizer.chat_template = None
+    pipeline = self._pipeline(tokenizer)
+    _, prompt_no_ctx, _ = pipeline._extract_prompts(
+        {"user_query": "Is coffee healthy?", "npov_response": "Maybe."}
+    )
+    self.assertEqual(prompt_no_ctx, "Is coffee healthy?")
+
+
+if __name__ == "__main__":
+  unittest.main()

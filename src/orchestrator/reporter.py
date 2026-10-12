@@ -1,0 +1,742 @@
+"""Scientific reporting engine: generates Markdown summaries, Rich console tables, and W&B reports."""
+
+from __future__ import annotations
+
+import datetime
+import logging
+import os
+from typing import Any, Dict, List, Optional
+from src.orchestrator import eval_metrics
+from src.orchestrator import flavors
+from src.orchestrator.config import CampaignConfig
+from src.orchestrator.state import CampaignState, StageResult, StageStatus
+
+logger = logging.getLogger(__name__)
+
+#: Metrics summarised across the temperature grid, in the order the report
+#: shows them. Hallucination rate and rubric quality are read together: a
+#: faithfulness gain that costs prose quality is a copied context, not a win.
+SWEEP_SUMMARY_METRICS = (
+    ("hallucination_rate", "Hallucination rate"),
+    (eval_metrics.REWARD_HACKING_QUALITY_KEY, "Reward-hacking quality"),
+)
+
+
+def _comparison_table_lines(
+    metrics: Dict[str, Any], labels: List[str], caption: str
+) -> List[str]:
+  """Renders one per-metric comparison table over ``labels``.
+
+  Args:
+    metrics: The eval stage metric map.
+    labels: Target labels to put in columns, in order.
+    caption: Bullet line placed above the table.
+
+  Returns:
+    Markdown lines, ending with a blank line.
+  """
+  titles = [eval_metrics.target_title(label) for label in labels]
+  policies = [
+      eval_metrics.target_title(label)
+      for label in labels
+      if not eval_metrics.is_baseline(label)
+  ]
+  delta_heads = [
+      "Δ" if len(policies) == 1 else f"Δ {title}" for title in policies
+  ]
+  header = (
+      "| Metric | "
+      + " | ".join(titles)
+      + "".join(f" | {head}" for head in delta_heads)
+      + " |"
+  )
+  divider = (
+      "| :--- | "
+      + " | ".join("---:" for _ in titles)
+      + "".join(" | ---:" for _ in delta_heads)
+      + " |"
+  )
+  lines = [caption, "", header, divider]
+  for name, values, deltas in eval_metrics.comparison_rows(metrics, labels):
+    cells = " | ".join(
+        f"**{eval_metrics.format_row_value(name, v)}**" for v in values
+    )
+    delta_cells = "".join(
+        f" | {d:+.4f}" if isinstance(d, float) else " | -" for d in deltas
+    )
+    lines.append(f"| `{name}` | {cells}{delta_cells} |")
+  lines.append("")
+  return lines
+
+
+def _sweep_summary_lines(metrics: Dict[str, Any]) -> List[str]:
+  """Renders the metric-vs-temperature tables with 95% confidence intervals.
+
+  One table per summary metric: a row per temperature, a column per policy,
+  every cell ``value [low, high]``. A star marks the temperature a PE-RL
+  policy was trained at, so the reader can see the result is not confined
+  to the training regime.
+
+  Args:
+    metrics: The eval stage metric map.
+
+  Returns:
+    Markdown lines, empty when the campaign scored a single temperature.
+  """
+  groups = eval_metrics.temperature_groups(metrics)
+  if len(groups) < 2:
+    return []
+  stage_ids: List[str] = []
+  for label in eval_metrics.target_labels(metrics):
+    stage_id, _ = eval_metrics.split_target_label(label)
+    if stage_id not in stage_ids:
+      stage_ids.append(stage_id)
+  lines = [
+      "* **Temperature sweep** (95% confidence intervals: Wilson for rates,"
+      " normal on the standard error for means; ★ = the PE-RL policy's"
+      " rollout temperature). Intervals are per cell and unpaired, hence"
+      " conservative for comparing two policies on the same prompts.",
+      "",
+  ]
+  for name, title in SWEEP_SUMMARY_METRICS:
+    rows = []
+    for temperature, labels in groups:
+      by_stage = {
+          eval_metrics.split_target_label(label)[0]: label for label in labels
+      }
+      cells = []
+      for stage_id in stage_ids:
+        label = by_stage.get(stage_id)
+        values = (
+            eval_metrics.target_values(metrics, label) if label else {}
+        )
+        if name not in values:
+          cells.append("-")
+          continue
+        cell = eval_metrics.format_with_interval(values, name)
+        rollout = values.get(eval_metrics.ROLLOUT_TEMPERATURE_KEY)
+        if (
+            temperature is not None
+            and isinstance(rollout, (int, float))
+            and eval_metrics.format_temperature(rollout)
+            == eval_metrics.format_temperature(temperature)
+        ):
+          cell += " ★"
+        cells.append(cell)
+      if all(cell == "-" for cell in cells):
+        continue
+      head = (
+          "?" if temperature is None
+          else eval_metrics.format_temperature(temperature)
+      )
+      rows.append(f"| {head} | " + " | ".join(cells) + " |")
+    if not rows:
+      continue
+    lines.extend([
+        f"**{title}** vs. decoding temperature:",
+        "",
+        "| T | "
+        + " | ".join(eval_metrics.target_title(s) for s in stage_ids)
+        + " |",
+        "| ---: | " + " | ".join("---:" for _ in stage_ids) + " |",
+        *rows,
+        "",
+    ])
+  return lines
+
+
+def _selection_lines(result: StageResult, metric_label: str) -> List[str]:
+  """Explains how a stage's headline number was picked, when that matters.
+
+  A score obtained by early stopping is not the same claim as a score the
+  run actually ended on, and neither is the same claim as an average over the
+  end of training. The difference decides whether the number is a result or a
+  lucky spike. Silent for plain ``final`` selection so that reports from
+  stages which rank on a single stable evaluation read exactly as before.
+
+  Args:
+    result: The stage's outcome.
+    metric_label: Human-readable metric name for the prose.
+
+  Returns:
+    Zero, one or two markdown bullet lines.
+  """
+  if result.selection_strategy == "final_window":
+    points = result.selection_window
+    span = f"last {points} logged points" if points else "final logged window"
+    lines = [
+        f"* **Selection**: {metric_label} averaged over the {span} of each "
+        "trial (the converged level, not the single step the trial stopped "
+        "on)."
+    ]
+    if result.final_metric_val is not None:
+      lines.append(
+          f"* **Final-step {metric_label}**: "
+          f"`{result.final_metric_val:.5f}` - the gap to the value above is "
+          "step-to-step noise, and is how far a single-point ranking could "
+          "have moved this trial."
+      )
+    return lines
+  if result.selection_strategy == "constrained_continual_eval":
+    if result.selection_step is None:
+      return [
+          "* **Selection**: best constrained continual-eval hallucination rate "
+          "(step > 0, under the reward-hacking ceiling; the winning trial "
+          "ended at its best constrained checkpoint)."
+      ]
+    lines = [
+        "* **Selection**: best constrained continual-eval hallucination rate "
+        f"(step > 0, under the reward-hacking ceiling), reached at step "
+        f"`{result.selection_step}` (early stopping)."
+    ]
+    if result.final_metric_val is not None:
+      lines.append(
+          f"* **Final-step continual-eval hallucination rate**: "
+          f"`{result.final_metric_val:.5f}`."
+      )
+    return lines
+  if result.selection_strategy != "best":
+    return []
+  if result.selection_step is None:
+    return [
+        "* **Selection**: best "
+        f"{metric_label} over all evaluation steps (the winning trial ended "
+        "at its best point)."
+    ]
+  lines = [
+      f"* **Selection**: best {metric_label} over all evaluation steps, "
+      f"reached at step `{result.selection_step}` (early stopping)."
+  ]
+  if result.final_metric_val is not None:
+    lines.append(
+        f"* **Final-step {metric_label}**: `{result.final_metric_val:.5f}` - "
+        "the gap to the value above is what early stopping recovered, and "
+        "is optimistically biased by the selection itself."
+    )
+  return lines
+
+
+
+def _metric_text(value: Optional[float], spec: str = ".5f") -> str:
+  """Formats a stage's headline metric, tolerating a missing one.
+
+  ``StageResult.best_metric_val`` is optional, and a stage can legitimately
+  complete without it - a resumed state file written before the field existed,
+  or a sweep whose metric query came back empty after the checkpoint was
+  already published. Formatting None raises, and because these lines are
+  assembled for the whole document at once, that used to lose the *entire*
+  report rather than one bullet.
+
+  Args:
+    value: The metric, if it was recorded.
+    spec: Format spec applied when it was.
+
+  Returns:
+    The formatted number, or a dash.
+  """
+  if isinstance(value, bool) or not isinstance(value, (int, float)):
+    return "-"
+  return format(float(value), spec)
+
+
+class CampaignReporter:
+  """Generates publication-ready Markdown summaries and interactive reports."""
+
+  def __init__(self, config: CampaignConfig, state: CampaignState):
+    self.config = config
+    self.state = state
+
+  def generate_all(self) -> Dict[str, str]:
+    """Generates all configured reports and returns a dictionary of report paths/URLs.
+
+    Reporting runs after every checkpoint has been trained and pushed, so a
+    failure here (a formatting bug, a W&B outage) must never be allowed to
+    mark a successful campaign as failed. Each artifact is attempted
+    independently and errors are recorded instead of raised.
+
+    Returns:
+      Artifact paths/URLs, plus a ``reporting_error`` entry when something
+      could not be produced.
+    """
+    artifacts = {}
+    if self.config.reporting.generate_markdown:
+      try:
+        artifacts["markdown_report"] = self.generate_markdown_report()
+      except Exception as error:  # pylint: disable=broad-except
+        logger.exception("Markdown report generation failed")
+        artifacts["reporting_error"] = f"markdown report: {error}"
+
+    if self.config.reporting.render_console_summary:
+      try:
+        self.render_console_summary()
+      except Exception as error:  # pylint: disable=broad-except
+        logger.warning("Console summary rendering failed: %s", error)
+
+    if self.config.reporting.publish_wandb_report:
+      try:
+        report_url = self.publish_wandb_report()
+        if report_url:
+          artifacts["wandb_report_url"] = report_url
+      except Exception as error:  # pylint: disable=broad-except
+        logger.warning("W&B report publishing failed: %s", error)
+        artifacts.setdefault("reporting_error", f"wandb report: {error}")
+
+    return artifacts
+
+  def generate_markdown_report(self) -> str:
+    """Builds a comprehensive scientific summary report in GitHub-flavored Markdown."""
+    reports_dir = self.config.reporting.reports_dir
+    os.makedirs(reports_dir, exist_ok=True)
+    report_file = os.path.join(reports_dir, f"{self.config.name}_summary.md")
+
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    lines = [
+        f"# Auto-PERL Scientific Campaign Report: `{self.config.task_name}`",
+        "",
+        "> **Automated Research Summary**  ",
+        f"> **Campaign ID**: `{self.config.name}`  ",
+        f"> **Generated At**: {now_str}  ",
+        f"> **Base Model**: `{self.config.base_model}`  ",
+        f"> **Random Seed**: `{self.config.seed}`  ",
+        f"> **W&B Project**: `{self.config.wandb_entity or self.config.user}/{self.config.project}`",
+        "",
+        "---",
+        "",
+        "## 1. Executive Performance Scorecard",
+        "",
+        (
+            "| Pipeline Stage | Model Identifier | Primary Metric | Best"
+            " Value | Trials | Status |"
+        ),
+        (
+            "| :--- | :--- | :--- | :---"
+            " | :--- | :--- |"
+        ),
+    ]
+
+    #: Degradations collected while building the table, rendered underneath
+    #: it. A report whose scorecard is a wall of green ticks while the PE-RL
+    #: sweep only ran 3 of its 5 trials is worse than no report at all.
+    warning_lines: List[str] = []
+
+    #: Doubts about the *judge* rather than about the search. Kept apart
+    #: because they qualify every number in the report rather than marking
+    #: one stage as incomplete.
+    judge_warning_lines: List[str] = []
+
+    for planned in flavors.build_plan(self.config):
+      stage_name = planned.stage_id
+      stage_title = planned.title or stage_name.upper()
+      stage_res = self.state.stages.get(stage_name)
+      if not stage_res:
+        lines.append(
+            f"| **{stage_title}** | *Pending* | - | - | - | ⏳ PENDING |"
+        )
+        continue
+
+      model_str = f"`{stage_res.model_repo_id}`" if stage_res.model_repo_id else "*N/A*"
+      partial = (
+          stage_res.status == StageStatus.COMPLETED
+          and stage_res.sweep_outcome == "partial"
+      )
+      if stage_res.status != StageStatus.COMPLETED:
+        status_icon = f"⚠️ {stage_res.status.value}"
+      elif partial:
+        status_icon = "⚠️ COMPLETED (PARTIAL)"
+      else:
+        status_icon = "✅ COMPLETED"
+
+      trials_str = "-"
+      if stage_res.trials_total:
+        trials_str = f"{stage_res.trials_done}/{stage_res.trials_total}"
+        if partial:
+          trials_str = f"**{trials_str}**"
+
+      for warning in stage_res.warnings or []:
+        if planned.kind == "autorater":
+          judge_warning_lines.append(f"* {warning}")
+        else:
+          warning_lines.append(f"* **{stage_title}**: {warning}")
+
+      if planned.kind == "autorater":
+        metric_str = "judge roc_auc"
+        val_str = (
+            f"{stage_res.best_metric_val:.4f}"
+            if stage_res.best_metric_val is not None
+            else "-"
+        )
+      elif planned.kind == "sft":
+        metric_str = "eval/loss"
+        val_str = f"{stage_res.best_metric_val:.4f}" if stage_res.best_metric_val is not None else "-"
+      elif planned.kind == "rm":
+        metric_str = "eval/roc_auc"
+        val_str = f"{stage_res.best_metric_val:.4f}" if stage_res.best_metric_val is not None else "-"
+      elif planned.kind == "perl":
+        metric_str = "rewards/mean"
+        val_str = f"{stage_res.best_metric_val:.4f}" if stage_res.best_metric_val is not None else "-"
+      elif planned.kind == "eval":
+        metric_str = "autorater_hallucination"
+        h_rate = eval_metrics.headline_metric(stage_res.metrics)
+        val_str = f"{h_rate:.4f}" if h_rate is not None else "Done"
+      else:
+        metric_str = "-"
+        val_str = "-"
+
+      lines.append(
+          f"| **{stage_title}** | {model_str} | `{metric_str}` |"
+          f" **{val_str}** | {trials_str} | {status_icon} |"
+      )
+
+    if judge_warning_lines:
+      lines.extend([
+          "",
+          "> [!CAUTION]",
+          "> The autorater that produced every hallucination number below is"
+          " itself of doubtful quality.",
+          "",
+          *judge_warning_lines,
+      ])
+
+    if warning_lines:
+      lines.extend([
+          "",
+          "> [!WARNING]",
+          "> This campaign did not run as configured. The results below come"
+          " from a reduced search.",
+          "",
+          "### 1.1. Degradations",
+          "",
+          *warning_lines,
+      ])
+
+    lines.extend([
+        "",
+        "---",
+        "",
+        "## 2. Stage Breakdown & Winning Hyperparameters",
+        "",
+    ])
+
+    # Autorater calibration. Numbered 2.0 rather than 2.1 so that the SFT,
+    # RM, PE-RL and evaluation sections keep the numbers they have always
+    # had - a report is read against older reports, and renumbering every
+    # section to insert one at the front makes that comparison harder than
+    # the odd number does.
+    cal_res = self.state.stages.get("autorater")
+    if cal_res and cal_res.status == StageStatus.COMPLETED:
+      calibration = eval_metrics.autorater_calibration(cal_res.metrics)
+      rows = eval_metrics.format_autorater_rows(calibration)
+      if rows:
+        eval_cfg = self.config.eval
+        lines.extend([
+            "### 2.0. Autorater Calibration (Judge Quality)",
+            "",
+            "How well the Gemini judge reproduces the human labels, measured"
+            " before any training, on"
+            f" `{self.config.user}/{self.config.task_name}_autorater`"
+            " (test split).",
+            "",
+            f"* **Judge**: `{eval_cfg.evaluator_model}`"
+            f" ({eval_cfg.evaluator_num_fewshot}-shot,"
+            f" k={eval_cfg.autorater_num_samples})",
+            "",
+            "| Calibration metric | Value |",
+            "| :--- | :--- |",
+        ])
+        lines.extend(f"| {label} | `{value}` |" for label, value in rows)
+        lines.extend([
+            "",
+            "The fitted threshold above is the operating point section 2.4"
+            " scored at. Numbers from a campaign calibrated at a different"
+            " threshold are not directly comparable with these.",
+            "",
+        ])
+
+    # SFT Details
+    sft_res = self.state.stages.get("sft")
+    if sft_res and sft_res.status == StageStatus.COMPLETED:
+      sft_sw = (
+          f"`{sft_res.sweep_name}` (`{sft_res.sweep_id}`)"
+          if sft_res.sweep_name
+          else f"`{sft_res.sweep_id}`"
+      )
+      lines.extend([
+          "### 2.1. Supervised Fine-Tuning (SFT)",
+          f"* **Sweep**: {sft_sw}",
+          f"* **Winning Run ID**: `{sft_res.best_run_id}`",
+          f"* **Best Eval Loss**: `{_metric_text(sft_res.best_metric_val)}`",
+          *_selection_lines(sft_res, "eval loss"),
+          f"* **Hugging Face Model**: [{sft_res.model_repo_id}](https://huggingface.co/{sft_res.model_repo_id})",
+          "* **Optimal Hyperparameters**:",
+          "```yaml",
+      ])
+      for k, v in sorted(sft_res.best_params.items()):
+        if not k.startswith("_"):
+          lines.append(f"  {k}: {v}")
+      lines.extend(["```", ""])
+
+    # RM Details - one block per dataset-flavor branch. An unbranched
+    # campaign keeps the flat "2.2." heading it has always had.
+    branched = flavors.is_branched(self.config)
+    for index, rm_stage_id in enumerate(
+        flavors.branch_stage_ids(self.config, "rm"), start=1
+    ):
+      rm_res = self.state.stages.get(rm_stage_id)
+      if not rm_res or rm_res.status != StageStatus.COMPLETED:
+        continue
+      _, rm_flavor = flavors.split_stage_id(rm_stage_id)
+      rm_suffix = (
+          f" - {flavors.flavor_title(rm_flavor)} dataset" if rm_flavor else ""
+      )
+      rm_sw = (
+          f"`{rm_res.sweep_name}` (`{rm_res.sweep_id}`)"
+          if rm_res.sweep_name
+          else f"`{rm_res.sweep_id}`"
+      )
+      lines.extend([
+          f"### 2.2{f'.{index}' if branched else ''}."
+          f" Reward Model (RM){rm_suffix}",
+          f"* **Sweep**: {rm_sw}",
+          f"* **Winning Run ID**: `{rm_res.best_run_id}`",
+          f"* **Best ROC-AUC**: `{_metric_text(rm_res.best_metric_val)}`",
+          *_selection_lines(rm_res, "ROC-AUC"),
+          f"* **Hugging Face Model**: [{rm_res.model_repo_id}](https://huggingface.co/{rm_res.model_repo_id})",
+          "* **Optimal Hyperparameters**:",
+          "```yaml",
+      ])
+      for k, v in sorted(rm_res.best_params.items()):
+        if not k.startswith("_"):
+          lines.append(f"  {k}: {v}")
+      lines.extend(["```", ""])
+
+    # PE-RL Details - one block per branch, each against its own reward model.
+    for index, perl_stage_id in enumerate(
+        flavors.branch_stage_ids(self.config, "perl"), start=1
+    ):
+      perl_res = self.state.stages.get(perl_stage_id)
+      if not perl_res or perl_res.status != StageStatus.COMPLETED:
+        continue
+      _, perl_flavor = flavors.split_stage_id(perl_stage_id)
+      perl_suffix = (
+          f" - {flavors.flavor_title(perl_flavor)} reward model"
+          if perl_flavor
+          else ""
+      )
+      perl_sw = (
+          f"`{perl_res.sweep_name}` (`{perl_res.sweep_id}`)"
+          if perl_res.sweep_name
+          else f"`{perl_res.sweep_id}`"
+      )
+      lines.extend([
+          f"### 2.3{f'.{index}' if branched else ''}."
+          f" Parameter-Efficient Reinforcement Learning (PE-RL){perl_suffix}",
+          f"* **Sweep**: {perl_sw}",
+          f"* **Winning Run ID**: `{perl_res.best_run_id}`",
+          f"* **Best Mean Reward**: `{_metric_text(perl_res.best_metric_val)}`",
+          *_selection_lines(perl_res, "mean reward"),
+          f"* **Hugging Face Model**: [{perl_res.model_repo_id}](https://huggingface.co/{perl_res.model_repo_id})",
+          "* **Optimal Hyperparameters**:",
+          "```yaml",
+      ])
+      for k, v in sorted(perl_res.best_params.items()):
+        if not k.startswith("_"):
+          lines.append(f"  {k}: {v}")
+      lines.extend(["```", ""])
+
+    # Eval Details
+    eval_res = self.state.stages.get("eval")
+    if eval_res and eval_res.status == StageStatus.COMPLETED:
+      targets = eval_metrics.present_targets(eval_res.metrics)
+      eval_cfg = self.config.eval
+      lines.extend([
+          "### 2.4. Final Evaluation & Gemini Autorating",
+          f"* **Evaluator Model**: `{eval_cfg.evaluator_model}`",
+          f"* **Headline Policy**: `{eval_res.model_repo_id}`",
+          f"* **Evaluation Seed**: `{eval_cfg.seed}`"
+          f" (subsamples {eval_cfg.max_eval_samples} test examples)",
+      ])
+      if eval_cfg.run_reward_hacking_autorater:
+        lines.append(
+            "* **Reward-hacking rubric**:"
+            f" `{eval_cfg.reward_hacking_model or eval_cfg.evaluator_model}`"
+            f" ({eval_cfg.reward_hacking_num_fewshot}-pair,"
+            f" k={eval_cfg.autorater_num_samples},"
+            f" flag threshold {eval_cfg.reward_hacking_threshold})"
+        )
+      lines.append("")
+
+      if targets:
+        # Δ is signed so that positive always means PE-RL improved on SFT,
+        # regardless of whether the metric is minimized or maximized. One Δ
+        # column per PE-RL branch. Every SFT row is a baseline and gets no Δ
+        # of its own.
+        groups = eval_metrics.temperature_groups(eval_res.metrics)
+        if len(groups) > 1:
+          # A grid: the summary with intervals first, then one table per
+          # temperature, so every column in a table was decoded identically
+          # and each Δ is against the SFT column right beside it.
+          lines.extend(_sweep_summary_lines(eval_res.metrics))
+          for temperature, labels in groups:
+            head = (
+                "unknown temperature" if temperature is None
+                else f"T = {eval_metrics.format_temperature(temperature)}"
+            )
+            lines.extend(_comparison_table_lines(
+                eval_res.metrics,
+                labels,
+                f"* **Per-policy results at {head}** (Δ = PE-RL improvement"
+                " over the SFT column sampled at the same temperature):",
+            ))
+        else:
+          lines.extend(_comparison_table_lines(
+              eval_res.metrics,
+              [label for label, _ in targets],
+              "* **Per-policy results** (Δ = PE-RL improvement over SFT):",
+          ))
+        if eval_cfg.run_reward_hacking_autorater:
+          lines.extend([
+              "The `reward_hacking_*` rows grade the *writing*, not the"
+              " facts: fluency, non-repetition and non-extractiveness, each"
+              " on a 1-5 scale rescaled to [0, 1], with"
+              " `reward_hacking_quality` their unweighted mean. Read them"
+              " against `hallucination_rate`: a policy whose hallucination"
+              " rate falls while its rubric quality falls too has most"
+              " likely learned to copy the context rather than to answer"
+              " from it, and the faithfulness win is not real.",
+              "",
+              "Unlike the hallucination threshold, the rubric's flag"
+              " threshold is **not calibrated** against labelled data, so"
+              " the absolute level of `reward_hacking_rate` carries little"
+              " meaning. The Δ columns, which compare policies graded by the"
+              " same judge under the same prompt, are the trustworthy part.",
+              "",
+          ])
+      else:
+        lines.extend([
+            "| Metric | Measured Value |",
+            "| :--- | :--- |",
+        ])
+        for m_name, m_val in eval_res.metrics.items():
+          lines.append(
+              f"| `{m_name}` | **{eval_metrics.format_value(m_val)}** |"
+          )
+        lines.append("")
+
+    lines.extend([
+        "---",
+        "",
+        "## 3. Scientific Verification & Checkpoint Integrity",
+        "* All intermediate checkpoints are tagged with explicit seeds and parameter digests.",
+        f"* Base and downstream LoRA adapters are fully reproducible using seed `{self.config.seed}`.",
+        "",
+        f"*Report auto-generated by Auto-PERL on `{now_str}`.*",
+    ])
+
+    content = "\n".join(lines)
+    with open(report_file, "w", encoding="utf-8") as f:
+      f.write(content)
+
+    logger.info("Generated scientific Markdown report: %s", report_file)
+    return report_file
+
+  def render_console_summary(self) -> None:
+    """Renders an attractive summary scorecard in the terminal using Rich."""
+    try:
+      from rich.console import Console  # pylint: disable=g-import-not-at-top
+      from rich.panel import Panel  # pylint: disable=g-import-not-at-top
+      from rich.table import Table  # pylint: disable=g-import-not-at-top
+
+      console = Console()
+      table = Table(
+          title=f"Auto-PERL Campaign Summary: {self.config.task_name}",
+          show_header=True,
+          header_style="bold magenta",
+      )
+
+      table.add_column("Stage", style="cyan", width=10)
+      table.add_column("Status", width=12)
+      table.add_column("Metric", style="yellow")
+      table.add_column("Score", style="bold green", justify="right")
+      table.add_column("Hugging Face Checkpoint", style="dim")
+
+      for stage_name in self.config.stages:
+        stage_res = self.state.stages.get(stage_name)
+        if not stage_res:
+          table.add_row(stage_name.upper(), "[dim]PENDING[/dim]", "-", "-", "-")
+          continue
+
+        status_str = (
+            "[bold green]COMPLETED[/bold green]"
+            if stage_res.status == StageStatus.COMPLETED
+            else f"[red]{stage_res.status.value}[/red]"
+        )
+        val_str = (
+            f"{stage_res.best_metric_val:.4f}"
+            if stage_res.best_metric_val is not None
+            else "-"
+        )
+        metric_str = (
+            "loss"
+            if stage_name == "sft"
+            else "roc_auc"
+            if stage_name == "rm"
+            else "reward"
+            if stage_name == "perl"
+            else "metrics"
+        )
+        repo_str = stage_res.model_repo_id or "-"
+
+        table.add_row(
+            stage_name.upper(), status_str, metric_str, val_str, repo_str
+        )
+
+      panel = Panel(
+          table,
+          title="[bold green]Campaign Execution Finished[/bold green]",
+          border_style="green",
+      )
+      console.print(panel)
+
+    except ImportError:
+      # Fallback to plain text printing if rich is not present
+      print(f"=== Auto-PERL Campaign Summary: {self.config.task_name} ===")
+      for stage_name in self.config.stages:
+        stage_res = self.state.stages.get(stage_name)
+        status = stage_res.status.value if stage_res else "PENDING"
+        print(f"  Stage {stage_name.upper()}: {status}")
+
+  def publish_wandb_report(self) -> Optional[str]:
+    """Publishes an interactive W&B Report via wandb-workspaces if available."""
+    target_entity = self.config.wandb_entity or self.config.user
+    if self.config.dry_run:
+      logger.info(
+          "[DRY-RUN] Simulating W&B Report creation: https://wandb.ai/%s/%s/reports/mock",
+          target_entity,
+          self.config.project,
+      )
+      return f"https://wandb.ai/{target_entity}/{self.config.project}/reports/mock"
+
+    try:
+      import wandb_workspaces.reports.v2 as wr  # pylint: disable=g-import-not-at-top
+
+      report = wr.Report(
+          entity=self.config.wandb_entity or self.config.user,
+          project=self.config.project,
+          title=f"Auto-PERL Campaign: {self.config.task_name} ({self.config.name})",
+          description=f"Automated PE-RL science report for task '{self.config.task_name}' on model {self.config.base_model}.",
+      )
+
+      blocks = [
+          wr.H1(f"Auto-PERL Experiment Campaign: {self.config.task_name}"),
+          wr.P(f"Execution finished on {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}."),
+          wr.H2("Stage Outcomes"),
+      ]
+
+      report.blocks = blocks
+      report.save()
+      logger.info("Published W&B Report: %s", report.url)
+      return report.url
+    except Exception as e:
+      logger.debug("Could not publish programmatic W&B report via wandb_workspaces: %s", e)
+      return None

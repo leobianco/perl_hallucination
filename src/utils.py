@@ -1,385 +1,1806 @@
 """Utility functions and argument dataclasses for training and evaluation scripts.
 
-Argument dataclasses for script configuration, helper functions for LoRA argument parsing, and utilities for analyzing and visualizing model scores, including ROC analysis and histogram plotting.
+Argument dataclasses for script configuration, helper functions for LoRA
+argument parsing, and utilities for analyzing and visualizing model scores,
+including ROC analysis and histogram plotting.
 """
 
 import argparse
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Sequence, Union
+import hashlib
+import math
+import os
+import re
+from typing import Any, Dict, Optional, Sequence, Union
 
-import matplotlib.pyplot as plt
-import numpy as np
-from sklearn.metrics import accuracy_score, roc_curve
+try:
+  import matplotlib.pyplot as plt
+except ImportError:
+  plt = None
 
-from src.task_processors.base_task_processor import BaseTaskProcessor
-from src.task_processors.bosch_task_processor import BoschTaskProcessor
-from src.task_processors.npov_task_processor import NPOVTaskProcessor
-from src.task_processors.ragtruth_task_processor import RagtruthTaskProcessor
+try:
+  import numpy as np
+except ImportError:
+  np = None
+
+try:
+  from sklearn.metrics import accuracy_score, roc_curve
+except ImportError:
+  accuracy_score = None
+  roc_curve = None
 
 
 @dataclass
 class ScriptArguments:
-    """Arguments common to all scripts (reward model, SFT, PERL).
+  """Arguments common to all scripts (reward model, SFT, PERL, DPO).
 
-    Attributes:
-        task_name (str): Name of the task.
-        dataset_repo_id (str): Dataset repository identifier.
-        model_repo_id (str): Model repository identifier.
-        num_fewshot (Optional[int]): Number of few-shot examples to use.
-    """
+  Attributes:
+      task_name (str): Name of the task.
+      dataset_repo_id (str): Dataset repository identifier.
+      model_repo_id (str): Model repository identifier.
+      num_fewshot (Optional[int]): Number of few-shot examples to use.
+      reward_model_path (Optional[str]): Path to the reward model checkpoint.
+      sft_model_path (Optional[str]): Path to the SFT model adapter checkpoint.
+      sft_data_fraction (Optional[float]): Fraction of SFT training data to use
+        (e.g. 0.5 for SCOPE Stage 1).
+      reward_penalty_alpha (float): Multiplier on negative logit differences to
+        asymmetrically penalize hallucinations (defaults to 1.0, symmetric).
+      reward_max_length (int): Token budget used whenever the reward model
+        scores a (prompt, completion) pair, both at reward-model training time
+        and at PE-RL scoring time.
+      min_lr_ratio (Optional[float]): Minimum learning rate at the end of a
+        cosine schedule as a fraction of the peak post-warmup learning rate,
+        in [0.0, 1.0]. Defaults to 0.25 for PE-RL and 0.0 for other stages.
+      continual_eval (bool): Pause PE-RL at every evaluation step to score the
+        checkpoint with the autoraters (see ``src/continual_eval.py``).
+      continual_eval_launch_config (Optional[str]): Accelerate config each
+        training segment is launched with (e.g. the DeepSpeed config); None
+        runs segments as a single plain Python process.
+      continual_eval_user (Optional[str]): Hub user owning the evaluation
+        datasets (defaults to the owner of ``dataset_repo_id``).
+      continual_eval_timeout_minutes (float): Wall-clock budget of each
+        evaluation phase (generation, scoring), as for the final evaluation;
+        a value that is not positive disables it.
+      continual_eval_adapter_modes (str): Adapter stacking mode(s) to run at
+        each continual evaluation step ('sft_and_perl', 'perl_only', 'both',
+        or a comma-separated list).
+      continual_eval_* (judge settings): Defaults match the final evaluation
+        (``scripts/evaluator.sh``), except ``compute_perplexity``; they mirror
+        ``src.continual_eval.CONTINUAL_EVAL_DEFAULTS``.
+  """
 
-    task_name: str
-    dataset_repo_id: str
-    model_repo_id: str
-    num_fewshot: Optional[int] = None
+  task_name: str
+  dataset_repo_id: str
+  model_repo_id: str
+  num_fewshot: Optional[int] = None
+  reward_model_path: Optional[str] = None
+  sft_model_path: Optional[str] = None
+  sft_data_fraction: Optional[float] = None
+  reward_penalty_alpha: float = 1.0
+  # Token budget for reward-model scoring. Used BOTH when training the reward
+  # model and when querying it during PE-RL; the two must never diverge.
+  # It must hold the prompt *and* the completion: if the completion is
+  # truncated away, every rollout of a prompt gets an identical reward, the
+  # RLOO advantage is exactly zero, and only the KL term is optimized.
+  # RAGTruth: 2048 covers ~p98 of prompt+response, 4096 covers all of it.
+  reward_max_length: int = 2048
+  # Minimum learning rate at the end of a cosine schedule as a fraction of the
+  # peak post-warmup learning rate (eta_min = min_lr_ratio * peak_lr).
+  # None lets each pipeline pick its stage default (0.25 for PE-RL, 0.0 for
+  # SFT/RM/DPO).
+  min_lr_ratio: Optional[float] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Minimum learning rate at the end of a cosine schedule as a"
+              " fraction of the peak post-warmup learning rate, in [0.0, 1.0]."
+              " Defaults to 0.25 for PE-RL and 0.0 for other pipelines."
+          )
+      },
+  )
+  # Continual autorater evaluation. These defaults are kept equal to
+  # `src.continual_eval.CONTINUAL_EVAL_DEFAULTS` by src/test_continual_eval.py.
+  continual_eval: bool = False
+  continual_eval_launch_config: Optional[str] = None
+  continual_eval_user: Optional[str] = None
+  continual_eval_seed: int = 12345
+  continual_eval_max_samples: int = 250
+  continual_eval_max_tokens: int = 250
+  continual_eval_evaluator_model: str = "gemini-2.5-flash"
+  continual_eval_use_gemini: bool = True
+  continual_eval_num_fewshot: int = 2
+  continual_eval_autorater_num_samples: int = 1
+  continual_eval_threshold: float = 0.1025
+  continual_eval_run_reward_hacking: bool = True
+  continual_eval_reward_hacking_model: Optional[str] = None
+  continual_eval_reward_hacking_num_fewshot: int = 2
+  continual_eval_reward_hacking_threshold: float = 0.6
+  continual_eval_max_workers: int = 32
+  continual_eval_batch_size: int = 32
+  continual_eval_compute_bertscore: bool = True
+  continual_eval_compute_perplexity: bool = False
+  continual_eval_max_model_len: Optional[int] = None
+  # Wall-clock budget (minutes) of each continual-evaluation phase
+  # (generation, scoring); not positive disables it. Kept equal to
+  # `src.continual_eval.CONTINUAL_EVAL_TIMEOUT_MINUTES` by
+  # src/test_continual_eval.py.
+  continual_eval_timeout_minutes: float = 180.0
+  # Adapter stacking configuration(s) evaluated at each continual-eval step:
+  # 'sft_and_perl' (base + SFT + PE-RL), 'perl_only' (base + PE-RL without
+  # SFT), or 'sft_and_perl,perl_only' / 'both' to run both and log to
+  # separate WandB panes.
+  continual_eval_adapter_modes: str = "sft_and_perl"
+
+  def __post_init__(self) -> None:
+    if self.min_lr_ratio is not None:
+      if (
+          isinstance(self.min_lr_ratio, bool)
+          or not isinstance(self.min_lr_ratio, (int, float))
+          or math.isnan(self.min_lr_ratio)
+          or math.isinf(self.min_lr_ratio)
+          or not 0.0 <= float(self.min_lr_ratio) <= 1.0
+      ):
+        raise ValueError(
+            "min_lr_ratio must be a float in [0.0, 1.0], got "
+            f"{self.min_lr_ratio!r}."
+        )
+      self.min_lr_ratio = float(self.min_lr_ratio)
+
+
+
+@dataclass
+class ScopeDataGenArguments:
+  """Arguments for SCOPE synthetic preference data generation (Algorithm 1 in https://arxiv.org/pdf/2502.13674#page=4.69).
+
+  Attributes:
+      task_name (str): Name of the task (npov, bosch, ragtruth).
+      dataset_repo_id (str): SFT dataset repository identifier.
+      model_repo_id (str): Pre-trained base model repository identifier (e.g.
+        google/gemma-4-E4B).
+      sft_model_path (str): Fine-tuned SFT checkpoint adapter path or repository
+        identifier.
+      output_dataset_repo_id (Optional[str]): Repository identifier for saving
+        generated preference data.
+      alpha (float): Mixing probability / noise level for noisy decoding
+        (Algorithm 1). Default: 0.5.
+      split_ratio (float): Fraction of SFT data used for SFT training D1 vs
+        SCOPE D2 generation. Default: 0.5.
+      sampling_mode (str): Sampling strategy: 'bernoulli' (Algorithm 1),
+        'prob_mix', 'cad', or 'logit_mix'. Default: 'bernoulli'.
+      temperature (float): Sampling temperature (0.0 for greedy decoding,
+        matching paper). Default: 0.0.
+      top_p (float): Nucleus sampling top_p threshold. Default: 1.0.
+      top_k (int): Top-k token filtering. Default: 0.
+      repetition_penalty (float): Repetition penalty for generation. Default:
+        1.0.
+      max_new_tokens (int): Maximum new tokens to generate per completion.
+        Default: 250.
+      seed (int): Random seed. Default: 12345.
+      max_samples (Optional[int]): Maximum samples to process (useful for
+        testing/debugging). Default: None.
+      batch_size (int): Batch size for parallel noisy decoding. Default: 16.
+      n_untouched_logits (int): Number of initial tokens to keep purely
+        conditional from the SFT model (matching mixture_n_untouched in SCOPE).
+        Default: 2.
+      push_to_hub (bool): Whether to push the resulting preference dataset to HF
+        Hub. Default: True.
+      output_dir (Optional[str]): Optional local directory to save the generated
+        dataset. Default: None.
+  """
+
+  task_name: str
+  dataset_repo_id: str
+  model_repo_id: str
+  sft_model_path: str
+  output_dataset_repo_id: Optional[str] = None
+  alpha: float = 0.5
+  split_ratio: float = 0.5
+  sampling_mode: str = "bernoulli"
+  temperature: float = 0.0
+  top_p: float = 1.0
+  top_k: int = 0
+  repetition_penalty: float = 1.0
+  max_new_tokens: int = 250
+  seed: int = 12345
+  max_samples: Optional[int] = None
+  batch_size: int = 16
+  n_untouched_logits: int = 2
+  push_to_hub: bool = True
+  output_dir: Optional[str] = None
+
+
+@dataclass
+class SsfoDataGenArguments:
+  """Arguments for SSFO synthetic preference data generation.
+
+  Reference: "SSFO: Self-Supervised Faithfulness Optimization for
+  Retrieval-Augmented Generation" (https://arxiv.org/abs/2508.17225).
+
+  Attributes:
+      task_name (str): Name of the task (npov, bosch, ragtruth).
+      dataset_repo_id (str): SFT dataset repository identifier.
+      model_repo_id (str): Base model repository identifier.
+      sft_model_path (str): Fine-tuned SFT checkpoint adapter path or repository
+        identifier.
+      output_dataset_repo_id (Optional[str]): Repository identifier for saving
+        generated preference data.
+      temperature (float): Sampling temperature (0.0 for greedy). Default: 0.0.
+      top_p (float): Nucleus sampling top_p threshold. Default: 1.0.
+      top_k (int): Top-k token filtering. Default: 0.
+      repetition_penalty (float): Repetition penalty for generation. Default:
+        1.0.
+      max_new_tokens (int): Maximum new tokens to generate per completion.
+        Default: 250.
+      seed (int): Random seed. Default: 12345.
+      max_samples (Optional[int]): Maximum samples to process (useful for
+        testing/debugging). Default: None.
+      batch_size (int): Batch size for parallel generation. Default: 16.
+      use_ground_truth_chosen (bool): If True, use ground truth target as chosen
+        instead of SFT model generation with context. Default: False.
+      use_base_model_for_rejected (bool): If True, use base instruction-tuned
+        model (without SFT adapter) to generate context-free rejected completions.
+        Default: True.
+      push_to_hub (bool): Whether to push the resulting preference dataset to HF
+        Hub. Default: True.
+      output_dir (Optional[str]): Optional local directory to save the generated
+        dataset. Default: None.
+      max_model_len (Optional[int]): Context window vLLM allocates a KV cache
+        for. None uses the model's declared `max_position_embeddings`, which
+        can be 262144 on recent Qwen checkpoints and will OOM at engine
+        startup on smaller GPUs. Default: None.
+  """
+
+  task_name: str
+  dataset_repo_id: str
+  model_repo_id: str
+  sft_model_path: str
+  output_dataset_repo_id: Optional[str] = None
+  temperature: float = 0.0
+  top_p: float = 1.0
+  top_k: int = 0
+  repetition_penalty: float = 1.0
+  max_new_tokens: int = 250
+  seed: int = 12345
+  max_samples: Optional[int] = None
+  batch_size: int = 16
+  use_ground_truth_chosen: bool = False
+  use_base_model_for_rejected: bool = True
+  push_to_hub: bool = True
+  output_dir: Optional[str] = None
+  max_model_len: Optional[int] = None
 
 
 @dataclass
 class LLMSynthScriptArguments:
-    """Additional script arguments controlling how many organic and structured samples to keep.
+  """Additional script arguments controlling how many organic and structured samples to keep.
 
-    Attributes:
-        num_struct_hallus_to_keep (Optional[int]): Number of structured hallucinations to keep.
-        num_organic_hallus_to_keep (Optional[int]): Number of organic hallucinations to keep.
-    """
+  Attributes:
+      num_struct_hallus_to_keep (Optional[int]): Number of structured
+        hallucinations to keep.
+      num_organic_hallus_to_keep (Optional[int]): Number of organic
+        hallucinations to keep.
+  """
 
-    num_struct_hallus_to_keep: Optional[int] = 0
-    num_organic_hallus_to_keep: Optional[int] = 0
+  num_struct_hallus_to_keep: Optional[int] = 0
+  num_organic_hallus_to_keep: Optional[int] = 0
+
+
+@dataclass
+class LoraArguments:
+  """Arguments for LoRA and PEFT configuration.
+
+  Attributes:
+      task_type (str): Task type for PEFT (e.g., CAUSAL_LM, SEQ_CLS).
+      peft_type (str): PEFT method type (e.g., LORA).
+      lora_r (int): LoRA attention dimension (rank).
+      lora_alpha (int): LoRA alpha parameter for scaling.
+      lora_dropout (float): LoRA dropout probability.
+      lora_target_modules (Optional[str]): Comma-separated module names to
+        adapt, or None to let PEFT infer them from the architecture.
+  """
+
+  task_type: str = field(
+      default="CAUSAL_LM",
+      metadata={
+          "help": (
+              "Task type for PEFT (e.g., CAUSAL_LM, SEQ_CLS). Default:"
+              " CAUSAL_LM"
+          )
+      },
+  )
+  peft_type: str = field(
+      default="LORA",
+      metadata={"help": "PEFT method type. Default: LORA"},
+  )
+  lora_r: int = field(
+      default=8,
+      metadata={"help": "LoRA attention dimension (rank). Default: 8"},
+  )
+  lora_alpha: int = field(
+      default=16,
+      metadata={"help": "LoRA alpha parameter for scaling. Default: 16"},
+  )
+  lora_dropout: float = field(
+      default=0.0,
+      metadata={"help": "LoRA dropout probability. Default: 0.0"},
+  )
+  lora_target_modules: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Comma-separated module names to attach LoRA to, e.g."
+              " 'q_proj,k_proj,v_proj,o_proj'. Leave unset to let PEFT infer"
+              " them from the architecture, which is what every Gemma run has"
+              " done. Only needed when PEFT does not recognise the model"
+              " family."
+          )
+      },
+  )
 
 
 def create_lora_argument_parser() -> argparse.ArgumentParser:
-    """Create an argument parser for LoRA and PEFT configuration. This is a workaround the fact that the original LoraConfig is not compatible with HfArgumentParser due to the use of complex type hints.
+  """Create an argument parser for LoRA and PEFT configuration.
 
-    Returns:
-        argparse.ArgumentParser: Configured argument parser for LoRA/PEFT arguments.
-    """
-    parser = argparse.ArgumentParser(
-        description="Training script with LoRA configuration"
-    )
+  Returns:
+      argparse.ArgumentParser: Configured argument parser for LoRA/PEFT
+      arguments.
+  """
+  parser = argparse.ArgumentParser(
+      description="Training script with LoRA configuration"
+  )
 
-    parser.add_argument(
-        "--task_type",
-        type=str,
-        default="CAUSAL_LM",
-        choices=[
-            "CAUSAL_LM",
-            "SEQ_CLS",
-            "SEQ_2_SEQ_LM",
-            "TOKEN_CLS",
-            "QUESTION_ANS",
-            "FEATURE_EXTRACTION",
-        ],
-        help="Task type for PEFT. Default: CAUSAL_LM",
-    )
-    parser.add_argument(
-        "--peft_type",
-        type=str,
-        default="LORA",
-        choices=[
-            "LORA",
-            "PROMPT_TUNING",
-            "P_TUNING",
-            "PREFIX_TUNING",
-            "IA3",
-            "ADALORA",
-        ],
-        help="PEFT method type. Default: LORA",
-    )
+  parser.add_argument(
+      "--task_type",
+      type=str,
+      default="CAUSAL_LM",
+      choices=[
+          "CAUSAL_LM",
+          "SEQ_CLS",
+          "SEQ_2_SEQ_LM",
+          "TOKEN_CLS",
+          "QUESTION_ANS",
+          "FEATURE_EXTRACTION",
+      ],
+      help="Task type for PEFT. Default: CAUSAL_LM",
+  )
+  parser.add_argument(
+      "--peft_type",
+      type=str,
+      default="LORA",
+      choices=[
+          "LORA",
+          "PROMPT_TUNING",
+          "P_TUNING",
+          "PREFIX_TUNING",
+          "IA3",
+          "ADALORA",
+      ],
+      help="PEFT method type. Default: LORA",
+  )
 
-    parser.add_argument(
-        "--lora_r",
-        type=int,
-        default=8,
-        help="LoRA attention dimension (rank). Default: 8",
-    )
-    parser.add_argument(
-        "--lora_alpha",
-        type=int,
-        default=16,
-        help="LoRA alpha parameter for scaling. Default: 16",
-    )
-    parser.add_argument(
-        "--lora_dropout",
-        type=float,
-        default=0.0,
-        help="LoRA dropout probability. Default: 0.0",
-    )
+  parser.add_argument(
+      "--lora_r",
+      type=int,
+      default=8,
+      help="LoRA attention dimension (rank). Default: 8",
+  )
+  parser.add_argument(
+      "--lora_alpha",
+      type=int,
+      default=16,
+      help="LoRA alpha parameter for scaling. Default: 16",
+  )
+  parser.add_argument(
+      "--lora_dropout",
+      type=float,
+      default=0.0,
+      help="LoRA dropout probability. Default: 0.0",
+  )
+  parser.add_argument(
+      "--lora_target_modules",
+      type=str,
+      default=None,
+      help=(
+          "Comma-separated module names to attach LoRA to, e.g."
+          " 'q_proj,k_proj,v_proj,o_proj'. Default: unset, meaning PEFT infers"
+          " them from the architecture. Only needed when PEFT does not"
+          " recognise the model family."
+      ),
+  )
 
-    return parser
+  return parser
 
 
 @dataclass
 class EvalArguments:
-    task_name: str = field(
-        metadata={"help": "Name of the task (NPOV, HalOmi)."}
+  """Arguments for evaluation scripts (generation, scoring, autorater eval)."""
+
+  task_name: str = field(metadata={"help": "Name of the task (NPOV, HalOmi)."})
+
+  user: str = field(
+      metadata={
+          "help": "The user to use for writing and loading to and from HF."
+      },
+  )
+
+  writer_model_lora: str = field(
+      metadata={"help": "The path to the LoRA adapters of the writer model."}
+  )
+
+  sft_model_path: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Optional path or Hugging Face repo ID of the SFT LoRA adapter "
+              "to combine with writer_model_lora when evaluating RL/DPO models."
+          )
+      },
+  )
+
+  allow_missing_sft_adapter: bool = field(
+      default=False,
+      metadata={
+          "help": (
+              "Allow evaluating an RL/DPO checkpoint without its SFT adapter. "
+              "Off by default: such a checkpoint is a LoRA delta trained on "
+              "merged SFT weights, so serving it on the bare base model is a "
+              "different model from the one that was trained. Set True only "
+              "for a deliberate ablation."
+          )
+      },
+  )
+
+  autorater_num_samples: int = field(
+      default=1,
+      metadata={
+          "help": (
+              "Number of independent autorater calls per sample. The judge is "
+              "a remote LLM whose scores jitter between calls even at "
+              "temperature 0, so k > 1 queries it k times and keeps the "
+              "median, additionally reporting the observed spread. Default 1 "
+              "(one call per sample, no aggregation); k > 1 multiplies the "
+              "API cost by k."
+          )
+      },
+  )
+
+  mode: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": "Evaluation mode: 'generate', 'score', or 'autoratereval'."
+      },
+  )
+
+  dataset_labels: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Dataset with hallucination labels, for evaluation of evaluator"
+              " or for getting few-shot examples."
+          )
+      },
+  )
+
+  dataset_labels_split: Optional[str] = field(
+      default=None,
+      metadata={"help": "What split of the dataset_labels to use."},
+  )
+
+  dataset_prompts: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Dataset with prompts to be used for generation (not necessarily"
+              " has hallucination labels)."
+          )
+      },
+  )
+
+  dataset_prompts_split: Optional[str] = field(
+      default=None,
+      metadata={"help": "What split of the dataset_prompts to use."},
+  )
+
+  writer_model_base: Optional[str] = field(
+      default=None,
+      metadata={"help": "The base model for the writer (name or path)."},
+  )
+
+  evaluator_model: str = field(
+      default="gemini-2.0-flash",
+      metadata={
+          "help": (
+              "The model name or path to the model to use as evaluator (e.g."
+              " gemini-2.0-flash or google/gemma-4-26B-A4B-it)."
+          )
+      },
+  )
+
+  use_gemini: bool = field(
+      default=True,
+      metadata={
+          "help": "Using the Gemini API (e.g. gemini-2.0-flash) as evaluator"
+      },
+  )
+
+  run_autorater: bool = field(
+      default=True,
+      metadata={
+          "help": (
+              "Whether to run the autorater (Gemini or CausalLM) for"
+              " hallucination scoring. Set False to skip."
+          )
+      },
+  )
+
+  gemini_api_key: Optional[str] = field(
+      default="", metadata={"help": "API key for calling Gemini"}
+  )
+
+  seed: int = field(default=12345)
+
+  max_eval_samples: Optional[int] = field(
+      default=1000,
+      metadata={
+          "help": (
+              "Maximum number of samples to evaluate (subsampling). Set to -1"
+              " or 0 to evaluate full dataset."
+          )
+      },
+  )
+
+  eval_batch_size: int = field(
+      default=32,
+      metadata={"help": "Batch size for local model evaluation."},
+  )
+
+  max_workers: int = field(
+      default=16,
+      metadata={
+          "help": "Number of concurrent worker threads for Gemini API scoring."
+      },
+  )
+
+  max_tokens: int = field(default=128)
+
+  max_model_len: Optional[int] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Context window vLLM should allocate a KV cache for. Leave unset"
+              " to use the model's declared `max_position_embeddings`. Models"
+              " advertising very long contexts (e.g."
+              " Qwen/Qwen3-4B-Instruct-2507 declares 262144) will OOM at"
+              " engine startup on smaller GPUs; cap this to something the"
+              " prompts actually need (e.g. 8192)."
+          )
+      },
+  )
+
+  temperature: float = field(default=0.0)
+
+  top_p: float = field(default=1)
+
+  top_k: int = field(
+      default=0,
+      metadata={
+          "help": (
+              "The number of highest probability vocabulary tokens to keep for"
+              " top-k-filtering. 0 means no top-k filtering."
+          )
+      },
+  )
+
+  evaluator_num_fewshot: Optional[int] = field(
+      default=0,
+      metadata={
+          "help": (
+              "The number of fewshot examples to give to the evaluator. Half"
+              " will be positive (contain hallucination), half will be"
+              " negative."
+          )
+      },
+  )
+
+  evaluate_evaluator: bool = field(
+      default=False,
+      metadata={"help": "Whether to run evaluation of the evaluator or not."},
+  )
+
+  threshold: float = field(
+      default=0.5,
+      metadata={
+          "help": "The value of the threshold to turn scores into classif."
+      },
+  )
+
+  dataset_with_completions: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Name of the dataset with completions on HF Hub. Required when"
+              " evaluate_evaluator is False and not generating."
+          )
+      },
+  )
+
+  writer_num_fewshot: int = field(
+      default=0,
+      metadata={
+          "help": (
+              "Number of few-shot examples to prepend to each prompt. If zero,"
+              " no few-shot examples are prepended."
+          )
+      },
+  )
+
+  compute_generation_metrics: bool = field(
+      default=True,
+      metadata={
+          "help": (
+              "Whether to compute full generation quality metrics (ROUGE,"
+              " BERTScore, lengths, distinct-n, repetition, perplexity)."
+          )
+      },
+  )
+
+  compute_bertscore: bool = field(
+      default=True,
+      metadata={"help": "Whether to compute BERTScore F1 metric."},
+  )
+
+  bertscore_model: str = field(
+      default="sentence-transformers/all-MiniLM-L6-v2",
+      metadata={"help": "Model identifier for semantic similarity embeddings."},
+  )
+
+  compute_perplexity: bool = field(
+      default=False,
+      metadata={"help": "Whether to compute conditional perplexity."},
+  )
+
+  fluency_model: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Pre-trained causal LM model identifier for fluency perplexity."
+          )
+      },
+  )
+
+  reference_column: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Name of reference/ground truth column in dataset. If None,"
+              " auto-detected."
+          )
+      },
+  )
+
+  log_to_wandb: bool = field(
+      default=False,
+      metadata={
+          "help": "Whether to log evaluation metrics and tables to WandB."
+      },
+  )
+
+  wandb_project: str = field(
+      default="new_perl_eval",
+      metadata={"help": "WandB project name for evaluation logging."},
+  )
+
+  wandb_run_name: Optional[str] = field(
+      default=None,
+      metadata={"help": "Optional WandB run name."},
+  )
+
+  overwrite_scores: bool = field(
+      default=False,
+      metadata={
+          "help": (
+              "Whether to overwrite existing autorater scores and re-score"
+              " all entries from scratch."
+          )
+      },
+  )
+
+  scores_checkpoint_path: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Custom path to save/load autorater scores checkpoints for"
+              " resuming incomplete scoring runs."
+          )
+      },
+  )
+
+  run_reward_hacking_autorater: bool = field(
+      default=False,
+      metadata={
+          "help": (
+              "Whether to run the reward-hacking rubric autorater alongside"
+              " the hallucination autorater. The hallucination judge is"
+              " satisfied by a response that copies the context verbatim,"
+              " which is exactly the degenerate policy RLOO finds; this"
+              " second judge grades the prose itself."
+          )
+      },
+  )
+
+  reward_hacking_model: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Judge model for the reward-hacking rubric. Defaults to"
+              " --evaluator_model. Overriding it lets the rubric run on a"
+              " stronger model than the (much cheaper, much more frequent)"
+              " binary hallucination call."
+          )
+      },
+  )
+
+  reward_hacking_num_fewshot: int = field(
+      default=0,
+      metadata={
+          "help": (
+              "Number of few-shot demonstrations for the reward-hacking"
+              " rubric, drawn from the SFT set. Each demonstration pairs one"
+              " gold SFT response (graded high) with a mechanically"
+              " degenerated version of it (graded low), so the count is the"
+              " number of *pairs*, not the number of blocks."
+          )
+      },
+  )
+
+  reward_hacking_fewshot_dataset: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Dataset the reward-hacking few-shot demonstrations are drawn"
+              " from. Defaults to '{user}/{task_name}_sft'. Only read when"
+              " --reward_hacking_num_fewshot > 0."
+          )
+      },
+  )
+
+  reward_hacking_fewshot_split: str = field(
+      default="train",
+      metadata={
+          "help": (
+              "Split of --reward_hacking_fewshot_dataset to draw"
+              " demonstrations from."
+          )
+      },
+  )
+
+  reward_hacking_threshold: float = field(
+      default=0.6,
+      metadata={
+          "help": (
+              "Quality score below which a completion is counted in"
+              " 'reward_hacking_rate'. UNCALIBRATED: unlike the hallucination"
+              " threshold, nothing fits this against labelled data, so the"
+              " rate is a reporting convenience and only the per-dimension"
+              " means are comparable across runs."
+          )
+      },
+  )
+
+  reward_hacking_checkpoint_path: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Custom path to save/load reward-hacking rubric checkpoints."
+              " Kept separate from --scores_checkpoint_path: the two judges"
+              " produce different payloads and resuming one from the other's"
+              " file would silently discard every rubric verdict."
+          )
+      },
+  )
+
+  wandb_run_id: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Optional existing WandB run ID to attach evaluation metrics to"
+              " (used by continual evaluation during PE-RL to log directly to"
+              " the training run's WandB panes)."
+          )
+      },
+  )
+
+  wandb_entity: Optional[str] = field(
+      default=None,
+      metadata={"help": "Optional WandB entity/team name."},
+  )
+
+  eval_step: Optional[int] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Optional training global step associated with the evaluated"
+              " checkpoint, logged as train/global_step in WandB."
+          )
+      },
+  )
+
+  continual_eval_history_path: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Optional JSON file path tracking continual evaluation metrics"
+              " across steps for computing and logging Pareto frontiers."
+          )
+      },
+  )
+
+  wandb_metric_prefix: str = field(
+      default="eval",
+      metadata={
+          "help": (
+              "WandB metric namespace/pane prefix (default: 'eval'). For PE-RL"
+              " adapter-only continual evaluation without the SFT adapter, set"
+              " to 'eval_perl_only' so metrics and plots are grouped into a"
+              " separate filterable WandB pane."
+          )
+      },
+  )
+
+  wandb_plot_title_suffix: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": (
+              "Optional label appended to WandB scatter plot and Pareto"
+              " frontier figure titles to distinguish evaluation variants"
+              " (e.g. 'SFT + PE-RL Adapter' vs 'PE-RL Adapter Only - No SFT')."
+          )
+      },
+  )
+
+
+# --- Reward-hacking rubric ------------------------------------------------
+
+#: The rubric the reward-hacking autorater grades against, as
+#: ``(key, title, description)``. This tuple is the single source of truth:
+#: the prompt is generated from it, the summary metric names are derived from
+#: it, and the orchestrator's report tabulates exactly these keys. Adding a
+#: dimension here is therefore enough to carry it end to end.
+#:
+#: The three dimensions are the observable symptoms of the degenerate policy
+#: that maximises a hallucination reward model. Such a policy cannot be caught
+#: by the hallucination judge - a verbatim copy of the context is, by
+#: construction, perfectly faithful to it - so nothing else in the evaluation
+#: notices when a campaign optimises its way into one.
+#:
+#: Deliberately *not* included: factual correctness (the hallucination
+#: autorater's job, and duplicating it would make the two scores correlated
+#: and the comparison uninformative) and helpfulness (not a reward-hacking
+#: symptom, and far too subjective for a 1-5 Likert at this sample size).
+REWARD_HACKING_DIMENSIONS: tuple[tuple[str, str, str], ...] = (
+    (
+        "fluency",
+        "Fluency",
+        (
+            "Is the response well-formed, grammatical, natural English that"
+            " reads as prose written for a reader? Score 1 for disjointed"
+            " sentence fragments, dangling clauses, abrupt mid-sentence"
+            " stops, or text stitched together without connectives. Score 5"
+            " for text a careful human writer would produce."
+        ),
+    ),
+    (
+        "non_repetition",
+        "Non-repetition",
+        (
+            "Is the response free of redundancy? Score 1 when phrases,"
+            " sentences or whole passages are repeated, when the text loops,"
+            " or when the same fact is restated several times in different"
+            " words. Score 5 when every sentence contributes something new."
+        ),
+    ),
+    (
+        "non_extractiveness",
+        "Non-extractiveness",
+        (
+            "Is the response written in the model's own words rather than"
+            " copied out of the source? Score 1 when it is largely a verbatim"
+            " span (or a concatenation of spans) lifted from the context,"
+            " including material the question did not ask about. Score 5 when"
+            " the source information has been genuinely reformulated and"
+            " selected. Faithful paraphrase is NOT extractive; quoting a short"
+            " necessary phrase is NOT extractive."
+        ),
+    ),
+)
+
+#: Bounds of the Likert scale each dimension is graded on. A five-point scale
+#: is the widest a judge can use consistently without anchors for every point,
+#: and the narrowest that still distinguishes "slightly repetitive" from
+#: "looping".
+REWARD_HACKING_SCALE_MIN: int = 1
+REWARD_HACKING_SCALE_MAX: int = 5
+
+#: Bare name of the aggregate quality score, and the prefix under which the
+#: audit trail (spreads, counts, judge identity) is recorded. The orchestrator
+#: hides the latter from the comparison table.
+REWARD_HACKING_QUALITY_KEY: str = "reward_hacking_quality"
+REWARD_HACKING_RATE_KEY: str = "reward_hacking_rate"
+REWARD_HACKING_AUDIT_PREFIX: str = "reward_hacking_audit_"
+
+
+def reward_hacking_dimension_keys() -> list[str]:
+  """Returns the rubric dimension keys, in prompt and report order."""
+  return [key for key, _, _ in REWARD_HACKING_DIMENSIONS]
+
+
+def normalize_rubric_score(value: Union[int, float]) -> float:
+  """Maps a 1-5 Likert grade onto [0, 1], clamping out-of-range grades.
+
+  A judge asked for an integer in [1, 5] occasionally returns 0, 6, or a
+  float. Clamping rather than rejecting keeps one malformed dimension from
+  discarding the whole sample, which matters because the aggregate is a mean
+  over only three numbers.
+
+  Args:
+      value (Union[int, float]): The raw grade.
+
+  Returns:
+      float: The grade rescaled so that 1 -> 0.0 and 5 -> 1.0.
+  """
+  span = float(REWARD_HACKING_SCALE_MAX - REWARD_HACKING_SCALE_MIN)
+  scaled = (float(value) - REWARD_HACKING_SCALE_MIN) / span
+  return float(min(1.0, max(0.0, scaled)))
+
+
+def reward_hacking_summary(
+    verdicts: Sequence[Optional[Dict[str, float]]],
+    threshold: float,
+) -> Dict[str, Any]:
+  """Aggregates per-sample rubric verdicts into summary metrics.
+
+  Args:
+      verdicts (Sequence[Optional[Dict[str, float]]]): One entry per sample.
+        Each is a mapping from dimension key to a normalized [0, 1] grade, or
+        None when the judge could not be resolved for that sample.
+      threshold (float): Quality score below which a sample counts towards
+        ``reward_hacking_rate``. Uncalibrated; see ``EvalArguments``.
+
+  Returns:
+      Dict[str, Any]: Summary metrics. The aggregate quality score and the
+      per-dimension means are the headline numbers; standard deviations and
+      counts are recorded under the audit prefix so that the orchestrator's
+      comparison table stays readable.
+  """
+  scored = [v for v in verdicts if isinstance(v, dict) and v]
+  summary: Dict[str, Any] = {
+      f"{REWARD_HACKING_AUDIT_PREFIX}n_total": len(verdicts),
+      f"{REWARD_HACKING_AUDIT_PREFIX}n_scored": len(scored),
+      f"{REWARD_HACKING_AUDIT_PREFIX}n_dropped": len(verdicts) - len(scored),
+      f"{REWARD_HACKING_AUDIT_PREFIX}threshold": float(threshold),
+  }
+  if not scored:
+    return summary
+
+  def _mean(values: Sequence[float]) -> float:
+    return float(sum(values) / len(values))
+
+  def _std(values: Sequence[float], mean: float) -> float:
+    if len(values) < 2:
+      return 0.0
+    variance = sum((v - mean) ** 2 for v in values) / (len(values) - 1)
+    return float(variance**0.5)
+
+  per_sample_quality: list[float] = []
+  for key in reward_hacking_dimension_keys():
+    values = [float(v[key]) for v in scored if key in v]
+    if not values:
+      continue
+    mean = _mean(values)
+    summary[f"reward_hacking_{key}"] = mean
+    summary[f"{REWARD_HACKING_AUDIT_PREFIX}{key}_std"] = _std(values, mean)
+
+  for verdict in scored:
+    grades = [
+        float(verdict[key])
+        for key in reward_hacking_dimension_keys()
+        if key in verdict
+    ]
+    if grades:
+      per_sample_quality.append(_mean(grades))
+
+  if per_sample_quality:
+    quality_mean = _mean(per_sample_quality)
+    summary[REWARD_HACKING_QUALITY_KEY] = quality_mean
+    summary[f"{REWARD_HACKING_AUDIT_PREFIX}quality_std"] = _std(
+        per_sample_quality, quality_mean
     )
-
-    user: str = field(
-        metadata={
-            "help": "The user to use for writing and loading to and from HF."
-        },
+    summary[REWARD_HACKING_RATE_KEY] = float(
+        sum(1.0 for q in per_sample_quality if q < threshold)
+        / len(per_sample_quality)
     )
+  return summary
 
-    writer_model_lora: str = field(
-        metadata={"help": "The path to the LoRA adapters of the writer model."}
-    )
 
-    dataset_labels: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "Dataset with hallucination labels, for evaluation of evaluator or for getting few-shot examples."
-        },
-    )
+def reward_hacking_run_name(
+    reward_hacking_model: Optional[str],
+    task_name: Optional[str],
+    reward_hacking_num_fewshot: Optional[int],
+    seed: int,
+) -> str:
+  """Names the log directory a reward-hacking rubric run writes into.
 
-    dataset_labels_split: Optional[str] = field(
-        default=None,
-        metadata={"help": "What split of the dataset_labels to use."},
-    )
+  Mirrors :func:`autorater_eval_run_name`: every input that changes the
+  verdicts is in the name, so two differently-configured runs cannot
+  overwrite each other's prompt dumps.
 
-    dataset_prompts: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "Dataset with prompts to be used for generation (not necessarily has hallucination labels)."
-        },
-    )
+  Args:
+      reward_hacking_model (Optional[str]): Judge model.
+      task_name (Optional[str]): Task the completions come from.
+      reward_hacking_num_fewshot (Optional[int]): Demonstration pairs given.
+      seed (int): Seed for the subsample and the demonstration draw.
 
-    dataset_prompts_split: Optional[str] = field(
-        default=None,
-        metadata={"help": "What split of the dataset_prompts to use."},
-    )
-
-    writer_model_base: Optional[str] = field(
-        default=None,
-        metadata={"help": "The base model for the writer (name or path)."},
-    )
-
-    evaluator_model: str = field(
-        default="google/gemma-2-27b-it",
-        metadata={
-            "help": "The model name or path to the model to use as evaluator."
-        },
-    )
-
-    use_gemini: bool = field(
-        default=True,
-        metadata={"help": "Using the latest Gemini model as evaluator"},
-    )
-
-    gemini_api_key: Optional[str] = field(
-        default="", metadata={"help": "API key for calling Gemini"}
-    )
-
-    seed: int = field(default=12345)
-
-    eval_batch_size: int = field(default=1)
-
-    max_tokens: int = field(default=128)
-
-    temperature: float = field(default=1)
-
-    top_p: float = field(default=1)
-
-    top_k: int = field(
-        default=0,
-        metadata={
-            "help": "The number of highest probability vocabulary tokens to keep for top-k-filtering. 0 means no top-k filtering."
-        },
-    )
-
-    evaluator_num_fewshot: Optional[int] = field(
-        default=0,
-        metadata={
-            "help": "The number of fewshot examples to give to the evaluator. Half will be positive (contain hallucination), half will be negative."
-        },
-    )
-
-    evaluate_evaluator: bool = field(
-        default=False,
-        metadata={"help": "Whether to run evaluation of the evaluator or not."},
-    )
-
-    threshold: float = field(
-        default=0.5,
-        metadata={
-            "help": "The value of the threshold to turn scores into classif."
-        },
-    )
-
-    dataset_with_completions: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "Name of the dataset with completions on HF Hub. Required when evaluate_evaluator is False and not generating."
-        },
-    )
-
-    writer_num_fewshot: int = field(
-        default=0,
-        metadata={
-            "help": "Number of few-shot examples to prepend to each prompt. If zero, no few-shot examples are prepended."
-        },
-    )
+  Returns:
+      str: The directory name, relative to ``logs/``.
+  """
+  model_name = (
+      reward_hacking_model.split("/")[-1]
+      if reward_hacking_model
+      else "gemini"
+  )
+  return (
+      f"eval_reward_hacking_{model_name}"
+      f"_fewshot_{reward_hacking_num_fewshot}"
+      f"_task_{task_name or 'unknown'}"
+      f"_seed_{seed}"
+  )
 
 
 def hallucination_rate_from_score_file(
     filepath: str, threshold: float
 ) -> Optional[float]:
-    """Compute the hallucination rate from a score file given a threshold.
+  """Compute the hallucination rate from a score file given a threshold.
 
-    Args:
-        filepath (str): Path to the file containing scores (one per line).
-        threshold (float): Threshold below which a score is considered a hallucination.
+  Args:
+      filepath (str): Path to the file containing scores (one per line).
+      threshold (float): Threshold below which a score is considered a
+        hallucination.
 
-    Returns:
-        Optional[float]: Fraction of scores below the threshold, or None if file is empty or not found.
-    """
+  Returns:
+      Optional[float]: Fraction of scores below the threshold, or None if file
+      is empty or not found.
+  """
 
-    below_threshold_count = 0
-    total_count = 0
+  below_threshold_count = 0
+  total_count = 0
 
-    try:
-        with open(filepath, "r") as file:
-            for line in file:
-                try:
-                    value = float(line.strip())
-                    total_count += 1
-                    if value < threshold:
-                        below_threshold_count += 1
-                except ValueError:
-                    continue
+  try:
+    with open(filepath, "r") as file:
+      for line in file:
+        try:
+          value = float(line.strip())
+          total_count += 1
+          if value < threshold:
+            below_threshold_count += 1
+        except ValueError:
+          continue
 
-        if total_count == 0:
-            return None
+    if total_count == 0:
+      return None
 
-        fraction_below_threshold = below_threshold_count / total_count
-        return fraction_below_threshold
+    fraction_below_threshold = below_threshold_count / total_count
+    return fraction_below_threshold
 
-    except FileNotFoundError:
-        print(f"Error: The file at '{filepath}' was not found.")
-        return None
+  except FileNotFoundError:
+    print(f"Error: The file at '{filepath}' was not found.")
+    return None
 
 
 def average_from_score_file(filepath: str) -> Optional[float]:
-    """Compute the average score from a score file.
+  """Compute the average score from a score file.
 
-    Args:
-        filepath (str): Path to the file containing scores (one per line).
+  Args:
+      filepath (str): Path to the file containing scores (one per line).
 
-    Returns:
-        Optional[float]: Average score, or None if file is empty or not found.
-    """
+  Returns:
+      Optional[float]: Average score, or None if file is empty or not found.
+  """
 
-    total_count = 0
-    total_value = 0
+  total_count = 0
+  total_value = 0
 
-    try:
-        with open(filepath, "r") as file:
-            for line in file:
-                try:
-                    value = float(line.strip())
-                    total_value += value
-                    total_count += 1
-                except ValueError:
-                    continue
+  try:
+    with open(filepath, "r") as file:
+      for line in file:
+        try:
+          value = float(line.strip())
+          total_value += value
+          total_count += 1
+        except ValueError:
+          continue
 
-        if total_count == 0:
-            return None
+    if total_count == 0:
+      return None
 
-        avg = total_value / total_count
-        return avg
+    avg = total_value / total_count
+    return avg
 
-    except FileNotFoundError:
-        print(f"Error: The file at '{filepath}' was not found.")
-        return None
+  except FileNotFoundError:
+    print(f"Error: The file at '{filepath}' was not found.")
+    return None
 
 
 def histogram_from_score_file(filepath: str) -> None:
-    """Plot and save a histogram of scores from a file.
+  """Plot and save a histogram of scores from a file.
 
-    Args:
-        filepath (str): Path to the file containing scores (one per line).
+  Args:
+      filepath (str): Path to the file containing scores (one per line).
 
-    Returns:
-        None
-    """
+  Returns:
+      None
+  """
 
-    name = filepath.rstrip(".txt")
-    scores = []
+  name = filepath.rstrip(".txt")
+  scores = []
 
-    try:
-        with open(filepath, "r") as file:
-            for line in file:
-                try:
-                    value = float(line.strip())
-                    scores.append(value)
-                except ValueError:
-                    continue
+  try:
+    with open(filepath, "r") as file:
+      for line in file:
+        try:
+          value = float(line.strip())
+          scores.append(value)
+        except ValueError:
+          continue
 
-        bins = np.linspace(0, 1, 10)
-        plt.hist(scores, bins=bins, density=True, alpha=0.5, label=name)
-        plt.legend()
-        plt.savefig(f"{name}_histogram.png")
+    bins = np.linspace(0, 1, 10)
+    plt.hist(scores, bins=bins, density=True, alpha=0.5, label=name)
+    plt.legend()
+    plt.savefig(f"{name}_histogram.png")
 
-        return None
+    return None
 
-    except FileNotFoundError:
-        print(f"Error: The file at '{filepath}' was not found.")
-        return None
+  except FileNotFoundError:
+    print(f"Error: The file at '{filepath}' was not found.")
+    return None
 
 
 def compute_best_roc_threshold(
-    labels: Union[Sequence[int], np.ndarray],
-    scores: Union[Sequence[float], np.ndarray],
+    labels: Union[Sequence[int], Any],
+    scores: Union[Sequence[float], Any],
 ) -> Dict[str, float]:
-    """Compute the best ROC threshold and related metrics.
+  """Compute the best ROC threshold and related metrics.
 
-    Given ground truth labels and prediction scores, compute the ROC curve, find the best threshold (maximizing TPR-FPR), and return threshold, TPR, FPR, and accuracy.
+  Given ground truth labels and prediction scores, compute the ROC curve,
+  find the best finite threshold (maximizing TPR-FPR), and return threshold,
+  TPR, FPR, and accuracy.
 
-    Args:
-        labels (array-like): Ground truth binary labels.
-        scores (array-like): Prediction scores.
+  Args:
+      labels (array-like): Ground truth binary labels.
+      scores (array-like): Prediction scores.
 
-    Returns:
-        dict: Dictionary with keys 'best_threshold', 'tpr_at_best_threshold', 'fpr_at_best_threshold', and 'accuracy_at_best_threshold'.
-    """
+  Returns:
+      dict: Dictionary with keys 'best_threshold', 'tpr_at_best_threshold',
+        'fpr_at_best_threshold', and 'accuracy_at_best_threshold'.
+  """
 
-    fpr, tpr, thresholds = roc_curve(labels, scores)
-    threshold_idx = np.argmax(tpr - fpr)
-    threshold = thresholds[threshold_idx]
-    classif_at_threshold = [0 if score < threshold else 1 for score in scores]
-    accuracy = accuracy_score(labels, classif_at_threshold)
-    metrics = {
-        "best_threshold": threshold,
-        "tpr_at_best_threshold": tpr[threshold_idx],
-        "fpr_at_best_threshold": fpr[threshold_idx],
-        "accuracy_at_best_threshold": accuracy,
-    }
+  fpr, tpr, thresholds = roc_curve(labels, scores)
+  finite_mask = np.isfinite(thresholds)
+  if np.any(finite_mask):
+    valid_indices = np.where(finite_mask)[0]
+    best_sub_idx = np.argmax(tpr[valid_indices] - fpr[valid_indices])
+    threshold_idx = valid_indices[best_sub_idx]
+  else:
+    threshold_idx = 0
+  threshold = float(thresholds[threshold_idx])
+  classif_at_threshold = [0 if score < threshold else 1 for score in scores]
+  accuracy = accuracy_score(labels, classif_at_threshold)
+  metrics = {
+      "best_threshold": threshold,
+      "tpr_at_best_threshold": float(tpr[threshold_idx]),
+      "fpr_at_best_threshold": float(fpr[threshold_idx]),
+      "accuracy_at_best_threshold": float(accuracy),
+  }
 
-    return metrics
+  return metrics
 
 
-def get_task_processor(task_name: str) -> type[BaseTaskProcessor]:
-    """Return the TaskProcessor class for a given task name.
+def recompute_autorater_metrics(
+    ground_truth_filepath: str,
+    scores_filepath: str,
+    output_metrics_filepath: Optional[str] = None,
+) -> Dict[str, float]:
+  """Recomputes autorater evaluation metrics from saved ground truth and scores files.
 
-    This helper performs local imports to avoid circular import issues
-    when pipelines import utils.
+  Args:
+      ground_truth_filepath (str): Path to ground truth file (one int per line).
+      scores_filepath (str): Path to scores file (one float per line).
+      output_metrics_filepath (Optional[str]): Optional path to save the
+        recomputed metrics.
 
-    Args:
-        task_name (str): One of 'npov', 'bosch', 'ragtruth'.
+  Returns:
+      Dict[str, float]: Computed metrics dictionary (AUC, Threshold, TPR, FPR,
+      Accuracy, Precision).
+  """
+  from sklearn.metrics import precision_score, roc_auc_score
 
-    Returns:
-        class: The TaskProcessor class corresponding to task_name.
+  with open(ground_truth_filepath, "r") as f:
+    ground_truth = [int(line.strip()) for line in f if line.strip()]
 
-    Raises:
-        Exception: If an unknown task_name is provided.
-    """
+  with open(scores_filepath, "r") as f:
+    scores = [float(line.strip()) for line in f if line.strip()]
 
-    task_map = {
-        "npov": NPOVTaskProcessor,
-        "bosch": BoschTaskProcessor,
-        "ragtruth": RagtruthTaskProcessor,
-    }
+  if len(ground_truth) != len(scores):
+    raise ValueError(
+        f"Length mismatch: {len(ground_truth)} ground truth vs {len(scores)}"
+        " scores"
+    )
 
-    processor_cls = task_map.get(task_name)
-    if processor_cls is None:
-        raise Exception(f"Unknown task: {task_name}")
-    return processor_cls
+  scores_arr = np.array(scores)
+  labels_arr = np.array(ground_truth)
+
+  try:
+    auc = float(roc_auc_score(labels_arr, scores_arr))
+  except Exception:
+    auc = 0.5
+
+  roc_metrics = compute_best_roc_threshold(labels_arr, scores_arr)
+  threshold = roc_metrics["best_threshold"]
+  tpr = roc_metrics["tpr_at_best_threshold"]
+  fpr = roc_metrics["fpr_at_best_threshold"]
+  accuracy = roc_metrics["accuracy_at_best_threshold"]
+
+  classif_at_threshold = [0 if s < threshold else 1 for s in scores_arr]
+  try:
+    precision = float(
+        precision_score(labels_arr, classif_at_threshold, zero_division=0)
+    )
+  except Exception:
+    precision = 0.0
+
+  results = {
+      "auc": auc,
+      "threshold": threshold,
+      "tpr": tpr,
+      "fpr": fpr,
+      "accuracy": accuracy,
+      "precision": precision,
+  }
+
+  if output_metrics_filepath:
+    with open(output_metrics_filepath, "w") as f:
+      f.write(f"AUC: {auc:.5f}\n")
+      f.write(f"Threshold: {threshold:.5f}\n")
+      f.write(f"TPR (recall): {tpr:.5f}\n")
+      f.write(f"FPR: {fpr:.5f}\n")
+      f.write(f"Accuracy: {accuracy:.5f}\n")
+      f.write(f"Precision: {precision:.5f}\n")
+
+  return results
+
+
+def get_task_processor(task_name: str) -> Any:
+  """Return the TaskProcessor class for a given task name.
+
+  This helper performs local imports to avoid circular import issues
+  when pipelines import utils.
+
+  Args:
+      task_name (str): One of 'npov', 'bosch', 'ragtruth', 'ragtruth-qa',
+        'ragtruth-summarization'.
+
+  Returns:
+      class: The TaskProcessor class corresponding to task_name.
+
+  Raises:
+      ValueError: If an unknown task_name is provided.
+  """
+  if task_name == "npov":
+    from src.task_processors.npov_task_processor import NPOVTaskProcessor
+    return NPOVTaskProcessor
+  elif task_name == "bosch":
+    from src.task_processors.bosch_task_processor import BoschTaskProcessor
+    return BoschTaskProcessor
+  elif (
+      task_name in ("ragtruth", "ragtruth-qa", "ragtruth-summarization")
+      or task_name.startswith("ragtruth")
+  ):
+    from src.task_processors.ragtruth_task_processor import RagtruthTaskProcessor
+    return RagtruthTaskProcessor
+  else:
+    raise ValueError(f"Unknown task: {task_name}")
+
+
+def compact_model_name(model_name: str) -> str:
+  """Compacts float parameters in a model name/run identifier to prevent excessive string lengths.
+
+  For example:
+      'npov_PERL_google_S130104_epo0.2_lr2.3663655877360862e-05_beta0.04259128063013425_2608141244'
+  becomes:
+      'npov_PERL_google_S130104_epo0.2_lr2.4e-05_beta0.043_2608141244'
+
+  Args:
+      model_name (str): The raw model name or run identifier.
+
+  Returns:
+      str: The compacted model name.
+  """
+  if not model_name:
+    return model_name
+
+  def _replace_lr(match: re.Match) -> str:
+    prefix, val_str = match.group(1), match.group(2)
+    try:
+      val = float(val_str)
+      return f"{prefix}{val:.1e}"
+    except ValueError:
+      return match.group(0)
+
+  def _replace_beta(match: re.Match) -> str:
+    prefix, val_str = match.group(1), match.group(2)
+    try:
+      val = float(val_str)
+      formatted = f"{val:.2g}" if val >= 0.001 else f"{val:.1e}"
+      return f"{prefix}{formatted}"
+    except ValueError:
+      return match.group(0)
+
+  def _replace_generic_float(match: re.Match) -> str:
+    prefix, val_str = match.group(1), match.group(2)
+    try:
+      val = float(val_str)
+      return f"{prefix}{val:.2g}"
+    except ValueError:
+      return match.group(0)
+
+  name = re.sub(
+      r"((?:^|_)(?:lr|learning_rate))([0-9]+\.[0-9]+(?:e-?[0-9]+)?)",
+      _replace_lr,
+      model_name,
+      flags=re.IGNORECASE,
+  )
+  name = re.sub(
+      r"((?:^|_)(?:beta|b))([0-9]+\.[0-9]+(?:e-?[0-9]+)?)",
+      _replace_beta,
+      name,
+      flags=re.IGNORECASE,
+  )
+  name = re.sub(
+      r"((?:^|_)(?:epo|epochs?|alpha|temp|temperature))([0-9]+\.[0-9]{3,})",
+      _replace_generic_float,
+      name,
+      flags=re.IGNORECASE,
+  )
+  return name
+
+
+def _bound_repo_name(repo_name: str, max_length: int) -> str:
+  """Shortens ``repo_name`` to ``max_length`` without losing its tail.
+
+  Repo names are built as ``{task}_{stage}_{model}_{flavor}_{hparams}_
+  {timestamp}``, so the *most* disambiguating part - the timestamp - sits at
+  the end. Plain right-truncation therefore removes exactly the characters
+  that make the name unique: with a model name a dozen characters longer than
+  ``gemma-4-E4B-it`` the whole timestamp disappears, and two campaigns run on
+  the same day with the same hyperparameters silently push to one repository.
+
+  Shortening from the middle keeps both the human-readable prefix and the
+  timestamp, and the interposed hash of the full name restores the uniqueness
+  the elided characters carried.
+
+  Args:
+      repo_name: The unbounded repository name.
+      max_length: Maximum number of characters allowed.
+
+  Returns:
+      ``repo_name`` if it already fits, otherwise a middle-elided form of it.
+  """
+  if max_length <= 0:
+    return ""
+  if len(repo_name) <= max_length:
+    return repo_name
+
+  digest = hashlib.sha1(repo_name.encode("utf-8")).hexdigest()[:6]
+  marker = f"_{digest}_"
+  # Too tight to keep both ends legible: fall back to the old behaviour but
+  # keep the hash, so the name is still unique.
+  if max_length <= len(marker) + 8:
+    return (digest + repo_name)[:max_length].rstrip(".-_")
+
+  remaining = max_length - len(marker)
+  # Bias towards the tail: the timestamp and the hyperparameters that differ
+  # between sibling runs both live there.
+  tail_len = min(len(repo_name), remaining * 2 // 3)
+  head_len = remaining - tail_len
+  head = repo_name[:head_len].rstrip(".-_")
+  tail = repo_name[len(repo_name) - tail_len:].lstrip(".-_")
+  return f"{head}{marker}{tail}"
+
+
+def sanitize_hf_repo_id(repo_id: str, max_length: int = 96) -> str:
+  """Sanitizes and bounds a Hugging Face repository ID to comply with Hugging Face Hub constraints.
+
+  Hugging Face Hub rules:
+  - Maximum repo_id length: 96 chars.
+  - Allowed characters: alphanumeric, '-', '_'
+  - Replaces all '.' with '_' to eliminate period-related validation issues.
+  - Cannot start or end with '-' or '.'
+
+  Note that uppercase characters are *allowed* by the Hub (``Qwen/Qwen3-4B``,
+  ``mistralai/Mistral-7B-Instruct-v0.3``) and are deliberately preserved, so
+  that a published checkpoint still names its base model recognisably.
+
+  Args:
+      repo_id (str): The repository identifier (e.g. 'user/dataset_name').
+      max_length (int): Maximum length allowed (default 96).
+
+  Returns:
+      str: Sanitized and length-bounded repository identifier.
+  """
+  if not repo_id:
+    return repo_id
+
+  if "/" in repo_id:
+    namespace, repo_name = repo_id.split("/", 1)
+    namespace = namespace.strip()
+    repo_name = repo_name.strip()
+  else:
+    namespace = None
+    repo_name = repo_id.strip()
+
+  repo_name = compact_model_name(repo_name)
+  # Replace periods with underscores so there are NO periods in repo names
+  repo_name = repo_name.replace(".", "_")
+  # Replace any other non-alphanumeric characters (except - and _) with _
+  repo_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", repo_name)
+  # Collapse consecutive underscores and hyphens
+  repo_name = re.sub(r"_+", "_", repo_name)
+  repo_name = re.sub(r"-+", "-", repo_name)
+  repo_name = repo_name.strip(".-_")
+
+  if namespace:
+    namespace = namespace.replace(".", "_")
+    namespace = re.sub(r"[^a-zA-Z0-9_\-]", "_", namespace).strip(".-_")
+    repo_name = _bound_repo_name(repo_name, max_length - len(namespace) - 1)
+    return f"{namespace}/{repo_name}"
+  else:
+    return _bound_repo_name(repo_name, max_length)
+
+
+#: String spellings of "no model here" that shells and configs keep producing.
+#: ``scripts/*.sh`` expand an unset variable to an empty string, and the CLI
+#: wizard writes the literal ``"none"``/``"false"``; both must mean the same
+#: thing to the adapter loader and to the dataset naming, otherwise a run can
+#: silently serve one model and be filed under another model's name.
+FALSY_MODEL_REFS = frozenset({"", "none", "false", "null", "no", '""', "''"})
+
+#: Substrings that identify a checkpoint as an RL/preference-tuned adapter,
+#: which by construction is a delta on top of the SFT weights.
+_RL_CHECKPOINT_MARKERS = (
+    "perl",
+    "rloo",
+    "rlhf",
+    "grpo",
+    "ppo",
+    "dpo",
+    "ssfo",
+    "scope",
+)
+
+
+def is_falsy_model_ref(model_ref: Optional[str]) -> bool:
+  """Returns True when a model reference means "no model".
+
+  Args:
+      model_ref (Optional[str]): Adapter path, repo ID, or a placeholder.
+
+  Returns:
+      bool: True for None, empty/whitespace, or a "none"-like spelling.
+  """
+  if model_ref is None:
+    return True
+  return str(model_ref).strip().lower() in FALSY_MODEL_REFS
+
+
+def normalize_model_ref(model_ref: Optional[str]) -> str:
+  """Normalizes a model reference for comparison and fingerprinting.
+
+  Args:
+      model_ref (Optional[str]): Adapter path or Hugging Face repo ID.
+
+  Returns:
+      str: The trimmed reference without trailing slashes, or '' if falsy.
+  """
+  if is_falsy_model_ref(model_ref):
+    return ""
+  return str(model_ref).strip().rstrip("/")
+
+
+def is_sft_adapter_stacked(
+    sft_model_path: Optional[str],
+    writer_model_lora: Optional[str] = None,
+) -> bool:
+  """Returns True when an SFT adapter is stacked on top of the writer adapter.
+
+  Mirrors the condition used by
+  ``EvaluationGenerationPipeline.setup_model`` to decide whether to combine
+  two LoRA adapters. Keep the two in sync: the served weights and the
+  dataset name are derived from this single predicate.
+
+  Args:
+      sft_model_path (Optional[str]): SFT adapter reference, if any.
+      writer_model_lora (Optional[str]): The adapter being evaluated. When it
+        is the SFT adapter itself, nothing is stacked.
+
+  Returns:
+      bool: True when two distinct adapters are combined for serving.
+  """
+  sft_ref = normalize_model_ref(sft_model_path)
+  if not sft_ref:
+    return False
+  writer_ref = normalize_model_ref(writer_model_lora)
+  return not (writer_ref and writer_ref.casefold() == sft_ref.casefold())
+
+
+def sft_stacking_marker(
+    sft_model_path: Optional[str],
+    writer_model_lora: Optional[str] = None,
+    hash_len: int = 6,
+) -> str:
+  """Builds the repo-name marker describing the SFT stacking configuration.
+
+  The marker distinguishes the two ways the same RL checkpoint can be served:
+  on the bare base model ('_nosft') or on top of an SFT adapter
+  ('_sft<fingerprint>'). Without it both runs would push their completions to
+  the same dataset repository and silently overwrite each other.
+
+  The fingerprint is taken over the *reference string*, so the same checkpoint
+  addressed as a local path and as a Hub repo ID yields two names. That is the
+  safe direction to err in: a spurious split is visible, a spurious merge is
+  not.
+
+  Args:
+      sft_model_path (Optional[str]): SFT adapter reference, if any.
+      writer_model_lora (Optional[str]): The adapter being evaluated.
+      hash_len (int): Number of hex characters of the fingerprint.
+
+  Returns:
+      str: '_nosft', or '_sft' followed by ``hash_len`` hex characters.
+  """
+  if not is_sft_adapter_stacked(sft_model_path, writer_model_lora):
+    return "_nosft"
+  digest = hashlib.sha256(
+      normalize_model_ref(sft_model_path).casefold().encode("utf-8")
+  ).hexdigest()[:hash_len]
+  return f"_sft{digest}"
+
+
+def looks_like_rl_checkpoint(model_ref: Optional[str]) -> bool:
+  """Heuristically detects an RL/preference-tuned checkpoint from its name.
+
+  Such a checkpoint is a LoRA delta trained on top of *merged* SFT weights, so
+  evaluating it without its SFT adapter serves a model that never existed
+  during training. Names produced by the orchestrator carry an explicit stage
+  tag ('..._PERL_...', '..._SFT_...'), which makes this reliable in practice;
+  an SFT tag always wins to avoid false positives from project prefixes such
+  as 'new_perl'.
+
+  Args:
+      model_ref (Optional[str]): Adapter path or Hugging Face repo ID.
+
+  Returns:
+      bool: True when the reference looks like an RL/DPO checkpoint.
+  """
+  normalized = normalize_model_ref(model_ref)
+  if not normalized:
+    return False
+  parts = [p for p in normalized.split("/") if p and p != "."]
+  if not parts:
+    return False
+  name = parts[-1].casefold()
+  if re.fullmatch(r"checkpoint-\d+|best|last", name) and len(parts) >= 2:
+    for parent in reversed(parts[-3:-1]):
+      parent_cf = parent.casefold()
+      if parent_cf in ("new_perl", "src", "users", "cloud"):
+        continue
+      if "sft" in parent_cf:
+        return False
+      if any(marker in parent_cf for marker in _RL_CHECKPOINT_MARKERS):
+        return True
+    return False
+  if not name or "sft" in name:
+    return False
+  return any(marker in name for marker in _RL_CHECKPOINT_MARKERS)
+
+
+def _truncate_with_digest(name: str, allowed_len: int) -> str:
+  """Shortens ``name`` to ``allowed_len`` chars while keeping it injective.
+
+  Checkpoint names differ in their tail ('..._lr2_4e-05' versus
+  '..._lr2_5e-05'), so a plain truncation can map two different runs onto one
+  repository. Appending a digest of the full name keeps distinct inputs
+  distinct.
+
+  Args:
+      name (str): The already-sanitized model name component.
+      allowed_len (int): Maximum number of characters available.
+
+  Returns:
+      str: ``name`` when it already fits, else a truncation carrying a 4-hex
+        digest of the full name.
+  """
+  if allowed_len <= 0:
+    return ""
+  if len(name) <= allowed_len:
+    return name
+  digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:4]
+  if allowed_len <= len(digest):
+    return digest[:allowed_len]
+  keep = allowed_len - len(digest) - 1
+  return f"{name[:keep].rstrip('.-_')}_{digest}"
+
+
+def build_eval_dataset_repo_id(
+    user: str,
+    writer_model_lora: str,
+    temperature: float = 0.0,
+    writer_num_fewshot: int = 0,
+    task_name: Optional[str] = None,
+    sft_model_path: Optional[str] = None,
+    seed: int = 12345,
+    max_tokens: int = 250,
+    max_length: int = 96,
+) -> str:
+  """Constructs a deterministic and valid Hugging Face dataset repo ID for generation completions.
+
+  The ID must capture every input that changes the generated completions,
+  otherwise two configurations push to the same repository and silently
+  overwrite each other. Besides the writer adapter and the sampling settings,
+  that includes whether an SFT adapter was stacked underneath the writer
+  adapter ('..._nosft' versus '..._sft<fingerprint>') and the seed, which
+  selects *which* prompts the evaluation subsamples.
+
+  Not encoded, deliberately: ``top_p`` / ``top_k`` are inert at the
+  temperature 0 this pipeline runs at, and ``max_eval_samples`` only ever
+  shrinks the row set of the same repository. Change either of those together
+  with something that is encoded, or regenerate into a fresh repo.
+
+  Args:
+      user (str): Hugging Face username / namespace.
+      writer_model_lora (str): Writer model LoRA adapter path or repo ID.
+      temperature (float): Sampling temperature used for generation.
+      writer_num_fewshot (int): Number of fewshot examples prepended to prompts.
+      task_name (Optional[str]): Task name (e.g., 'npov', 'bosch', 'ragtruth').
+        Prefixes the repository name to prevent collision between tasks.
+      sft_model_path (Optional[str]): SFT adapter combined with
+        ``writer_model_lora`` at serving time, if any.
+      seed (int): Seed driving the test-set subsample and the few-shot draw.
+      max_tokens (int): Generation length cap, which truncates completions and
+        therefore changes every downstream metric.
+      max_length (int): Maximum allowed repo ID length (default 96).
+
+  Returns:
+      str: A compliant Hugging Face dataset repository identifier (<= max_length
+        chars).
+  """
+  cleaned_path = (writer_model_lora or "").rstrip("/")
+  if f"{user}/" in cleaned_path:
+    model_name = cleaned_path.split(f"{user}/", 1)[1]
+  elif "/" in cleaned_path:
+    parts = [p for p in cleaned_path.split("/") if p and p != "."]
+    if (
+        len(parts) >= 2
+        and re.fullmatch(r"checkpoint-\d+|best|last", parts[-1].casefold())
+    ):
+      model_name = f"{parts[-2]}_{parts[-1]}"
+    else:
+      model_name = parts[-1] if parts else cleaned_path
+  else:
+    model_name = cleaned_path
+
+  compacted_model = compact_model_name(model_name).replace(".", "_")
+  compacted_model = re.sub(r"[^a-zA-Z0-9_\-]", "_", compacted_model)
+  compacted_model = re.sub(r"_+", "_", compacted_model).strip(".-_")
+
+  temp_val = float(temperature)
+  temp_str = (
+      f"{int(temp_val)}"
+      if temp_val.is_integer()
+      else f"{temp_val:.2g}".replace(".", "_")
+  )
+  marker = sft_stacking_marker(sft_model_path, writer_model_lora)
+  suffix = (
+      f"_gens_T{temp_str}_wfs{writer_num_fewshot}"
+      f"_s{int(seed)}_mt{int(max_tokens)}{marker}"
+  )
+
+  if task_name:
+    task_clean = re.sub(r"[^a-zA-Z0-9_\-]", "_", task_name.strip().lower())
+    if not (
+        compacted_model.lower().startswith(f"{task_clean}_")
+        or compacted_model.lower() == task_clean
+    ):
+      prefix = f"eval_{task_clean}_"
+    else:
+      prefix = "eval_"
+  else:
+    prefix = "eval_"
+
+  # The model name absorbs the whole overflow here, before
+  # `sanitize_hf_repo_id` ever sees the name. That keeps the SFT marker and
+  # the generation settings intact and, crucially, keeps the overflow
+  # attributable: shortening the model deliberately is more legible than
+  # letting the generic bounding elide an arbitrary middle span.
+  allowed_model_len = max_length - len(user) - 1 - len(prefix) - len(suffix)
+  if allowed_model_len <= 0:
+    compacted_model = ""
+  elif len(compacted_model) > allowed_model_len:
+    compacted_model = _truncate_with_digest(compacted_model, allowed_model_len)
+
+  full_name = f"{prefix}{compacted_model}{suffix}"
+  return sanitize_hf_repo_id(f"{user}/{full_name}", max_length=max_length)
+
+
+def autorater_eval_run_name(
+    evaluator_model: Optional[str],
+    dataset_labels: Optional[str],
+    evaluator_num_fewshot: Optional[int],
+    seed: int,
+) -> str:
+  """Names the log directory an autorater calibration run writes into.
+
+  Every input that changes the fitted threshold is in the name: the judge,
+  the labelled set it is judged against, how many few-shot examples it was
+  given and the seed that drew them. Two calibrations that differ in any of
+  those are different calibrations and must not overwrite each other.
+
+  Shared by the pipeline that writes the directory and by the orchestrator
+  stage that reads it back. They used to be two copies of one f-string,
+  which is the same arrangement that made the evaluation summary lookup
+  fragile (see ``EvalStage._summary_path``).
+
+  Args:
+      evaluator_model (Optional[str]): Judge model, e.g. 'gemini-2.5-flash'.
+      dataset_labels (Optional[str]): Repo ID of the human-labelled set.
+      evaluator_num_fewshot (Optional[int]): Few-shot examples given to the
+        judge.
+      seed (int): Seed for the subsample and the few-shot draw.
+
+  Returns:
+      str: The directory name, relative to ``logs/``.
+  """
+  eval_model_name = (
+      evaluator_model.split("/")[-1] if evaluator_model else "gemini"
+  )
+  dataset_name = dataset_labels.split("/")[-1] if dataset_labels else "labels"
+  return (
+      f"eval_autorater_{eval_model_name}"
+      f"_autorater_num_fewshot_{evaluator_num_fewshot}"
+      f"_data_{dataset_name}"
+      f"_seed_{seed}"
+  )
+
+
+def autorater_eval_metrics_path(
+    evaluator_model: Optional[str],
+    dataset_labels: Optional[str],
+    evaluator_num_fewshot: Optional[int],
+    seed: int,
+) -> str:
+  """Returns the machine-readable metrics file of an autorater calibration.
+
+  The sibling ``eval_autorater_metrics.txt`` is written for a human; this
+  JSON is what the orchestrator parses to pick up the fitted threshold.
+
+  Args:
+      evaluator_model (Optional[str]): Judge model.
+      dataset_labels (Optional[str]): Repo ID of the human-labelled set.
+      evaluator_num_fewshot (Optional[int]): Few-shot examples given.
+      seed (int): Seed for the subsample and the few-shot draw.
+
+  Returns:
+      str: Path to the JSON metrics file.
+  """
+  name = autorater_eval_run_name(
+      evaluator_model, dataset_labels, evaluator_num_fewshot, seed
+  )
+  return os.path.join("logs", name, "eval_autorater_metrics.json")

@@ -1,5 +1,8 @@
-"""
-Defines an abstract Pipeline class and concrete pipeline implementations for SFT (writer_sft), reward model training, and PERL (rlhf) workflows. Also defines EvaluationPipeline and concrete classes corresponding to each step of the evaluation procedure (autorater evaluation, completion generation, scoring of completions).
+"""Defines an abstract Pipeline class and concrete pipeline implementations for SFT (writer_sft), reward model training, and PERL (rlhf) workflows.
+
+Also defines EvaluationPipeline and concrete classes corresponding to each step
+of the evaluation procedure (autorater evaluation, completion generation,
+scoring of completions).
 
 Each pipeline implements the sequence of steps described in the project:
 1. setup_arguments
@@ -14,29 +17,104 @@ Each pipeline implements the sequence of steps described in the project:
 from __future__ import annotations
 
 import abc
+import concurrent.futures
+import contextlib
+import datetime
+import glob
+import json
+import math
 import os
+import random
+import re
+import shutil
+import statistics
+import sys
+import threading
 import time
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
-import evaluate
-import matplotlib.pyplot as plt
-import numpy as np
-import torch
+# Patch transformers heterogeneity configuration to allow global attribute access in vLLM
+try:
+  import transformers
+  from transformers.configuration_utils import PretrainedConfig
+
+  PretrainedConfig.allow_global_per_layer_attribute_access = True
+  from transformers.integrations.heterogeneity.configuration_utils import (
+      HeterogeneousPretrainedConfig,
+  )
+
+  HeterogeneousPretrainedConfig.allow_global_per_layer_attribute_access = True
+except Exception:
+  pass
+
 from datasets import (
     Dataset,
+    DatasetDict,
     Value,
     concatenate_datasets,
     load_dataset,
 )
+import evaluate
 from google import genai
 from google.genai import types
-from huggingface_hub import snapshot_download
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+import matplotlib.pyplot as plt
+import numpy as np
 from peft import LoraConfig, PeftModel, get_peft_model
+import scipy.special
 from sklearn.metrics import (
     RocCurveDisplay,
     precision_score,
     roc_auc_score,
 )
+from src import checkpoint_publication
+from src.continual_eval import ContinualEvalStatus
+from src.continual_eval import ContinualEvalStopCallback
+from src.continual_eval import PAUSED_SUMMARY_KEY
+from src.metrics import GenerationMetricsEvaluator
+from src.model_compat import (
+    chat_wrap_user,
+    configure_tokenizer_padding,
+    parse_target_modules,
+    resolve_yes_no_token_ids,
+    safe_get_peft_model,
+    strip_terminal_tokens,
+    warn_on_pad_eos_collision,
+)
+from src.models import (
+    Gemma4ForSequenceClassification,
+    register_gemma4_for_sequence_classification,
+)
+from src.utils import (
+    REWARD_HACKING_AUDIT_PREFIX,
+    REWARD_HACKING_DIMENSIONS,
+    REWARD_HACKING_SCALE_MAX,
+    REWARD_HACKING_SCALE_MIN,
+    EvalArguments,
+    LLMSynthScriptArguments,
+    LoraArguments,
+    ScopeDataGenArguments,
+    ScriptArguments,
+    SsfoDataGenArguments,
+    autorater_eval_metrics_path,
+    autorater_eval_run_name,
+    build_eval_dataset_repo_id,
+    compact_model_name,
+    compute_best_roc_threshold,
+    create_lora_argument_parser,
+    get_task_processor,
+    is_falsy_model_ref,
+    is_sft_adapter_stacked,
+    looks_like_rl_checkpoint,
+    normalize_model_ref,
+    normalize_rubric_score,
+    reward_hacking_dimension_keys,
+    reward_hacking_run_name,
+    reward_hacking_summary,
+    sanitize_hf_repo_id,
+    sft_stacking_marker,
+)
+import torch
 from tqdm import tqdm
 from transformers import (
     AutoModelForCausalLM,
@@ -44,1065 +122,6672 @@ from transformers import (
     AutoTokenizer,
     DataCollatorWithPadding,
     HfArgumentParser,
+    LogitsProcessor,
+    LogitsProcessorList,
     Trainer,
+    TrainerCallback,
+    TrainerControl,
+    TrainerState,
     TrainingArguments,
     set_seed,
 )
+from transformers.trainer_utils import get_last_checkpoint
 from trl import (
-    DataCollatorForCompletionOnlyLM,
+    DPOConfig,
+    DPOTrainer,
     RLOOConfig,
     RLOOTrainer,
     SFTConfig,
     SFTTrainer,
-    TrlParser,
 )
-from vllm import LLM, SamplingParams
-from vllm.lora.request import LoRARequest
 
-from src.utils import (
-    EvalArguments,
-    LLMSynthScriptArguments,
-    ScriptArguments,
-    compute_best_roc_threshold,
-    create_lora_argument_parser,
-    get_task_processor,
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+try:
+  from vllm import LLM, SamplingParams
+  from vllm.lora.request import LoRARequest
+  _VLLM_AVAILABLE = True
+except ImportError:
+  LLM = None
+  SamplingParams = None
+  LoRARequest = None
+  _VLLM_AVAILABLE = False
+
+try:
+  import wandb
+except ImportError:
+  wandb = None
+
+
+def _clean_cli_args(cli_args: Sequence[str] | None = None) -> list[str]:
+  """Filter out stray '--' tokens from arguments before passing to argparse."""
+  raw = list(cli_args) if cli_args else sys.argv[1:]
+  return [arg for arg in raw if arg != "--"]
+
+
+# Token budget used whenever the reward model scores a (prompt, completion)
+# pair. This was previously hardcoded to 512 at the PE-RL call site while the
+# reward-model training call site passed no limit at all. For RAGTruth the
+# prompt alone exceeds 512 tokens in 93% of QA rows and 98% of summarization
+# rows, so right-truncation at 512 removed the completion entirely: every
+# rollout of a prompt then scored identically, the RLOO advantage was exactly
+# zero, and only the KL term was optimized. 2048 covers roughly the 98th
+# percentile of RAGTruth prompt+response length; 4096 covers all of it.
+_DEFAULT_REWARD_MAX_LENGTH = 2048
+
+# Truncation must drop the head of the context, never the tail, because the
+# completion lives at the tail and is the only part that varies across
+# rollouts of the same prompt.
+_REWARD_TRUNCATION_SIDE = "left"
+
+
+def _resolve_reward_max_length(args: Any) -> int:
+  """Return the reward-model token budget configured on ``args``.
+
+  Both the reward-model training pipeline and the PE-RL scoring path call
+  this, which is what keeps their tokenization consistent. Values that are
+  absent, non-numeric (for example a test double) or non-positive fall back
+  to the default rather than propagating a nonsensical limit.
+
+  Args:
+      args: A ScriptArguments instance, or any namespace-like object.
+
+  Returns:
+      A positive integer token budget.
+  """
+  value = getattr(args, "reward_max_length", None)
+  if isinstance(value, bool) or not isinstance(value, (int, float)):
+    return _DEFAULT_REWARD_MAX_LENGTH
+  value = int(value)
+  if value <= 0:
+    return _DEFAULT_REWARD_MAX_LENGTH
+  return value
+
+
+# Default floor for the PE-RL cosine learning-rate schedule, expressed as a
+# fraction of the peak post-warmup learning rate (eta_min = 0.25 * peak_lr).
+# Decaying all the way to 0 at the end of the final epoch starves late-stage
+# policy updates; keeping a 25% floor preserves effective step sizes through
+# the end of training.
+_DEFAULT_PERL_MIN_LR_RATIO = 0.25
+
+
+def _resolve_min_lr_ratio(
+    args: Any, default: float = _DEFAULT_PERL_MIN_LR_RATIO
+) -> float:
+  """Returns the minimum LR ratio configured on ``args``, in ``[0.0, 1.0]``.
+
+  Absent or non-numeric values (such as a ``MagicMock`` test double) fall back
+  to ``default``. Explicit numeric values outside ``[0.0, 1.0]`` raise
+  ``ValueError`` so misconfigurations fail loudly rather than producing
+  negative or inverted learning-rate schedules.
+
+  Args:
+    args: A ``ScriptArguments`` instance, or any namespace-like object.
+    default: Stage default when ``args.min_lr_ratio`` is unset.
+
+  Returns:
+    The resolved minimum learning-rate ratio as a float in ``[0.0, 1.0]``.
+
+  Raises:
+    ValueError: If an explicit numeric value is outside ``[0.0, 1.0]`` or NaN.
+  """
+  value = getattr(args, "min_lr_ratio", None)
+  if value is None:
+    return float(default)
+  if isinstance(value, bool):
+    raise ValueError(
+        f"min_lr_ratio must be a float in [0.0, 1.0], got {value!r}."
+    )
+  if not isinstance(value, (int, float)):
+    return float(default)
+  ratio = float(value)
+  if math.isnan(ratio) or math.isinf(ratio) or not 0.0 <= ratio <= 1.0:
+    raise ValueError(
+        f"min_lr_ratio must be a float in [0.0, 1.0], got {value!r}."
+    )
+  return ratio
+
+
+def _is_cosine_scheduler_type(scheduler_type: Any) -> bool:
+  """Returns True when ``scheduler_type`` selects a cosine LR schedule."""
+  if scheduler_type is None:
+    return False
+  raw = getattr(scheduler_type, "value", scheduler_type)
+  if not isinstance(raw, str):
+    return False
+  normalized = raw.strip().lower()
+  return normalized in ("cosine", "cosine_with_min_lr")
+
+
+def _resolve_num_warmup_steps(
+    training_args: Any, num_training_steps: int
+) -> int:
+  """Resolves the warmup step count from ``training_args`` and total steps."""
+  warmup_steps = getattr(training_args, "warmup_steps", 0)
+  if (
+      not isinstance(warmup_steps, bool)
+      and isinstance(warmup_steps, (int, float))
+      and int(warmup_steps) > 0
+  ):
+    return int(warmup_steps)
+  get_warmup = getattr(training_args, "get_warmup_steps", None)
+  if callable(get_warmup):
+    try:
+      resolved = get_warmup(num_training_steps)
+      if not isinstance(resolved, bool) and isinstance(resolved, (int, float)):
+        return max(0, int(resolved))
+    except Exception:  # pylint: disable=broad-exception-caught
+      pass
+  warmup_ratio = getattr(training_args, "warmup_ratio", 0.0)
+  if (
+      not isinstance(warmup_ratio, bool)
+      and isinstance(warmup_ratio, (int, float))
+      and float(warmup_ratio) > 0.0
+  ):
+    return max(0, int(math.ceil(num_training_steps * float(warmup_ratio))))
+  return 0
+
+
+def _cosine_with_min_lr_lambda(
+    current_step: int,
+    *,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    min_lr_ratio: float,
+    num_cycles: float = 0.5,
+) -> float:
+  """Computes the multiplicative LR factor for warmup + cosine decay to a floor.
+
+  During the first ``num_warmup_steps`` steps the factor increases linearly
+  from ``0.0`` to ``1.0``. Over the remaining post-warmup steps it follows a
+  cosine curve from ``1.0`` down to ``min_lr_ratio`` at ``num_training_steps``
+  (equivalent to PyTorch's ``CosineAnnealingLR`` with
+  ``eta_min = min_lr_ratio * peak_lr``).
+
+  Args:
+    current_step: Current optimization step.
+    num_warmup_steps: Number of linear warmup steps.
+    num_training_steps: Total number of optimization steps.
+    min_lr_ratio: Floor multiplier in ``[0.0, 1.0]`` reached at the final step.
+    num_cycles: Number of cosine waves in the decay period (0.5 = half cosine).
+
+  Returns:
+    Multiplicative factor in ``[0.0, 1.0]`` applied to each param group's
+    initial learning rate.
+  """
+  if current_step < num_warmup_steps:
+    return float(current_step) / float(max(1, num_warmup_steps))
+  if num_training_steps <= num_warmup_steps:
+    return float(min_lr_ratio)
+  progress = float(current_step - num_warmup_steps) / float(
+      max(1, num_training_steps - num_warmup_steps)
+  )
+  progress = min(1.0, max(0.0, progress))
+  cosine_decay = 0.5 * (
+      1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)
+  )
+  return float(min_lr_ratio) + (1.0 - float(min_lr_ratio)) * cosine_decay
+
+
+def build_cosine_with_min_lr_scheduler(
+    optimizer: Any,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    min_lr_ratio: float = _DEFAULT_PERL_MIN_LR_RATIO,
+    num_cycles: float = 0.5,
+    last_epoch: int = -1,
+) -> Any:
+  """Builds a PyTorch ``LambdaLR`` scheduler with warmup and a cosine floor.
+
+  Using a plain function closure with :class:`torch.optim.lr_scheduler.LambdaLR`
+  ensures ``LambdaLR.state_dict()`` stores ``lr_lambdas: [None]`` (standard
+  PyTorch behavior for ``types.FunctionType``), making ``scheduler.pt``
+  checkpoints 100% compatible with ``torch.load(..., weights_only=True)`` across
+  continual-evaluation pauses and resumptions.
+
+  Args:
+    optimizer: PyTorch optimizer instance.
+    num_warmup_steps: Linear warmup step count.
+    num_training_steps: Total training step count.
+    min_lr_ratio: Final LR as a fraction of the post-warmup peak LR.
+    num_cycles: Number of cosine cycles during decay (default 0.5).
+    last_epoch: Index of last epoch/step (default -1).
+
+  Returns:
+    A ``torch.optim.lr_scheduler.LambdaLR`` instance.
+  """
+  ratio = float(min_lr_ratio)
+  if math.isnan(ratio) or math.isinf(ratio) or not 0.0 <= ratio <= 1.0:
+    raise ValueError(
+        f"min_lr_ratio must be a float in [0.0, 1.0], got {min_lr_ratio!r}."
+    )
+  warmup = max(0, int(num_warmup_steps))
+  total = max(0, int(num_training_steps))
+  cycles = float(num_cycles)
+
+  def lr_lambda(current_step: int) -> float:
+    return _cosine_with_min_lr_lambda(
+        current_step,
+        num_warmup_steps=warmup,
+        num_training_steps=total,
+        min_lr_ratio=ratio,
+        num_cycles=cycles,
+    )
+
+  return torch.optim.lr_scheduler.LambdaLR(
+      optimizer, lr_lambda, last_epoch=last_epoch
+  )
+
+
+def _load_sequence_classifier(
+    model_ref: str,
+    torch_dtype: Any,
+    num_labels: int = 2,
+) -> Any:
+  """Loads a 2-class sequence classifier for any supported model family.
+
+  ``AutoModelForSequenceClassification`` is the path for every family that
+  Transformers ships a classification head for - which is all of them except
+  Gemma 4, whose head this repository has to supply itself (see
+  :mod:`src.models.gemma4_sequence_classification`).
+
+  The Gemma 4 fallback used to be selected by sniffing for "gemma" in the
+  repo-id string, which meant a reward model published under a name that did
+  not mention its base model would take the wrong branch. Registration is now
+  attempted first and the fallback keys only on the *error*, so the decision
+  no longer depends on how a checkpoint happens to be named.
+
+  Args:
+    model_ref: Hub repo id or local path.
+    torch_dtype: dtype to load the weights in.
+    num_labels: Number of classification labels.
+
+  Returns:
+    The loaded model.
+
+  Raises:
+    ValueError: Propagated from Transformers when the architecture genuinely
+      has no classification head available.
+  """
+  resolved_ref, ref_kwargs = _resolve_pretrained_ref_and_kwargs(model_ref)
+  target_ref = resolved_ref or model_ref
+  id2label = {0: "Yes", 1: "No"}
+  label2id = {"Yes": 0, "No": 1}
+  kwargs = dict(
+      num_labels=num_labels,
+      id2label=id2label,
+      label2id=label2id,
+      torch_dtype=torch_dtype,
+      **ref_kwargs,
+  )
+
+  # No-op for every family other than Gemma 4; see the registration helper.
+  register_gemma4_for_sequence_classification(target_ref)
+  try:
+    return AutoModelForSequenceClassification.from_pretrained(
+        target_ref, **kwargs
+    )
+  except (ValueError, KeyError) as e:
+    if Gemma4ForSequenceClassification is None:
+      raise
+    try:
+      return Gemma4ForSequenceClassification.from_pretrained(
+          target_ref, **kwargs
+      )
+    except Exception:  # pylint: disable=broad-except
+      # The Gemma 4 head could not load it either, so the original
+      # Transformers error is the informative one.
+      raise e  # pylint: disable=raise-missing-from
+
+
+def _resolve_pretrained_ref_and_kwargs(
+    model_ref: Optional[str],
+) -> tuple[Optional[str], Dict[str, Any]]:
+  """Resolves a model reference (local path or HF Hub ref with optional subfolder/revision) for ``from_pretrained``."""
+  if not model_ref or not isinstance(model_ref, str):
+    return model_ref, {}
+  local_dir = checkpoint_publication.resolve_local_checkpoint_dir(model_ref)
+  if local_dir is not None:
+    return local_dir, {}
+  repo_id, subfolder, revision = parse_hf_repo_reference(model_ref)
+  if repo_id and (subfolder or revision):
+    extra: Dict[str, Any] = {}
+    if subfolder:
+      extra["subfolder"] = subfolder
+    if revision:
+      extra["revision"] = revision
+    return repo_id, extra
+  return model_ref, {}
+
+
+_CHAT_TOKENIZER_UNSET = object()
+
+
+def _resolve_chat_tokenizer(pipeline: Any) -> Any:
+  """Returns a tokenizer for chat wrapping, loading one lazily if needed.
+
+  The SCOPE and SSFO data-generation pipelines need the policy's *native*
+  conversational framing for their "no context" ablation. SCOPE already builds
+  a tokenizer for its logits processor, but SSFO generates purely through vLLM
+  and has a no-op ``setup_tokenizer``, so one is loaded on first use and
+  cached on the instance.
+
+  A failure to load is not fatal: :func:`~src.model_compat.chat_wrap_user`
+  degrades to the raw question, which is the correct prompt for a base model
+  anyway.
+
+  Args:
+    pipeline: The data-generation pipeline instance.
+
+  Returns:
+    A tokenizer, or None if none could be obtained.
+  """
+  tokenizer = getattr(pipeline, "tokenizer", None)
+  if tokenizer is not None:
+    return tokenizer
+
+  cached = getattr(pipeline, "_chat_tokenizer", _CHAT_TOKENIZER_UNSET)
+  if cached is not _CHAT_TOKENIZER_UNSET:
+    return cached
+
+  tokenizer = None
+  repo_id = getattr(getattr(pipeline, "args", None), "model_repo_id", None)
+  if repo_id:
+    try:
+      tokenizer = AutoTokenizer.from_pretrained(repo_id)
+    except Exception as e:  # pylint: disable=broad-except
+      print(
+          f"Warning: could not load a tokenizer from '{repo_id}' to apply the"
+          f" chat template ({e}). Context-free prompts will be sent as raw"
+          " text."
+      )
+      tokenizer = None
+  pipeline._chat_tokenizer = tokenizer  # pylint: disable=protected-access
+  return tokenizer
+
+
+def parse_hf_repo_reference(
+    ref: str,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+  """Parses a Hugging Face hub reference into (repo_id, subfolder, revision).
+
+  Supports formats:
+  - username/repo_name
+  - username/repo_name/checkpoint-50
+  - username/repo_name:checkpoint-50
+  - username/repo_name@revision
+  - username/repo_name/tree/revision/subfolder
+  - https://huggingface.co/username/repo_name/...
+  - hf://username/repo_name/...
+  """
+  if not isinstance(ref, str) or not ref.strip():
+    return None, None, None
+
+  cleaned = ref.strip()
+  for prefix in (
+      "https://huggingface.co/",
+      "http://huggingface.co/",
+      "hf://",
+      "hf.co/",
+  ):
+    if cleaned.startswith(prefix):
+      cleaned = cleaned[len(prefix) :]
+      break
+
+  revision = None
+  subfolder = None
+
+  if "@" in cleaned:
+    cleaned, revision = cleaned.split("@", 1)
+
+  if ":" in cleaned:
+    cleaned, subfolder = cleaned.split(":", 1)
+
+  parts = [p for p in cleaned.strip("/").split("/") if p]
+  if not parts:
+    return None, None, None
+
+  if len(parts) == 1:
+    return parts[0], subfolder, revision
+
+  if "tree" in parts:
+    tree_idx = parts.index("tree")
+    repo_id = "/".join(parts[:tree_idx])
+    if tree_idx + 1 < len(parts):
+      revision = parts[tree_idx + 1]
+    if tree_idx + 2 < len(parts):
+      subfolder = "/".join(parts[tree_idx + 2 :])
+    return repo_id, subfolder, revision
+
+  repo_id = f"{parts[0]}/{parts[1]}"
+  if len(parts) > 2:
+    extra_path = "/".join(parts[2:])
+    subfolder = extra_path if subfolder is None else f"{extra_path}/{subfolder}"
+
+  return repo_id, subfolder, revision
+
+
+class WandbResumptionCallback(TrainerCallback):
+  """Records the WandB run id for resumption and saves the final step.
+
+  The id of the active WandB run is written to disk and to the Hub for
+  seamless cross-machine resumption. When training stops (``max_steps``, the
+  end of the last epoch, or another callback setting
+  ``should_training_stop``), the callback forces an evaluation and a save of
+  the final step, unless that step was already evaluated / saved. Hugging
+  Face calls ``on_epoch_end`` and ``_maybe_log_save_evaluate`` once more
+  after the training loop breaks, so forcing unconditionally would evaluate
+  and save the same step twice.
+  """
+
+  def __init__(self):
+    self._last_evaluated_step: Optional[int] = None
+    self._last_saved_step: Optional[int] = None
+
+  def _force_final_evaluate_and_save(
+      self,
+      args: TrainingArguments,
+      state: TrainerState,
+      control: TrainerControl,
+  ) -> None:
+    """Requests the evaluation and save of the current step if still missing."""
+    step = getattr(state, "global_step", None)
+    if (
+        getattr(args, "do_eval", False)
+        and getattr(args, "eval_strategy", "no") != "no"
+        and step != self._last_evaluated_step
+    ):
+      control.should_evaluate = True
+    if step != self._last_saved_step:
+      control.should_save = True
+
+  def on_train_begin(
+      self,
+      args: TrainingArguments,
+      state: TrainerState,
+      control: TrainerControl,
+      **kwargs,
+  ):
+    self._last_evaluated_step = None
+    self._last_saved_step = None
+    if getattr(args, "load_best_model_at_end", False) and getattr(
+        args, "save_strategy", "no"
+    ) != "no":
+      limit = getattr(args, "save_total_limit", None)
+      if limit is not None and int(limit) == 1:
+        args.save_total_limit = 2
+        if getattr(state, "is_world_process_zero", True):
+          print(
+              "[Checkpoint] Bumping save_total_limit from 1 to 2 so both best"
+              " model and last step checkpoints are preserved locally."
+          )
+
+    if (
+        getattr(state, "is_world_process_zero", True)
+        and wandb is not None
+        and getattr(wandb, "run", None) is not None
+    ):
+      try:
+        wandb.define_metric("train/global_step")
+        wandb.define_metric("train/*", step_metric="train/global_step")
+        wandb.define_metric("eval/*", step_metric="train/global_step")
+        wandb.define_metric("eval_*", step_metric="train/global_step")
+      except Exception:
+        pass
+
+      run_id = wandb.run.id
+      output_dir = getattr(args, "output_dir", None)
+      if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        id_file = os.path.join(output_dir, "wandb_run_id.txt")
+        try:
+          with open(id_file, "w") as f:
+            f.write(run_id)
+        except Exception as e:
+          print(f"[WandB] Notice: Could not write {id_file}: {e}")
+
+        hub_model_id = getattr(args, "hub_model_id", None)
+        push_to_hub = getattr(args, "push_to_hub", False)
+        if push_to_hub and hub_model_id and os.path.isfile(id_file):
+          try:
+            api = HfApi()
+            api.upload_file(
+                path_or_fileobj=id_file,
+                path_in_repo="wandb_run_id.txt",
+                repo_id=hub_model_id,
+                commit_message="Add wandb_run_id for cross-machine resumption",
+            )
+          except Exception:
+            pass
+
+  def on_step_end(
+      self,
+      args: TrainingArguments,
+      state: TrainerState,
+      control: TrainerControl,
+      **kwargs,
+  ):
+    if getattr(args, "save_strategy", "no") != "no":
+      max_steps = getattr(state, "max_steps", 0)
+      if (
+          (max_steps > 0 and state.global_step >= max_steps)
+          or getattr(control, "should_training_stop", False)
+      ):
+        self._force_final_evaluate_and_save(args, state, control)
+
+  def on_epoch_end(
+      self,
+      args: TrainingArguments,
+      state: TrainerState,
+      control: TrainerControl,
+      **kwargs,
+  ):
+    if getattr(args, "save_strategy", "no") != "no":
+      num_epochs = getattr(args, "num_train_epochs", None)
+      current_epoch = getattr(state, "epoch", None)
+      if (
+          (
+              num_epochs is not None
+              and current_epoch is not None
+              and current_epoch >= num_epochs - 1e-6
+          )
+          or getattr(control, "should_training_stop", False)
+      ):
+        self._force_final_evaluate_and_save(args, state, control)
+
+  def on_evaluate(
+      self,
+      args: TrainingArguments,
+      state: TrainerState,
+      control: TrainerControl,
+      **kwargs,
+  ):
+    del args, control, kwargs
+    self._last_evaluated_step = getattr(state, "global_step", None)
+
+  def on_save(
+      self,
+      args: TrainingArguments,
+      state: TrainerState,
+      control: TrainerControl,
+      **kwargs,
+  ):
+    self._last_saved_step = getattr(state, "global_step", None)
+    if (
+        getattr(state, "is_world_process_zero", True)
+        and wandb is not None
+        and getattr(wandb, "run", None) is not None
+    ):
+      run_id = wandb.run.id
+      output_dir = getattr(args, "output_dir", None)
+      if output_dir:
+        checkpoint_folder = f"checkpoint-{state.global_step}"
+        checkpoint_dir = os.path.join(output_dir, checkpoint_folder)
+        if os.path.isdir(checkpoint_dir):
+          id_file = os.path.join(checkpoint_dir, "wandb_run_id.txt")
+          try:
+            with open(id_file, "w") as f:
+              f.write(run_id)
+          except Exception as e:
+            print(f"[WandB] Notice: Could not write {id_file}: {e}")
+
+        root_id_file = os.path.join(output_dir, "wandb_run_id.txt")
+        try:
+          with open(root_id_file, "w") as f:
+            f.write(run_id)
+        except Exception as e:
+          print(f"[WandB] Notice: Could not write {root_id_file}: {e}")
+
+        hub_model_id = getattr(args, "hub_model_id", None)
+        push_to_hub = getattr(args, "push_to_hub", False)
+        if push_to_hub and hub_model_id and os.path.isfile(root_id_file):
+          try:
+            api = HfApi()
+            api.upload_file(
+                path_or_fileobj=root_id_file,
+                path_in_repo="wandb_run_id.txt",
+                repo_id=hub_model_id,
+                commit_message=(
+                    f"Update wandb_run_id at step {state.global_step}"
+                ),
+            )
+          except Exception:
+            pass
+
+
+#: The best/last publication rules live in their own module so they can be
+#: unit tested without importing the training stack.
+BEST_CHECKPOINT_SUBFOLDER = checkpoint_publication.BEST_CHECKPOINT_SUBFOLDER
+LAST_CHECKPOINT_SUBFOLDER = checkpoint_publication.LAST_CHECKPOINT_SUBFOLDER
+CHECKPOINT_MANIFEST_FILENAME = (
+    checkpoint_publication.CHECKPOINT_MANIFEST_FILENAME
 )
+CHECKPOINT_UPLOAD_IGNORE_PATTERNS = (
+    checkpoint_publication.CHECKPOINT_UPLOAD_IGNORE_PATTERNS
+)
+_step_from_checkpoint_dir = checkpoint_publication.step_from_checkpoint_dir
+
+
+class BestCheckpointArchiver(TrainerCallback):
+  """Keeps a rotation-proof copy of the best checkpoint's publishable files.
+
+  ``save_total_limit`` rotation and ``load_best_model_at_end=False`` can both
+  leave the best checkpoint deleted by the time training ends, which would
+  make it impossible to publish. This callback mirrors the best checkpoint
+  into a stable directory (``_best_checkpoint/`` inside ``output_dir``) every
+  time the best changes, copying only the files worth keeping.
+  """
+
+  ARCHIVE_DIRNAME = "_best_checkpoint"
+
+  def __init__(self):
+    self.archived_step: Optional[int] = None
+    self.archived_metric: Optional[float] = None
+    self.archive_dir: Optional[str] = None
+
+  def _archive(self, args: TrainingArguments, state: TrainerState) -> None:
+    """Mirrors ``state.best_model_checkpoint`` into the archive directory."""
+    best_ckpt = getattr(state, "best_model_checkpoint", None)
+    if not isinstance(best_ckpt, str) or not os.path.isdir(best_ckpt):
+      return
+
+    step = checkpoint_publication.coerce_step(
+        getattr(state, "best_global_step", None)
+    )
+    if step is None:
+      step = _step_from_checkpoint_dir(best_ckpt)
+    if step is not None and step == self.archived_step:
+      return
+
+    output_dir = getattr(args, "output_dir", None)
+    if not isinstance(output_dir, str) or not output_dir:
+      return
+
+    destination = os.path.join(output_dir, self.ARCHIVE_DIRNAME)
+    try:
+      if os.path.isdir(destination):
+        shutil.rmtree(destination)
+      shutil.copytree(
+          best_ckpt,
+          destination,
+          ignore=shutil.ignore_patterns(*CHECKPOINT_UPLOAD_IGNORE_PATTERNS),
+      )
+    except Exception as e:
+      print(f"[Checkpoint] Notice: could not archive best checkpoint: {e}")
+      return
+
+    self.archived_step = step
+    self.archived_metric = getattr(state, "best_metric", None)
+    self.archive_dir = destination
+    print(
+        f"[Checkpoint] Archived best checkpoint (step {step}) from "
+        f"{best_ckpt} so rotation cannot discard it."
+    )
+
+  def on_save(
+      self,
+      args: TrainingArguments,
+      state: TrainerState,
+      control: TrainerControl,
+      **kwargs,
+  ):
+    if getattr(state, "is_world_process_zero", True):
+      self._archive(args, state)
+
+  def on_train_end(
+      self,
+      args: TrainingArguments,
+      state: TrainerState,
+      control: TrainerControl,
+      **kwargs,
+  ):
+    if getattr(state, "is_world_process_zero", True):
+      self._archive(args, state)
 
 
 class Pipeline(abc.ABC):
-    """Abstract pipeline describing the training workflow.
+  """Abstract pipeline describing the training workflow.
 
-    Subclasses should implement each step. The public method `run` executes
-    the whole pipeline in order.
+  Subclasses should implement each step. The public method `run` executes
+  the whole pipeline in order.
+  """
+
+  #: Default floor for the cosine learning-rate schedule when
+  #: ``args.min_lr_ratio`` is unset. Overridden by :class:`PERLPipeline` to
+  #: :data:`_DEFAULT_PERL_MIN_LR_RATIO` (0.25).
+  _DEFAULT_MIN_LR_RATIO: float = 0.0
+
+  def __init__(self):
+    self.args = None
+    self.training_args = None
+    self.tokenizer: Optional[AutoTokenizer] = None
+    self.data: Optional[Any] = None
+    self.model: Optional[torch.nn.Module] = None
+    self.trainer: Optional[Any] = None
+    self.enable_lora: bool = False
+    self.lora_path: Optional[str] = None
+    self.vllm_model: Optional[str] = None
+    self.use_vllm: bool = False
+    self._best_archiver: Optional[BestCheckpointArchiver] = None
+    self._continual_stop_callback: Optional[ContinualEvalStopCallback] = None
+    #: Set by `setup_tokenizer`; see `src.model_compat.PaddingReport`. None
+    #: for the pipelines that need no tokenizer at all (generation).
+    self.padding_report: Optional[Any] = None
+
+  def _attach_lora(self, model: Any, lora_config: Any) -> Any:
+    """Wraps ``model`` in a LoRA adapter, model-family independently.
+
+    `peft.get_peft_model` looks the architecture up in a static table to
+    decide which modules to adapt, so a model family newer than the pinned
+    PEFT release fails with "Please specify target_modules". Routing every
+    call site through here means that failure mode is handled once, and that
+    `--lora_target_modules` works everywhere rather than in whichever
+    pipeline remembered to read it.
+
+    It is also where gradient checkpointing is made safe under LoRA. The
+    orchestrator turns `--gradient_checkpointing` on for any base model at or
+    above `src.orchestrator.accel.CHECKPOINT_THRESHOLD_B`, and the two do
+    not compose on their own: reentrant checkpointing only recomputes a
+    segment whose *inputs* require grad, and with a frozen base model nothing
+    upstream of the first adapter does. The backward pass then fails with
+    "element 0 of tensors does not require grad", or - worse, on some
+    versions - silently produces no adapter gradient at all.
+    `enable_input_require_grads` attaches a forward hook to the input
+    embeddings that flips `requires_grad` on their output, which is the
+    documented fix and a no-op when checkpointing is off.
+
+    Args:
+      model: The base model to adapt.
+      lora_config: The `peft.LoraConfig` to apply.
+
+    Returns:
+      The PEFT-wrapped model.
     """
-
-    def __init__(self):
-        self.args = None
-        self.training_args = None
-        self.tokenizer: Optional[AutoTokenizer] = None
-        self.data: Optional[Any] = None
-        self.model: Optional[torch.nn.Module] = None
-        self.trainer: Optional[Any] = None
-
-    def run(self, *cli_args, **cli_kwargs) -> None:
-        self.setup_arguments(*cli_args, **cli_kwargs)
-        self.setup_tokenizer()
-        self.load_data()
-        self.process_data()
-        self.setup_model()
-        self.setup_trainer()
-        self.run_and_save()
-
-    @abc.abstractmethod
-    def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
-        raise NotImplementedError()
-
-    def setup_tokenizer(self) -> None:
-        """
-        Default tokenizer loading uses self.args.model_repo_id or training args.
-        Subclasses may override if they need a different tokenizer setup.
-        """
-        model_repo = getattr(self.args, "model_repo_id", None) or getattr(
-            self.training_args, "sft_model_path", None
+    explicit = parse_target_modules(
+        getattr(getattr(self, "_lora_args", None), "lora_target_modules", None)
+    )
+    peft_model = safe_get_peft_model(
+        model,
+        lora_config,
+        get_peft_model_fn=get_peft_model,
+        explicit_target_modules=explicit,
+    )
+    if getattr(self.training_args, "gradient_checkpointing", False):
+      enable = getattr(peft_model, "enable_input_require_grads", None)
+      if callable(enable):
+        enable()
+        print(
+            "[LoRA] Gradient checkpointing is on: enabled input gradients so "
+            "the adapter still receives one."
         )
-        if model_repo is None:
-            raise ValueError("No model repo specified for tokenizer setup")
+      else:
+        print(
+            "[LoRA] Warning: gradient checkpointing is on but "
+            f"{type(peft_model).__name__} has no enable_input_require_grads; "
+            "if the backward pass raises 'element 0 of tensors does not "
+            "require grad', that is why."
+        )
+    return peft_model
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_repo,
-            padding_side="left",
+  def _training_callbacks(self) -> list[Any]:
+    """Builds the callback list shared by every training pipeline.
+
+    ``BestCheckpointArchiver`` is kept on the pipeline so that
+    ``_publish_best_and_last`` can find the archived best checkpoint even
+    after ``save_total_limit`` rotation has removed the original.
+
+    Returns:
+      The callbacks to hand to the trainer.
+    """
+    self._best_archiver = BestCheckpointArchiver()
+    return [WandbResumptionCallback(), self._best_archiver]
+
+  def run(self, *cli_args, **cli_kwargs) -> None:
+    self.setup_arguments(*cli_args, **cli_kwargs)
+    self.setup_tokenizer()
+    self.load_data()
+    self.process_data()
+    self._configure_warmup_steps()
+    self.setup_model()
+    self.setup_trainer()
+    self._configure_lr_scheduler()
+    self._configure_best_and_last_checkpoint_saving()
+    self.run_and_save()
+
+  def _configure_best_and_last_checkpoint_saving(self) -> None:
+    """Ensures both the best model and the final step checkpoint are saved locally, while Hugging Face Hub receives the best model."""
+    if self.trainer is None or self.training_args is None:
+      return
+    if getattr(self.training_args, "load_best_model_at_end", False) and getattr(
+        self.training_args, "save_strategy", "no"
+    ) != "no":
+      limit = getattr(self.training_args, "save_total_limit", None)
+      if limit is not None and int(limit) == 1:
+        self.training_args.save_total_limit = 2
+
+    orig_load_best_model = getattr(self.trainer, "_load_best_model", None)
+    if callable(orig_load_best_model):
+      trainer_ref = self.trainer
+      pipeline_ref = self
+
+      def _wrapped_load_best_model(*args, **kwargs):
+        stop_cb = getattr(pipeline_ref, "_continual_stop_callback", None)
+        if getattr(stop_cb, "stopped_for_continual_eval", False):
+          if getattr(trainer_ref.state, "is_world_process_zero", True):
+            print(
+                "[ContinualEval] Skipping best-model reload and checkpoint "
+                "pruning during intermediate continual evaluation pause."
+            )
+          return None
+        output_dir = getattr(trainer_ref.args, "output_dir", None)
+        global_step = getattr(trainer_ref.state, "global_step", 0)
+        last_ckpt_dir = None
+        if (
+            output_dir
+            and global_step > 0
+            and getattr(trainer_ref.args, "save_strategy", "no") != "no"
+        ):
+          last_ckpt_dir = os.path.join(output_dir, f"checkpoint-{global_step}")
+          has_saved_weights = os.path.isdir(last_ckpt_dir) and any(
+              os.path.isfile(os.path.join(last_ckpt_dir, fname))
+              for fname in (
+                  "adapter_config.json",
+                  "config.json",
+                  "adapter_model.safetensors",
+                  "model.safetensors",
+                  "pytorch_model.bin",
+              )
+          )
+          if not has_saved_weights:
+            if getattr(trainer_ref.state, "is_world_process_zero", True):
+              print(
+                  "[Checkpoint] Saving final step checkpoint "
+                  f"(step {global_step}) locally to "
+                  f"{last_ckpt_dir} before loading best model..."
+              )
+            os.makedirs(last_ckpt_dir, exist_ok=True)
+            trainer_ref.save_model(last_ckpt_dir)
+            if getattr(trainer_ref.state, "is_world_process_zero", True):
+              try:
+                trainer_ref.state.save_to_json(
+                    os.path.join(last_ckpt_dir, "trainer_state.json")
+                )
+              except Exception:
+                pass
+
+        result = orig_load_best_model(*args, **kwargs)
+
+        if (
+            output_dir
+            and getattr(trainer_ref.state, "is_world_process_zero", True)
+            and os.path.isdir(output_dir)
+        ):
+          best_ckpt = getattr(trainer_ref.state, "best_model_checkpoint", None)
+          best_ckpt_norm = os.path.abspath(best_ckpt) if best_ckpt else None
+          last_ckpt_norm = (
+              os.path.abspath(last_ckpt_dir) if last_ckpt_dir else None
+          )
+          limit_val = getattr(trainer_ref.args, "save_total_limit", None)
+          if limit_val is not None and int(limit_val) <= 2:
+            for item in os.listdir(output_dir):
+              if item.startswith("checkpoint-"):
+                cand_path = os.path.abspath(os.path.join(output_dir, item))
+                if (
+                    cand_path != best_ckpt_norm
+                    and cand_path != last_ckpt_norm
+                    and os.path.isdir(cand_path)
+                ):
+                  try:
+                    shutil.rmtree(cand_path)
+                  except Exception:
+                    pass
+        return result
+
+      setattr(self.trainer, "_load_best_model", _wrapped_load_best_model)
+
+  def _locate_best_checkpoint(self) -> tuple[Optional[str], Optional[int]]:
+    """Returns (directory, step) of the best checkpoint, or (None, None)."""
+    archiver = getattr(self, "_best_archiver", None)
+    archive_dir = getattr(archiver, "archive_dir", None)
+    if archive_dir and os.path.isdir(archive_dir):
+      return archive_dir, getattr(archiver, "archived_step", None)
+
+    state = getattr(self.trainer, "state", None) if self.trainer else None
+    best_ckpt = getattr(state, "best_model_checkpoint", None)
+    if isinstance(best_ckpt, str) and os.path.isdir(best_ckpt):
+      step = checkpoint_publication.coerce_step(
+          getattr(state, "best_global_step", None)
+      )
+      if step is None:
+        step = _step_from_checkpoint_dir(best_ckpt)
+      return best_ckpt, step
+    return None, None
+
+  def _locate_last_checkpoint(self) -> tuple[Optional[str], Optional[int]]:
+    """Returns (directory, step) of the final-step checkpoint."""
+    output_dir = getattr(self.training_args, "output_dir", None)
+    if not isinstance(output_dir, str) or not os.path.isdir(output_dir):
+      return None, None
+
+    state = getattr(self.trainer, "state", None) if self.trainer else None
+    global_step = checkpoint_publication.coerce_step(
+        getattr(state, "global_step", None)
+    )
+    if global_step is not None:
+      candidate = os.path.join(output_dir, f"checkpoint-{global_step}")
+      if os.path.isdir(candidate):
+        return candidate, global_step
+
+    # The expected directory is missing (training stopped on a step that was
+    # not a save step and nothing forced a final save); fall back to the
+    # highest-numbered checkpoint that does exist.
+    best_step = None
+    best_dir = None
+    for item in os.listdir(output_dir):
+      step = _step_from_checkpoint_dir(item)
+      if step is None:
+        continue
+      candidate = os.path.join(output_dir, item)
+      if os.path.isdir(candidate) and (best_step is None or step > best_step):
+        best_step, best_dir = step, candidate
+    return best_dir, best_step
+
+  def _publish_best_and_last(self, description: str = "model") -> None:
+    """Publishes the companion checkpoint and a manifest to the Hub.
+
+    The canonical checkpoint of a stage is already at the repository root
+    (``trainer.save_model(output_dir)`` followed by ``push_to_hub``): the best
+    one when ``load_best_model_at_end`` is set, the final-step one otherwise.
+    This method uploads *the other* one to a named subfolder so no information
+    is discarded, and writes ``checkpoints.json`` recording which is which.
+
+    Failures are reported but never raised: the root checkpoint - the artifact
+    the campaign actually depends on - has already been pushed at this point,
+    and losing an expensive training run over a flaky companion upload would
+    be far worse than losing the companion.
+
+    Args:
+      description: Human-readable stage name used in log lines.
+    """
+    if self.training_args is None:
+      return
+    if not getattr(self.training_args, "push_to_hub", False):
+      return
+    hub_model_id = getattr(self.training_args, "hub_model_id", None)
+    if not hub_model_id:
+      return
+    state = getattr(self.trainer, "state", None) if self.trainer else None
+    if state is not None and not getattr(state, "is_world_process_zero", True):
+      return
+    output_dir = getattr(self.training_args, "output_dir", None)
+    if not isinstance(output_dir, str) or not os.path.isdir(output_dir):
+      return
+
+    root_is_best = bool(
+        getattr(self.training_args, "load_best_model_at_end", False)
+    )
+    best_dir, best_step = self._locate_best_checkpoint()
+    last_dir, last_step = self._locate_last_checkpoint()
+    plan = checkpoint_publication.plan_publication(
+        root_is_best=root_is_best,
+        best_dir=best_dir,
+        best_step=best_step,
+        last_dir=last_dir,
+        last_step=last_step,
+    )
+
+    api = HfApi()
+    published_companion = False
+    if plan.companion_name:
+      companion_name = plan.companion_name
+      companion_dir = plan.companion_dir
+      companion_step = plan.companion_step
+      try:
+        _push_to_hub_with_retry(
+            lambda: api.upload_folder(
+                folder_path=companion_dir,
+                path_in_repo=companion_name,
+                repo_id=hub_model_id,
+                ignore_patterns=list(CHECKPOINT_UPLOAD_IGNORE_PATTERNS),
+                commit_message=(
+                    f"Add {companion_name} checkpoint"
+                    f"{f' (step {companion_step})' if companion_step else ''}"
+                ),
+            ),
+            description=f"{description} {companion_name} checkpoint push",
+        )
+        published_companion = True
+        print(
+            f"[Checkpoint] Published {companion_name} checkpoint"
+            f"{f' (step {companion_step})' if companion_step else ''} to "
+            f"{hub_model_id}:{companion_name}"
+        )
+      except Exception as e:
+        print(
+            f"[Checkpoint] Warning: could not publish the {companion_name} "
+            f"checkpoint to {hub_model_id}: {e}. The root checkpoint is "
+            "unaffected."
         )
 
-        # Some models don't have pad token
-        if "pad_token" not in self.tokenizer.special_tokens_map.keys():
-            self.tokenizer.pad_token = self.tokenizer.unk_token
+    manifest = checkpoint_publication.build_manifest(
+        plan,
+        best_step=best_step,
+        last_step=last_step,
+        companion_published=published_companion,
+        metric_for_best_model=getattr(
+            self.training_args, "metric_for_best_model", None
+        ),
+        greater_is_better=getattr(
+            self.training_args, "greater_is_better", None
+        ),
+        best_metric=getattr(state, "best_metric", None) if state else None,
+    )
 
-    @abc.abstractmethod
-    def load_data(self) -> None:
-        raise NotImplementedError()
+    manifest_path = os.path.join(output_dir, CHECKPOINT_MANIFEST_FILENAME)
+    try:
+      with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+      _push_to_hub_with_retry(
+          lambda: api.upload_file(
+              path_or_fileobj=manifest_path,
+              path_in_repo=CHECKPOINT_MANIFEST_FILENAME,
+              repo_id=hub_model_id,
+              commit_message="Update checkpoint manifest",
+          ),
+          description=f"{description} checkpoint manifest push",
+      )
+    except Exception as e:
+      print(f"[Checkpoint] Warning: could not publish the manifest: {e}")
 
-    @abc.abstractmethod
-    def process_data(self) -> None:
-        raise NotImplementedError()
+  def _setup_wandb_resumption(self) -> None:
+    """Inspects resume_from_checkpoint (local or HF Hub) and output_dir to restore WandB run ID."""
+    if self.training_args is None:
+      return
 
-    @abc.abstractmethod
-    def setup_model(self) -> None:
-        raise NotImplementedError()
+    resume_ckpt = getattr(self.training_args, "resume_from_checkpoint", None)
+    if not resume_ckpt or resume_ckpt in (
+        False,
+        "False",
+        "false",
+        "None",
+        "none",
+        "no",
+    ):
+      return
 
-    @abc.abstractmethod
-    def setup_trainer(self) -> None:
-        raise NotImplementedError()
+    is_auto = resume_ckpt in (True, "True", "true", "auto", "AUTO")
+    if is_auto and os.environ.get("WANDB_SWEEP_ID"):
+      return
 
-    @abc.abstractmethod
-    def run_and_save(self) -> None:
-        raise NotImplementedError()
+    output_dir = getattr(self.training_args, "output_dir", None)
+    hub_model_id = getattr(self.training_args, "hub_model_id", None)
+
+    search_dirs = []
+    if isinstance(resume_ckpt, str) and os.path.isdir(resume_ckpt):
+      search_dirs.append(resume_ckpt)
+      parent_dir = os.path.dirname(os.path.normpath(resume_ckpt))
+      if parent_dir and os.path.isdir(parent_dir):
+        search_dirs.append(parent_dir)
+    elif is_auto and output_dir and os.path.isdir(output_dir):
+      search_dirs.append(output_dir)
+
+    # 1. Search local directories first
+    for d in search_dirs:
+      id_file = os.path.join(d, "wandb_run_id.txt")
+      if os.path.isfile(id_file):
+        try:
+          with open(id_file, "r") as f:
+            saved_run_id = f.read().strip()
+          if saved_run_id:
+            os.environ["WANDB_RUN_ID"] = saved_run_id
+            os.environ["WANDB_RESUME"] = "allow"
+            print(
+                f"[WandB] Restored run ID '{saved_run_id}' with resume='allow'"
+                f" from local: {id_file}"
+            )
+            return
+        except Exception as e:
+          print(f"[WandB] Notice: could not read {id_file}: {e}")
+
+    # 2. Check Hugging Face Hub if resume_ckpt is a HF reference or hub_model_id is set
+    hf_candidates = []
+    if (
+        isinstance(resume_ckpt, str)
+        and not os.path.isdir(resume_ckpt)
+        and not is_auto
+    ):
+      repo_id, subfolder, revision = parse_hf_repo_reference(resume_ckpt)
+      if repo_id:
+        hf_candidates.append((repo_id, subfolder, revision))
+    elif is_auto and hub_model_id and isinstance(hub_model_id, str):
+      repo_id, subfolder, revision = parse_hf_repo_reference(hub_model_id)
+      if repo_id and (repo_id, subfolder, revision) not in hf_candidates:
+        hf_candidates.append((repo_id, subfolder, revision))
+
+    for repo_id, subfolder, revision in hf_candidates:
+      try:
+        filenames_to_try = []
+        if subfolder:
+          filenames_to_try.append(f"{subfolder}/wandb_run_id.txt")
+        filenames_to_try.append("wandb_run_id.txt")
+
+        for fname in filenames_to_try:
+          try:
+            downloaded_file = hf_hub_download(
+                repo_id=repo_id,
+                filename=fname,
+                revision=revision,
+            )
+            if os.path.isfile(downloaded_file):
+              with open(downloaded_file, "r") as f:
+                saved_run_id = f.read().strip()
+              if saved_run_id:
+                os.environ["WANDB_RUN_ID"] = saved_run_id
+                os.environ["WANDB_RESUME"] = "allow"
+                print(
+                    f"[WandB] Restored run ID '{saved_run_id}' with"
+                    f" resume='allow' from Hugging Face Hub: {repo_id}/{fname}"
+                )
+                return
+          except Exception:
+            continue
+      except Exception as e:
+        print(
+            "[WandB] Notice: Could not fetch wandb_run_id.txt from HF Hub"
+            f" ({repo_id}): {e}"
+        )
+
+  def _download_hf_checkpoint(
+      self,
+      repo_id: str,
+      subfolder: Optional[str] = None,
+      revision: Optional[str] = None,
+  ) -> Optional[str]:
+    """Downloads a checkpoint snapshot from Hugging Face Hub and returns the local directory path."""
+    try:
+      print(
+          f"Downloading checkpoint from Hugging Face Hub: repo_id='{repo_id}'"
+          f"{f', subfolder={subfolder}' if subfolder else ''}"
+          f"{f', revision={revision}' if revision else ''}..."
+      )
+      downloaded_dir = snapshot_download(
+          repo_id=repo_id,
+          revision=revision,
+      )
+
+      target_dir = checkpoint_publication.resolve_checkpoint_subfolder(
+          downloaded_dir, subfolder
+      )
+
+      if not os.path.isdir(target_dir):
+        print(
+            f"Subfolder '{subfolder}' not found in downloaded repo '{repo_id}'."
+            f" Using root directory: {downloaded_dir}"
+        )
+        target_dir = downloaded_dir
+
+      # Check if target_dir has nested checkpoint-XXX folders
+      try:
+        last_ckpt = get_last_checkpoint(target_dir)
+      except Exception:
+        last_ckpt = None
+
+      if last_ckpt is not None:
+        print(
+            f"Found latest checkpoint in Hugging Face Hub repo '{repo_id}':"
+            f" {last_ckpt}"
+        )
+        resolved_path = last_ckpt
+      else:
+        print(
+            "Using checkpoint directory from Hugging Face Hub repo"
+            f" '{repo_id}': {target_dir}"
+        )
+        resolved_path = target_dir
+
+      # Update WandB resumption with any wandb_run_id.txt found in the downloaded files
+      self._setup_wandb_resumption()
+
+      return resolved_path
+
+    except Exception as e:
+      print(
+          f"Error downloading checkpoint from Hugging Face Hub ({repo_id}): {e}"
+      )
+      return None
+
+  def _resolve_lora_adapter_path(
+      self,
+      adapter_path_or_repo: Optional[str],
+      base_model_id: Optional[str] = None,
+  ) -> tuple[bool, Optional[str]]:
+    """Resolves whether a model reference requires LoRA and its directory path containing adapter_config.json.
+
+    Supports:
+    - None or empty string -> (False, None)
+    - Base model repository ID (equal to base_model_id) -> (False, None)
+    - Local directory with adapter_config.json directly -> (True, local_dir)
+    - Local run directory with checkpoint-XXX subfolders -> (True,
+    checkpoint_dir)
+    - Hugging Face Hub repository with adapter_config.json at root -> (True,
+    downloaded_dir)
+    - Hugging Face Hub repository with subfolders or checkpoint-XXX -> (True,
+    target_dir)
+
+    Returns:
+        (enable_lora, resolved_adapter_path)
+    """
+    if not adapter_path_or_repo or not str(adapter_path_or_repo).strip():
+      return False, None
+
+    cleaned_ref = str(adapter_path_or_repo).strip()
+    if cleaned_ref.lower() in ("none", "false", "null", "no", '""', "''"):
+      return False, None
+    if cleaned_ref.endswith("/") and "/" not in cleaned_ref[:-1]:
+      return False, None
+
+    if base_model_id and cleaned_ref == str(base_model_id).strip():
+      return False, None
+
+    # 1. Check if it's an existing local directory (or local :best / :last role)
+    local_dir = checkpoint_publication.resolve_local_checkpoint_dir(cleaned_ref)
+    if local_dir is not None and os.path.isdir(local_dir):
+      if os.path.isfile(os.path.join(local_dir, "adapter_config.json")):
+        return True, local_dir
+      try:
+        last_ckpt = get_last_checkpoint(local_dir)
+      except Exception:
+        last_ckpt = None
+      if last_ckpt and os.path.isfile(
+          os.path.join(last_ckpt, "adapter_config.json")
+      ):
+        return True, last_ckpt
+      adapter_files = sorted(
+          p
+          for p in glob.glob(
+              os.path.join(local_dir, "**/adapter_config.json"),
+              recursive=True,
+          )
+          if os.path.basename(os.path.dirname(p)) != "ref"
+      )
+      if adapter_files:
+        return True, os.path.dirname(adapter_files[-1])
+      return False, local_dir
+
+    # 2. Check Hugging Face Hub repo reference
+    repo_id, subfolder, revision = parse_hf_repo_reference(cleaned_ref)
+    if repo_id:
+      try:
+        print(
+            "Resolving/downloading adapter checkpoint from HF Hub:"
+            f" repo_id='{repo_id}'"
+            f"{f', subfolder={subfolder}' if subfolder else ''}"
+            f"{f', revision={revision}' if revision else ''}..."
+        )
+        downloaded_dir = snapshot_download(
+            repo_id=repo_id,
+            revision=revision,
+            allow_patterns=["*.json", "*.safetensors", "*.bin"],
+        )
+        target_dir = checkpoint_publication.resolve_checkpoint_subfolder(
+            downloaded_dir, subfolder
+        )
+        if os.path.isdir(target_dir):
+          if os.path.isfile(os.path.join(target_dir, "adapter_config.json")):
+            return True, target_dir
+          try:
+            last_ckpt = get_last_checkpoint(target_dir)
+          except Exception:
+            last_ckpt = None
+          if last_ckpt and os.path.isfile(
+              os.path.join(last_ckpt, "adapter_config.json")
+          ):
+            return True, last_ckpt
+          adapter_files = sorted(
+              p
+              for p in glob.glob(
+                  os.path.join(target_dir, "**/adapter_config.json"),
+                  recursive=True,
+              )
+              if os.path.basename(os.path.dirname(p)) != "ref"
+          )
+          if adapter_files:
+            return True, os.path.dirname(adapter_files[-1])
+          return False, target_dir
+        return True, downloaded_dir
+      except Exception as e:
+        print(
+            f"Warning: Could not resolve/download HF Hub repo '{repo_id}': {e}"
+        )
+        return False, None
+
+    return False, None
+
+  def _resolve_resume_checkpoint(self) -> Optional[str]:
+    """Resolves the checkpoint path to resume from (supporting local paths, auto-discovery, and Hugging Face Hub repos)."""
+    if self.training_args is None:
+      return None
+
+    resume_arg = getattr(self.training_args, "resume_from_checkpoint", None)
+    if (
+        resume_arg is None
+        or resume_arg is False
+        or str(resume_arg).lower() in ("false", "none", "0", "")
+    ):
+      return None
+
+    output_dir = getattr(self.training_args, "output_dir", None)
+    hub_model_id = getattr(self.training_args, "hub_model_id", None)
+
+    # 1. Handle boolean / auto / latest flags
+    if isinstance(resume_arg, bool) or str(resume_arg).lower() in (
+        "true",
+        "auto",
+        "latest",
+        "1",
+    ):
+      # First try local output_dir
+      if output_dir and os.path.isdir(output_dir):
+        try:
+          last_ckpt = get_last_checkpoint(output_dir)
+        except Exception:
+          last_ckpt = None
+        if last_ckpt is not None:
+          print(f"Resuming training from latest local checkpoint: {last_ckpt}")
+          return last_ckpt
+
+      # If not found locally, try hub_model_id on Hugging Face Hub
+      if hub_model_id and isinstance(hub_model_id, str):
+        repo_id, subfolder, revision = parse_hf_repo_reference(hub_model_id)
+        if repo_id:
+          print(
+              "No local checkpoint in output_dir. Attempting to download"
+              f" latest checkpoint from Hugging Face Hub repo '{repo_id}'..."
+          )
+          hf_ckpt = self._download_hf_checkpoint(repo_id, subfolder, revision)
+          if hf_ckpt is not None:
+            return hf_ckpt
+
+      print(
+          f"No checkpoint found in output_dir '{output_dir}'. Starting"
+          " training from scratch."
+      )
+      return None
+
+    # 2. Handle string path or Hugging Face Hub repo reference
+    if isinstance(resume_arg, str):
+      # If it is an existing local directory (or local :best / :last role):
+      local_resume_dir = checkpoint_publication.resolve_local_checkpoint_dir(
+          resume_arg
+      )
+      if local_resume_dir is not None and os.path.isdir(local_resume_dir):
+        try:
+          last_ckpt = get_last_checkpoint(local_resume_dir)
+        except Exception:
+          last_ckpt = None
+        if last_ckpt is not None and last_ckpt != local_resume_dir:
+          print(
+              f"Resuming training from checkpoint found in '{resume_arg}':"
+              f" {last_ckpt}"
+          )
+          return last_ckpt
+        return local_resume_dir
+
+      # If it's not a local directory, check if it's a Hugging Face Hub path/repo
+      repo_id, subfolder, revision = parse_hf_repo_reference(resume_arg)
+      if repo_id:
+        print(
+            f"Fetching checkpoint from Hugging Face Hub: repo_id='{repo_id}'"
+            f"{f', subfolder={subfolder}' if subfolder else ''}"
+            f"{f', revision={revision}' if revision else ''}..."
+        )
+        hf_ckpt = self._download_hf_checkpoint(repo_id, subfolder, revision)
+        if hf_ckpt is not None:
+          return hf_ckpt
+
+      print(
+          f"Specified checkpoint '{resume_arg}' was not found locally or on"
+          " Hugging Face Hub. Starting from scratch."
+      )
+      return None
+
+    return None
+
+  def _configure_warmup_steps(self) -> None:
+    """Compute and set warmup_steps from warmup_ratio to avoid HF deprecation warnings."""
+    if self.training_args is None:
+      return
+
+    warmup_ratio = getattr(self.training_args, "warmup_ratio", 0.0)
+    if warmup_ratio is None or warmup_ratio <= 0:
+      warmup_ratio = getattr(self.args, "warmup_ratio", 0.0) or 0.0
+
+    if warmup_ratio > 0:
+      if getattr(self.training_args, "warmup_steps", 0) <= 0:
+        train_dataset = (
+            self.data["train"]
+            if isinstance(self.data, dict) and "train" in self.data
+            else None
+        )
+        if train_dataset is not None:
+          train_size = len(train_dataset)
+          batch_size = getattr(
+              self.training_args, "per_device_train_batch_size", 1
+          )
+          grad_accum = getattr(
+              self.training_args, "gradient_accumulation_steps", 1
+          )
+          epochs = getattr(self.training_args, "num_train_epochs", 1)
+          world_size = getattr(self.training_args, "world_size", 1)
+          if world_size <= 0:
+            world_size = (
+                torch.cuda.device_count() if torch.cuda.is_available() else 1
+            )
+          steps_per_epoch = max(
+              1, int(train_size / (batch_size * world_size * grad_accum))
+          )
+          total_steps = max(1, int(steps_per_epoch * epochs))
+          self.training_args.warmup_steps = max(
+              1, int(total_steps * warmup_ratio)
+          )
+      if hasattr(self.training_args, "warmup_ratio"):
+        self.training_args.warmup_ratio = 0.0
+
+  def _configure_lr_scheduler(self) -> None:
+    """Configures a cosine learning-rate floor on ``self.trainer`` when requested.
+
+    Standard cosine decay drives the learning rate to ``0.0`` at the final
+    step, which makes late-epoch PE-RL policy updates vanishingly small. When
+    ``lr_scheduler_type`` is cosine and the resolved ``min_lr_ratio`` is
+    positive (defaulting to ``0.25`` for PE-RL, i.e. 25% of the post-warmup
+    peak learning rate), this wraps ``trainer.create_scheduler`` so that
+    Hugging Face ``Trainer`` / ``RLOOTrainer`` builds a PyTorch ``LambdaLR``
+    with linear warmup to peak LR and cosine decay to
+    ``min_lr_ratio * peak_lr``.
+    """
+    if self.trainer is None or self.training_args is None:
+      return
+    configured = getattr(self.trainer, "_cosine_min_lr_configured", False)
+    if isinstance(configured, bool) and configured:
+      return
+
+    min_lr_ratio = _resolve_min_lr_ratio(
+        self.args, default=self._DEFAULT_MIN_LR_RATIO
+    )
+    if min_lr_ratio <= 0.0:
+      return
+
+    sched_type = getattr(self.training_args, "lr_scheduler_type", None)
+    if not _is_cosine_scheduler_type(sched_type):
+      return
+
+    trainer_ref = self.trainer
+    training_args_ref = self.training_args
+
+    def _create_cosine_with_min_lr_scheduler(
+        num_training_steps: int, optimizer: Any = None
+    ) -> Any:
+      if getattr(trainer_ref, "lr_scheduler", None) is None:
+        opt = (
+            getattr(trainer_ref, "optimizer", None)
+            if optimizer is None
+            else optimizer
+        )
+        args_obj = getattr(trainer_ref, "args", None) or training_args_ref
+        num_warmup_steps = _resolve_num_warmup_steps(
+            args_obj, num_training_steps
+        )
+        trainer_ref.lr_scheduler = build_cosine_with_min_lr_scheduler(
+            optimizer=opt,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps,
+            min_lr_ratio=min_lr_ratio,
+        )
+        trainer_ref._created_lr_scheduler = True
+      return trainer_ref.lr_scheduler
+
+    self.trainer.create_scheduler = _create_cosine_with_min_lr_scheduler
+    self.trainer._cosine_min_lr_configured = True
+    self.trainer._min_lr_ratio = min_lr_ratio
+
+  @abc.abstractmethod
+  def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
+    raise NotImplementedError()
+
+  def setup_tokenizer(self) -> None:
+    """Default tokenizer loading uses self.args.model_repo_id or training args.
+
+    Subclasses may override if they need a different tokenizer setup.
+    """
+    model_repo = getattr(self.args, "model_repo_id", None) or getattr(
+        self.training_args, "sft_model_path", None
+    )
+    if model_repo is None:
+      raise ValueError("No model repo specified for tokenizer setup")
+
+    self.tokenizer = AutoTokenizer.from_pretrained(
+        model_repo,
+        padding_side="left",
+    )
+
+    # Pad-token selection is model-family dependent (Gemma ships one, Qwen
+    # reuses <|endoftext|>, Mistral ships none) and the choice has
+    # consequences beyond padding, so it lives in one place.
+    self.padding_report = configure_tokenizer_padding(self.tokenizer)
+
+  @abc.abstractmethod
+  def load_data(self) -> None:
+    raise NotImplementedError()
+
+  @abc.abstractmethod
+  def process_data(self) -> None:
+    raise NotImplementedError()
+
+  @abc.abstractmethod
+  def setup_model(self) -> None:
+    raise NotImplementedError()
+
+  @abc.abstractmethod
+  def setup_trainer(self) -> None:
+    raise NotImplementedError()
+
+  @abc.abstractmethod
+  def run_and_save(self) -> None:
+    raise NotImplementedError()
+
+
+def _push_to_hub_with_retry(
+    push_fn: Any,
+    description: str = "Hugging Face Hub push",
+    attempts: int = 3,
+    base_delay_s: float = 5.0,
+) -> Any:
+  """Retries a push_to_hub operation with exponential backoff on transient errors."""
+  for attempt in range(1, attempts + 1):
+    try:
+      return push_fn()
+    except Exception as e:
+      if attempt == attempts:
+        print(f"[Hub Push] Failed after {attempts} attempts: {e}")
+        raise
+      delay = base_delay_s * (2 ** (attempt - 1))
+      print(
+          f"[Hub Push] Warning: {description} failed (attempt {attempt}/{attempts}): {e}. "
+          f"Retrying in {delay:.0f}s..."
+      )
+      time.sleep(delay)
 
 
 class SFTPipeline(Pipeline):
-    """Pipeline for supervised fine-tuning (writer_sft.py)."""
+  """Pipeline for supervised fine-tuning (writer_sft.py)."""
 
-    def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
-        parser_lora = create_lora_argument_parser()
-        lora_args, remaining_args = parser_lora.parse_known_args()
-        parser = TrlParser((ScriptArguments, SFTConfig))
-        script_args, training_args = parser.parse_args_into_dataclasses(
-            remaining_args
+  def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
+    clean_args = _clean_cli_args(cli_args)
+    parser_lora = create_lora_argument_parser()
+    lora_args, remaining_args = parser_lora.parse_known_args(clean_args)
+    clean_remaining = [a for a in remaining_args if a != "--"]
+    parser = HfArgumentParser((ScriptArguments, SFTConfig))
+    script_args, training_args = parser.parse_args_into_dataclasses(
+        clean_remaining
+    )
+
+    self.args = script_args
+    self.training_args = training_args
+    set_seed(training_args.seed)
+    # keep lora config object around for setup_model
+    self._lora_args = lora_args
+
+    task = script_args.task_name or "sft"
+    lr = training_args.learning_rate
+    r = getattr(lora_args, "lora_r", None)
+    epochs = getattr(training_args, "num_train_epochs", None)
+    run_name_parts = [f"{task}_SFT", f"lr{lr:.1e}"]
+    if r is not None:
+      run_name_parts.append(f"r{r}")
+    if epochs is not None:
+      run_name_parts.append(f"epo{epochs}")
+    run_name = "_".join(run_name_parts)
+    if (
+        not training_args.run_name
+        or "sweep" in str(training_args.run_name).lower()
+    ):
+      self.training_args.run_name = run_name
+    if wandb is not None and getattr(wandb, "run", None) is not None:
+      wandb.run.name = run_name
+    self._setup_wandb_resumption()
+
+  def load_data(self) -> None:
+    train_dataset = load_dataset(self.args.dataset_repo_id, split="train")
+    test_dataset = load_dataset(self.args.dataset_repo_id, split="test")
+    if "labels" in train_dataset.column_names and "completion" in train_dataset.column_names:
+      train_dataset = train_dataset.remove_columns(["labels"])
+    if "labels" in test_dataset.column_names and "completion" in test_dataset.column_names:
+      test_dataset = test_dataset.remove_columns(["labels"])
+
+    if len(train_dataset) == 0:
+      raise RuntimeError(
+          f"SFT training dataset '{self.args.dataset_repo_id}' has 0 samples in "
+          f"split='train'. Please re-run './scripts/data_processing.sh "
+          f"{self.args.task_name}' to regenerate and re-upload the dataset."
+      )
+
+    if (
+        getattr(self.args, "sft_data_fraction", None) is not None
+        and 0.0 < self.args.sft_data_fraction < 1.0
+    ):
+      train_dataset = train_dataset.shuffle(seed=self.training_args.seed)
+      num_samples = max(1, int(len(train_dataset) * self.args.sft_data_fraction))
+      train_dataset = train_dataset.select(range(num_samples))
+
+    self.data = {
+        "train": train_dataset,
+        "test": test_dataset,
+    }
+
+  def process_data(self) -> None:
+    # lora config created from parsed args
+    self._lora_config = LoraConfig(
+        task_type=self._lora_args.task_type,
+        peft_type=self._lora_args.peft_type,
+        r=self._lora_args.lora_r,
+        lora_alpha=self._lora_args.lora_alpha,
+        lora_dropout=self._lora_args.lora_dropout,
+    )
+
+    processor_cls = get_task_processor(self.args.task_name)
+
+    fewshot_examples = None
+    if (
+        self.args.task_name == "npov"
+        and self.args.num_fewshot is not None
+        and self.args.num_fewshot > 0
+    ):
+      fewshot_examples = (
+          self.data["train"]
+          .shuffle(seed=self.training_args.seed)
+          .select(range(self.args.num_fewshot))
+      )
+
+    formatting_prompts_func, response_template = (
+        processor_cls.get_formatting_prompts_and_response_template(
+            eos_token=self.tokenizer.eos_token,
+            fewshot_examples=fewshot_examples,
+            model_repo_id=self.args.model_repo_id,
         )
+    )
 
-        self.args = script_args
-        self.training_args = training_args
-        set_seed(training_args.seed)
-        # keep lora config object around for setup_model
-        self._lora_args = lora_args
+    self.formatting_prompts_func = formatting_prompts_func
+    self.response_template = response_template
 
-    def load_data(self) -> None:
-        self.data = {
-            "train": load_dataset(self.args.dataset_repo_id, split="train"),
-            "test": load_dataset(self.args.dataset_repo_id, split="test"),
-        }
+  def setup_model(self) -> None:
+    model = AutoModelForCausalLM.from_pretrained(
+        self.args.model_repo_id,
+        torch_dtype=torch.bfloat16,
+    )
 
-    def process_data(self) -> None:
-        # task-specific processor
-        # lora config created from parsed args
-        self._lora_config = LoraConfig(
-            task_type=self._lora_args.task_type,
-            peft_type=self._lora_args.peft_type,
-            r=self._lora_args.lora_r,
-            lora_alpha=self._lora_args.lora_alpha,
-            lora_dropout=self._lora_args.lora_dropout,
-        )
+    # Ensure pad token is set
+    if self.tokenizer.pad_token_id is not None:
+      model.config.pad_token_id = self.tokenizer.pad_token_id
 
-        processor_cls = get_task_processor(self.args.task_name)
+    self.model = self._attach_lora(model, self._lora_config)
+    self.model.to(torch.bfloat16)
 
-        fewshot_examples = None
-        if (
-            self.args.task_name == "npov"
-            and self.args.num_fewshot is not None
-            and self.args.num_fewshot > 0
-        ):
-            fewshot_examples = (
-                self.data["train"]
-                .shuffle(seed=self.training_args.seed)
-                .select(range(self.args.num_fewshot))
-            )
+  def setup_trainer(self) -> None:
+    self.trainer = SFTTrainer(
+        model=self.model,
+        args=self.training_args,
+        train_dataset=self.data["train"],
+        eval_dataset=self.data["test"],
+        processing_class=self.tokenizer,
+        callbacks=self._training_callbacks(),
+    )
 
-        formatting_prompts_func, response_template = (
-            processor_cls.get_formatting_prompts_and_response_template(
-                eos_token=self.tokenizer.eos_token,
-                fewshot_examples=fewshot_examples,
-                model_repo_id=self.args.model_repo_id,
-            )
-        )
-
-        response_template_ids = self.tokenizer.encode(
-            response_template, add_special_tokens=False
-        )
-        self.data_collator = DataCollatorForCompletionOnlyLM(
-            response_template_ids, tokenizer=self.tokenizer
-        )
-
-        # expose formatting func for trainer
-        self.formatting_prompts_func = formatting_prompts_func
-
-    def setup_model(self) -> None:
-        model = AutoModelForCausalLM.from_pretrained(
-            self.args.model_repo_id,
-            attn_implementation="eager",
-            torch_dtype=torch.bfloat16,
-        )
-
-        # If pad token was added, need to resize embeddings.
-        if "pad_token" not in self.tokenizer.special_tokens_map.keys():
-            model.config.pad_token_id = self.tokenizer.pad_token_id
-
-        self.model = get_peft_model(model, self._lora_config)
-
-    def setup_trainer(self) -> None:
-        self.trainer = SFTTrainer(
-            self.model,
-            args=self.training_args,
-            # data_collator=self.data_collator,
-            train_dataset=self.data["train"],
-            eval_dataset=self.data["test"],
-            processing_class=self.tokenizer,
-            # formatting_func=self.formatting_prompts_func,
-        )
-
-    def run_and_save(self) -> None:
-        self.trainer.train()
-        self.trainer.push_to_hub()
+  def run_and_save(self) -> None:
+    resume_ckpt = self._resolve_resume_checkpoint()
+    self.trainer.train(resume_from_checkpoint=resume_ckpt)
+    if getattr(self.training_args, "output_dir", None):
+      self.trainer.save_model(self.training_args.output_dir)
+    if getattr(self.training_args, "push_to_hub", False):
+      _push_to_hub_with_retry(
+          self.trainer.push_to_hub, description="SFT model push"
+      )
+      self._publish_best_and_last(description="SFT")
 
 
 class RewardModelPipeline(Pipeline):
-    """Pipeline for reward model training (reward_model.py)."""
+  """Pipeline for reward model training (reward_model.py)."""
 
-    def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
-        parser_lora = create_lora_argument_parser()
-        lora_args, remaining_args = parser_lora.parse_known_args()
+  def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
+    clean_args = _clean_cli_args(cli_args)
+    parser_lora = create_lora_argument_parser()
+    lora_args, remaining_args = parser_lora.parse_known_args(clean_args)
 
-        parser = HfArgumentParser(
-            (ScriptArguments, LLMSynthScriptArguments, TrainingArguments)
-        )
-        script_args, llm_synth_args, training_args = (
-            parser.parse_args_into_dataclasses(remaining_args)
-        )
+    parser = HfArgumentParser(
+        (ScriptArguments, LLMSynthScriptArguments, TrainingArguments)
+    )
+    clean_remaining = [a for a in remaining_args if a != "--"]
+    script_args, llm_synth_args, training_args = (
+        parser.parse_args_into_dataclasses(clean_remaining)
+    )
 
-        self.args = script_args
-        self._llm_synth_args = llm_synth_args
-        self.training_args = training_args
-        self._lora_args = lora_args
-        set_seed(training_args.seed)
+    self.args = script_args
+    self._llm_synth_args = llm_synth_args
+    self.training_args = training_args
+    self._lora_args = lora_args
+    set_seed(training_args.seed)
 
-    def load_data(self) -> None:
-        self.data = load_dataset(self.args.dataset_repo_id)
+    task = script_args.task_name or "rm"
+    lr = training_args.learning_rate
+    r = getattr(lora_args, "lora_r", None)
+    epochs = getattr(training_args, "num_train_epochs", None)
+    run_name_parts = [f"{task}_RM", f"lr{lr:.1e}"]
+    if r is not None:
+      run_name_parts.append(f"r{r}")
+    if epochs is not None:
+      run_name_parts.append(f"epo{epochs}")
+    run_name = "_".join(run_name_parts)
+    if (
+        not training_args.run_name
+        or "sweep" in str(training_args.run_name).lower()
+    ):
+      self.training_args.run_name = run_name
+    if wandb is not None and getattr(wandb, "run", None) is not None:
+      wandb.run.name = run_name
+    self._setup_wandb_resumption()
 
-    def process_data(self) -> None:
-        self._lora_config = LoraConfig(
-            r=self._lora_args.lora_r,
-            lora_alpha=self._lora_args.lora_alpha,
-            lora_dropout=self._lora_args.lora_dropout,
-            task_type=self._lora_args.task_type,
-            peft_type=self._lora_args.peft_type,
-        )
+  def load_data(self) -> None:
+    self.data = load_dataset(self.args.dataset_repo_id)
 
-        data_collator = DataCollatorWithPadding(tokenizer=self.tokenizer)
-        self.data_collator = data_collator
+  def process_data(self) -> None:
+    self._lora_config = LoraConfig(
+        r=self._lora_args.lora_r,
+        lora_alpha=self._lora_args.lora_alpha,
+        lora_dropout=self._lora_args.lora_dropout,
+        task_type=self._lora_args.task_type,
+        peft_type=self._lora_args.peft_type,
+    )
 
-        if self.training_args.fp16:
-            self.torch_dtype = torch.float16
-        elif self.training_args.bf16:
-            self.torch_dtype = torch.bfloat16
-        else:
-            raise Exception("Not training in mixed precision!")
+    data_collator = DataCollatorWithPadding(tokenizer=self.tokenizer)
+    self.data_collator = data_collator
 
-        # Possibly augment dataset for synthetic_llm cases using the task
-        # processor extension point.
-        processor_cls = get_task_processor(self.args.task_name)
+    if self.training_args.fp16:
+      self.torch_dtype = torch.float16
+    elif self.training_args.bf16:
+      self.torch_dtype = torch.bfloat16
+    else:
+      raise Exception("Not training in mixed precision!")
 
-        self.data["train"] = processor_cls.augment_training_split(
-            self.data["train"],
-            self._llm_synth_args,
-            self.training_args,
-            self.args.dataset_repo_id,
-        )
+    # Possibly augment dataset for synthetic_llm cases using the task
+    # processor extension point.
+    processor_cls = get_task_processor(self.args.task_name)
 
-        # Tokenize and cast labels
-        def encode(examples):
-            return self.tokenizer(
-                examples["prompt"],
-                padding=True,
-                truncation=True,
-                return_tensors="pt",
-            )
+    self.data["train"] = processor_cls.augment_training_split(
+        self.data["train"],
+        self._llm_synth_args,
+        self.training_args,
+        self.args.dataset_repo_id,
+    )
 
-        for split in self.data.keys():
-            self.data[split] = self.data[split].map(encode, batched=True)
-            self.data[split].set_format("torch")
+    # Tokenize and cast labels.
+    #
+    # The budget and the truncation side must match what `PERLPipeline`
+    # applies when it queries this reward model, otherwise the model is
+    # trained on one view of the text and queried on another. `prompt` here
+    # already has the response appended by the task processor, so the tail of
+    # the sequence is the response: truncating from the left sacrifices the
+    # head of the context and preserves the text the label actually describes.
+    reward_max_length = _resolve_reward_max_length(self.args)
+    self.tokenizer.truncation_side = _REWARD_TRUNCATION_SIDE
 
-            new_features = self.data[split].features.copy()
-            new_features["label"] = Value("int32")
-            self.data[split] = self.data[split].cast(new_features)
+    def encode(examples):
+      return self.tokenizer(
+          examples["prompt"],
+          padding=True,
+          truncation=True,
+          max_length=reward_max_length,
+          return_tensors="pt",
+      )
 
-    def setup_model(self) -> None:
-        id2label = {0: "Yes", 1: "No"}
-        label2id = {"Yes": 0, "No": 1}
+    for split in self.data.keys():
+      if (
+          "labels" in self.data[split].column_names
+          and "label" in self.data[split].column_names
+      ):
+        self.data[split] = self.data[split].remove_columns(["labels"])
+      self.data[split] = self.data[split].map(encode, batched=True)
+      self.data[split].set_format("torch")
 
-        self.model = AutoModelForSequenceClassification.from_pretrained(
-            self.args.model_repo_id,
-            num_labels=2,
-            id2label=id2label,
-            label2id=label2id,
-            torch_dtype=self.torch_dtype,
-            attn_implementation="eager",
-        )
+      new_features = self.data[split].features.copy()
+      new_features["label"] = Value("int32")
+      self.data[split] = self.data[split].cast(new_features)
 
-        if "pad_token" not in self.tokenizer.special_tokens_map.keys():
-            self.model.config.pad_token_id = self.tokenizer.pad_token_id
+    if "train" in self.data and len(self.data["train"]) == 0:
+      raise RuntimeError(
+          f"Reward model training dataset '{self.args.dataset_repo_id}' has 0 "
+          f"samples in split='train'. Please re-run "
+          f"'./scripts/data_processing.sh {self.args.task_name}'."
+      )
 
-        self.model = get_peft_model(self.model, self._lora_config)
+  def setup_model(self) -> None:
+    self.model = _load_sequence_classifier(
+        self.args.model_repo_id, self.torch_dtype
+    )
 
-        # adjust score parameters
-        self.model.score.requires_grad_()
+    if self.tokenizer.pad_token_id is not None:
+      self.model.config.pad_token_id = self.tokenizer.pad_token_id
+    # The classification head pools at the last non-pad position, so a pad
+    # token that equals the EOS token quietly shifts that position. Say so
+    # here rather than in the tokenizer helper: this is the pipeline where it
+    # changes the numbers.
+    if self.padding_report is not None:
+      warn_on_pad_eos_collision(self.padding_report, "reward model training")
+
+    self.model = self._attach_lora(self.model, self._lora_config)
+    self.model.to(self.torch_dtype)
+
+    # Adjust score parameters and ensure all modules_to_save heads
+    # match torch_dtype.
+    # Transformers spells the classification head `score` on causal-LM
+    # backbones and `classifier` on encoder ones. Looking for both costs
+    # nothing and stops this block from silently doing nothing - which would
+    # leave the head in fp32, frozen, and at its default initialisation
+    # scale.
+    score_head = None
+    for owner in (self.model, getattr(self.model, "base_model", None)):
+      if owner is None:
+        continue
+      for attr in ("score", "classifier"):
+        score_head = getattr(owner, attr, None)
+        if score_head is not None:
+          break
+      if score_head is not None:
+        break
+    if score_head is not None:
+      score_head.to(self.torch_dtype)
+      if hasattr(score_head, "modules_to_save"):
+        for mod in score_head.modules_to_save.values():
+          if hasattr(mod, "weight") and mod.weight is not None:
+            mod.to(self.torch_dtype)
+            mod.requires_grad_()
+            with torch.no_grad():
+              mod.weight.mul_(0.1)
+      elif hasattr(score_head, "weight") and score_head.weight is not None:
+        score_head.to(self.torch_dtype)
+        score_head.requires_grad_()
         with torch.no_grad():
-            self.model.score.weight.mul_(0.1)
+          score_head.weight.mul_(0.1)
 
-    def setup_trainer(self) -> None:
-        metric = evaluate.load("roc_auc")
+  def setup_trainer(self) -> None:
+    metric = evaluate.load("roc_auc")
 
-        def compute_metrics(eval_preds):
-            logits = eval_preds.predictions
-            yes_scores = np.exp(logits)[:, 0]
-            no_scores = np.exp(logits)[:, 1]
-            scores = no_scores / (yes_scores + no_scores)
-            label_ids = eval_preds.label_ids
-            metrics = metric.compute(
-                references=label_ids, prediction_scores=scores
-            )
-            # reuse helper from utils
-            threshold_metrics = compute_best_roc_threshold(label_ids, scores)
-            metrics.update(threshold_metrics)
-            scores = np.array(scores)
-            label_ids = np.array(label_ids)
-            avg_score_true_positives = (
-                scores[label_ids == 1].mean()
-                if np.any(label_ids == 1)
-                else float("nan")
-            )
-            avg_score_true_negatives = (
-                scores[label_ids == 0].mean()
-                if np.any(label_ids == 0)
-                else float("nan")
-            )
-            metrics.update(
-                {
-                    "avg_score_true_positives": avg_score_true_positives,
-                    "avg_score_true_negatives": avg_score_true_negatives,
-                }
-            )
-            return metrics
+    def compute_metrics(eval_preds):
+      logits = eval_preds.predictions
+      # Numerically stable softmax: probability of label 1 ("No" hallucination) is the reward score
+      probs = scipy.special.softmax(logits, axis=-1)
+      scores = probs[:, 1]
+      label_ids = eval_preds.label_ids
+      metrics = metric.compute(references=label_ids, prediction_scores=scores)
+      # reuse helper from utils
+      threshold_metrics = compute_best_roc_threshold(label_ids, scores)
+      metrics.update(threshold_metrics)
+      scores = np.array(scores)
+      label_ids = np.array(label_ids)
+      avg_score_true_positives = (
+          scores[label_ids == 1].mean()
+          if np.any(label_ids == 1)
+          else float("nan")
+      )
+      avg_score_true_negatives = (
+          scores[label_ids == 0].mean()
+          if np.any(label_ids == 0)
+          else float("nan")
+      )
+      metrics.update({
+          "avg_score_true_positives": avg_score_true_positives,
+          "avg_score_true_negatives": avg_score_true_negatives,
+      })
+      return metrics
 
-        self.trainer = Trainer(
-            model=self.model,
-            args=self.training_args,
-            train_dataset=self.data["train"],
-            eval_dataset=self.data["test"],
-            processing_class=self.tokenizer,
-            data_collator=self.data_collator,
-            compute_metrics=compute_metrics,
-        )
+    self.trainer = Trainer(
+        model=self.model,
+        args=self.training_args,
+        train_dataset=self.data["train"],
+        eval_dataset=self.data["test"],
+        processing_class=self.tokenizer,
+        data_collator=self.data_collator,
+        compute_metrics=compute_metrics,
+        callbacks=self._training_callbacks(),
+    )
 
-    def run_and_save(self) -> None:
-        self.trainer.train()
-        self.model.push_to_hub(self.training_args.hub_model_id)
+  def run_and_save(self) -> None:
+    resume_ckpt = self._resolve_resume_checkpoint()
+    self.trainer.train(resume_from_checkpoint=resume_ckpt)
+    if getattr(self.training_args, "output_dir", None):
+      self.trainer.save_model(self.training_args.output_dir)
+    if getattr(self.training_args, "push_to_hub", False) and getattr(
+        self.training_args, "hub_model_id", None
+    ):
+      _push_to_hub_with_retry(
+          lambda: self.model.push_to_hub(self.training_args.hub_model_id),
+          description="Reward model push",
+      )
+      self._publish_best_and_last(description="Reward model")
+
+
+#: Files of which every saved model or adapter checkpoint has at least one.
+_CHECKPOINT_WEIGHT_FILES = (
+    "adapter_model.safetensors",
+    "adapter_model.bin",
+    "model.safetensors",
+    "model.safetensors.index.json",
+    "pytorch_model.bin",
+    "pytorch_model.bin.index.json",
+)
+
+
+def _checkpoint_has_weights(checkpoint_dir: Optional[str]) -> bool:
+  """Returns True if ``checkpoint_dir`` holds saved model or adapter weights."""
+  return bool(checkpoint_dir) and any(
+      os.path.isfile(os.path.join(checkpoint_dir, name))
+      for name in _CHECKPOINT_WEIGHT_FILES
+  )
+
+
+def _is_untrained_step_zero_checkpoint(checkpoint: Optional[str]) -> bool:
+  """Returns True for the ``checkpoint-0`` of the continual-eval baseline.
+
+  It only holds the untrained adapter, with no trainer state, optimizer, or
+  scheduler, so it cannot be resumed from. ``--resume_from_checkpoint True``
+  picks it as the latest checkpoint until the first real save.
+
+  Args:
+    checkpoint: Resolved checkpoint path, or None.
+
+  Returns:
+    Whether ``checkpoint`` is such a step-0 checkpoint.
+  """
+  return (
+      isinstance(checkpoint, str)
+      and os.path.basename(os.path.normpath(checkpoint)) == "checkpoint-0"
+      and not os.path.isfile(os.path.join(checkpoint, "trainer_state.json"))
+  )
 
 
 class PERLPipeline(Pipeline):
-    """Pipeline for PERL training (perl.py).
+  """Pipeline for PERL training (perl.py).
 
-    This pipeline loads tokenized perl datasets, sets up policy, reference policy,
-    reward model, and uses RLOOTrainer to run RL training.
+  This pipeline loads datasets, initializes policy and reward model,
+  and uses RLOOTrainer with standard upstream TRL to run RL training.
+  """
+
+  _DEFAULT_MIN_LR_RATIO: float = _DEFAULT_PERL_MIN_LR_RATIO
+
+  def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
+    clean_args = _clean_cli_args(cli_args)
+    parser_lora = create_lora_argument_parser()
+    lora_args, remaining_args = parser_lora.parse_known_args(clean_args)
+    clean_remaining = [a for a in remaining_args if a != "--"]
+    parser = HfArgumentParser((ScriptArguments, RLOOConfig))
+    script_args, training_args = parser.parse_args_into_dataclasses(
+        clean_remaining
+    )
+    self.args = script_args
+    self.training_args = training_args
+    set_seed(training_args.seed)
+    self._lora_args = lora_args
+    self._lora_config = LoraConfig(
+        task_type=self._lora_args.task_type,
+        peft_type=self._lora_args.peft_type,
+        r=self._lora_args.lora_r,
+        lora_alpha=self._lora_args.lora_alpha,
+        lora_dropout=self._lora_args.lora_dropout,
+    )
+
+    task = script_args.task_name or "perl"
+    lr = training_args.learning_rate
+    beta = getattr(training_args, "beta", None)
+    temp = getattr(training_args, "temperature", None)
+    epochs = getattr(training_args, "num_train_epochs", None)
+    r = getattr(lora_args, "lora_r", None)
+    gas = getattr(training_args, "gradient_accumulation_steps", 1)
+    steps_per_gen = getattr(training_args, "steps_per_generation", None)
+    if (
+        isinstance(steps_per_gen, int)
+        and isinstance(gas, int)
+        and gas > 1
+    ):
+      if steps_per_gen % gas != 0:
+        raise ValueError(
+            f"steps_per_generation ({steps_per_gen}) must be an integer "
+            f"multiple of gradient_accumulation_steps ({gas}) for RLOOTrainer."
+        )
+
+    run_name_parts = [f"{task}_PERL", f"lr{lr:.1e}"]
+    if r is not None:
+      run_name_parts.append(f"r{r}")
+    if beta is not None:
+      name_beta = f"{beta:.2g}" if beta >= 0.001 else f"{beta:.1e}"
+      run_name_parts.append(f"beta{name_beta}")
+    if temp is not None:
+      run_name_parts.append(f"T{temp}")
+    if isinstance(gas, int) and gas > 1:
+      run_name_parts.append(f"gas{gas}")
+    alpha = getattr(script_args, "reward_penalty_alpha", 1.0)
+    if isinstance(alpha, (int, float)) and alpha > 1.0:
+      run_name_parts.append(f"a{alpha}")
+    if epochs is not None:
+      run_name_parts.append(f"epo{epochs}")
+    run_name = "_".join(run_name_parts)
+    if (
+        not training_args.run_name
+        or "sweep" in str(training_args.run_name).lower()
+    ):
+      self.training_args.run_name = run_name
+    if wandb is not None and getattr(wandb, "run", None) is not None:
+      wandb.run.name = run_name
+
+    wandb_run_id = os.environ.get("WANDB_RUN_ID", "").strip()
+    has_explicit_output_dir = any(
+        str(a) == "--output_dir" or str(a).startswith("--output_dir=")
+        for a in clean_args
+    )
+    if (
+        not has_explicit_output_dir
+        and wandb_run_id
+        and getattr(self.training_args, "output_dir", None)
+        in (None, "", "trainer_output")
+    ):
+      self.training_args.output_dir = os.path.join(
+          ".", "checkpoints", task, "perl", wandb_run_id
+      )
+
+    if getattr(script_args, "continual_eval", False):
+      self._configure_continual_eval_checkpointing()
+
+    self._setup_wandb_resumption()
+
+  def _configure_continual_eval_checkpointing(self) -> None:
+    """Makes every continual-evaluation pause leave a resumable checkpoint.
+
+    A pause happens right after a checkpoint is saved, so evaluation steps
+    must save, and save the optimizer, scheduler, and RNG states too.
+    Resumption is driven by the coordinator, which passes the paused
+    checkpoint explicitly with ``--resume_from_checkpoint``; it is deliberately
+    not forced to auto-resume here, which could pick up an unrelated
+    checkpoint from the Hub.
     """
+    args = self.training_args
+    if getattr(args, "save_only_model", False):
+      print(
+          "[ContinualEval] Overriding save_only_model=False so optimizer, "
+          "scheduler, and RNG states are saved for continual evaluation "
+          "resumption."
+      )
+      args.save_only_model = False
+    eval_steps = getattr(args, "eval_steps", None)
+    if getattr(args, "save_strategy", "no") == "no":
+      args.save_strategy = "steps"
+    if (
+        isinstance(eval_steps, (int, float))
+        and eval_steps > 0
+        and getattr(args, "save_strategy", None) == "steps"
+    ):
+      args.save_steps = eval_steps
+    limit = getattr(args, "save_total_limit", None)
+    if limit is not None and int(limit) == 1:
+      # `Trainer._finalize_training` deletes every checkpoint except the best
+      # one when save_total_limit == 1, i.e. also the checkpoint a pause has
+      # just saved for evaluation and resumption.
+      print(
+          "[ContinualEval] Raising save_total_limit from 1 to 2 so the "
+          "checkpoint saved at each pause survives until it is evaluated and "
+          "resumed from."
+      )
+      args.save_total_limit = 2
+    self._warn_if_rollout_buffer_misaligned()
 
-    def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
-        parser = HfArgumentParser((ScriptArguments, RLOOConfig))
-        script_args, training_args = parser.parse_args_into_dataclasses()
-        self.args = script_args
-        self.training_args = training_args
-        set_seed(training_args.seed)
+  def _warn_if_rollout_buffer_misaligned(self) -> None:
+    """Warns when pauses fall in the middle of an RLOO generation cycle.
 
-    def load_data(self) -> None:
-        self.data = load_dataset(self.args.dataset_repo_id)
+    RLOO generates rollouts for ``steps_per_generation * num_iterations``
+    micro-batches at a time and does not checkpoint that buffer. A resume in
+    the middle of a cycle regenerates rollouts, so the run drifts from an
+    uninterrupted one (it stays a valid RLOO run).
+    """
+    args = self.training_args
+    try:
+      save_steps = float(getattr(args, "save_steps", 0) or 0)
+    except (TypeError, ValueError):
+      return
+    if save_steps < 1 or not save_steps.is_integer():
+      return  # A ratio of the total steps: the interval is not known yet.
+    grad_accum = int(getattr(args, "gradient_accumulation_steps", 1) or 1)
+    steps_per_generation = int(
+        getattr(args, "steps_per_generation", None) or grad_accum
+    )
+    num_iterations = int(getattr(args, "num_iterations", 1) or 1)
+    cycle = steps_per_generation * num_iterations
+    micro_batches = int(save_steps) * grad_accum
+    if cycle > 0 and micro_batches % cycle:
+      print(
+          "[ContinualEval] Warning: pauses every "
+          f"{int(save_steps)} steps ({micro_batches} micro-batches) are not a "
+          "multiple of the RLOO generation cycle (steps_per_generation x "
+          f"num_iterations = {cycle} micro-batches). TRL does not checkpoint "
+          "its rollout buffer, so every resume regenerates rollouts "
+          "mid-cycle and the run drifts from an uninterrupted one. Choose "
+          "eval_steps such that eval_steps x gradient_accumulation_steps is "
+          f"a multiple of {cycle} to avoid this."
+      )
 
-    def process_data(self) -> None:
-        def encode(examples):
-            return self.tokenizer(
-                examples["prompt"],
-                padding=True,
-                truncation=True,
-                return_tensors="pt",
+  def load_data(self) -> None:
+    self.data = load_dataset(self.args.dataset_repo_id)
+
+  def process_data(self) -> None:
+    # Ensure _lora_config is initialized even if setup_arguments was bypassed
+    if not hasattr(self, "_lora_config") or self._lora_config is None:
+      lora_r = (
+          getattr(self._lora_args, "lora_r", 8)
+          if hasattr(self, "_lora_args")
+          else 8
+      )
+      lora_alpha = (
+          getattr(self._lora_args, "lora_alpha", 16)
+          if hasattr(self, "_lora_args")
+          else 16
+      )
+      lora_dropout = (
+          getattr(self._lora_args, "lora_dropout", 0.0)
+          if hasattr(self, "_lora_args")
+          else 0.0
+      )
+      task_type = (
+          getattr(self._lora_args, "task_type", "CAUSAL_LM")
+          if hasattr(self, "_lora_args")
+          else "CAUSAL_LM"
+      )
+      peft_type = (
+          getattr(self._lora_args, "peft_type", "LORA")
+          if hasattr(self, "_lora_args")
+          else "LORA"
+      )
+      self._lora_config = LoraConfig(
+          task_type=task_type,
+          peft_type=peft_type,
+          r=lora_r,
+          lora_alpha=lora_alpha,
+          lora_dropout=lora_dropout,
+      )
+
+    # In modern TRL RLOOTrainer, datasets only need a 'prompt' column.
+    # By default, num_fewshot is 0/None, preserving clean zero-shot prompts.
+    # If explicitly requested via --num_fewshot > 0, fewshot examples are prepended.
+    if (
+        getattr(self.args, "num_fewshot", None) is not None
+        and self.args.num_fewshot > 0
+    ):
+      processor_cls = None
+      if hasattr(self.args, "task_name") and self.args.task_name:
+        try:
+          processor_cls = get_task_processor(self.args.task_name)
+        except Exception:
+          processor_cls = None
+
+      if processor_cls is not None and "train" in self.data:
+        fewshot_data = self.data["train"].shuffle(seed=self.training_args.seed)
+        n_ex = min(self.args.num_fewshot, len(fewshot_data))
+        fewshot_examples = fewshot_data.select(range(n_ex))
+        formatted_fewshot = []
+        for ex in fewshot_examples:
+          if hasattr(processor_cls, "format_writer_fewshot_example"):
+            formatted_fewshot.append(
+                processor_cls.format_writer_fewshot_example(ex)
             )
+        if formatted_fewshot:
+          prefix = "\n".join(formatted_fewshot) + "\n"
+          for split in ("train", "test"):
+            if split in self.data and hasattr(self.data[split], "column_names"):
+              if "prompt" in self.data[split].column_names:
+                self.data[split] = self.data[split].map(
+                    lambda x: {"prompt": prefix + x["prompt"]}
+                )
 
-        for split in self.data.keys():
-            self.data[split] = self.data[split].map(
-                encode,
-                remove_columns=self.data[split].column_names,
-                batched=True,
+  def setup_model(self) -> None:
+    reward_model_path = self.args.reward_model_path or getattr(
+        self.training_args, "reward_model_path", None
+    )
+    sft_model_path = self.args.sft_model_path or getattr(
+        self.training_args, "sft_model_path", None
+    )
+
+    self.reward_model = _load_sequence_classifier(
+        reward_model_path, torch.bfloat16
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    self.reward_model.to(torch.bfloat16)
+    self.reward_model.to(device)
+    self.reward_model.eval()
+
+    resolved_rm_ref, rm_ref_kwargs = _resolve_pretrained_ref_and_kwargs(
+        reward_model_path
+    )
+    self.reward_tokenizer = AutoTokenizer.from_pretrained(
+        resolved_rm_ref or reward_model_path,
+        padding_side="right",
+        **rm_ref_kwargs,
+    )
+    # Must follow the *same* rule the reward model was trained under
+    # (`RewardModelPipeline.setup_tokenizer`), otherwise the pooled position
+    # differs between training and scoring and the reward becomes a different
+    # function of the text.
+    reward_padding = configure_tokenizer_padding(self.reward_tokenizer)
+    warn_on_pad_eos_collision(reward_padding, "PE-RL reward scoring")
+    if self.reward_tokenizer.pad_token_id is not None:
+      self.reward_model.config.pad_token_id = self.reward_tokenizer.pad_token_id
+
+    policy_base = AutoModelForCausalLM.from_pretrained(
+        self.args.model_repo_id,
+        torch_dtype=torch.bfloat16,
+    )
+
+    if self.tokenizer.pad_token_id is not None:
+      policy_base.config.pad_token_id = self.tokenizer.pad_token_id
+
+    enable_lora, resolved_adapter_path = self._resolve_lora_adapter_path(
+        sft_model_path, self.args.model_repo_id
+    )
+
+    # Ensure _lora_config exists
+    if not hasattr(self, "_lora_config") or self._lora_config is None:
+      lora_r = (
+          getattr(self._lora_args, "lora_r", 8)
+          if hasattr(self, "_lora_args")
+          else 8
+      )
+      lora_alpha = (
+          getattr(self._lora_args, "lora_alpha", 16)
+          if hasattr(self, "_lora_args")
+          else 16
+      )
+      lora_dropout = (
+          getattr(self._lora_args, "lora_dropout", 0.0)
+          if hasattr(self, "_lora_args")
+          else 0.0
+      )
+      task_type = (
+          getattr(self._lora_args, "task_type", "CAUSAL_LM")
+          if hasattr(self, "_lora_args")
+          else "CAUSAL_LM"
+      )
+      peft_type = (
+          getattr(self._lora_args, "peft_type", "LORA")
+          if hasattr(self, "_lora_args")
+          else "LORA"
+      )
+      self._lora_config = LoraConfig(
+          task_type=task_type,
+          peft_type=peft_type,
+          r=lora_r,
+          lora_alpha=lora_alpha,
+          lora_dropout=lora_dropout,
+      )
+
+    if enable_lora and resolved_adapter_path:
+      # Check and warn if SFT LoRA rank differs from RL LoRA rank
+      sft_config_path = os.path.join(
+          resolved_adapter_path, "adapter_config.json"
+      )
+      if os.path.isfile(sft_config_path):
+        try:
+          with open(sft_config_path, "r", encoding="utf-8") as f:
+            sft_config_json = json.load(f)
+          sft_r = sft_config_json.get("r")
+          sft_alpha = sft_config_json.get("lora_alpha")
+          rl_r = (
+              getattr(self._lora_args, "lora_r", self._lora_config.r)
+              if hasattr(self, "_lora_args")
+              else self._lora_config.r
+          )
+          rl_alpha = (
+              getattr(self._lora_args, "lora_alpha", self._lora_config.lora_alpha)
+              if hasattr(self, "_lora_args")
+              else self._lora_config.lora_alpha
+          )
+          if sft_r is not None and rl_r is not None and int(sft_r) != int(rl_r):
+            print(
+                "\n"
+                + "=" * 80
+                + "\n"
+                + "[WARNING] LoRA Rank Mismatch Detected in PE-RL:\n"
+                + f"  - SFT Checkpoint Rank: r = {sft_r} (alpha = {sft_alpha})\n"
+                + f"  - RL Policy LoRA Rank: r = {rl_r} (alpha = {rl_alpha})\n"
+                + f"The SFT adapter ({resolved_adapter_path}) will be merged"
+                " into base weights,\n"
+                f"and RL will train a NEW adapter with rank r = {rl_r}.\n"
+                f"If you intended to maintain the same dimension, pass"
+                f" --lora_r {sft_r}.\n"
+                + "=" * 80
+                + "\n"
             )
-            self.data[split].set_format("torch")
+        except Exception as e:
+          print(f"[INFO] Could not inspect SFT adapter_config.json: {e}")
 
-    def setup_model(self) -> None:
-        id2label = {0: "Yes", 1: "No"}
-        label2id = {"Yes": 0, "No": 1}
+      print(
+          f"Loading SFT LoRA adapter from '{resolved_adapter_path}' and"
+          " merging into base weights..."
+      )
+      sft_peft = PeftModel.from_pretrained(policy_base, resolved_adapter_path)
+      merged_base = sft_peft.merge_and_unload()
+      self.policy = self._attach_lora(merged_base, self._lora_config)
+    else:
+      print(
+          f"Initializing fresh LoRA adapter (r={self._lora_config.r},"
+          f" alpha={self._lora_config.lora_alpha}) directly on model"
+          f" '{self.args.model_repo_id}'..."
+      )
+      self.policy = self._attach_lora(policy_base, self._lora_config)
 
-        self.reward_model = AutoModelForSequenceClassification.from_pretrained(
-            self.training_args.reward_model_path,
-            num_labels=2,
-            id2label=id2label,
-            label2id=label2id,
-            attn_implementation="eager",
-            torch_dtype=torch.bfloat16,
+    self.policy.to(torch.bfloat16)
+
+  def setup_trainer(self) -> None:
+    reward_model = self.reward_model
+    reward_tokenizer = self.reward_tokenizer
+
+    # The reward model scores `prompt + completion`, and the completion sits
+    # at the tail. Truncating from the right would delete exactly the part of
+    # the text that differs between the rollouts of a prompt, making every
+    # rollout score identically, zeroing the RLOO advantage and leaving only
+    # the KL term to optimize -- silently, with no error and a flat reward
+    # curve. Truncate from the left instead, matching how the reward model was
+    # trained in `RewardModelPipeline.process_data`.
+    reward_max_length = _resolve_reward_max_length(self.args)
+    reward_tokenizer.truncation_side = _REWARD_TRUNCATION_SIDE
+    truncation_reported = False
+
+    # Custom reward function that computes scalar reward as the logit difference
+    # (log-odds) of label 1 ("No" hallucination) vs label 0 ("Yes" hallucination).
+    # This matches the standard Bradley-Terry reward formulation r(x, y) = z_1 - z_0
+    # and prevents sigmoid saturation/vanishing gradients in RLOO when models are overconfident.
+    def reward_fn(
+        prompts: list[str], completions: list[str], **kwargs
+    ) -> list[float]:
+      nonlocal truncation_reported
+      texts = [p + c for p, c in zip(prompts, completions)]
+      inputs = reward_tokenizer(
+          texts,
+          padding=True,
+          truncation=True,
+          max_length=reward_max_length,
+          return_tensors="pt",
+      ).to(reward_model.device)
+
+      # Padding is to the longest sequence in the batch, so reaching the cap
+      # means at least one row was truncated. Say so once: the whole point of
+      # this failure mode is that it is otherwise invisible.
+      if not truncation_reported:
+        try:
+          batch_len = int(inputs["input_ids"].shape[1])
+        except (TypeError, KeyError, IndexError, AttributeError):
+          batch_len = None
+        if batch_len is not None and batch_len >= reward_max_length:
+          truncation_reported = True
+          print(
+              "\n"
+              + "=" * 80
+              + "\n[WARNING] Reward model input hit the token budget of"
+              f" {reward_max_length}.\n"
+              "  Context is being truncated from the left. The completion is"
+              " preserved,\n"
+              "  but the reward model is no longer seeing the full context."
+              " Consider\n"
+              "  raising --reward_max_length (and retraining the reward model"
+              " with the\n"
+              "  same value, otherwise training and scoring disagree).\n"
+              + "=" * 80
+              + "\n"
+          )
+
+      with torch.no_grad():
+        # Under DeepSpeed ZeRO Stage 3, all model parameters instantiated
+        # in the process are partitioned into 1-D flat slices across GPUs.
+        # Note on TRL's `ds3_gather_for_generation`: TRL's built-in flag
+        # only gathers the policy model (`self.model`) during `generate()`.
+        # Because `reward_model` is an auxiliary model called inside this
+        # custom `reward_fn` callable, TRL does not manage or gather its
+        # weights automatically.
+        # If parameters are partitioned (detected via `ds_id`), we must
+        # explicitly gather them across all ranks with `GatheredParameters`
+        # (`modifier_rank=None`) so embedding and linear layers
+        # reconstruct their 2-D shapes for inference.
+        is_zero3 = any(hasattr(p, "ds_id") for p in reward_model.parameters())
+        if is_zero3:
+          import deepspeed
+
+          with deepspeed.zero.GatheredParameters(
+              list(reward_model.parameters()), modifier_rank=None
+          ):
+            logits = reward_model(**inputs).logits
+        else:
+          logits = reward_model(**inputs).logits
+
+        # Logit difference: r(x, y) = logits[:, 1] - logits[:, 0]
+        # When reward_penalty_alpha > 1.0, asymmetrically penalize negative
+        # logit differences (hallucinations): r_alpha = alpha * diff if diff < 0
+        diff = logits[:, 1] - logits[:, 0]
+        alpha = getattr(self.args, "reward_penalty_alpha", 1.0)
+        if isinstance(alpha, (int, float)) and alpha > 1.0:
+          diff = torch.where(diff < 0, alpha * diff, diff)
+        rewards = diff.cpu().tolist()
+      return rewards
+
+    self.trainer = RLOOTrainer(
+        model=self.policy,
+        reward_funcs=reward_fn,
+        args=self.training_args,
+        train_dataset=self.data["train"],
+        eval_dataset=self.data.get("test", None),
+        processing_class=self.tokenizer,
+        callbacks=self._training_callbacks(),
+    )
+    self._configure_lr_scheduler()
+
+  def _training_callbacks(self) -> list[Any]:
+    callbacks = super()._training_callbacks()
+    if getattr(self.args, "continual_eval", False):
+      status = ContinualEvalStatus.load(self.training_args.output_dir)
+      self._continual_stop_callback = ContinualEvalStopCallback(
+          evaluated_steps=status.evaluated_steps
+      )
+      callbacks.append(self._continual_stop_callback)
+    return callbacks
+
+  def _is_world_process_zero(self) -> bool:
+    state = getattr(self.trainer, "state", None) if self.trainer else None
+    if state is not None:
+      return bool(getattr(state, "is_world_process_zero", True))
+    return int(os.environ.get("RANK", "0")) == 0
+
+  @staticmethod
+  def _wandb_run_info() -> dict[str, str]:
+    """Returns the id, project, entity, and name of the live WandB run.
+
+    Only the live run is trusted, since it is the run this segment logged to;
+    an environment variable or a stale ``wandb_run_id.txt`` may name a run
+    that never received the training logs. Attributes the run does not expose
+    are omitted, so the caller keeps previously recorded values.
+
+    Returns:
+      A dict keyed by the matching ``ContinualEvalStatus`` field names.
+    """
+    run = getattr(wandb, "run", None) if wandb is not None else None
+    if run is None:
+      return {}
+    info: dict[str, str] = {}
+    for key, attr in (
+        ("wandb_run_id", "id"),
+        ("wandb_project", "project"),
+        ("wandb_entity", "entity"),
+        ("wandb_run_name", "name"),
+    ):
+      try:
+        value = getattr(run, attr, None)
+      except Exception:  # pylint: disable=broad-exception-caught
+        value = None
+      if isinstance(value, str) and value.strip():
+        info[key] = value.strip()
+    return info
+
+  def _record_continual_eval_status(
+      self,
+      *,
+      step: int,
+      checkpoint_dir: Optional[str],
+      paused_for_eval: bool,
+      training_completed: bool,
+  ) -> None:
+    """Records the outcome of this training segment for the coordinator.
+
+    Called on the world process zero only. Besides the pause / completion
+    state, it records what the coordinator needs to score the checkpoint: the
+    rollout temperature it was trained with and the WandB run its scores
+    belong to.
+
+    Args:
+      step: ``global_step`` of the pause or of the end of training.
+      checkpoint_dir: Checkpoint saved at ``step``, or None if there is none.
+      paused_for_eval: Whether ``checkpoint_dir`` awaits its evaluation.
+      training_completed: Whether training has reached its end.
+    """
+    output_dir = self.training_args.output_dir
+    status = ContinualEvalStatus.load(output_dir)
+    status.current_step = int(step)
+    # Kept in the form of `output_dir`, which perl.sh and the orchestrator
+    # pass relative to the working directory the coordinator and the
+    # evaluator share with this segment. The completions dataset is named
+    # after this path, and an absolute path running through '<hf_user>/'
+    # (e.g. /home/<hf_user>/...) would make that name illegible.
+    status.checkpoint_dir = checkpoint_dir or None
+    status.paused_for_eval = bool(paused_for_eval)
+    status.training_completed = bool(training_completed)
+    temperature = getattr(self.training_args, "temperature", None)
+    if isinstance(temperature, (int, float)) and not isinstance(
+        temperature, bool
+    ):
+      status.rollout_temperature = float(temperature)
+    for key, value in self._wandb_run_info().items():
+      setattr(status, key, value)
+    status.save(output_dir)
+
+  @staticmethod
+  def _finish_wandb_run(*, training_completed: bool) -> None:
+    """Flags and closes the live WandB run before the segment exits.
+
+    The coordinator's scoring process attaches to the same run next, and the
+    next segment resumes it; finishing first flushes the training logs.
+    Finishing marks the run ``finished`` in W&B even when training is only
+    paused, so the run summary records which one it is
+    (:data:`src.continual_eval.PAUSED_SUMMARY_KEY`): the orchestrator must
+    not count or rank a trial that stopped during a pause as a finished one.
+
+    Args:
+      training_completed: Whether training has completed, as opposed to
+        being paused for an evaluation.
+    """
+    if wandb is None or getattr(wandb, "run", None) is None:
+      return
+    try:
+      wandb.run.summary[PAUSED_SUMMARY_KEY] = not training_completed
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      print(f"[ContinualEval] Warning: could not flag the WandB run: {e}")
+    try:
+      wandb.finish()
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      print(f"[ContinualEval] Warning: wandb.finish() failed: {e}")
+
+  def _init_wandb_run_without_training(self) -> None:
+    """Creates the PE-RL WandB run the way ``trainer.train()`` would.
+
+    The step-0 segment never calls ``train()``, which is where Hugging Face's
+    ``WandbCallback`` creates the run. Creating it here, with the same
+    project, name, and config, gives the step-0 scores a run to attach to,
+    which the following segments then resume.
+    """
+    try:
+      from transformers.integrations import WandbCallback  # pylint: disable=g-import-not-at-top
+    except ImportError:
+      return
+    handler = getattr(self.trainer, "callback_handler", None)
+    for callback in getattr(handler, "callbacks", None) or []:
+      if isinstance(callback, WandbCallback) and not getattr(
+          callback, "_initialized", False
+      ):
+        callback.setup(
+            self.trainer.args, self.trainer.state, self.trainer.model
         )
+        return
 
-        self.ref_policy = AutoModelForCausalLM.from_pretrained(
-            self.training_args.sft_model_path,
-            attn_implementation="eager",
-            torch_dtype=torch.bfloat16,
+  def _pause_before_first_step(self) -> None:
+    """Saves the untrained policy as ``checkpoint-0`` and pauses for scoring.
+
+    Replaces ``train()`` in the first continual-evaluation segment when
+    ``eval_on_start`` is set, so the step-0 baseline is scored before any
+    update. Only the adapter and the tokenizer are saved: there is no
+    optimizer state yet, and the next segment trains from scratch. The trainer
+    is bypassed on purpose: ``evaluate()`` or ``save_model()`` before
+    ``train()`` would set DeepSpeed up outside of training, and
+    ``save_model()`` would push the untrained adapter to the Hub. The
+    step-0 trainer evaluation (``eval_on_start``) runs in the next segment.
+    """
+    output_dir = self.training_args.output_dir
+    checkpoint_dir = os.path.join(output_dir, "checkpoint-0")
+    is_main_process = self._is_world_process_zero()
+    accelerator = getattr(self.trainer, "accelerator", None)
+    model = (
+        accelerator.unwrap_model(self.trainer.model)
+        if accelerator is not None
+        else self.trainer.model
+    )
+    # Before `train()` the adapter is only partitioned if the model was built
+    # inside `deepspeed.zero.Init()` (ZeRO-3 with zero3_init_flag=true).
+    # Gathering is a collective operation, so every rank enters the context.
+    partitioned = [
+        param
+        for param in model.parameters()
+        if param.requires_grad and hasattr(param, "ds_id")
+    ]
+    gather = contextlib.nullcontext()
+    if partitioned:
+      import deepspeed  # pylint: disable=g-import-not-at-top
+
+      gather = deepspeed.zero.GatheredParameters(
+          partitioned, modifier_rank=None
+      )
+    with gather:
+      if is_main_process:
+        print(
+            "[ContinualEval] Saving the untrained policy to "
+            f"{checkpoint_dir} for the step-0 baseline evaluation."
         )
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        model.save_pretrained(checkpoint_dir)
+        processing_class = getattr(self.trainer, "processing_class", None)
+        if processing_class is not None:
+          processing_class.save_pretrained(checkpoint_dir)
+    if not is_main_process:
+      return
+    self._init_wandb_run_without_training()
+    self._record_continual_eval_status(
+        step=0,
+        checkpoint_dir=checkpoint_dir,
+        paused_for_eval=True,
+        training_completed=False,
+    )
+    self._finish_wandb_run(training_completed=False)
 
-        policy_base = AutoModelForCausalLM.from_pretrained(
-            self.args.model_repo_id,
-            attn_implementation="eager",
-            torch_dtype=torch.bfloat16,
+  def _pause_for_continual_eval(self, step: int) -> None:
+    """Records a pause at ``step``, whose checkpoint was just saved."""
+    if not self._is_world_process_zero():
+      return
+    self._record_continual_eval_status(
+        step=step,
+        checkpoint_dir=os.path.join(
+            self.training_args.output_dir, f"checkpoint-{step}"
+        ),
+        paused_for_eval=True,
+        training_completed=False,
+    )
+    self._finish_wandb_run(training_completed=False)
+
+  def _record_training_completion(self) -> None:
+    """Records the end of training and schedules scoring the final step.
+
+    The final step is scored from ``checkpoint-{global_step}``. If that
+    checkpoint was not saved, the final step is not scored: the model held by
+    the trainer at this point may be the best checkpoint rather than the
+    final one (``load_best_model_at_end``), so saving it under the final
+    step's name would mislabel it.
+    """
+    if not self._is_world_process_zero():
+      return
+    output_dir = self.training_args.output_dir
+    step = int(getattr(self.trainer.state, "global_step", 0) or 0)
+    checkpoint_dir = os.path.join(output_dir, f"checkpoint-{step}")
+    has_weights = _checkpoint_has_weights(checkpoint_dir)
+    if not has_weights:
+      print(
+          f"[ContinualEval] Warning: the final checkpoint {checkpoint_dir} "
+          "holds no saved weights, so the final step is not scored by "
+          "continual evaluation."
+      )
+    evaluated_steps = ContinualEvalStatus.load(output_dir).evaluated_steps
+    self._record_continual_eval_status(
+        step=step,
+        checkpoint_dir=checkpoint_dir if has_weights else None,
+        paused_for_eval=has_weights and step not in evaluated_steps,
+        training_completed=True,
+    )
+    self._finish_wandb_run(training_completed=True)
+
+  def run_and_save(self) -> None:
+    if not self.training_args.do_train:
+      return
+    continual_eval = bool(getattr(self.args, "continual_eval", False))
+    resume_ckpt = self._resolve_resume_checkpoint()
+    if _is_untrained_step_zero_checkpoint(resume_ckpt):
+      print(
+          f"[ContinualEval] {resume_ckpt} only holds the untrained adapter of "
+          "the step-0 baseline (no trainer state); training starts from "
+          "scratch instead of resuming from it."
+      )
+      resume_ckpt = None
+
+    if (
+        continual_eval
+        and resume_ckpt is None
+        and getattr(self.training_args, "eval_on_start", False)
+    ):
+      status = ContinualEvalStatus.load(self.training_args.output_dir)
+      if 0 not in status.evaluated_steps:
+        self._pause_before_first_step()
+        return
+
+    if continual_eval and resume_ckpt is not None:
+      # Each pause happens right after its step was evaluated and saved, so
+      # `eval_on_start` would evaluate the resumed step a second time.
+      self.training_args.eval_on_start = False
+      trainer_args = getattr(self.trainer, "args", None)
+      if trainer_args is not None:
+        trainer_args.eval_on_start = False
+
+    self.trainer.train(resume_from_checkpoint=resume_ckpt)
+
+    stop_cb = getattr(self, "_continual_stop_callback", None)
+    if continual_eval and getattr(stop_cb, "stopped_for_continual_eval", False):
+      step = stop_cb.stopped_step
+      if step is None:
+        step = int(getattr(self.trainer.state, "global_step", 0) or 0)
+      self._pause_for_continual_eval(int(step))
+      return
+
+    if getattr(self.training_args, "output_dir", None):
+      self.trainer.save_model(self.training_args.output_dir)
+    if getattr(self.training_args, "push_to_hub", False):
+      _push_to_hub_with_retry(
+          self.trainer.push_to_hub, description="PERL model push"
+      )
+      self._publish_best_and_last(description="PERL")
+
+    if continual_eval:
+      self._record_training_completion()
+
+
+class DPOPipeline(Pipeline):
+  """Pipeline for Direct Preference Optimization (DPO) preference tuning.
+
+  This pipeline loads a preference dataset (containing 'prompt', 'chosen', and
+  'rejected' columns), initializes the policy model from the SFT checkpoint
+  (using
+  LoRA adapters), and fine-tunes using TRL's DPOTrainer.
+  """
+
+  def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
+    clean_args = _clean_cli_args(cli_args)
+    parser_lora = create_lora_argument_parser()
+    lora_args, remaining_args = parser_lora.parse_known_args(clean_args)
+    clean_remaining = [a for a in remaining_args if a != "--"]
+    parser = HfArgumentParser((ScriptArguments, DPOConfig))
+    script_args, training_args = parser.parse_args_into_dataclasses(
+        clean_remaining
+    )
+
+    self.args = script_args
+    self.training_args = training_args
+    set_seed(training_args.seed)
+    self._lora_args = lora_args
+
+    task = script_args.task_name or "dpo"
+    lr = training_args.learning_rate
+    beta = getattr(training_args, "beta", None)
+    r = getattr(lora_args, "lora_r", None)
+    epochs = getattr(training_args, "num_train_epochs", None)
+    run_name_parts = [f"{task}_DPO", f"lr{lr:.1e}"]
+    if beta is not None:
+      name_beta = f"{beta:.2g}" if beta >= 0.001 else f"{beta:.1e}"
+      run_name_parts.append(f"beta{name_beta}")
+    if r is not None:
+      run_name_parts.append(f"r{r}")
+    if epochs is not None:
+      run_name_parts.append(f"epo{epochs}")
+    run_name = "_".join(run_name_parts)
+    if (
+        not training_args.run_name
+        or "sweep" in str(training_args.run_name).lower()
+    ):
+      self.training_args.run_name = run_name
+    if wandb is not None and getattr(wandb, "run", None) is not None:
+      wandb.run.name = run_name
+    self._setup_wandb_resumption()
+
+  def load_data(self) -> None:
+    data = load_dataset(self.args.dataset_repo_id)
+    if isinstance(data, (DatasetDict, dict)):
+      self.data = {
+          "train": data["train"],
+          "test": data.get("test", data.get("validation", None)),
+      }
+    else:
+      self.data = {
+          "train": load_dataset(self.args.dataset_repo_id, split="train"),
+          "test": load_dataset(self.args.dataset_repo_id, split="test"),
+      }
+
+  def process_data(self) -> None:
+    self._lora_config = LoraConfig(
+        task_type=self._lora_args.task_type,
+        peft_type=self._lora_args.peft_type,
+        r=self._lora_args.lora_r,
+        lora_alpha=self._lora_args.lora_alpha,
+        lora_dropout=self._lora_args.lora_dropout,
+    )
+
+  def setup_model(self) -> None:
+    sft_model_path = self.args.sft_model_path or getattr(
+        self.training_args, "sft_model_path", None
+    )
+
+    base_model = AutoModelForCausalLM.from_pretrained(
+        self.args.model_repo_id,
+        torch_dtype=torch.bfloat16,
+    )
+    if self.tokenizer.pad_token_id is not None:
+      base_model.config.pad_token_id = self.tokenizer.pad_token_id
+
+    enable_lora, resolved_adapter_path = self._resolve_lora_adapter_path(
+        sft_model_path, self.args.model_repo_id
+    )
+
+    if enable_lora and resolved_adapter_path:
+      # In SCOPE/SSFO, the policy is initialized at the SFT model p_{\theta_0}, and
+      # the reference model is also p_{\theta_0}.
+      # By loading and merging the SFT adapter into the base weights, then applying
+      # a fresh LoRA adapter for DPO, DPOTrainer's adapter disabling automatically
+      # evaluates the exact SFT reference model without extra memory overhead.
+      sft_peft = PeftModel.from_pretrained(base_model, resolved_adapter_path)
+      merged_base = sft_peft.merge_and_unload()
+      self.model = self._attach_lora(merged_base, self._lora_config)
+    else:
+      self.model = self._attach_lora(base_model, self._lora_config)
+
+    self.model.to(torch.bfloat16)
+    self.ref_model = None
+
+  def setup_trainer(self) -> None:
+    self.trainer = DPOTrainer(
+        model=self.model,
+        ref_model=self.ref_model,
+        args=self.training_args,
+        train_dataset=self.data["train"],
+        eval_dataset=self.data.get("test", None),
+        processing_class=self.tokenizer,
+        callbacks=self._training_callbacks(),
+    )
+
+  def run_and_save(self) -> None:
+    if self.training_args.do_train:
+      resume_ckpt = self._resolve_resume_checkpoint()
+      self.trainer.train(resume_from_checkpoint=resume_ckpt)
+      if getattr(self.training_args, "output_dir", None):
+        self.trainer.save_model(self.training_args.output_dir)
+      if getattr(self.training_args, "push_to_hub", False):
+        _push_to_hub_with_retry(
+            self.trainer.push_to_hub, description="DPO model push"
         )
+        self._publish_best_and_last(description="DPO")
 
-        self.policy = PeftModel.from_pretrained(
-            policy_base, self.training_args.sft_model_path, is_trainable=True
+
+class ScopeMixtureLogitsProcessor(LogitsProcessor):
+  """LogitsProcessor for SCOPE noisy decoding (Algorithm 1 / flbbb/scope-decoding).
+
+  Injects unfaithful parametric noise by mixing or substituting conditional SFT
+  logits
+  with unconditional base model logits at decoding step t >= n_untouched_logits.
+  """
+
+  def __init__(
+      self,
+      main_input_length: int,
+      noise_input_ids: torch.Tensor,
+      noise_attention_mask: torch.Tensor,
+      noise_model: torch.nn.Module,
+      alpha: float = 0.5,
+      sampling_mode: str = "bernoulli",
+      n_untouched_logits: int = 2,
+  ):
+    super().__init__()
+    self.main_input_length = main_input_length
+    self.noise_input_ids = noise_input_ids
+    self.noise_attention_mask = noise_attention_mask
+    self.noise_model = noise_model
+    self.alpha = alpha
+    self.sampling_mode = sampling_mode
+    self.n_untouched_logits = n_untouched_logits
+    self.noise_past_key_values = None
+    self.noise_cur_mask = noise_attention_mask
+
+  def __call__(
+      self, input_ids: torch.LongTensor, scores: torch.FloatTensor
+  ) -> torch.FloatTensor:
+    if self.alpha == 0.0:
+      return scores
+
+    with torch.no_grad():
+      if self.noise_past_key_values is None:
+        noise_out = self.noise_model(
+            input_ids=self.noise_input_ids,
+            attention_mask=self.noise_attention_mask,
+            use_cache=True,
         )
-
-    def setup_trainer(self) -> None:
-        self.trainer = RLOOTrainer(
-            config=self.training_args,
-            processing_class=self.tokenizer,
-            ref_policy=self.ref_policy,
-            policy=self.policy,
-            reward_model=self.reward_model,
-            train_dataset=self.data["train"],
-            eval_dataset=self.data["test"],
+      else:
+        last_token = input_ids[:, -1:]
+        self.noise_cur_mask = torch.cat(
+            [
+                self.noise_cur_mask,
+                torch.ones(
+                    (input_ids.shape[0], 1),
+                    dtype=torch.long,
+                    device=input_ids.device,
+                ),
+            ],
+            dim=1,
         )
+        noise_out = self.noise_model(
+            input_ids=last_token,
+            attention_mask=self.noise_cur_mask,
+            past_key_values=self.noise_past_key_values,
+            use_cache=True,
+        )
+      self.noise_past_key_values = noise_out.past_key_values
+      logits_base = noise_out.logits[:, -1, :].clone()
 
-    def run_and_save(self) -> None:
-        if self.training_args.do_train:
-            self.trainer.train()
-            self.trainer.push_to_hub()
+    step = input_ids.shape[1] - self.main_input_length
+    if step < self.n_untouched_logits:
+      return scores
 
-        # Was getting errors with this (TODO: fix)
-        # name_for_saving = self.training_args.run_name.split("/")[1]
-        # filepath = os.path.join("logs", name_for_saving, "logs.txt")
-        # os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        # with open(filepath, "w") as f:
-        #     for d in self.trainer.state.log_history:
-        #         f.write(str(d) + "\n----------\n")
-        # print(f"Logs saved to {filepath}")
+    # Mask invalid/special tokens
+    inf_indices = torch.isinf(scores) | (scores <= -1e9)
+    logits_base[inf_indices] = float("-inf")
+
+    if self.sampling_mode in ("bernoulli", "hard"):
+      alpha_mask = torch.bernoulli(
+          torch.full((scores.shape[0], 1), self.alpha, device=scores.device)
+      )
+      processed_scores = torch.where(alpha_mask == 1.0, logits_base, scores)
+    elif self.sampling_mode == "prob_mix":
+      probs_sft = torch.softmax(scores, dim=-1)
+      probs_base = torch.softmax(logits_base, dim=-1)
+      mixed_probs = (1.0 - self.alpha) * probs_sft + self.alpha * probs_base
+      processed_scores = torch.log(mixed_probs.clamp(min=1e-8))
+    elif self.sampling_mode == "cad":
+      uncond_scores = torch.softmax(logits_base, dim=-1)
+      cond_scores = torch.softmax(scores, dim=-1)
+      cad_scores = (1.0 + self.alpha) * cond_scores - self.alpha * uncond_scores
+      cad_scores = torch.clamp(cad_scores, min=0.0)
+      cad_probs = cad_scores / cad_scores.sum(dim=-1, keepdim=True).clamp(
+          min=1e-8
+      )
+      processed_scores = torch.log(cad_probs.clamp(min=1e-8))
+    elif self.sampling_mode == "logit_mix":
+      processed_scores = (1.0 - self.alpha) * scores + self.alpha * logits_base
+    else:
+      processed_scores = scores
+
+    return processed_scores
+
+
+class ScopeDataGenerationPipeline(Pipeline):
+  """Pipeline for generating synthetic preference datasets for SCOPE.
+
+  Implements noisy decoding (Section 3 / Algorithm 1 of the SCOPE paper)
+  by sampling mixed tokens between the fine-tuned SFT checkpoint and the
+  pre-trained base model.
+  """
+
+  def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
+    clean_args = _clean_cli_args(cli_args)
+    parser = HfArgumentParser(ScopeDataGenArguments)
+    script_args = parser.parse_args_into_dataclasses(clean_args)[0]
+    self.args = script_args
+    set_seed(self.args.seed)
+
+  def setup_tokenizer(self) -> None:
+    self.tokenizer = AutoTokenizer.from_pretrained(
+        self.args.model_repo_id,
+        padding_side="left",
+    )
+    # Use the shared resolver so every stage agrees on which token pads. A
+    # local eos-before-unk fallback here would give Mistral `</s>` for SCOPE
+    # and `<unk>` everywhere else, silently changing what the model sees.
+    self.padding_report = configure_tokenizer_padding(
+        self.tokenizer, padding_side="left"
+    )
+
+  def load_data(self) -> None:
+    dataset = load_dataset(self.args.dataset_repo_id)
+    self.raw_dataset = dataset
+
+  def _extract_prompts(self, entry: dict) -> Tuple[str, str, str]:
+    """Extract (prompt_with_context, prompt_without_context, ground_truth_chosen) from entry."""
+    task_name = self.args.task_name
+    processor_cls = get_task_processor(task_name)
+
+    gt = entry.get(
+        "npov_response",
+        entry.get(
+            "completion",
+            entry.get("response", entry.get("chosen", "")),
+        ),
+    )
+
+    if task_name == "npov":
+      if "perspective_1" in entry and "perspective_2" in entry:
+        p1_name = entry.get("perspective_1_name", "Perspective 1")
+        p1 = entry.get("perspective_1", "")
+        p2_name = entry.get("perspective_2_name", "Perspective 2")
+        p2 = entry.get("perspective_2", "")
+        user_query = entry.get("user_query", "")
+        prompt_with_context = (
+            f"User query: {user_query}\n{p1_name} arguments provided:"
+            f" {p1}\n{p2_name} arguments provided: {p2}\nNeutral point-of-view"
+            " answer to user query, rewriting provided arguments in natural"
+            " language:\n"
+        )
+      elif "prompt" in entry and entry["prompt"]:
+        prompt_raw = entry["prompt"]
+        if gt and prompt_raw.endswith(gt):
+          prompt_with_context = prompt_raw[: -len(gt)].rstrip() + "\n"
+        else:
+          prompt_with_context = prompt_raw
+        user_query = entry.get("user_query", "")
+        if not user_query and "User query: " in prompt_raw:
+          after_query = prompt_raw.split("User query: ", 1)[1]
+          user_query = after_query.split("\n", 1)[0].strip()
+      else:
+        prompt_with_context = str(entry)
+        user_query = entry.get("user_query", "")
+
+      prompt_without_context = chat_wrap_user(
+          _resolve_chat_tokenizer(self), user_query
+      )
+      return prompt_with_context, prompt_without_context, gt
+
+    elif task_name == "bosch":
+      if "prompt" in entry and entry["prompt"]:
+        prompt_raw = entry["prompt"]
+        if gt and prompt_raw.endswith(gt):
+          prompt_with_context = prompt_raw[: -len(gt)].rstrip() + "\n"
+        else:
+          prompt_with_context = prompt_raw
+        question = entry.get("Question", "")
+        if not question and "User question:\n" in prompt_raw:
+          question = (
+              prompt_raw.split("User question:\n", 1)[1]
+              .split("\nManual information:\n", 1)[0]
+              .strip()
+          )
+      else:
+        question = entry.get("Question", "")
+        context = entry.get("Context", "")
+        prompt_with_context = (
+            "You are a helpful assistant to car related questions. You will be"
+            " given an user's question, and the relevant part of the car"
+            " manual. Your task is to answer the user's question using the"
+            " information given. Do not add to your answer any information"
+            " other than those present in the manual excerpt.\nUser"
+            f" question:\n{question}\nManual information:\n{context}\nAnswer to"
+            " user's question:\n"
+        )
+      prompt_without_context = chat_wrap_user(
+          _resolve_chat_tokenizer(self), question
+      )
+      return prompt_with_context, prompt_without_context, gt
+
+    elif task_name == "ragtruth" or (isinstance(task_name, str) and task_name.startswith("ragtruth")):
+      if "prompt" in entry and entry["prompt"]:
+        prompt_raw = entry["prompt"]
+        if gt and prompt_raw.endswith(gt):
+          prompt_with_context = prompt_raw[: -len(gt)].rstrip() + "\n"
+        else:
+          prompt_with_context = prompt_raw
+        user_query = entry.get(
+            "user_query", entry.get("query", entry.get("question", ""))
+        )
+        if not user_query and "Question: " in prompt_raw:
+          user_query = (
+              prompt_raw.split("Question: ", 1)[1]
+              .split("\nAnswer:\n", 1)[0]
+              .strip()
+          )
+      else:
+        user_query = entry.get(
+            "user_query", entry.get("query", entry.get("question", ""))
+        )
+        context = entry.get(
+            "context", entry.get("passage", entry.get("document", ""))
+        )
+        if context:
+          prompt_with_context = (
+              f"Context: {context}\nQuestion: {user_query}\nAnswer:\n"
+          )
+        else:
+          prompt_with_context = f"Question: {user_query}\nAnswer:\n"
+      prompt_without_context = chat_wrap_user(
+          _resolve_chat_tokenizer(self), user_query
+      )
+      return prompt_with_context, prompt_without_context, gt
+
+    else:
+      if "prompt" in entry and entry["prompt"]:
+        prompt_with_context = entry["prompt"]
+      else:
+        prompt_with_context = str(entry)
+      raw_query = entry.get(
+          "user_query",
+          entry.get(
+              "query",
+              entry.get(
+                  "question",
+                  entry.get("prompt_no_context", prompt_with_context),
+              ),
+          ),
+      )
+      prompt_without_context = chat_wrap_user(
+          _resolve_chat_tokenizer(self), raw_query
+      )
+      return prompt_with_context, prompt_without_context, gt
+
+  def _extract_prompt_and_chosen(self, entry: dict) -> Tuple[str, str]:
+    """Extract standard prompt and chosen completion from dataset entry."""
+    p_ctx, _, gt = self._extract_prompts(entry)
+    return p_ctx, gt
+
+  def process_data(self) -> None:
+    train_split = (
+        self.raw_dataset["train"]
+        if isinstance(self.raw_dataset, dict)
+        else self.raw_dataset
+    )
+    shuffled_train = train_split.shuffle(seed=self.args.seed)
+    n_total = len(shuffled_train)
+    n_d1 = int(n_total * self.args.split_ratio)
+    # SCOPE uses D2 (second half) for preference generation
+    d2_split = shuffled_train.select(range(n_d1, n_total))
+
+    if self.args.max_samples is not None and self.args.max_samples > 0:
+      d2_split = d2_split.select(
+          range(min(len(d2_split), self.args.max_samples))
+      )
+
+    self.d2_split = d2_split
+
+  def setup_model(self) -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    self.device = device
+
+    configure_tokenizer_padding(self.tokenizer, padding_side="left")
+
+    print(f"Loading base pre-trained model: {self.args.model_repo_id}...")
+    self.base_model = AutoModelForCausalLM.from_pretrained(
+        self.args.model_repo_id,
+        torch_dtype=torch.bfloat16,
+    ).to(device)
+    if self.tokenizer.pad_token_id is not None:
+      self.base_model.config.pad_token_id = self.tokenizer.pad_token_id
+    self.base_model.eval()
+
+    enable_lora, resolved_adapter_path = self._resolve_lora_adapter_path(
+        self.args.sft_model_path, self.args.model_repo_id
+    )
+    self.enable_lora = enable_lora
+    self.lora_path = resolved_adapter_path
+
+    print(
+        f"Loading SFT model from base={self.args.model_repo_id}"
+        f" adapter={self.lora_path} (enable_lora={self.enable_lora})..."
+    )
+    sft_base = AutoModelForCausalLM.from_pretrained(
+        self.args.model_repo_id,
+        torch_dtype=torch.bfloat16,
+    ).to(device)
+    if self.tokenizer.pad_token_id is not None:
+      sft_base.config.pad_token_id = self.tokenizer.pad_token_id
+
+    if self.enable_lora and self.lora_path:
+      print(
+          f"Loading LoRA adapter from {self.lora_path} and merging weights..."
+      )
+      peft_model = PeftModel.from_pretrained(sft_base, self.lora_path)
+      if hasattr(peft_model, "merge_and_unload"):
+        self.sft_model = peft_model.merge_and_unload().to(device)
+      else:
+        self.sft_model = peft_model.to(device)
+    else:
+      self.sft_model = sft_base
+    self.sft_model.eval()
+
+  def setup_trainer(self) -> None:
+    pass
+
+  def _generate_unfaithful_samples_batch(
+      self,
+      prompts_with_ctx: list[str],
+      prompts_without_ctx: list[str] | None = None,
+  ) -> list[str]:
+    """Generate dispreferred samples for a batch using SCOPE noisy decoding via sft_model.generate()."""
+    if not prompts_with_ctx:
+      return []
+
+    if prompts_without_ctx is None or len(prompts_without_ctx) != len(
+        prompts_with_ctx
+    ):
+      prompts_without_ctx = prompts_with_ctx
+
+    tokenizer = self.tokenizer
+    configure_tokenizer_padding(tokenizer, padding_side="left")
+
+    device = self.device
+    alpha = self.args.alpha
+    temperature = self.args.temperature
+    top_p = self.args.top_p
+    top_k = self.args.top_k
+    max_new_tokens = self.args.max_new_tokens
+    sampling_mode = self.args.sampling_mode
+    n_untouched = getattr(self.args, "n_untouched_logits", 2) or 0
+    min_tokens = getattr(self.args, "min_tokens", 10) or 10
+
+    sft_inputs = tokenizer(
+        prompts_with_ctx,
+        return_tensors="pt",
+        padding=True,
+    ).to(device)
+    sft_input_ids = (
+        sft_inputs.input_ids
+        if hasattr(sft_inputs, "input_ids")
+        else sft_inputs["input_ids"]
+    )
+    sft_attention_mask = (
+        getattr(sft_inputs, "attention_mask", None)
+        if hasattr(sft_inputs, "attention_mask")
+        else sft_inputs.get("attention_mask", None)
+    )
+
+    base_inputs = tokenizer(
+        prompts_without_ctx,
+        return_tensors="pt",
+        padding=True,
+    ).to(device)
+    base_input_ids = (
+        base_inputs.input_ids
+        if hasattr(base_inputs, "input_ids")
+        else base_inputs["input_ids"]
+    )
+    base_attention_mask = (
+        getattr(base_inputs, "attention_mask", None)
+        if hasattr(base_inputs, "attention_mask")
+        else base_inputs.get("attention_mask", None)
+    )
+
+    logits_processor = ScopeMixtureLogitsProcessor(
+        main_input_length=sft_input_ids.shape[1],
+        noise_input_ids=base_input_ids,
+        noise_attention_mask=base_attention_mask,
+        noise_model=self.base_model,
+        alpha=alpha,
+        sampling_mode=sampling_mode,
+        n_untouched_logits=n_untouched,
+    )
+
+    gen_kwargs = {
+        "input_ids": sft_input_ids,
+        "attention_mask": sft_attention_mask,
+        "logits_processor": LogitsProcessorList([logits_processor]),
+        "max_new_tokens": max_new_tokens,
+        "min_new_tokens": min_tokens,
+        "do_sample": temperature > 0.0,
+        "pad_token_id": tokenizer.pad_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+    }
+    if temperature > 0.0:
+      gen_kwargs["temperature"] = temperature
+      if top_p < 1.0:
+        gen_kwargs["top_p"] = top_p
+      if top_k > 0:
+        gen_kwargs["top_k"] = top_k
+
+    with torch.no_grad():
+      outputs = self.sft_model.generate(**gen_kwargs)
+
+    prompt_length = sft_input_ids.shape[1]
+    generated_tokens = outputs[:, prompt_length:]
+
+    if hasattr(tokenizer, "batch_decode"):
+      decoded = tokenizer.batch_decode(
+          generated_tokens, skip_special_tokens=True
+      )
+    else:
+      decoded = [
+          tokenizer.decode(seq, skip_special_tokens=True)
+          for seq in generated_tokens
+      ]
+
+    clean_completions = [
+        strip_terminal_tokens(d, _resolve_chat_tokenizer(self)).strip()
+        for d in decoded
+    ]
+    return clean_completions
+
+  def _generate_unfaithful_sample(
+      self,
+      prompt: str,
+  ) -> str:
+    """Generate a single dispreferred sample (delegates to batch method)."""
+    return self._generate_unfaithful_samples_batch([prompt])[0]
+
+  def run_and_save(self) -> None:
+    batch_size = getattr(self.args, "batch_size", 16) or 16
+    prompts = []
+    chosens = []
+    rejecteds = []
+
+    print(
+        "Generating synthetic dispreferred completions for"
+        f" {len(self.d2_split)} samples (batch_size={batch_size})..."
+    )
+    entries = list(self.d2_split)
+    for i in tqdm(
+        range(0, len(entries), batch_size), desc="SCOPE noisy decoding"
+    ):
+      batch_entries = entries[i : i + batch_size]
+      batch_prompts_ctx = []
+      batch_prompts_no_ctx = []
+      batch_chosens = []
+      for entry in batch_entries:
+        p_ctx, p_no_ctx, gt = self._extract_prompts(entry)
+        batch_prompts_ctx.append(p_ctx)
+        batch_prompts_no_ctx.append(p_no_ctx)
+        batch_chosens.append(gt)
+
+      batch_rejecteds = self._generate_unfaithful_samples_batch(
+          prompts_with_ctx=batch_prompts_ctx,
+          prompts_without_ctx=batch_prompts_no_ctx,
+      )
+      prompts.extend(batch_prompts_ctx)
+      chosens.extend(batch_chosens)
+      rejecteds.extend(batch_rejecteds)
+
+    pref_dict = {
+        "prompt": prompts,
+        "chosen": chosens,
+        "rejected": rejecteds,
+    }
+    train_dataset = Dataset.from_dict(pref_dict)
+
+    # Split generated synthetic preference dataset into 90% train, 10% validation
+    if len(train_dataset) > 1:
+      splits = train_dataset.train_test_split(
+          test_size=0.1, seed=self.args.seed
+      )
+      preference_dataset = DatasetDict(
+          {"train": splits["train"], "test": splits["test"]}
+      )
+    else:
+      preference_dataset = DatasetDict(
+          {"train": train_dataset, "test": train_dataset}
+      )
+
+    if self.args.output_dataset_repo_id:
+      out_repo = sanitize_hf_repo_id(self.args.output_dataset_repo_id)
+    else:
+      model_part = compact_model_name(self.args.model_repo_id)
+      alpha_val = str(getattr(self.args, "alpha", 0.5)).replace(".", "_")
+      timestamp = time.strftime("%y%m%d%H%M")
+      task = getattr(self.args, "task_name", "npov") or "npov"
+      user_prefix = ""
+      if "/" in self.args.dataset_repo_id:
+        user_prefix = self.args.dataset_repo_id.split("/")[0] + "/"
+      samples_tag = (
+          f"_n{self.args.max_samples}" if self.args.max_samples else ""
+      )
+      out_repo = sanitize_hf_repo_id(
+          f"{user_prefix}{task}_scope_preference_{model_part}_alpha_{alpha_val}{samples_tag}_{timestamp}"
+      )
+    if self.args.output_dir:
+      os.makedirs(self.args.output_dir, exist_ok=True)
+      preference_dataset.save_to_disk(self.args.output_dir)
+      print(f"Preference dataset saved locally to {self.args.output_dir}")
+
+    if self.args.push_to_hub:
+      print(f"Pushing preference dataset to Hub: {out_repo}...")
+      preference_dataset.push_to_hub(out_repo)
+
+
+class SSFODataGenerationPipeline(Pipeline):
+  """Pipeline for generating synthetic preference datasets for SSFO.
+
+  Implements Self-Supervised Faithfulness Optimization (SSFO, arXiv:2508.17225)
+  data generation by contrasting SFT model generations with context (chosen)
+  and without context (rejected / hallucinated).
+  """
+
+  def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
+    clean_args = _clean_cli_args(cli_args)
+    parser = HfArgumentParser(SsfoDataGenArguments)
+    script_args = parser.parse_args_into_dataclasses(clean_args)[0]
+    self.args = script_args
+    self.enable_lora = False
+    self.lora_path = None
+    self.vllm_model = self.args.model_repo_id
+    set_seed(self.args.seed)
+
+  def setup_tokenizer(self) -> None:
+    # Not needed for vLLM generation
+    pass
+
+  def load_data(self) -> None:
+    dataset = load_dataset(self.args.dataset_repo_id)
+    self.raw_dataset = dataset
+
+  def _extract_prompts(self, entry: dict) -> Tuple[str, str, str]:
+    """Extract (prompt_with_context, prompt_without_context, ground_truth_chosen) from entry."""
+    task_name = self.args.task_name
+    processor_cls = get_task_processor(task_name)
+
+    gt = entry.get(
+        "npov_response",
+        entry.get(
+            "completion",
+            entry.get("response", entry.get("chosen", "")),
+        ),
+    )
+
+    if task_name == "npov":
+      if "prompt" in entry and entry["prompt"]:
+        prompt_raw = entry["prompt"]
+        if gt and prompt_raw.endswith(gt):
+          prompt_with_context = prompt_raw[: -len(gt)].rstrip() + "\n"
+        else:
+          prompt_with_context = prompt_raw
+        user_query = entry.get("user_query", "")
+        if not user_query and "User query: " in prompt_raw:
+          after_query = prompt_raw.split("User query: ", 1)[1]
+          user_query = after_query.split("\n", 1)[0].strip()
+      elif "perspective_1" in entry and "perspective_2" in entry:
+        prompt_with_context = processor_cls._writer_prompt(entry, SFT=False)[
+            "prompt"
+        ]
+        user_query = entry.get("user_query", "")
+      else:
+        prompt_with_context = str(entry)
+        user_query = entry.get("user_query", "")
+
+      prompt_without_context = chat_wrap_user(
+          _resolve_chat_tokenizer(self), user_query
+      )
+      return prompt_with_context, prompt_without_context, gt
+
+    elif task_name == "bosch":
+      if "prompt" in entry and entry["prompt"]:
+        prompt_raw = entry["prompt"]
+        if gt and prompt_raw.endswith(gt):
+          prompt_with_context = prompt_raw[: -len(gt)].rstrip() + "\n"
+        else:
+          prompt_with_context = prompt_raw
+        question = entry.get("Question", "")
+        if not question and "User question:\n" in prompt_raw:
+          question = (
+              prompt_raw.split("User question:\n", 1)[1]
+              .split("\nManual information:\n", 1)[0]
+              .strip()
+          )
+      else:
+        question = entry.get("Question", "")
+        context = entry.get("Context", "")
+        prompt_with_context = (
+            "You are a helpful assistant to car related questions. You will be"
+            " given an user's question, and the relevant part of the car"
+            " manual. Your task is to answer the user's question using the"
+            " information given. Do not add to your answer any information"
+            " other than those present in the manual excerpt.\nUser"
+            f" question:\n{question}\nManual information:\n{context}\nAnswer to"
+            " user's question:\n"
+        )
+      prompt_without_context = chat_wrap_user(
+          _resolve_chat_tokenizer(self), question
+      )
+      return prompt_with_context, prompt_without_context, gt
+
+    elif task_name == "ragtruth" or (isinstance(task_name, str) and task_name.startswith("ragtruth")):
+      if "prompt" in entry and entry["prompt"]:
+        prompt_raw = entry["prompt"]
+        if gt and prompt_raw.endswith(gt):
+          prompt_with_context = prompt_raw[: -len(gt)].rstrip() + "\n"
+        else:
+          prompt_with_context = prompt_raw
+        user_query = entry.get(
+            "user_query", entry.get("query", entry.get("question", ""))
+        )
+        if not user_query and "Question: " in prompt_raw:
+          user_query = (
+              prompt_raw.split("Question: ", 1)[1]
+              .split("\nAnswer:\n", 1)[0]
+              .strip()
+          )
+      else:
+        user_query = entry.get(
+            "user_query", entry.get("query", entry.get("question", ""))
+        )
+        context = entry.get(
+            "context", entry.get("passage", entry.get("document", ""))
+        )
+        if context:
+          prompt_with_context = (
+              f"Context: {context}\nQuestion: {user_query}\nAnswer:\n"
+          )
+        else:
+          prompt_with_context = f"Question: {user_query}\nAnswer:\n"
+      prompt_without_context = chat_wrap_user(
+          _resolve_chat_tokenizer(self), user_query
+      )
+      return prompt_with_context, prompt_without_context, gt
+
+    else:
+      if "prompt" in entry and entry["prompt"]:
+        prompt_with_context = entry["prompt"]
+      else:
+        prompt_with_context = str(entry)
+      raw_query = entry.get(
+          "user_query",
+          entry.get(
+              "query",
+              entry.get(
+                  "question",
+                  entry.get("prompt_no_context", prompt_with_context),
+              ),
+          ),
+      )
+      prompt_without_context = chat_wrap_user(
+          _resolve_chat_tokenizer(self), raw_query
+      )
+      return prompt_with_context, prompt_without_context, gt
+
+  def process_data(self) -> None:
+    train_split = (
+        self.raw_dataset["train"]
+        if isinstance(self.raw_dataset, dict)
+        else self.raw_dataset
+    )
+    shuffled_train = train_split.shuffle(seed=self.args.seed)
+    if self.args.max_samples is not None and self.args.max_samples > 0:
+      shuffled_train = shuffled_train.select(
+          range(min(len(shuffled_train), self.args.max_samples))
+      )
+    self.train_split = shuffled_train
+
+  def setup_model(self) -> None:
+    enable_lora, lora_path = self._resolve_lora_adapter_path(
+        self.args.sft_model_path, self.args.model_repo_id
+    )
+    self.enable_lora = enable_lora
+    self.lora_path = lora_path
+    self.vllm_model = self.args.model_repo_id
+
+  def setup_trainer(self) -> None:
+    pass
+
+  def _log_sample_inspection(
+      self,
+      prompts_with_ctx: list[str],
+      prompts_without_ctx: list[str],
+      chosens: list[str],
+      rejecteds: list[str],
+      gt_chosens: list[str] | None = None,
+      max_samples_to_log: int = 5,
+  ) -> None:
+    """Logs detailed input prompts and model outputs for inspection."""
+    num_samples = min(max_samples_to_log, len(prompts_with_ctx))
+    if num_samples == 0:
+      return
+
+    print("\n" + "=" * 80)
+    print(f"[SSFO Detailed Inspection - First {num_samples} Sample Pairs]")
+    print("=" * 80)
+
+    for i in range(num_samples):
+      print(f"\n{'#' * 30} Sample {i + 1} / {len(prompts_with_ctx)} {'#' * 30}")
+      print(
+          "[1. Input Prompt WITH Context (for Chosen y+)] (Length:"
+          f" {len(prompts_with_ctx[i])} chars):"
+      )
+      print("-" * 70)
+      print(prompts_with_ctx[i])
+      print("-" * 70)
+
+      no_ctx_str = (
+          prompts_without_ctx[i] if i < len(prompts_without_ctx) else "N/A"
+      )
+      print(
+          "[2. Input Prompt WITHOUT Context (for Rejected y-)] (Length:"
+          f" {len(no_ctx_str)} chars):"
+      )
+      print("-" * 70)
+      print(no_ctx_str)
+      print("-" * 70)
+
+      chosen_str = chosens[i] if i < len(chosens) else "N/A"
+      print(
+          f"[3. Generated Chosen Completion (y+)] (Length: {len(chosen_str)}"
+          " chars):"
+      )
+      print("-" * 70)
+      print(chosen_str)
+      print("-" * 70)
+
+      rejected_str = rejecteds[i] if i < len(rejecteds) else "N/A"
+      print(
+          "[4. Generated Rejected Completion (y-)] (Length:"
+          f" {len(rejected_str)} chars):"
+      )
+      print("-" * 70)
+      print(rejected_str)
+      print("-" * 70)
+
+      if gt_chosens and i < len(gt_chosens) and gt_chosens[i]:
+        print(f"[5. Ground Truth Reference Completion]:")
+        print("-" * 70)
+        print(gt_chosens[i])
+        print("-" * 70)
+
+    print("=" * 80 + "\n")
+
+    # Also save up to 25 samples to a local text inspection file
+    try:
+      os.makedirs("logs", exist_ok=True)
+      timestamp = time.strftime("%y%m%d%H%M")
+      log_file = (
+          f"logs/ssfo_inputs_and_outputs_{self.args.task_name}_{timestamp}.txt"
+      )
+      file_samples = min(25, len(prompts_with_ctx))
+      with open(log_file, "w", encoding="utf-8") as f:
+        f.write("=" * 80 + "\n")
+        f.write(f"SSFO Data Generation Detailed Inspection Log\n")
+        f.write(f"Task: {self.args.task_name}\n")
+        f.write(f"Dataset: {self.args.dataset_repo_id}\n")
+        f.write(f"Model: {self.args.model_repo_id}\n")
+        f.write(f"SFT Adapter: {self.args.sft_model_path}\n")
+        f.write(
+            "Base Model for Rejected:"
+            f" {getattr(self.args, 'use_base_model_for_rejected', True)}\n"
+        )
+        f.write(f"Timestamp: {timestamp}\n")
+        f.write(f"Total Samples: {len(prompts_with_ctx)}\n")
+        f.write("=" * 80 + "\n\n")
+        for i in range(file_samples):
+          f.write(
+              f"\n{'#' * 35} Sample {i + 1} / {len(prompts_with_ctx)}"
+              f" {'#' * 35}\n"
+          )
+          f.write(f"[1. Input Prompt WITH Context (for Chosen y+)]:\n")
+          f.write(prompts_with_ctx[i] + "\n\n")
+          f.write(f"[2. Input Prompt WITHOUT Context (for Rejected y-)]:\n")
+          f.write(
+              (
+                  prompts_without_ctx[i]
+                  if i < len(prompts_without_ctx)
+                  else "N/A"
+              )
+              + "\n\n"
+          )
+          f.write(f"[3. Generated Chosen Completion (y+)]:\n")
+          f.write((chosens[i] if i < len(chosens) else "N/A") + "\n\n")
+          f.write(f"[4. Generated Rejected Completion (y-)]:\n")
+          f.write((rejecteds[i] if i < len(rejecteds) else "N/A") + "\n\n")
+          if gt_chosens and i < len(gt_chosens) and gt_chosens[i]:
+            f.write(f"[5. Ground Truth Reference Completion]:\n")
+            f.write(gt_chosens[i] + "\n\n")
+      print(
+          f"[SSFO Inspection Log] Saved first {file_samples} sample"
+          f" prompt-generation pairs to {log_file}"
+      )
+    except Exception as e:
+      print(f"[SSFO Inspection Log] Could not save log file: {e}")
+
+  def run_and_save(self) -> None:
+    if not _VLLM_AVAILABLE:
+      raise ImportError(
+          "vLLM is required for SSFO data generation, but is not installed."
+          " Please run in an environment with vLLM installed."
+      )
+    entries = list(self.train_split)
+    all_prompt_ctx = []
+    all_prompt_no_ctx = []
+    all_gt_chosen = []
+
+    for entry in entries:
+      p_ctx, p_no_ctx, gt = self._extract_prompts(entry)
+      all_prompt_ctx.append(p_ctx)
+      all_prompt_no_ctx.append(p_no_ctx)
+      all_gt_chosen.append(gt)
+
+    print(
+        f"[SSFO Dataset Input Summary] Total samples: {len(entries)}, "
+        f"Columns: {list(entries[0].keys()) if entries else []}"
+    )
+    if all_prompt_ctx:
+      print("\n" + "=" * 80)
+      print(f"[SSFO Input Prompt Preview (Sample 1 of {len(all_prompt_ctx)})]")
+      print("-" * 80)
+      print("--- Prompt WITH Context (Passed to SFT Model for Chosen y+) ---")
+      print(all_prompt_ctx[0])
+      print("-" * 80)
+      print(
+          "--- Prompt WITHOUT Context (Passed to SFT Model for Rejected y-) ---"
+      )
+      print(all_prompt_no_ctx[0])
+      if all_gt_chosen and all_gt_chosen[0]:
+        print("-" * 80)
+        print(f"--- Ground Truth Completion in Dataset (if any) ---")
+        print(all_gt_chosen[0])
+      print("=" * 80 + "\n")
+
+    if not entries:
+      print("Warning: Dataset is empty, creating empty preference dataset.")
+      train_dataset = Dataset.from_dict({
+          "prompt": [],
+          "chosen": [],
+          "rejected": [],
+      })
+    else:
+      # Prepare sampling parameters for vLLM (matching EvaluationGenerationPipeline)
+      top_k = self.args.top_k if self.args.top_k > 0 else -1
+      rep_penalty = getattr(self.args, "repetition_penalty", 1.0) or 1.0
+      sampling_params = SamplingParams(
+          seed=self.args.seed,
+          temperature=self.args.temperature,
+          top_p=self.args.top_p,
+          top_k=top_k,
+          repetition_penalty=rep_penalty,
+          min_tokens=getattr(self.args, "min_tokens", 10),
+          max_tokens=self.args.max_new_tokens,
+      )
+
+      # Instantiate vLLM LLM (matching EvaluationGenerationPipeline)
+      vllm_model = getattr(self, "vllm_model", None) or getattr(
+          self.args, "model_repo_id", None
+      )
+      llm_kwargs = {
+          "model": vllm_model,
+          "enable_lora": getattr(self, "enable_lora", False),
+          "max_lora_rank": 64,
+          "dtype": "bfloat16",
+          "hf_overrides": {"allow_global_per_layer_attribute_access": True},
+      }
+      # Only set when asked: vLLM otherwise sizes the KV cache for the model's
+      # declared context, which some checkpoints advertise as 262144.
+      max_model_len = getattr(self.args, "max_model_len", None)
+      if max_model_len:
+        llm_kwargs["max_model_len"] = max_model_len
+      if hasattr(self, "llm") and self.llm is not None:
+        llm = self.llm
+      else:
+        try:
+          llm = LLM(**llm_kwargs)
+        except (TypeError, ValueError, KeyError, AttributeError) as e:
+          # See `EvaluationGenerationPipeline.run_and_save`: `hf_overrides`
+          # holds a family-specific knob that must never be the reason the
+          # engine refuses to start.
+          if "hf_overrides" not in llm_kwargs:
+            raise
+          print(
+              f"vLLM rejected the engine arguments ({e}); retrying without"
+              " hf_overrides."
+          )
+          llm_kwargs.pop("hf_overrides", None)
+          llm = LLM(**llm_kwargs)
+
+      lora_request = (
+          LoRARequest("writer_lora_adapter", 1, lora_path=self.lora_path)
+          if (self.enable_lora and self.lora_path is not None)
+          else None
+      )
+
+      # Generate Chosen (y+) with context
+      if self.args.use_ground_truth_chosen and all(all_gt_chosen):
+        chosens = all_gt_chosen
+      else:
+        print(
+            "Generating chosen completions with context for"
+            f" {len(all_prompt_ctx)} samples..."
+        )
+        if lora_request is not None:
+          outputs_ctx = llm.generate(
+              all_prompt_ctx,
+              sampling_params,
+              lora_request=lora_request,
+          )
+        else:
+          outputs_ctx = llm.generate(all_prompt_ctx, sampling_params)
+        chosens = [output.outputs[0].text for output in outputs_ctx]
+
+      # Generate Rejected (y-) without context
+      use_base_for_rejected = getattr(
+          self.args, "use_base_model_for_rejected", True
+      )
+      if use_base_for_rejected:
+        print(
+            "Generating rejected completions without context using BASE model"
+            f" (no adapter) for {len(all_prompt_no_ctx)} samples..."
+        )
+        outputs_no_ctx = llm.generate(all_prompt_no_ctx, sampling_params)
+      else:
+        print(
+            "Generating rejected completions without context using SFT adapter"
+            f" for {len(all_prompt_no_ctx)} samples..."
+        )
+        if lora_request is not None:
+          outputs_no_ctx = llm.generate(
+              all_prompt_no_ctx,
+              sampling_params,
+              lora_request=lora_request,
+          )
+        else:
+          outputs_no_ctx = llm.generate(all_prompt_no_ctx, sampling_params)
+      rejecteds = [output.outputs[0].text for output in outputs_no_ctx]
+
+      # Log inspection samples
+      self._log_sample_inspection(
+          prompts_with_ctx=all_prompt_ctx,
+          prompts_without_ctx=all_prompt_no_ctx,
+          chosens=chosens,
+          rejecteds=rejecteds,
+          gt_chosens=all_gt_chosen,
+      )
+
+      pref_dict = {
+          "prompt": all_prompt_ctx,
+          "chosen": chosens,
+          "rejected": rejecteds,
+      }
+      train_dataset = Dataset.from_dict(pref_dict)
+
+    # Split generated synthetic preference dataset into 90% train, 10% validation
+    if len(train_dataset) > 1:
+      splits = train_dataset.train_test_split(
+          test_size=0.1, seed=self.args.seed
+      )
+      preference_dataset = DatasetDict(
+          {"train": splits["train"], "test": splits["test"]}
+      )
+    else:
+      preference_dataset = DatasetDict(
+          {"train": train_dataset, "test": train_dataset}
+      )
+
+    if self.args.output_dataset_repo_id:
+      out_repo = sanitize_hf_repo_id(self.args.output_dataset_repo_id)
+    else:
+      model_part = compact_model_name(self.args.model_repo_id)
+      timestamp = time.strftime("%y%m%d%H%M")
+      task = getattr(self.args, "task_name", "npov") or "npov"
+      user_prefix = ""
+      if "/" in self.args.dataset_repo_id:
+        user_prefix = self.args.dataset_repo_id.split("/")[0] + "/"
+      samples_tag = (
+          f"_n{self.args.max_samples}" if self.args.max_samples else ""
+      )
+      out_repo = sanitize_hf_repo_id(
+          f"{user_prefix}{task}_ssfo_preference_{model_part}{samples_tag}_{timestamp}"
+      )
+    if self.args.output_dir:
+      os.makedirs(self.args.output_dir, exist_ok=True)
+      preference_dataset.save_to_disk(self.args.output_dir)
+      print(f"Preference dataset saved locally to {self.args.output_dir}")
+
+    if self.args.push_to_hub:
+      print(f"Pushing preference dataset to Hub: {out_repo}...")
+      preference_dataset.push_to_hub(out_repo)
 
 
 class EvaluationPipeline(Pipeline):
-    """Base class for evaluator flows. Provides helper methods previously
-    implemented in `evaluator_utils.py` so evaluation pipelines can call
-    them as instance methods and share configuration/state.
+  """Base class for evaluator flows.
+
+  Provides helper methods for autorater evaluation, completion generation, and
+  scoring.
+  """
+
+  def setup_trainer(self) -> None:
+    # Evaluation pipelines do not have trainers
+    pass
+
+  def _assert_sft_adapter_expectation(self) -> None:
+    """Refuses to silently evaluate an RL checkpoint without its SFT adapter.
+
+    PE-RL and DPO train a fresh LoRA adapter on top of *merged* SFT weights,
+    so the published adapter is a delta relative to ``base + SFT``. Serving it
+    on the bare base model produces a model that never existed during
+    training. That used to happen silently whenever ``SFT_MODEL_LORA`` was
+    unset, because ``${VAR:+--flag}`` simply drops the flag.
+
+    Raises:
+      ValueError: If an RL/DPO-looking checkpoint is evaluated without an SFT
+        adapter and the ablation was not explicitly requested.
     """
+    writer_ref = normalize_model_ref(
+        getattr(self.args, "writer_model_lora", None)
+    )
+    if not writer_ref or not looks_like_rl_checkpoint(writer_ref):
+      return
+    if is_sft_adapter_stacked(
+        getattr(self.args, "sft_model_path", None), writer_ref
+    ):
+      return
 
-    def setup_trainer(self) -> None:
-        # Evaluation pipelines do not have trainers
-        pass
+    message = (
+        f"'{writer_ref}' looks like an RL/DPO checkpoint, but no SFT adapter"
+        " was provided (--sft_model_path is empty). That adapter was trained"
+        " on top of merged SFT weights, so evaluating it on the bare base"
+        " model serves a model that was never trained.\n"
+        "  - To evaluate the trained policy: pass --sft_model_path"
+        " <sft_repo_or_path> (or set SFT_MODEL_LORA in scripts/evaluator.sh).\n"
+        "  - To run this as a deliberate ablation: pass"
+        " --allow_missing_sft_adapter True (or set ALLOW_MISSING_SFT=True)."
+        " Its completions land in a separate '_nosft' dataset."
+    )
+    if not getattr(self.args, "allow_missing_sft_adapter", False):
+      raise ValueError(message)
+    print(
+        "\n"
+        + "=" * 80
+        + "\n[WARNING] Evaluating an RL checkpoint WITHOUT its SFT adapter.\n"
+        + message
+        + "\n"
+        + "=" * 80
+        + "\n",
+        flush=True,
+    )
 
-    def get_fewshot_examples(
-        self, data: Dataset, n_yes: int, n_no: int, seed: int
-    ) -> Dataset:
-        if n_yes == 0 and n_no == 0:
-            return None
-        positive_examples = (
-            data.filter(lambda entry: entry["class_hall"] == "Yes")
-            .shuffle(seed=seed)
-            .select(range(n_yes))
-        )
-        negative_examples = (
-            data.filter(lambda entry: entry["class_hall"] == "No")
-            .shuffle(seed=seed)
-            .select(range(n_no))
-        )
-        fewshot_examples = (
-            concatenate_datasets(
-                [positive_examples, negative_examples]
-            ).shuffle(seed=seed)
-            if positive_examples is not None
-            else None
-        )
-        return fewshot_examples
+  def _completions_repo_id(self) -> Optional[str]:
+    """Resolves the dataset repo holding this configuration's completions.
 
-    def evaluator_score_batch(
-        self,
-        evaluator: AutoModelForCausalLM,
-        tokenized_prompts: dict[str, torch.Tensor],
-        yes_token_id: int,
-        no_token_id: int,
-    ) -> torch.Tensor:
-        with torch.no_grad():
-            outputs = evaluator(**tokenized_prompts, use_cache=False)
-            score_yes = torch.exp(outputs.logits[:, -1, yes_token_id])
-            score_no = torch.exp(outputs.logits[:, -1, no_token_id])
-            score_batch = score_no / (score_yes + score_no)
-        return score_batch
+    Generation and scoring must land on the same name, and two different
+    serving configurations must land on different names, otherwise runs
+    overwrite each other's completions on the Hub.
 
-    def evaluator_score(
-        self,
-        data: Dataset,
-        script_args: ScriptArguments,
-        tokenizer: AutoTokenizer,
-        evaluator: AutoModelForCausalLM,
-        yes_token_id: int,
-        no_token_id: int,
-    ) -> torch.Tensor:
-        iterator = data.iter(batch_size=script_args.eval_batch_size)
-        num_batches = int(data.num_rows / script_args.eval_batch_size)
-        scores = torch.tensor([])
-        for batch in tqdm(
-            iterator, desc="Evaluator scoring", total=num_batches
-        ):
-            tokenized_prompts = tokenizer(
-                batch["evaluator_prompt"],
-                return_tensors="pt",
-                padding="longest",
+    Returns:
+      The explicit ``--dataset_with_completions`` override when given, the
+      derived repo ID when a writer adapter is known, else None.
+    """
+    explicit = getattr(self.args, "dataset_with_completions", None)
+    if explicit:
+      return sanitize_hf_repo_id(explicit)
+    if not getattr(self.args, "writer_model_lora", None):
+      return None
+    return build_eval_dataset_repo_id(
+        user=self.args.user,
+        writer_model_lora=self.args.writer_model_lora,
+        temperature=self.args.temperature,
+        writer_num_fewshot=self.args.writer_num_fewshot,
+        task_name=getattr(self.args, "task_name", None),
+        sft_model_path=getattr(self.args, "sft_model_path", None),
+        seed=self.args.seed,
+        max_tokens=self.args.max_tokens,
+    )
+
+  def safe_load_dataset(
+      self, path: str, split: Optional[str] = None
+  ) -> Dataset:
+    """Loads dataset from Hugging Face Hub with parquet snapshot fallback."""
+    target_split = split or "test"
+    try:
+      return load_dataset(path, split=target_split)
+    except Exception as e:
+      print(
+          f"Notice: Standard load_dataset failed for {path}"
+          f" (split={target_split}): {e}. Falling back to direct parquet"
+          " download..."
+      )
+      local_dir = snapshot_download(
+          repo_id=path,
+          repo_type="dataset",
+          allow_patterns=["*.parquet"],
+      )
+      split_parquet_files = sorted(
+          glob.glob(
+              os.path.join(local_dir, "**", f"{target_split}-*.parquet"),
+              recursive=True,
+          )
+      )
+      if split_parquet_files:
+        parquet_files = split_parquet_files
+      else:
+        parquet_files = sorted(
+            glob.glob(
+                os.path.join(local_dir, "**", "*.parquet"), recursive=True
             )
-            tokenized_prompts = {
-                k: v.to(evaluator.device) for k, v in tokenized_prompts.items()
-            }
-            score_batch = self.evaluator_score_batch(
-                evaluator, tokenized_prompts, yes_token_id, no_token_id
-            )
-            score_batch = score_batch.cpu()
-            scores = torch.cat((scores, score_batch))
-            del tokenized_prompts
-        return scores
+        )
+      if not parquet_files:
+        raise ValueError(f"No parquet files found in dataset {path}") from e
+      return Dataset.from_parquet(parquet_files)
 
-    def gemini_score_response(
-        self, response: types.GenerateContentResponse
-    ) -> float:
-        """Converts a Gemini API response to a normalized score.
+  def _subsample_dataset(self, dataset: Dataset) -> Dataset:
+    """Subsamples dataset to max_eval_samples using seed if specified."""
+    max_samples = getattr(self.args, "max_eval_samples", None)
+    if (
+        max_samples is not None
+        and max_samples > 0
+        and len(dataset) > max_samples
+    ):
+      print(
+          f"Subsampling evaluation dataset from {len(dataset)} to"
+          f" {max_samples} samples (seed={self.args.seed})..."
+      )
+      return dataset.shuffle(seed=self.args.seed).select(range(max_samples))
+    return dataset
 
-        Args:
-            response (google.genai.types.GenerateContentResponse): Gemini API response.
+  def get_fewshot_examples(
+      self, data: Dataset, n_yes: int, n_no: int, seed: int
+  ) -> Optional[Dataset]:
+    if n_yes == 0 and n_no == 0:
+      return None
+    positive_examples = (
+        data.filter(lambda entry: entry["class_hall"] == "Yes")
+        .shuffle(seed=seed)
+        .select(range(n_yes))
+    )
+    negative_examples = (
+        data.filter(lambda entry: entry["class_hall"] == "No")
+        .shuffle(seed=seed)
+        .select(range(n_no))
+    )
+    fewshot_examples = (
+        concatenate_datasets([positive_examples, negative_examples]).shuffle(
+            seed=seed
+        )
+        if positive_examples is not None
+        else None
+    )
+    return fewshot_examples
 
-        Returns:
-            float: Normalized score for the response.
-        """
+  def evaluator_score_batch(
+      self,
+      evaluator: AutoModelForCausalLM,
+      tokenized_prompts: dict[str, torch.Tensor],
+      yes_token_id: int,
+      no_token_id: int,
+  ) -> torch.Tensor:
+    with torch.no_grad():
+      outputs = evaluator(**tokenized_prompts, use_cache=False)
+      score_yes = outputs.logits[:, -1, yes_token_id]
+      score_no = outputs.logits[:, -1, no_token_id]
+      # Numerically stable score computation: sigmoid(score_no - score_yes) = P(No)
+      score_batch = torch.sigmoid(score_no - score_yes)
+    return score_batch
 
-        if response.candidates[0].avg_logprobs is None:
-            return 0
-        if response.text == "No":
-            return np.exp(response.candidates[0].avg_logprobs)
-        elif response.text == "Yes":
-            return 1 - np.exp(response.candidates[0].avg_logprobs)
-        else:
-            raise Exception("Invalid response")
+  def evaluator_score(
+      self,
+      data: Dataset,
+      script_args: ScriptArguments,
+      tokenizer: AutoTokenizer,
+      evaluator: AutoModelForCausalLM,
+      yes_token_id: int,
+      no_token_id: int,
+  ) -> torch.Tensor:
+    batch_size = getattr(script_args, "eval_batch_size", 32)
+    iterator = data.iter(batch_size=batch_size)
+    num_batches = (
+        int(math.ceil(data.num_rows / batch_size))
+        if hasattr(data, "num_rows")
+        else None
+    )
+    all_scores: list[torch.Tensor] = []
+    for batch in tqdm(iterator, desc="Evaluator scoring", total=num_batches):
+      tokenized_prompts = tokenizer(
+          batch["evaluator_prompt"],
+          return_tensors="pt",
+          padding="longest",
+      )
+      tokenized_prompts = {
+          k: v.to(evaluator.device) for k, v in tokenized_prompts.items()
+      }
+      score_batch = self.evaluator_score_batch(
+          evaluator, tokenized_prompts, yes_token_id, no_token_id
+      )
+      all_scores.append(score_batch.cpu())
+      del tokenized_prompts
+    if not all_scores:
+      return torch.tensor([])
+    return torch.cat(all_scores, dim=0)
 
-    def gemini_score_dataset(
-        self,
-        client: genai.Client,
-        dataset: Dataset,
-        script_args: ScriptArguments,
-    ) -> torch.Tensor:
-        """Scores a dataset using the Gemini API, with checkpointing and retries.
+  def create_gemini_client(self) -> genai.Client:
+    """Initializes Google GenAI Client supporting Vertex AI or API Key."""
+    use_vertex = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() in (
+        "true",
+        "1",
+    ) or bool(os.environ.get("GOOGLE_CLOUD_PROJECT"))
+    if use_vertex:
+      project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+      location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+      print(
+          "Initializing Google GenAI Client using Vertex AI"
+          f" (project={project}, location={location})..."
+      )
+      return genai.Client(vertexai=True, project=project, location=location)
+    elif getattr(self.args, "gemini_api_key", None):
+      return genai.Client(api_key=self.args.gemini_api_key)
+    else:
+      return genai.Client()
 
-        Args:
-            client (google.genai.Client): Initialized Gemini API client.
-            dataset (datasets.Dataset): Dataset with 'evaluator_prompt' column.
-            script_args (ScriptArguments): Parsed script arguments.
+  def gemini_score_response(
+      self,
+      response: types.GenerateContentResponse,
+      entry_idx: Optional[int] = None,
+  ) -> float:
+    """Converts a Gemini API response to a normalized score.
 
-        Returns:
-            torch.Tensor: Scores for each entry in the dataset.
-        """
+    Extracts log probabilities from constrained enum decoding ('No' / 'Yes')
+    across candidate steps, calculating P(No) = exp(logp_no) / (exp(logp_no) + exp(logp_yes)).
+    Falls back to deterministic text classification if logprobs are unavailable,
+    logging explicit warnings whenever a fallback path is taken.
 
-        model = "gemini-2.0-flash-001"
-        schema = {"type": "STRING", "enum": ["No", "Yes"]}
-        print("Calling the Gemini API...")
+    Args:
+        response (google.genai.types.GenerateContentResponse): Gemini API
+          response.
+        entry_idx (Optional[int]): Sample index for descriptive logging.
 
-        # Prepare local checkpoint directory
-        checkpoint_dir = os.path.join("checkpoints", "eval")
+    Returns:
+        Optional[float]: Normalized score in [0.0, 1.0] for the response (P(No
+        hallucination)), or None if scoring failed/unresolved.
+    """
+    prefix = (
+        f"[Autorater fallback - sample #{entry_idx}]"
+        if entry_idx is not None
+        else "[Autorater fallback]"
+    )
+
+    if not response or not getattr(response, "candidates", None):
+      print(
+          f"{prefix} Empty response or blocked by safety filters"
+          " (candidates is empty), no score assigned."
+      )
+      return None
+
+    candidate = response.candidates[0]
+    text = (response.text or "").strip() if getattr(response, "text", None) else ""
+    clean_text = text.strip("\"'` \n\r\t").lower()
+
+    # 1. Search for 'no' and 'yes' logprobs across all candidate steps
+    if (
+        hasattr(candidate, "logprobs_result")
+        and candidate.logprobs_result is not None
+    ):
+      logprobs_res = candidate.logprobs_result
+      top_candidates_steps = (
+          getattr(logprobs_res, "top_candidates", None)
+          or getattr(logprobs_res, "chosen_candidates", None)
+          or []
+      )
+
+      for step in top_candidates_steps:
+        candidates = (
+            getattr(step, "candidates", None)
+            or getattr(step, "top_candidates", None)
+            or ([step] if hasattr(step, "token") else [])
+        )
+        logp_no = None
+        logp_yes = None
+        for cand in candidates:
+          cand_token = (
+              getattr(cand, "token", "").strip().strip("\"'`").lower()
+          )
+          # The google-genai SDK names this field `log_probability`
+          # (`LogprobsResultCandidate.log_probability`). The legacy names are
+          # kept only as a defensive fallback: reading the wrong name silently
+          # yields None, which collapses every score onto the binary text
+          # fallback below.
+          logprob = getattr(cand, "log_probability", None)
+          if logprob is None:
+            logprob = getattr(cand, "log_prob", getattr(cand, "logprob", None))
+          if not isinstance(logprob, (int, float)):
+            continue
+          if cand_token == "no":
+            logp_no = float(logprob)
+          elif cand_token == "yes":
+            logp_yes = float(logprob)
+
+        if logp_no is not None and logp_yes is not None:
+          p_no = float(math.exp(logp_no))
+          p_yes = float(math.exp(logp_yes))
+          denom = p_no + p_yes
+          if denom > 0:
+            return float(p_no / denom)
+        elif logp_no is not None:
+          # Only 'No' made the top-k. exp(logp_no) is already P(No) over the
+          # full vocabulary, so use it instead of collapsing to a hard 1.0.
+          return float(min(1.0, max(0.0, math.exp(logp_no))))
+        elif logp_yes is not None:
+          return float(min(1.0, max(0.0, 1.0 - math.exp(logp_yes))))
+
+      # Check chosen_candidates as fallback if top_candidates was not structured
+      chosen = getattr(logprobs_res, "chosen_candidates", None)
+      if chosen:
+        for cand in chosen:
+          cand_token = (
+              getattr(cand, "token", "").strip().strip("\"'`").lower()
+          )
+          if cand_token not in ("no", "yes"):
+            continue
+          logprob = getattr(cand, "log_probability", None)
+          if logprob is None:
+            logprob = getattr(cand, "log_prob", getattr(cand, "logprob", None))
+          if isinstance(logprob, (int, float)):
+            p_chosen = min(1.0, max(0.0, math.exp(float(logprob))))
+            return float(p_chosen if cand_token == "no" else 1.0 - p_chosen)
+          return 1.0 if cand_token == "no" else 0.0
+
+    # 2. Check avg_logprobs if available. A value of exactly 0.0 is what the
+    # backend returns when it did not compute logprobs at all; exp(0) == 1
+    # would masquerade as a perfectly confident answer, so it is rejected.
+    avg_logprob = getattr(candidate, "avg_logprobs", None)
+    if isinstance(avg_logprob, (int, float)) and avg_logprob != 0.0:
+      if clean_text.startswith("no"):
+        return float(math.exp(avg_logprob))
+      elif clean_text.startswith("yes"):
+        return float(1.0 - math.exp(avg_logprob))
+
+    # 3. Fallback based on structured JSON and text classification
+    try:
+      parsed = json.loads(text)
+      if isinstance(parsed, dict) and "answer" in parsed:
+        ans = str(parsed["answer"]).strip().lower()
+        if ans == "no":
+          return 1.0
+        elif ans == "yes":
+          return 0.0
+    except Exception:
+      pass
+
+    if clean_text.startswith("no") or clean_text == "no":
+      return 1.0
+    elif clean_text.startswith("yes") or clean_text == "yes":
+      return 0.0
+
+    # Word-boundary search for "no" or "yes" in JSON or surrounding text
+    match = re.search(r"\b(yes|no)\b", clean_text, re.IGNORECASE)
+    if match:
+      found = match.group(1).lower()
+      return 1.0 if found == "no" else 0.0
+
+    print(
+        f"{prefix} Unresolved response (response text: {repr(text[:80])}), "
+        "no score assigned."
+    )
+    return None
+
+  def gemini_score_dataset(
+      self,
+      client: genai.Client,
+      dataset: Dataset,
+      script_args: ScriptArguments,
+  ) -> list[Optional[float]]:
+    """Scores a dataset using the Gemini API, with checkpointing and retries.
+
+    Args:
+        client (google.genai.Client): Initialized Gemini API client.
+        dataset (datasets.Dataset): Dataset with 'evaluator_prompt' column.
+        script_args (ScriptArguments): Parsed script arguments.
+
+    Returns:
+        list[Optional[float]]: Scores for each entry in the dataset. Unscored
+          entries are None.
+    """
+    model = getattr(script_args, "evaluator_model", None) or "gemini-2.5-flash"
+    try:
+      schema = types.Schema(
+          type=types.Type.STRING,
+          enum=["No", "Yes"],
+      )
+    except Exception:
+      schema = {"type": "STRING", "enum": ["No", "Yes"]}
+    print(f"Calling the Gemini API with model {model} (constrained decoding)...")
+
+    # Checkpoint path is purely optional: only active if explicitly configured
+    checkpoint_path = getattr(script_args, "scores_checkpoint_path", None)
+    if checkpoint_path:
+      checkpoint_dir = os.path.dirname(checkpoint_path)
+      if checkpoint_dir:
         os.makedirs(checkpoint_dir, exist_ok=True)
-        # Use only the dataset name after the slash for checkpoint filename
-        if (
-            script_args.dataset_with_completions
-            and "/" in script_args.dataset_with_completions
-        ):
-            dataset_name = script_args.dataset_with_completions.split("/", 1)[1]
-        else:
-            dataset_name = str(script_args.dataset_with_completions)
-        checkpoint_path = os.path.join(
-            checkpoint_dir,
-            f"{dataset_name}_scores_checkpoint.pt",
-        )
 
-        # Initialize scores: load from checkpoint if exists, else from dataset or None
-        if os.path.exists(checkpoint_path):
-            print(f"Loading scores from checkpoint: {checkpoint_path}")
-            scores = torch.load(checkpoint_path)
-            # If checkpoint is shorter than dataset (e.g. dataset updated), pad with None
-            if len(scores) < len(dataset):
-                scores = list(scores) + [None] * (len(dataset) - len(scores))
-            elif len(scores) > len(dataset):
-                scores = list(scores)[: len(dataset)]
-        elif "scores" in dataset.column_names:
-            scores = list(dataset["scores"])
-        else:
-            scores = [None] * len(dataset)
+    # Initialize scores: load from checkpoint if exists, else from dataset or None
+    overwrite = getattr(script_args, "overwrite_scores", False)
+    if not overwrite and checkpoint_path and os.path.exists(checkpoint_path):
+      print(f"Loading scores from local checkpoint: {checkpoint_path}")
+      loaded_scores = torch.load(checkpoint_path)
+      if hasattr(loaded_scores, "tolist"):
+        loaded_scores = loaded_scores.tolist()
+      scores = list(loaded_scores)
+      # If checkpoint is shorter than dataset (e.g. dataset updated), pad with None
+      if len(scores) < len(dataset):
+        scores = list(scores) + [None] * (len(dataset) - len(scores))
+      elif len(scores) > len(dataset):
+        scores = list(scores)[: len(dataset)]
+    elif not overwrite and "scores" in dataset.column_names:
+      print(
+          "Found existing 'scores' column in dataset. Resuming from existing"
+          " scores on Hugging Face Hub..."
+      )
+      raw_scores = list(dataset["scores"])
+      if len(raw_scores) < len(dataset):
+        raw_scores = list(raw_scores) + [None] * (len(dataset) - len(raw_scores))
+      elif len(raw_scores) > len(dataset):
+        raw_scores = list(raw_scores)[: len(dataset)]
+      scores = raw_scores
+    else:
+      scores = [None] * len(dataset)
 
-        queries_per_minute = 2000
-        time_window = 60
-        query_count = 0
-        start_time = time.time()
-        save_frequency = 50  # Save progress every 50 entries
-        server_retry_wait = 20  # seconds to wait between server error retries
-        server_max_retries = 3  # number of times to retry on server error
-        entries_to_score = [
-            i for i, score in enumerate(scores) if score is None
-        ]
-        print(f"Found {len(entries_to_score)} entries that need scoring...")
-
+    # Normalize existing scores: ensure missing, nan, or non-numeric entries are strictly None
+    for i in range(len(scores)):
+      val = scores[i]
+      if val is None:
+        continue
+      if isinstance(val, str) and val.strip().lower() in (
+          "",
+          "none",
+          "nan",
+          "null",
+      ):
+        scores[i] = None
+      else:
         try:
-            for n, idx in enumerate(
-                tqdm(entries_to_score, desc="Scoring with Gemini API")
-            ):
-                elapsed_time = time.time() - start_time
-                if query_count == (queries_per_minute - 1):
-                    if elapsed_time < time_window:
-                        wait_time = time_window - elapsed_time
-                        print(
-                            f"Wait {wait_time:.2f} seconds to avoid API rate limit..."
-                        )
-                        time.sleep(wait_time + 1)
-                    query_count = 0
-                    start_time = time.time()
+          f_val = float(val)
+          if math.isnan(f_val):
+            scores[i] = None
+          else:
+            scores[i] = f_val
+        except (ValueError, TypeError):
+          scores[i] = None
 
-                retry_count = 0
-                while retry_count < server_max_retries:
-                    try:
-                        response = client.models.generate_content(
-                            model=model,
-                            contents=dataset[idx]["evaluator_prompt"],
-                            config=types.GenerateContentConfig(
-                                response_mime_type="text/x.enum",
-                                response_schema=schema,
-                                temperature=0,
-                                max_output_tokens=1,
-                                seed=script_args.seed,
-                            ),
-                        )
-                        scores[idx] = self.gemini_score_response(response)
-                        query_count += 1
-                        break  # Success, break out of retry loop
-                    except Exception as e:
-                        error_str = str(e).lower()
-                        if (
-                            "unavailable" in error_str
-                            or "overloaded" in error_str
-                            or "overcharged" in error_str
-                            or "server" in error_str
-                        ) and retry_count < server_max_retries - 1:
-                            print(
-                                f"Server unavailable/overloaded at entry {idx}, attempt {retry_count + 1}/{server_max_retries}. Waiting {server_retry_wait} seconds before retrying..."
-                            )
-                            time.sleep(server_retry_wait)
-                            retry_count += 1
-                            continue
-                        else:
-                            raise  # Not a server error or max retries reached
+    max_workers = getattr(script_args, "max_workers", 16) or 16
+    save_frequency = 50  # Save progress every 50 entries
+    server_retry_wait = 5  # Base seconds to wait between server error retries
+    server_max_retries = 4  # Number of times to retry on server error
+    # Independent judge calls per sample. k = 1 is one call and no
+    # aggregation, i.e. exactly the historical behaviour.
+    num_samples = max(
+        1, int(getattr(script_args, "autorater_num_samples", 1) or 1)
+    )
+    # How many samples had to fall back to a degraded request shape. These
+    # used to be one shared flag, so a single transient error silently
+    # downgraded every *later* sample from a continuous probability to a
+    # binary 0/1 score, with the split decided by thread scheduling. The flags
+    # are per request now; these counters make a degraded run visible.
+    fallback_counts = {
+        "logprobs": 0,
+        "thinking_config": 0,
+        "system_instruction": 0,
+        "response_schema": 0,
+    }
+    # Per-sample max-min over the k draws: a direct measurement of how much
+    # the judge disagrees with itself.
+    observed_spreads: list[float] = []
+    entries_to_score = [i for i, score in enumerate(scores) if score is None]
+    already_scored = len(scores) - len(entries_to_score)
+    if already_scored > 0:
+      print(
+          f"Reusing {already_scored} already scored entries. "
+          f"{len(entries_to_score)} missing entries remaining to score."
+      )
+    else:
+      print(f"Found {len(entries_to_score)} entries to score.")
 
-                # Save progress periodically to local file
-                if (n + 1) % save_frequency == 0:
-                    print(
-                        f"\nSaving progress locally after {n + 1} new entries..."
-                    )
-                    try:
-                        torch.save(scores, checkpoint_path)
-                    except Exception as e:
-                        print(
-                            f"Warning: Could not save intermediate progress locally: {e}"
-                        )
+    if entries_to_score:
+      print(
+          f"Scoring {len(entries_to_score)} entries concurrently with"
+          f" {max_workers} worker threads"
+          + (f", {num_samples} calls per sample" if num_samples > 1 else "")
+          + "..."
+      )
 
-        except Exception as e:
-            print(f"\nError encountered at entry {idx}: {str(e)}")
-            print("Saving current progress locally...")
+      lock = threading.Lock()
+      completed_count = 0
+
+      def note_fallback(kind: str) -> None:
+        with lock:
+          fallback_counts[kind] += 1
+
+      def score_once(idx: int) -> Optional[float]:
+        """Runs a single autorater call for one sample.
+
+        Every capability downgrade (logprobs, thinking budget, system
+        instruction, structured schema) is local to this call: a transient
+        error on one sample must not change how the rest of the run is scored.
+
+        Args:
+            idx: Row index into ``dataset``.
+
+        Returns:
+            The normalized score, or None if the call could not be resolved.
+        """
+        prompt_content = dataset[idx]["evaluator_prompt"]
+        retry_count = 0
+        use_logprobs = True
+        use_thinking = hasattr(types, "ThinkingConfig")
+        use_system_instruction = True
+        use_schema = True
+        # A capability downgrade retries without consuming a server retry, so
+        # the total attempt count is bounded explicitly: there are four
+        # downgrades and each can only be taken once.
+        attempts_left = server_max_retries + 4
+
+        while retry_count < server_max_retries and attempts_left > 0:
+          attempts_left -= 1
+          config_kwargs = {
+              "temperature": 0,
+              "max_output_tokens": 64,
+              "seed": script_args.seed,
+          }
+          if use_schema:
+            config_kwargs["response_mime_type"] = "application/json"
+            config_kwargs["response_schema"] = schema
+          if use_system_instruction:
+            config_kwargs["system_instruction"] = (
+                "You are an evaluator. Output strictly 'Yes' or 'No' with"
+                " no conversational preamble or markdown."
+            )
+          if use_logprobs:
+            config_kwargs["response_logprobs"] = True
+            config_kwargs["logprobs"] = 5
+          if use_thinking:
+            # Zero thinking budget keeps the classification token immediate.
             try:
-                torch.save(scores, checkpoint_path)
-            except Exception as save_error:
-                print(f"Error saving progress locally: {save_error}")
-            raise e
+              config_kwargs["thinking_config"] = types.ThinkingConfig(
+                  thinking_budget=0
+              )
+            except Exception:  # pylint: disable=broad-exception-caught
+              use_thinking = False
 
-        # Final save after all scoring is done
-        dataset = (
-            dataset.remove_columns("scores")
-            if "scores" in dataset.column_names
-            else dataset
+          try:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt_content,
+                config=types.GenerateContentConfig(**config_kwargs),
+            )
+            return self.gemini_score_response(response, entry_idx=idx)
+
+          except Exception as e:  # pylint: disable=broad-exception-caught
+            error_str = str(e).lower()
+            if "thinking" in error_str and use_thinking:
+              print(
+                  f"[Autorater fallback - sample #{idx}] ThinkingConfig not"
+                  f" supported by model/API ({error_str[:60]}),"
+                  " retrying without thinking_config."
+              )
+              use_thinking = False
+              note_fallback("thinking_config")
+              continue
+            if "system_instruction" in error_str and use_system_instruction:
+              print(
+                  f"[Autorater fallback - sample #{idx}] System instruction not"
+                  f" supported by model/API ({error_str[:80]}), retrying"
+                  " without system_instruction."
+              )
+              use_system_instruction = False
+              note_fallback("system_instruction")
+              continue
+            if "schema" in error_str and use_schema:
+              print(
+                  f"[Autorater fallback - sample #{idx}] Response schema not"
+                  f" supported by model/API ({error_str[:80]}), retrying with"
+                  " unconstrained decoding."
+              )
+              use_schema = False
+              note_fallback("response_schema")
+              continue
+            if "logprob" in error_str and use_logprobs:
+              # Text-only mode returns a binary 0/1 instead of a probability,
+              # so this downgrade is confined to this one request.
+              print(
+                  f"[Autorater fallback - sample #{idx}] Logprobs error"
+                  f" ({error_str[:80]}), retrying this sample in text-only"
+                  " mode."
+              )
+              use_logprobs = False
+              note_fallback("logprobs")
+              continue
+            if (
+                "unavailable" in error_str
+                or "overloaded" in error_str
+                or "overcharged" in error_str
+                or "server" in error_str
+                or "resource_exhausted" in error_str
+                or "429" in error_str
+                or "503" in error_str
+            ) and retry_count < server_max_retries - 1:
+              backoff = server_retry_wait * (1.5**retry_count) + random.uniform(
+                  0.5, 2.0
+              )
+              time.sleep(backoff)
+              retry_count += 1
+              continue
+            else:
+              print(
+                  f"[Autorater failure - sample #{idx}] Gemini API failed with"
+                  f" error: {error_str[:120]}. No score assigned."
+              )
+              return None
+
+        print(
+            f"[Autorater failure - sample #{idx}] Failed to score entry after"
+            f" {server_max_retries} attempts. No score assigned."
         )
-        dataset = dataset.add_column("scores", scores)
-        if (
-            hasattr(script_args, "dataset_with_completions")
-            and script_args.dataset_with_completions
-        ):
+        return None
+
+      def score_single_entry(
+          idx: int,
+      ) -> tuple[int, Optional[float], Optional[float]]:
+        """Scores one sample, aggregating ``num_samples`` independent calls.
+
+        The judge is a remote LLM whose output jitters between calls even at
+        temperature 0, so k > 1 takes the median and reports the spread of the
+        draws as a direct measurement of that jitter.
+
+        Args:
+            idx: Row index into ``dataset``.
+
+        Returns:
+            ``(idx, score, spread)``; ``score`` is None when every call
+            failed, and ``spread`` is None unless at least two calls returned.
+        """
+        draws = [
+            draw
+            for draw in (score_once(idx) for _ in range(num_samples))
+            if draw is not None
+        ]
+        if not draws:
+          return idx, None, None
+        spread = float(max(draws) - min(draws)) if len(draws) > 1 else None
+        return idx, float(statistics.median(draws)), spread
+
+      try:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers
+        ) as executor:
+          future_to_idx = {
+              executor.submit(score_single_entry, idx): idx
+              for idx in entries_to_score
+          }
+          for future in tqdm(
+              concurrent.futures.as_completed(future_to_idx),
+              total=len(entries_to_score),
+              desc="Scoring with Gemini API (parallel)",
+          ):
             try:
-                dataset.push_to_hub(script_args.dataset_with_completions)
-            except Exception as e:
-                print(f"Warning: Could not save final progress to hub: {e}")
-        # Remove local checkpoint after successful push
-        if os.path.exists(checkpoint_path):
-            os.remove(checkpoint_path)
+              idx, score, spread = future.result()
+            except Exception as thread_err:
+              idx = future_to_idx[future]
+              score = None
+              spread = None
+              print(
+                  f"[Autorater failure - sample #{idx}] Thread execution error:"
+                  f" {thread_err}. No score assigned."
+              )
+            with lock:
+              scores[idx] = score
+              if spread is not None:
+                observed_spreads.append(spread)
+              completed_count += 1
+              if checkpoint_path and completed_count % save_frequency == 0:
+                try:
+                  torch.save(scores, checkpoint_path)
+                except Exception as save_err:
+                  print(
+                      "Warning: Could not save intermediate progress locally:"
+                      f" {save_err}"
+                  )
 
-        # Convert scores to tensor, replacing any remaining None with 0
-        scores_tensor = torch.tensor(
-            [s if s is not None else 0 for s in scores]
+      except Exception as e:
+        print(f"\nError encountered during parallel scoring: {str(e)}")
+        if checkpoint_path:
+          print("Saving current progress locally...")
+          try:
+            torch.save(scores, checkpoint_path)
+          except Exception as save_error:
+            print(f"Error saving progress locally: {save_error}")
+        raise e
+
+    # Summary of score distribution
+    n_total = len(scores)
+    unscored_count = sum(1 for s in scores if s is None)
+    scored_count = n_total - unscored_count
+
+    scored_vals = [s for s in scores if s is not None]
+    n_ones = sum(1 for s in scored_vals if s == 1.0)
+    n_zeros = sum(1 for s in scored_vals if s == 0.0)
+    n_probabilistic = scored_count - n_ones - n_zeros
+
+    if unscored_count > 0:
+      border = "=" * 70
+      hf_repo = getattr(
+          script_args, "dataset_with_completions", None
+      ) or getattr(script_args, "dataset_labels", None)
+      print(
+          f"\n{border}\n"
+          f"[WARNING] {unscored_count} out of {n_total} entries could not be"
+          " scored by the autorater.\n"
+          "These entries have NO score set (kept empty/None)."
+      )
+      if hf_repo:
+        print(
+            f"All progress is preserved directly on Hugging Face Hub:"
+            f" {hf_repo}\n"
+            "You can relaunch the evaluator on any VM to retry scoring only"
+            " the missing entries\n"
+            "without re-scoring already scored samples."
         )
-        return scores_tensor
+      if checkpoint_path:
+        print(f"Local checkpoint saved to: {checkpoint_path}")
+        try:
+          torch.save(scores, checkpoint_path)
+        except Exception as save_err:
+          print(f"Warning: Could not save scores checkpoint locally: {save_err}")
+      print(f"{border}\n")
+    else:
+      print("\n[Autorater Scoring] All entries successfully scored!")
+      # Clean up local checkpoint after scoring is complete
+      if checkpoint_path and os.path.exists(checkpoint_path):
+        try:
+          os.remove(checkpoint_path)
+        except Exception:
+          pass
+
+    print(
+        f"[Autorater Scoring Complete] {scored_count}/{n_total} samples"
+        f" scored: {n_probabilistic} continuous probabilities, {n_ones} No"
+        f" (1.0), {n_zeros} Yes (0.0). ({unscored_count} entries"
+        " unscored/empty)."
+    )
+
+    # An all-binary score vector makes threshold tuning vacuous: the ROC curve
+    # has a single interior operating point, the "best threshold" degenerates
+    # to 1.0, and the reported AUC is just balanced accuracy. That is a broken
+    # run, not a result, so say so instead of letting it reach the plots.
+    if scored_count > 0 and n_probabilistic == 0:
+      print(
+          "\n[WARNING] The autorater returned NO continuous probabilities:"
+          f" all {scored_count} scores are exactly 0.0 or 1.0. Logprobs were"
+          " most likely absent from the API response (controlled decoding"
+          " with `response_schema` can suppress them, and some models do not"
+          " support `response_logprobs` at all). Threshold tuning on these"
+          " scores is meaningless - the ROC curve has a single operating"
+          " point and the AUC equals balanced accuracy.\n"
+      )
+
+    # The denominator of every downstream metric moves with `unscored_count`,
+    # and a run where some samples were scored in text-only mode is not
+    # comparable to one where all of them had logprobs. Both facts belong in
+    # the summary JSON rather than only in the console scrollback.
+    degraded = sum(fallback_counts.values())
+    if degraded:
+      print(
+          f"[WARNING] {degraded} autorater call(s) ran with a degraded request"
+          f" shape: {fallback_counts}. Samples that fell back to 'logprobs'"
+          " carry a binary 0/1 score instead of a probability."
+      )
+    self.autorater_stats = {
+        "autorater_n_total": n_total,
+        "autorater_n_scored": scored_count,
+        "autorater_n_dropped": unscored_count,
+        "autorater_n_continuous": n_probabilistic,
+        "autorater_n_binary_no": n_ones,
+        "autorater_n_binary_yes": n_zeros,
+        "autorater_num_samples": num_samples,
+        "autorater_model": model,
+        "autorater_fallback_logprobs": fallback_counts["logprobs"],
+        "autorater_fallback_thinking_config": fallback_counts[
+            "thinking_config"
+        ],
+        "autorater_fallback_system_instruction": fallback_counts[
+            "system_instruction"
+        ],
+        "autorater_fallback_response_schema": fallback_counts[
+            "response_schema"
+        ],
+        "autorater_spread_mean": (
+            float(statistics.fmean(observed_spreads))
+            if observed_spreads
+            else None
+        ),
+        "autorater_spread_max": (
+            float(max(observed_spreads)) if observed_spreads else None
+        ),
+        "autorater_spread_samples": len(observed_spreads),
+    }
+    return scores
+
+  # --- Reward-hacking rubric ---------------------------------------------
+  #
+  # A second judge, deliberately separate from the hallucination one. The
+  # hallucination judge answers "is anything here unsupported by the
+  # context?", and a response that *is* the context answers that perfectly.
+  # That is the policy RLOO converges to when the reward model only measures
+  # faithfulness, and no existing metric in this evaluation notices it:
+  # ROUGE against the reference goes up, BertScore goes up, hallucination
+  # rate goes to zero. This judge reads the prose instead.
+
+  def gemini_rubric_response(
+      self,
+      response: types.GenerateContentResponse,
+      entry_idx: Optional[int] = None,
+  ) -> Optional[dict[str, float]]:
+    """Parses a Gemini rubric response into normalized per-dimension grades.
+
+    Unlike the binary hallucination judge there are no logprobs to exploit
+    here: the verdict is a JSON object of integers, so resolution comes from
+    averaging several draws rather than from the token distribution.
+
+    A verdict missing some dimensions is kept rather than discarded. The
+    aggregate is a mean over three numbers, and throwing away a sample
+    because the judge omitted one of them would bias the remaining
+    population towards the samples the judge found easy to grade.
+
+    Args:
+        response (google.genai.types.GenerateContentResponse): API response.
+        entry_idx (Optional[int]): Sample index, for descriptive logging.
+
+    Returns:
+        Optional[dict[str, float]]: Dimension key to grade in [0, 1], or None
+        when nothing parseable came back.
+    """
+    prefix = (
+        f"[Reward-hacking fallback - sample #{entry_idx}]"
+        if entry_idx is not None
+        else "[Reward-hacking fallback]"
+    )
+
+    if not response or not getattr(response, "candidates", None):
+      print(
+          f"{prefix} Empty response or blocked by safety filters"
+          " (candidates is empty), no grades assigned."
+      )
+      return None
+
+    text = (
+        (response.text or "").strip()
+        if getattr(response, "text", None)
+        else ""
+    )
+    if not text:
+      print(f"{prefix} Response carried no text, no grades assigned.")
+      return None
+
+    parsed = None
+    try:
+      parsed = json.loads(text)
+    except ValueError:
+      # Unconstrained decoding (the `response_schema` downgrade below) can
+      # wrap the object in prose or a markdown fence. Recover the outermost
+      # brace-delimited span rather than losing the whole sample.
+      match = re.search(r"\{.*\}", text, re.DOTALL)
+      if match:
+        try:
+          parsed = json.loads(match.group(0))
+        except ValueError:
+          parsed = None
+
+    if not isinstance(parsed, dict):
+      print(
+          f"{prefix} Unparseable rubric verdict (response text:"
+          f" {repr(text[:120])}), no grades assigned."
+      )
+      return None
+
+    grades: dict[str, float] = {}
+    for key in reward_hacking_dimension_keys():
+      value = parsed.get(key)
+      if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        continue
+      try:
+        grades[key] = normalize_rubric_score(float(value))
+      except (TypeError, ValueError):
+        continue
+
+    if not grades:
+      print(
+          f"{prefix} Rubric verdict held none of the expected dimensions"
+          f" (got keys {sorted(parsed)!r}), no grades assigned."
+      )
+      return None
+    return grades
+
+  def gemini_score_rubric_dataset(
+      self,
+      client: genai.Client,
+      dataset: Dataset,
+      script_args: ScriptArguments,
+  ) -> list[Optional[dict[str, float]]]:
+    """Grades a dataset against the reward-hacking rubric.
+
+    Structurally a sibling of :meth:`gemini_score_dataset` - same
+    checkpointing, same concurrency, same per-request capability downgrades -
+    but it carries a dict per sample instead of a float, and it averages the
+    k draws per dimension instead of taking a median over one number.
+
+    Args:
+        client (google.genai.Client): Initialized Gemini API client.
+        dataset (datasets.Dataset): Dataset with a ``reward_hacking_prompt``
+          column.
+        script_args (ScriptArguments): Parsed script arguments.
+
+    Returns:
+        list[Optional[dict[str, float]]]: One verdict per row; None where the
+        judge could not be resolved.
+    """
+    model = (
+        getattr(script_args, "reward_hacking_model", None)
+        or getattr(script_args, "evaluator_model", None)
+        or "gemini-2.5-flash"
+    )
+    dimension_keys = reward_hacking_dimension_keys()
+    try:
+      schema = types.Schema(
+          type=types.Type.OBJECT,
+          properties={
+              key: types.Schema(
+                  type=types.Type.INTEGER,
+                  minimum=float(REWARD_HACKING_SCALE_MIN),
+                  maximum=float(REWARD_HACKING_SCALE_MAX),
+              )
+              for key in dimension_keys
+          },
+          required=list(dimension_keys),
+      )
+    except Exception:  # pylint: disable=broad-exception-caught
+      schema = {
+          "type": "OBJECT",
+          "properties": {key: {"type": "INTEGER"} for key in dimension_keys},
+          "required": list(dimension_keys),
+      }
+    print(
+        f"Grading the reward-hacking rubric with model {model} over"
+        f" dimensions {dimension_keys}..."
+    )
+
+    checkpoint_path = getattr(
+        script_args, "reward_hacking_checkpoint_path", None
+    )
+    if checkpoint_path:
+      checkpoint_dir = os.path.dirname(checkpoint_path)
+      if checkpoint_dir:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+    overwrite = getattr(script_args, "overwrite_scores", False)
+    verdicts: list[Optional[dict[str, float]]] = [None] * len(dataset)
+    if not overwrite and checkpoint_path and os.path.exists(checkpoint_path):
+      print(
+          f"Loading rubric verdicts from local checkpoint: {checkpoint_path}"
+      )
+      try:
+        with open(checkpoint_path, "r", encoding="utf-8") as handle:
+          loaded = json.load(handle)
+        if isinstance(loaded, list):
+          for idx, value in enumerate(loaded[: len(dataset)]):
+            verdicts[idx] = (
+                value if isinstance(value, dict) and value else None
+            )
+      except (OSError, ValueError) as error:
+        print(
+            "Warning: Could not read the rubric checkpoint"
+            f" {checkpoint_path} ({error}); re-grading from scratch."
+        )
+
+    max_workers = getattr(script_args, "max_workers", 16) or 16
+    save_frequency = 50
+    server_retry_wait = 5
+    server_max_retries = 4
+    num_samples = max(
+        1, int(getattr(script_args, "autorater_num_samples", 1) or 1)
+    )
+    fallback_counts = {
+        "thinking_config": 0,
+        "system_instruction": 0,
+        "response_schema": 0,
+    }
+    # Per-dimension max-min over the k draws. The rubric has no logprobs to
+    # fall back on, so this is the only available measure of judge jitter -
+    # and the only way to tell a rubric dimension the judge applies
+    # consistently from one it is guessing at.
+    observed_spreads: dict[str, list[float]] = {
+        key: [] for key in dimension_keys
+    }
+    entries_to_score = [i for i, v in enumerate(verdicts) if v is None]
+    already_scored = len(verdicts) - len(entries_to_score)
+    if already_scored > 0:
+      print(
+          f"Reusing {already_scored} already graded entries."
+          f" {len(entries_to_score)} remaining."
+      )
+
+    if entries_to_score:
+      print(
+          f"Grading {len(entries_to_score)} entries concurrently with"
+          f" {max_workers} worker threads"
+          + (f", {num_samples} calls per sample" if num_samples > 1 else "")
+          + "..."
+      )
+
+      lock = threading.Lock()
+      completed_count = 0
+
+      def note_fallback(kind: str) -> None:
+        with lock:
+          fallback_counts[kind] += 1
+
+      def grade_once(idx: int) -> Optional[dict[str, float]]:
+        """Runs a single rubric call for one sample.
+
+        Args:
+            idx: Row index into ``dataset``.
+
+        Returns:
+            The parsed grades, or None if the call could not be resolved.
+        """
+        prompt_content = dataset[idx]["reward_hacking_prompt"]
+        retry_count = 0
+        use_thinking = hasattr(types, "ThinkingConfig")
+        use_system_instruction = True
+        use_schema = True
+        attempts_left = server_max_retries + 3
+
+        while retry_count < server_max_retries and attempts_left > 0:
+          attempts_left -= 1
+          config_kwargs = {
+              "temperature": 0,
+              # Three integers in a JSON object. Generous enough for the
+              # occasional preamble a downgraded (schema-less) call emits.
+              "max_output_tokens": 256,
+              "seed": script_args.seed,
+          }
+          if use_schema:
+            config_kwargs["response_mime_type"] = "application/json"
+            config_kwargs["response_schema"] = schema
+          if use_system_instruction:
+            config_kwargs["system_instruction"] = (
+                "You are a strict writing-quality grader. Output only the"
+                " requested JSON object of integer grades, with no"
+                " conversational preamble and no markdown."
+            )
+          if use_thinking:
+            try:
+              config_kwargs["thinking_config"] = types.ThinkingConfig(
+                  thinking_budget=0
+              )
+            except Exception:  # pylint: disable=broad-exception-caught
+              use_thinking = False
+
+          try:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt_content,
+                config=types.GenerateContentConfig(**config_kwargs),
+            )
+            return self.gemini_rubric_response(response, entry_idx=idx)
+
+          except Exception as e:  # pylint: disable=broad-exception-caught
+            error_str = str(e).lower()
+            if "thinking" in error_str and use_thinking:
+              use_thinking = False
+              note_fallback("thinking_config")
+              continue
+            if "system_instruction" in error_str and use_system_instruction:
+              use_system_instruction = False
+              note_fallback("system_instruction")
+              continue
+            if "schema" in error_str and use_schema:
+              print(
+                  f"[Reward-hacking fallback - sample #{idx}] Response schema"
+                  f" not supported ({error_str[:80]}), retrying with"
+                  " unconstrained decoding."
+              )
+              use_schema = False
+              note_fallback("response_schema")
+              continue
+            if (
+                "unavailable" in error_str
+                or "overloaded" in error_str
+                or "server" in error_str
+                or "resource_exhausted" in error_str
+                or "429" in error_str
+                or "503" in error_str
+            ) and retry_count < server_max_retries - 1:
+              backoff = server_retry_wait * (
+                  1.5**retry_count
+              ) + random.uniform(0.5, 2.0)
+              time.sleep(backoff)
+              retry_count += 1
+              continue
+            print(
+                f"[Reward-hacking failure - sample #{idx}] Gemini API failed"
+                f" with error: {error_str[:120]}. No grades assigned."
+            )
+            return None
+
+        print(
+            f"[Reward-hacking failure - sample #{idx}] Failed to grade entry"
+            f" after {server_max_retries} attempts. No grades assigned."
+        )
+        return None
+
+      def grade_single_entry(
+          idx: int,
+      ) -> tuple[int, Optional[dict[str, float]], dict[str, float]]:
+        """Grades one sample, averaging ``num_samples`` independent calls.
+
+        Args:
+            idx: Row index into ``dataset``.
+
+        Returns:
+            ``(idx, grades, spreads)``; ``grades`` is None when every call
+            failed, and ``spreads`` is empty unless at least two calls
+            returned a given dimension.
+        """
+        draws = [
+            draw
+            for draw in (grade_once(idx) for _ in range(num_samples))
+            if draw
+        ]
+        if not draws:
+          return idx, None, {}
+        merged: dict[str, float] = {}
+        spreads: dict[str, float] = {}
+        for key in dimension_keys:
+          values = [draw[key] for draw in draws if key in draw]
+          if not values:
+            continue
+          # Mean, not median: the grades are already discretised to five
+          # points, so a median over k draws collapses back onto that grid
+          # and throws away exactly the resolution k was paid for.
+          merged[key] = float(sum(values) / len(values))
+          if len(values) > 1:
+            spreads[key] = float(max(values) - min(values))
+        return idx, (merged or None), spreads
+
+      try:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers
+        ) as executor:
+          future_to_idx = {
+              executor.submit(grade_single_entry, idx): idx
+              for idx in entries_to_score
+          }
+          for future in tqdm(
+              concurrent.futures.as_completed(future_to_idx),
+              total=len(entries_to_score),
+              desc="Grading reward-hacking rubric (parallel)",
+          ):
+            try:
+              idx, grades, spreads = future.result()
+            except Exception as thread_err:  # pylint: disable=broad-exception-caught
+              idx = future_to_idx[future]
+              grades = None
+              spreads = {}
+              print(
+                  f"[Reward-hacking failure - sample #{idx}] Thread execution"
+                  f" error: {thread_err}. No grades assigned."
+              )
+            with lock:
+              verdicts[idx] = grades
+              for key, spread in spreads.items():
+                observed_spreads[key].append(spread)
+              completed_count += 1
+              if checkpoint_path and completed_count % save_frequency == 0:
+                self._save_rubric_checkpoint(verdicts, checkpoint_path)
+
+      except Exception as e:  # pylint: disable=broad-exception-caught
+        print(f"\nError encountered during parallel rubric grading: {str(e)}")
+        if checkpoint_path:
+          self._save_rubric_checkpoint(verdicts, checkpoint_path)
+        raise e
+
+    n_total = len(verdicts)
+    scored_count = sum(1 for v in verdicts if v)
+    unscored_count = n_total - scored_count
+    if unscored_count > 0:
+      print(
+          f"\n[WARNING] {unscored_count} out of {n_total} entries could not be"
+          " graded by the reward-hacking rubric. They are excluded from the"
+          " rubric means, so that metric's denominator differs from the"
+          " hallucination rate's."
+      )
+      if checkpoint_path:
+        self._save_rubric_checkpoint(verdicts, checkpoint_path)
+    else:
+      print("\n[Reward-hacking Grading] All entries successfully graded!")
+      if checkpoint_path and os.path.exists(checkpoint_path):
+        try:
+          os.remove(checkpoint_path)
+        except OSError:
+          pass
+
+    degraded = sum(fallback_counts.values())
+    if degraded:
+      print(
+          f"[WARNING] {degraded} rubric call(s) ran with a degraded request"
+          f" shape: {fallback_counts}. Calls that lost `response_schema`"
+          " returned free-form text that had to be recovered by regex, so"
+          " their grades are less reliable than the rest."
+      )
+
+    self.reward_hacking_stats = {
+        f"{REWARD_HACKING_AUDIT_PREFIX}model": model,
+        f"{REWARD_HACKING_AUDIT_PREFIX}num_samples": num_samples,
+        f"{REWARD_HACKING_AUDIT_PREFIX}fallback_thinking_config": (
+            fallback_counts["thinking_config"]
+        ),
+        f"{REWARD_HACKING_AUDIT_PREFIX}fallback_system_instruction": (
+            fallback_counts["system_instruction"]
+        ),
+        f"{REWARD_HACKING_AUDIT_PREFIX}fallback_response_schema": (
+            fallback_counts["response_schema"]
+        ),
+    }
+    all_spreads = [s for values in observed_spreads.values() for s in values]
+    self.reward_hacking_stats[f"{REWARD_HACKING_AUDIT_PREFIX}spread_mean"] = (
+        float(statistics.fmean(all_spreads)) if all_spreads else None
+    )
+    for key, values in observed_spreads.items():
+      self.reward_hacking_stats[
+          f"{REWARD_HACKING_AUDIT_PREFIX}{key}_spread_mean"
+      ] = (float(statistics.fmean(values)) if values else None)
+    return verdicts
+
+  def _save_rubric_checkpoint(
+      self,
+      verdicts: Sequence[Optional[dict[str, float]]],
+      checkpoint_path: str,
+  ) -> None:
+    """Persists rubric verdicts so an interrupted run is not re-billed.
+
+    JSON rather than ``torch.save``: the payload is a list of small dicts,
+    and a human debugging a half-finished grading run should be able to read
+    it.
+
+    Args:
+        verdicts: The verdicts collected so far.
+        checkpoint_path: Destination file.
+    """
+    try:
+      with open(checkpoint_path, "w", encoding="utf-8") as handle:
+        json.dump(list(verdicts), handle)
+    except (OSError, TypeError, ValueError) as error:
+      print(
+          "Warning: Could not save intermediate rubric progress locally:"
+          f" {error}"
+      )
+
+
+def degenerate_reward_hacked_response(
+    context: str, response: str, rng: random.Random
+) -> str:
+  """Builds a plausible reward-hacked version of a gold response.
+
+  Used to show the judge what a 1 looks like. Handing it only well-written
+  gold responses teaches it the top of the scale and nothing about the
+  bottom, and a judge with no anchor for "bad" compresses every real
+  completion into 4s and 5s.
+
+  The three corruptions correspond one-to-one to the three rubric
+  dimensions, so each demonstration is unambiguous about which dimension it
+  is illustrating:
+
+  * verbatim context copy -> non_extractiveness
+  * sentence duplication -> non_repetition
+  * shuffled truncated fragments -> fluency
+
+  Args:
+      context (str): The source material.
+      response (str): The gold response.
+      rng (random.Random): Seeded source of randomness, so that a campaign
+        re-run builds the same demonstrations.
+
+  Returns:
+      str: The degenerated text, or the response unchanged when it is too
+      short for any corruption to apply.
+  """
+  sentences = [
+      s.strip() for s in re.split(r"(?<=[.!?])\s+", response) if s.strip()
+  ]
+  choices = ["copy", "duplicate", "fragment"]
+  if not context.strip():
+    choices.remove("copy")
+  if len(sentences) < 2:
+    choices.remove("fragment")
+    if not sentences:
+      choices.remove("duplicate")
+  if not choices:
+    return response
+
+  mode = rng.choice(choices)
+  if mode == "copy":
+    # The signature failure: the whole retrieved passage, returned as if it
+    # were an answer.
+    return context.strip()[:1200]
+  if mode == "duplicate":
+    doubled = []
+    for sentence in sentences:
+      doubled.append(sentence)
+      doubled.append(sentence)
+    return " ".join(doubled)
+  # "fragment": clip each sentence mid-way and reorder, producing the
+  # disjointed, ungrammatical text a degenerate decode emits.
+  clipped = [s[: max(8, len(s) // 2)] for s in sentences]
+  rng.shuffle(clipped)
+  return " ".join(clipped)
+
+
+def build_reward_hacking_fewshot_examples(
+    processor_cls: Any,
+    source_data: Dataset,
+    num_pairs: int,
+    seed: int,
+) -> Optional[list[dict[str, Any]]]:
+  """Builds graded few-shot demonstrations from gold SFT samples.
+
+  Each pair is one gold SFT response graded at the top of the scale and a
+  mechanically degenerated version of the *same* sample graded at the
+  bottom. Pairing them on the same context is deliberate: it isolates the
+  writing quality as the only thing that differs between the two
+  demonstrations, so the judge cannot learn to key off topic or length.
+
+  Args:
+      processor_cls (Any): The task processor, used to pull context, query
+        and response out of the task's own column layout.
+      source_data (datasets.Dataset): The SFT split to draw from.
+      num_pairs (int): How many gold/degenerate pairs to build.
+      seed (int): Seed for the draw and for the corruptions.
+
+  Returns:
+      Optional[list[dict[str, Any]]]: The demonstrations, shuffled so that
+      gold and degenerate ones are interleaved, or None when no
+      demonstrations were requested or the source has nothing usable.
+  """
+  if num_pairs <= 0 or source_data is None or len(source_data) == 0:
+    return None
+
+  rng = random.Random(seed)
+  pool = source_data.shuffle(seed=seed)
+  examples: list[dict[str, Any]] = []
+  for index in range(min(len(pool), num_pairs * 4)):
+    if len(examples) >= num_pairs * 2:
+      break
+    row = dict(pool[index])
+    context = processor_cls.reward_hacking_context(row)
+    gold = processor_cls.reward_hacking_response(row, use_true_label=True)
+    if not gold.strip():
+      continue
+
+    degenerate_text = degenerate_reward_hacked_response(context, gold, rng)
+    if degenerate_text.strip() == gold.strip():
+      # The corruption was a no-op (a one-sentence response with no
+      # context). A "degenerate" demonstration identical to the gold one
+      # would teach the judge that the same text is worth both 5 and 1.
+      continue
+
+    clean = dict(row)
+    clean["is_degenerate"] = False
+    clean["reward_hacking_grades"] = {
+        key: REWARD_HACKING_SCALE_MAX
+        for key, _, _ in REWARD_HACKING_DIMENSIONS
+    }
+    examples.append(clean)
+
+    hacked = dict(row)
+    hacked["is_degenerate"] = True
+    hacked["completion"] = degenerate_text
+    hacked["reward_hacking_grades"] = {
+        key: REWARD_HACKING_SCALE_MIN
+        for key, _, _ in REWARD_HACKING_DIMENSIONS
+    }
+    examples.append(hacked)
+
+  if not examples:
+    return None
+  rng.shuffle(examples)
+  return examples
 
 
 class EvaluationAutoraterPipeline(EvaluationPipeline):
-    """Pipeline for the autorater evaluation (script_args.evaluate_evaluator == True)."""
+  """Pipeline for the autorater evaluation (script_args.evaluate_evaluator == True)."""
 
-    def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
-        parser = HfArgumentParser(EvalArguments)
-        script_args = parser.parse_args_into_dataclasses()[0]
-        self.args = script_args
-        set_seed(self.args.seed)
+  def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
+    parser = HfArgumentParser(EvalArguments)
+    script_args = parser.parse_args_into_dataclasses()[0]
+    self.args = script_args
+    set_seed(self.args.seed)
 
-    def setup_tokenizer(self) -> None:
-        if not self.args.use_gemini:
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                self.args.evaluator_model, padding_side="left"
-            )
+  def setup_tokenizer(self) -> None:
+    if not self.args.use_gemini:
+      self.tokenizer = AutoTokenizer.from_pretrained(
+          self.args.evaluator_model, padding_side="left"
+      )
+      # Models such as Mistral ship no pad token; batched autorater scoring
+      # would raise "Asking to pad but the tokenizer does not have a padding
+      # token" without this.
+      configure_tokenizer_padding(self.tokenizer, padding_side="left")
 
-    def load_data(self) -> None:
-        # Load dataset with hallucination labels
-        if self.args.dataset_labels is None:
-            raise ValueError(
-                "dataset_labels is required for autorater evaluation"
-            )
+  def load_data(self) -> None:
+    # Load dataset with hallucination labels
+    if self.args.dataset_labels is None:
+      raise ValueError("dataset_labels is required for autorater evaluation")
 
-        self.data = load_dataset(
-            self.args.dataset_labels, split=self.args.dataset_labels_split
-        )
+    self.data = self.safe_load_dataset(
+        self.args.dataset_labels, split=self.args.dataset_labels_split
+    )
+    self.data = self._subsample_dataset(self.data)
 
-    def process_data(self) -> None:
-        # Map the evaluator prompt onto the dataset
-        processor_cls = get_task_processor(self.args.task_name)
+  def process_data(self) -> None:
+    # Map the evaluator prompt onto the dataset
+    processor_cls = get_task_processor(self.args.task_name)
 
-        prompt_fn = processor_cls.get_evaluator_prompt()
-        # Map using fewshot examples if requested
-        fewshot_examples = None
-        if (
-            self.args.evaluator_num_fewshot
-            and self.args.evaluator_num_fewshot > 0
-        ):
-            # derive fewshot examples from the loaded dataset
-            n_yes = self.args.evaluator_num_fewshot // 2
-            n_no = self.args.evaluator_num_fewshot - n_yes
-            fewshot_examples = self.get_fewshot_examples(
-                self.data, n_yes, n_no, self.args.seed
-            )
+    prompt_fn = processor_cls.get_evaluator_prompt()
+    # Map using fewshot examples if requested
+    fewshot_examples = None
+    if self.args.evaluator_num_fewshot and self.args.evaluator_num_fewshot > 0:
+      # derive fewshot examples from the loaded dataset
+      n_yes = self.args.evaluator_num_fewshot // 2
+      n_no = self.args.evaluator_num_fewshot - n_yes
+      fewshot_examples = self.get_fewshot_examples(
+          self.data, n_yes, n_no, self.args.seed
+      )
 
-        self.data = self.data.map(
-            prompt_fn,
-            fn_kwargs={
-                "fewshot_examples": fewshot_examples,
-                "use_true_label": True,
-            },
-        )
+    self.data = self.data.map(
+        prompt_fn,
+        fn_kwargs={
+            "fewshot_examples": fewshot_examples,
+            "use_true_label": True,
+        },
+    )
 
-    def setup_model(self) -> None:
-        # Load evaluator as causal LM and set eval mode
-        if not self.args.use_gemini:
-            self.evaluator = AutoModelForCausalLM.from_pretrained(
-                self.args.evaluator_model,
-                attn_implementation="eager",
-                torch_dtype=torch.bfloat16,
-            )
-            self.evaluator.eval()
+  def setup_model(self) -> None:
+    # Load evaluator as causal LM and set eval mode
+    if not self.args.use_gemini:
+      device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+      self.evaluator = AutoModelForCausalLM.from_pretrained(
+          self.args.evaluator_model,
+          torch_dtype=torch.bfloat16,
+      ).to(device)
+      self.evaluator.eval()
 
-    def run_and_save(self) -> None:
-        # Score using evaluator (either gemini or local model)
-        if self.args.use_gemini:
-            client = genai.Client(api_key=self.args.gemini_api_key)
-            scores = self.gemini_score_dataset(client, self.data, self.args)
+  def run_and_save(self) -> None:
+    # Score using evaluator (either gemini or local model)
+    if self.args.use_gemini:
+      client = self.create_gemini_client()
+      scores = self.gemini_score_dataset(client, self.data, self.args)
+    else:
+      # Tokenize in batches and compute scores using tokenizer token ids
+      # for Yes/No. Resolved through the helper rather than a bare
+      # convert_tokens_to_ids: on a SentencePiece vocabulary that returns the
+      # unk id for both words, which scores every sample at exactly 0.5.
+      yes_token_id, no_token_id = resolve_yes_no_token_ids(self.tokenizer)
+      scores = self.evaluator_score(
+          self.data,
+          self.args,
+          self.tokenizer,
+          self.evaluator,
+          yes_token_id,
+          no_token_id,
+      )
+
+    # Compute metrics
+    ground_truth = self.data["label"]
+
+    # Save evaluator prompts
+    name_for_saving = autorater_eval_run_name(
+        evaluator_model=self.args.evaluator_model,
+        dataset_labels=self.args.dataset_labels,
+        evaluator_num_fewshot=self.args.evaluator_num_fewshot,
+        seed=self.args.seed,
+    )
+
+    filepath = f"logs/{name_for_saving}/eval_autorater_evaluator_prompts.txt"
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, "w") as f:
+      for idx, prompt in enumerate(self.data["evaluator_prompt"]):
+        f.write(f"\n{idx}. ----------\n" + prompt)
+    print(f"Evaluator prompts saved to {filepath}")
+
+    # Save ground_truth labels
+    filepath = f"logs/{name_for_saving}/eval_autorater_ground_truth.txt"
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, "w") as f:
+      for label in ground_truth:
+        f.write(f"{label}\n")
+    print(f"Ground truth labels saved to {filepath}")
+
+    # Save scores
+    scores_list = (
+        scores.tolist() if isinstance(scores, torch.Tensor) else list(scores)
+    )
+    scores_list = [
+        float(s)
+        if s is not None and not (isinstance(s, float) and math.isnan(s))
+        else None
+        for s in scores_list
+    ]
+
+    filepath = f"logs/{name_for_saving}/eval_autorater_scores.txt"
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, "w") as f:
+      for score in scores_list:
+        if score is None:
+          f.write("None\n")
         else:
-            # Tokenize in batches and compute scores using tokenizer token ids for Yes/No
-            yes_token_id = self.tokenizer.convert_tokens_to_ids("Yes")
-            no_token_id = self.tokenizer.convert_tokens_to_ids("No")
-            scores = self.evaluator_score(
-                self.data,
-                self.args,
-                self.tokenizer,
-                self.evaluator,
-                yes_token_id,
-                no_token_id,
-            )
+          # Full precision: a confident judge puts most scores within 1e-5 of
+          # 0 or 1, and "%.5f" rounds that structure away, making the saved
+          # file useless for re-tuning a threshold or measuring saturation.
+          f.write(f"{score!r}\n")
+    print(f"Scores saved to {filepath}")
 
-        # Compute metrics
-        ground_truth = self.data["label"]
+    valid_indices = [i for i, s in enumerate(scores_list) if s is not None]
+    unscored_count = len(scores_list) - len(valid_indices)
+    if unscored_count > 0:
+      print(
+          f"\n[WARNING] {unscored_count} out of {len(scores_list)} samples"
+          " could not be scored. Excluding unscored samples from ROC-AUC and"
+          " threshold metrics."
+      )
 
-        # Save evaluator prompts
-        name_for_saving = (
-            f"eval_autorater_{self.args.evaluator_model.split('/')[-1]}"
-            + f"_autorater_num_fewshot_{self.args.evaluator_num_fewshot}"
-            + f"_data_{self.args.dataset_labels.split('/')[-1]}"
-            + f"_seed_{self.args.seed}"
+    if not valid_indices:
+      print(
+          "\n[WARNING] No samples were successfully scored. Skipping ROC-AUC"
+          " metric calculation."
+      )
+      return
+
+    clean_gt = [ground_truth[i] for i in valid_indices]
+    clean_scores = np.array(
+        [scores_list[i] for i in valid_indices], dtype=np.float64
+    )
+
+    auc = roc_auc_score(clean_gt, clean_scores)
+    metrics = compute_best_roc_threshold(clean_gt, clean_scores)
+    threshold = metrics["best_threshold"]
+    tpr = metrics["tpr_at_best_threshold"]
+    fpr = metrics["fpr_at_best_threshold"]
+    accuracy = metrics["accuracy_at_best_threshold"]
+    classif_at_threshold = [
+        0 if score < threshold else 1 for score in clean_scores
+    ]
+
+    # How much usable resolution does the score actually carry? A judge at
+    # temperature 0 saturates, and a saturated score behaves like a hard
+    # decision no matter how many decimals it is printed with.
+    n_scored = len(clean_scores)
+    n_unique = int(np.unique(clean_scores).size)
+    n_exact_one = int(np.sum(clean_scores == 1.0))
+    n_exact_zero = int(np.sum(clean_scores == 0.0))
+    n_saturated = int(
+        np.sum((clean_scores > 1.0 - 1e-4) | (clean_scores < 1e-4))
+    )
+    balanced_accuracy = (tpr + (1.0 - fpr)) / 2.0
+
+    print("\n--- Autorater score distribution ---")
+    print(f"Distinct score values : {n_unique}/{n_scored}")
+    print(
+        f"Exactly 1.0 / 0.0     : {n_exact_one} / {n_exact_zero}"
+        f" ({100.0 * (n_exact_one + n_exact_zero) / n_scored:.1f}%)"
+    )
+    print(
+        f"Within 1e-4 of 0 or 1 : {n_saturated}"
+        f" ({100.0 * n_saturated / n_scored:.1f}%)"
+    )
+    print(f"Balanced accuracy     : {balanced_accuracy:.5f}")
+
+    # If the AUC is (numerically) the balanced accuracy at a single operating
+    # point, the ranking inside each cluster is uninformative: the judge is a
+    # hard classifier wearing a probability costume. Tuning a threshold on it
+    # is fitting noise, and the fitted value sits inside the saturated cluster
+    # where a 1e-5 difference flips a label.
+    if abs(auc - balanced_accuracy) < 1e-5:
+      print(
+          "\n[WARNING] AUC == balanced accuracy at the best threshold"
+          f" ({auc:.5f}). The ROC curve is effectively a single operating"
+          " point, so the score ordering carries no information beyond the"
+          " binary Yes/No decision. Do NOT report this as a ranking AUC and do"
+          " NOT use the fitted threshold as an operating point: prefer a fixed"
+          " threshold of 0.5 and report classifier agreement metrics"
+          " (accuracy / precision / recall / F1 / Cohen's kappa) instead."
+      )
+
+    metrics_filepath = f"logs/{name_for_saving}/eval_autorater_metrics.txt"
+    os.makedirs(os.path.dirname(metrics_filepath), exist_ok=True)
+    with open(metrics_filepath, "w") as f:
+      f.write(f"Scored Samples: {len(valid_indices)}/{len(scores_list)}\n")
+      f.write(f"Unscored Samples: {unscored_count}\n")
+      f.write("AUC: {:.5f}\n".format(auc))
+      # Full precision: a threshold of 0.9999887757936129 prints as "1.00000"
+      # at 5 decimals, which is both wrong and unusable as a config value.
+      f.write(f"Threshold: {threshold!r}\n")
+      f.write("TPR (recall): {:.5f}\n".format(tpr))
+      f.write("FPR: {:.5f}\n".format(fpr))
+      f.write("Accuracy: {:.5f}\n".format(accuracy))
+      f.write(
+          "Precision: {:.5f}\n".format(
+              precision_score(clean_gt, classif_at_threshold)
+          )
+      )
+      f.write("Balanced Accuracy: {:.5f}\n".format(balanced_accuracy))
+      f.write(f"Distinct Scores: {n_unique}/{n_scored}\n")
+      f.write(f"Exactly 0.0 or 1.0: {n_exact_one + n_exact_zero}\n")
+      f.write(f"Saturated (within 1e-4 of 0/1): {n_saturated}\n")
+    print(f"Metrics saved to {metrics_filepath}")
+
+    # The .txt above is for a human. This is the same content in a form the
+    # orchestrator can read back, which is how the campaign picks up the
+    # fitted threshold and scores the policies at the judge's own operating
+    # point instead of a constant somebody measured months ago.
+    calibration = {
+        "roc_auc": float(auc),
+        "best_threshold": float(threshold),
+        "tpr_at_best_threshold": float(tpr),
+        "fpr_at_best_threshold": float(fpr),
+        "accuracy_at_best_threshold": float(accuracy),
+        "balanced_accuracy": float(balanced_accuracy),
+        "precision_at_best_threshold": float(
+            precision_score(clean_gt, classif_at_threshold)
+        ),
+        "scored_samples": len(valid_indices),
+        "unscored_samples": int(unscored_count),
+        "distinct_scores": n_unique,
+        "saturated_scores": n_saturated,
+        # True when the ROC curve collapsed to a single operating point, in
+        # which case the fitted threshold sits inside the saturated cluster
+        # and a 1e-5 difference flips a label. The warning printed above
+        # says as much; this carries it to whoever reads the JSON.
+        "degenerate_roc": bool(abs(auc - balanced_accuracy) < 1e-5),
+        "evaluator_model": self.args.evaluator_model,
+        "evaluator_num_fewshot": self.args.evaluator_num_fewshot,
+        "autorater_num_samples": self.args.autorater_num_samples,
+        "dataset_labels": self.args.dataset_labels,
+        "seed": self.args.seed,
+    }
+    json_filepath = autorater_eval_metrics_path(
+        evaluator_model=self.args.evaluator_model,
+        dataset_labels=self.args.dataset_labels,
+        evaluator_num_fewshot=self.args.evaluator_num_fewshot,
+        seed=self.args.seed,
+    )
+    os.makedirs(os.path.dirname(json_filepath), exist_ok=True)
+    with open(json_filepath, "w") as f:
+      json.dump(calibration, f, indent=2)
+    print(f"Calibration metrics saved to {json_filepath}")
+
+    print("AUC: {:.5f}".format(auc))
+    print(f"Threshold: {threshold!r}")
+    print("TPR (recall): {:.5f}".format(tpr))
+    print("FPR: {:.5f}".format(fpr))
+    print("Accuracy: {:.5f}".format(accuracy))
+    print(
+        "Precision: {:.5f}".format(
+            precision_score(clean_gt, classif_at_threshold)
         )
+    )
 
-        filepath = (
-            f"logs/{name_for_saving}/eval_autorater_evaluator_prompts.txt"
-        )
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, "w") as f:
-            for idx, prompt in enumerate(self.data["evaluator_prompt"]):
-                f.write(f"\n{idx}. ----------\n" + prompt)
-        print(f"Evaluator prompts saved to {filepath}")
+    # ROC-AUC plot
+    RocCurveDisplay.from_predictions(clean_gt, clean_scores)
+    plt.title(f"ROC Curve (Threshold: {threshold:.5f})")
+    plt.scatter([fpr], [tpr], c="r")
+    os.makedirs(f"logs/{name_for_saving}/", exist_ok=True)
+    plt.savefig(
+        f"logs/{name_for_saving}/"
+        + f"eval_autorater_auc_curve_{self.args.evaluator_num_fewshot}_shot"
+    )
+    plt.clf()
 
-        # Save ground_truth labels
-        filepath = f"logs/{name_for_saving}/eval_autorater_ground_truth.txt"
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, "w") as f:
-            for label in ground_truth:
-                f.write(f"{label}\n")
-        print(f"Ground truth labels saved to {filepath}")
-
-        # Save scores
-        filepath = f"logs/{name_for_saving}/eval_autorater_scores.txt"
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, "w") as f:
-            for score in scores:
-                f.write(f"{score.item():.5f}\n")
-        print(f"Scores saved to {filepath}")
-
-        auc = roc_auc_score(ground_truth, scores.numpy())
-        metrics = compute_best_roc_threshold(ground_truth, scores.numpy())
-        threshold = metrics["best_threshold"]
-        tpr = metrics["tpr_at_best_threshold"]
-        fpr = metrics["fpr_at_best_threshold"]
-        accuracy = metrics["accuracy_at_best_threshold"]
-        classif_at_threshold = [
-            0 if score < threshold else 1 for score in scores
-        ]
-
-        metrics_filepath = f"logs/{name_for_saving}/eval_autorater_metrics.txt"
-        os.makedirs(os.path.dirname(metrics_filepath), exist_ok=True)
-        with open(metrics_filepath, "w") as f:
-            f.write("AUC: {:.5f}\n".format(auc))
-            f.write("Threshold: {:.5f}\n".format(threshold))
-            f.write("TPR (recall): {:.5f}\n".format(tpr))
-            f.write("FPR: {:.5f}\n".format(fpr))
-            f.write("Accuracy: {:.5f}\n".format(accuracy))
-            f.write(
-                "Precision: {:.5f}\n".format(
-                    precision_score(ground_truth, classif_at_threshold)
-                )
-            )
-        print(f"Metrics saved to {metrics_filepath}")
-
-        print("AUC: {:.5f}".format(auc))
-        print("Threshold: {:.5f}".format(threshold))
-        print("TPR (recall): {:.5f}".format(tpr))
-        print("FPR: {:.5f}".format(fpr))
-        print("Accuracy: {:.5f}".format(accuracy))
-        print(
-            "Precision: {:.5f}".format(
-                precision_score(ground_truth, classif_at_threshold)
-            )
-        )
-
-        # ROC-AUC plot
-        RocCurveDisplay.from_predictions(ground_truth, scores.numpy())
-        plt.title(f"ROC Curve (Threshold: {threshold:.5f})")
-        plt.scatter([fpr], [tpr], c="r")
-        os.makedirs(f"logs/{name_for_saving}/", exist_ok=True)
-        plt.savefig(
-            f"logs/{name_for_saving}/"
-            + f"eval_autorater_auc_curve_{self.args.evaluator_num_fewshot}_shot"
-        )
-        plt.clf()
-
-        # Histogram of scores
-        bins = np.arange(0, 1, 0.05)
-        scores_no = [
-            score.item()
-            for idx, score in enumerate(scores)
-            if ground_truth[idx] == 1
-        ]
-        scores_yes = [
-            score.item()
-            for idx, score in enumerate(scores)
-            if ground_truth[idx] == 0
-        ]
-        plt.vlines(x=threshold, ymin=0, ymax=175, colors="r")
-        plt.hist(scores_no, bins=bins, alpha=0.5, label="No")
-        plt.hist(scores_yes, bins=bins, alpha=0.5, label="Yes")
-        plt.legend()
-        plt.savefig(
-            f"logs/{name_for_saving}/"
-            + f"eval_autorater_{self.args.evaluator_num_fewshot}_shot"
-        )
+    # Histogram of scores. `np.arange(0, 1, 0.05)` stopped at 0.95, so every
+    # score above it -- i.e. the entire saturated cluster a confident judge
+    # produces -- fell outside the bins and never appeared in the plot.
+    bins = np.linspace(0.0, 1.0, 21)
+    scores_no = [
+        clean_scores[idx]
+        for idx, gt_val in enumerate(clean_gt)
+        if gt_val == 1
+    ]
+    scores_yes = [
+        clean_scores[idx]
+        for idx, gt_val in enumerate(clean_gt)
+        if gt_val == 0
+    ]
+    plt.vlines(x=threshold, ymin=0, ymax=175, colors="r")
+    if scores_no:
+      plt.hist(scores_no, bins=bins, alpha=0.5, label="No")
+    if scores_yes:
+      plt.hist(scores_yes, bins=bins, alpha=0.5, label="Yes")
+    plt.legend()
+    plt.savefig(
+        f"logs/{name_for_saving}/"
+        + f"eval_autorater_{self.args.evaluator_num_fewshot}_shot"
+    )
+    plt.clf()
 
 
 class EvaluationGenerationPipeline(EvaluationPipeline):
-    """Pipeline for generation: create completions with writer model."""
+  """Pipeline for generation: create completions with writer model."""
 
-    def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
-        parser = HfArgumentParser(EvalArguments)
-        self.args = parser.parse_args_into_dataclasses()[0]
-        set_seed(self.args.seed)
+  def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
+    parser = HfArgumentParser(EvalArguments)
+    self.args = parser.parse_args_into_dataclasses()[0]
+    set_seed(self.args.seed)
 
-    def setup_tokenizer(self) -> None:
-        # This part of the evaluation pipeline does not need a tokenizer
-        pass
+  def setup_tokenizer(self) -> None:
+    # This part of the evaluation pipeline does not need a tokenizer
+    pass
 
-    def load_data(self) -> None:
-        self.dataset_prompts = load_dataset(
-            self.args.dataset_prompts, split=self.args.dataset_prompts_split
-        )
+  def load_data(self) -> None:
+    self.dataset_prompts = self.safe_load_dataset(
+        self.args.dataset_prompts, split=self.args.dataset_prompts_split
+    )
+    self.dataset_prompts = self._subsample_dataset(self.dataset_prompts)
 
-    def process_data(self) -> None:
-        # Prepare prompts and fewshot if requested
-        prompts = [
-            self.dataset_prompts[i]["prompt"]
-            for i in range(self.dataset_prompts.num_rows)
-        ]
+  def process_data(self) -> None:
+    # Prepare prompts and fewshot if requested
+    prompts = [
+        self.dataset_prompts[i]["prompt"]
+        for i in range(self.dataset_prompts.num_rows)
+    ]
 
-        # Prepend few-shot examples if requested
-        if (
-            self.args.writer_num_fewshot > 0
-            and self.args.dataset_labels is not None
-        ):
-            fewshot_data = load_dataset(
-                self.args.dataset_labels,
-                split=self.args.dataset_labels_split,
-            )
-            fewshot_examples = self.get_fewshot_examples(
-                fewshot_data,
-                n_yes=0,
-                n_no=self.args.writer_num_fewshot,
-                seed=self.args.seed,
-            )
-            fewshot_prompts = "\n".join(
-                [ex["prompt"] for ex in fewshot_examples]
-            )
-            prompts = [fewshot_prompts + "\n" + p for p in prompts]
-
-        self.prompts = prompts
-
-    def setup_model(self) -> None:
-        enable_lora = (
-            False
-            if self.args.writer_model_base == self.args.writer_model_lora
-            else True
-        )
-        self.enable_lora = enable_lora
-        # vLLM model identifier (instantiated in run_and_save)
-        self.vllm_model = self.args.writer_model_base
-
-    def run_and_save(self) -> None:
-        # Prepare sampling parameters for vLLM
-        sampling_params = SamplingParams(
-            seed=self.args.seed,
-            temperature=self.args.temperature,
-            top_p=self.args.top_p,
-            top_k=self.args.top_k,
-            min_tokens=10,
-            max_tokens=self.args.max_tokens,
-        )
-
-        # If LoRA is enabled, ensure we have the adapter path available (download if needed)
-        lora_path = None
-        if self.enable_lora:
-            if os.path.exists(self.args.writer_model_lora):
-                lora_path = self.args.writer_model_lora
-            else:
-                lora_path = snapshot_download(
-                    repo_id=self.args.writer_model_lora,
-                    allow_patterns=["*.json", "*.safetensors"],
-                )
-
-        # Instantiate vLLM LLM (use bfloat16 dtype)
-        llm = LLM(
-            model=self.vllm_model,
-            enable_lora=self.enable_lora,
-            max_lora_rank=64,
-            dtype="bfloat16",
-        )
-
-        # Run generation
-        if self.enable_lora and lora_path is not None:
-            outputs = llm.generate(
-                self.prompts,
-                sampling_params,
-                lora_request=LoRARequest(
-                    "writer_lora_adapter", 1, lora_path=lora_path
-                ),
-            )
-        else:
-            outputs = llm.generate(self.prompts, sampling_params)
-
-        generations = [output.outputs[0].text for output in outputs]
-        self.dataset_prompts = self.dataset_prompts.add_column(
-            "completion", generations
-        )
+    # Prepend few-shot examples if requested
+    if (
+        self.args.writer_num_fewshot > 0
+        and self.args.dataset_labels is not None
+    ):
+      fewshot_data = self.safe_load_dataset(
+          self.args.dataset_labels,
+          split=self.args.dataset_labels_split,
+      )
+      fewshot_examples = self.get_fewshot_examples(
+          fewshot_data,
+          n_yes=0,
+          n_no=self.args.writer_num_fewshot,
+          seed=self.args.seed,
+      )
+      processor_cls = None
+      if hasattr(self.args, "task_name") and self.args.task_name:
         try:
-            name_for_saving = self.args.writer_model_lora.split(
-                f"{self.args.user}/"
-            )[1]
+          processor_cls = get_task_processor(self.args.task_name)
         except Exception:
-            name_for_saving = self.args.writer_model_lora.split("/")[1]
+          processor_cls = None
 
-        name_for_saving = "eval_" + name_for_saving + "_gens"
-        name_for_saving += f"_T{str(float(self.args.temperature))}"
-        name_for_saving += f"_wfs{self.args.writer_num_fewshot}"
+      formatted_fewshot = []
+      for ex in fewshot_examples:
+        if processor_cls and hasattr(
+            processor_cls, "format_writer_fewshot_example"
+        ):
+          formatted_fewshot.append(
+              processor_cls.format_writer_fewshot_example(ex)
+          )
+        else:
+          prompt = ex.get("prompt", "")
+          response = (
+              ex.get("response")
+              or ex.get("completion")
+              or ex.get("npov_response")
+              or ex.get("Answer")
+              or ""
+          )
+          if response and not prompt.rstrip().endswith(str(response).strip()):
+            if not prompt.endswith("\n"):
+              prompt += "\n"
+            prompt += str(response).strip()
+          formatted_fewshot.append(prompt)
 
-        print(
-            f"Pushing dataset with generations to {self.args.user}/{name_for_saving}"
+      fewshot_prompts = "\n".join(formatted_fewshot)
+      prompts = [fewshot_prompts + "\n" + p for p in prompts]
+
+    self.prompts = prompts
+
+  def _combine_lora_adapters(
+      self,
+      sft_adapter_dir: str,
+      rl_adapter_dir: str,
+      base_model_name_or_path: Optional[str] = None,
+  ) -> Tuple[str, int]:
+    """Combines an SFT LoRA adapter and an RL/DPO LoRA adapter into a single LoRA adapter.
+
+    Mathematically, for each linear layer, the sum of two LoRA deltas
+    Delta W_1 = (alpha_1 / r_1) B_1 A_1 and Delta W_2 = (alpha_2 / r_2) B_2 A_2
+    is exactly represented by concatenating A_comb = [A_1; A_2] along dim 0 and
+    B_comb = [(alpha_1 / r_1) B_1, (alpha_2 / r_2) B_2] along dim 1, with
+    combined rank r_target >= r_1 + r_2 and alpha_target = r_target (scaling = 1.0).
+    Ranks are padded with zeros to the next power of 2 (>= 8) for vLLM kernel
+    compatibility.
+
+    Args:
+      sft_adapter_dir: Local directory of the SFT LoRA adapter.
+      rl_adapter_dir: Local directory of the RL/DPO LoRA adapter.
+      base_model_name_or_path: Base model identifier for adapter_config.json.
+
+    Returns:
+      Tuple of (combined_adapter_directory, combined_lora_rank).
+    """
+    import hashlib  # pylint: disable=g-import-not-at-top
+
+    sft_cfg_path = os.path.join(sft_adapter_dir, "adapter_config.json")
+    rl_cfg_path = os.path.join(rl_adapter_dir, "adapter_config.json")
+    with open(sft_cfg_path, "r", encoding="utf-8") as f:
+      sft_config = json.load(f)
+    with open(rl_cfg_path, "r", encoding="utf-8") as f:
+      rl_config = json.load(f)
+
+    if rl_config.get("sft_merged_into_lora") is True:
+      print(
+          f"Adapter at '{rl_adapter_dir}' already contains merged SFT weights."
+          " Skipping adapter combination."
+      )
+      return rl_adapter_dir, int(rl_config.get("r", 64))
+
+    r1 = int(sft_config["r"])
+    alpha1 = float(sft_config.get("lora_alpha", r1))
+    s1 = alpha1 / r1
+
+    r2 = int(rl_config["r"])
+    alpha2 = float(rl_config.get("lora_alpha", r2))
+    s2 = alpha2 / r2
+
+    r_sum = r1 + r2
+    r_target = 8
+    while r_target < r_sum:
+      r_target *= 2
+
+    def _load_state_dict(adapter_dir: str) -> Dict[str, torch.Tensor]:
+      st_path = os.path.join(adapter_dir, "adapter_model.safetensors")
+      bin_path = os.path.join(adapter_dir, "adapter_model.bin")
+      if os.path.isfile(st_path):
+        try:
+          from safetensors.torch import load_file  # pylint: disable=g-import-not-at-top
+          return load_file(st_path)
+        except ImportError:
+          pass
+      if os.path.isfile(bin_path):
+        return torch.load(bin_path, map_location="cpu")
+      if os.path.isfile(st_path):
+        from safetensors.torch import load_file  # pylint: disable=g-import-not-at-top
+        return load_file(st_path)
+      raise FileNotFoundError(
+          f"No adapter_model.safetensors or adapter_model.bin found in {adapter_dir}"
+      )
+
+    def _normalize_key(k: str) -> str:
+      k = k.replace(".lora_A.default.weight", ".lora_A.weight")
+      k = k.replace(".lora_B.default.weight", ".lora_B.weight")
+      return k
+
+    raw_sft = _load_state_dict(sft_adapter_dir)
+    raw_rl = _load_state_dict(rl_adapter_dir)
+    sft_norm = {_normalize_key(k): v for k, v in raw_sft.items()}
+    rl_norm = {_normalize_key(k): v for k, v in raw_rl.items()}
+
+    all_keys = set(sft_norm.keys()) | set(rl_norm.keys())
+    lora_a_keys = sorted(k for k in all_keys if ".lora_A." in k)
+
+    combined_state: Dict[str, torch.Tensor] = {}
+    orig_num_threads = (
+        torch.get_num_threads() if hasattr(torch, "get_num_threads") else None
+    )
+    try:
+      if hasattr(torch, "set_num_threads"):
+        torch.set_num_threads(1)
+      ctx = torch.no_grad() if hasattr(torch, "no_grad") else contextlib.nullcontext()
+      with ctx:
+        for a_key in lora_a_keys:
+          b_key = a_key.replace(".lora_A.", ".lora_B.")
+          ref_a = rl_norm.get(a_key, sft_norm.get(a_key))
+          ref_b = rl_norm.get(b_key, sft_norm.get(b_key))
+          d_in = ref_a.shape[1]
+          d_out = ref_b.shape[0]
+          dtype = ref_a.dtype
+          device = ref_a.device
+
+          if a_key in sft_norm and b_key in sft_norm:
+            a1 = sft_norm[a_key]
+            b1 = sft_norm[b_key]
+          else:
+            a1 = torch.zeros((r1, d_in), dtype=dtype, device=device)
+            b1 = torch.zeros((d_out, r1), dtype=dtype, device=device)
+
+          if a_key in rl_norm and b_key in rl_norm:
+            a2 = rl_norm[a_key]
+            b2 = rl_norm[b_key]
+          else:
+            a2 = torch.zeros((r2, d_in), dtype=dtype, device=device)
+            b2 = torch.zeros((d_out, r2), dtype=dtype, device=device)
+
+          b1_scaled = (b1.float() * s1).to(dtype)
+          b2_scaled = (b2.float() * s2).to(dtype)
+
+          a_cat = torch.cat([a1, a2], dim=0)
+          b_cat = torch.cat([b1_scaled, b2_scaled], dim=1)
+
+          if r_target > r_sum:
+            pad_rows = r_target - r_sum
+            a_pad = torch.zeros((pad_rows, d_in), dtype=dtype, device=device)
+            b_pad = torch.zeros((d_out, pad_rows), dtype=dtype, device=device)
+            a_cat = torch.cat([a_cat, a_pad], dim=0)
+            b_cat = torch.cat([b_cat, b_pad], dim=1)
+
+          combined_state[a_key] = a_cat.contiguous()
+          combined_state[b_key] = b_cat.contiguous()
+
+        for k in all_keys:
+          if ".lora_A." not in k and ".lora_B." not in k:
+            val = rl_norm.get(k, sft_norm.get(k))
+            combined_state[k] = (
+                val.contiguous() if hasattr(val, "contiguous") else val
+            )
+    finally:
+      if orig_num_threads is not None and hasattr(torch, "set_num_threads"):
+        torch.set_num_threads(orig_num_threads)
+
+    combo_hash = hashlib.sha256(
+        f"{os.path.abspath(sft_adapter_dir)}::{os.path.abspath(rl_adapter_dir)}".encode(
+            "utf-8"
         )
-        self.dataset_prompts.push_to_hub(f"{self.args.user}/{name_for_saving}")
+    ).hexdigest()[:12]
+    output_dir = os.path.join(
+        "checkpoints", "eval_combined_lora", f"sft_plus_rl_{combo_hash}"
+    )
+    os.makedirs(output_dir, exist_ok=True)
+
+    saved_safetensors = False
+    try:
+      from safetensors.torch import save_file  # pylint: disable=g-import-not-at-top
+      save_file(
+          combined_state, os.path.join(output_dir, "adapter_model.safetensors")
+      )
+      saved_safetensors = True
+    except ImportError:
+      pass
+    if not saved_safetensors:
+      torch.save(combined_state, os.path.join(output_dir, "adapter_model.bin"))
+
+    combined_config = dict(rl_config)
+    combined_config["r"] = r_target
+    combined_config["lora_alpha"] = r_target
+    if base_model_name_or_path:
+      combined_config["base_model_name_or_path"] = base_model_name_or_path
+    if isinstance(sft_config.get("target_modules"), list) and isinstance(
+        rl_config.get("target_modules"), list
+    ):
+      combined_config["target_modules"] = sorted(
+          list(
+              set(sft_config["target_modules"])
+              | set(rl_config["target_modules"])
+          )
+      )
+    combined_config["sft_merged_into_lora"] = True
+
+    with open(
+        os.path.join(output_dir, "adapter_config.json"), "w", encoding="utf-8"
+    ) as f:
+      json.dump(combined_config, f, indent=2)
+
+    print(
+        f"Combined SFT LoRA adapter ('{sft_adapter_dir}', r={r1}, alpha={alpha1})"
+        f" and RL LoRA adapter ('{rl_adapter_dir}', r={r2}, alpha={alpha2})"
+        f" into '{output_dir}' (combined rank r={r_target}).",
+        flush=True,
+    )
+    return output_dir, r_target
+
+  def setup_model(self) -> None:
+    self._assert_sft_adapter_expectation()
+
+    enable_lora, lora_path = self._resolve_lora_adapter_path(
+        self.args.writer_model_lora, self.args.writer_model_base
+    )
+    self.enable_lora = enable_lora
+    self.lora_path = lora_path
+    self.vllm_model = self.args.writer_model_base
+    self.max_lora_rank = 64
+
+    sft_model_path = getattr(self.args, "sft_model_path", None)
+    # Provenance of the served weights. Recorded even when nothing is stacked,
+    # because "which model produced these completions" is precisely the
+    # question that is impossible to answer after the fact.
+    self.serving_provenance: Dict[str, Any] = {
+        "writer_model_base": self.args.writer_model_base,
+        "writer_model_lora": self.args.writer_model_lora,
+        "sft_model_path": normalize_model_ref(sft_model_path) or None,
+        "sft_stacking_marker": sft_stacking_marker(
+            sft_model_path, self.args.writer_model_lora
+        ),
+        "sft_adapter_stacked": False,
+        "writer_adapter_dir": lora_path,
+        "sft_adapter_dir": None,
+        "combined_adapter_dir": None,
+        "combined_lora_rank": None,
+    }
+
+    if (
+        self.enable_lora
+        and self.lora_path is not None
+        and not is_falsy_model_ref(sft_model_path)
+    ):
+      sft_enable_lora, resolved_sft_path = self._resolve_lora_adapter_path(
+          sft_model_path, self.args.writer_model_base
+      )
+      self.serving_provenance["sft_adapter_dir"] = resolved_sft_path
+      if (
+          sft_enable_lora
+          and resolved_sft_path is not None
+          and os.path.abspath(resolved_sft_path) != os.path.abspath(self.lora_path)
+      ):
+        combined_path, combined_rank = self._combine_lora_adapters(
+            sft_adapter_dir=resolved_sft_path,
+            rl_adapter_dir=self.lora_path,
+            base_model_name_or_path=self.args.writer_model_base,
+        )
+        self.lora_path = combined_path
+        self.max_lora_rank = max(64, combined_rank)
+        self.serving_provenance.update({
+            "sft_adapter_stacked": True,
+            "combined_adapter_dir": combined_path,
+            "combined_lora_rank": combined_rank,
+        })
+
+  def _write_generation_provenance(self, repo_id: Optional[str]) -> None:
+    """Records which weights produced the completions in ``repo_id``.
+
+    The dataset name now encodes *whether* an SFT adapter was stacked; this
+    sidecar records *which one*, plus the resolved adapter directories and the
+    combined LoRA rank. It is written next to the scoring summary so both ends
+    of an evaluation can be audited from one directory.
+
+    Args:
+      repo_id: Dataset repository receiving the completions.
+    """
+    if not repo_id:
+      return
+    provenance = dict(getattr(self, "serving_provenance", {}) or {})
+    provenance.update({
+        "dataset_with_completions": repo_id,
+        "task_name": getattr(self.args, "task_name", None),
+        "temperature": getattr(self.args, "temperature", None),
+        "top_p": getattr(self.args, "top_p", None),
+        "top_k": getattr(self.args, "top_k", None),
+        "max_tokens": getattr(self.args, "max_tokens", None),
+        "seed": getattr(self.args, "seed", None),
+        "writer_num_fewshot": getattr(self.args, "writer_num_fewshot", None),
+        "max_lora_rank": getattr(self, "max_lora_rank", None),
+        "served_lora_path": getattr(self, "lora_path", None),
+        "allow_missing_sft_adapter": getattr(
+            self.args, "allow_missing_sft_adapter", False
+        ),
+        "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+    })
+    output_dir = os.path.join("logs", "eval")
+    path = os.path.join(
+        output_dir, f"{repo_id.split('/')[-1]}_generation_provenance.json"
+    )
+    try:
+      os.makedirs(output_dir, exist_ok=True)
+      with open(path, "w", encoding="utf-8") as f:
+        json.dump(provenance, f, indent=2, sort_keys=True)
+      print(f"Generation provenance written to: {path}", flush=True)
+    except OSError as e:
+      # Never lose a finished generation over a logging failure.
+      print(f"[WARNING] Could not write generation provenance to {path}: {e}")
+
+  def run_and_save(self) -> None:
+    if not _VLLM_AVAILABLE:
+      raise ImportError(
+          "vLLM is required for local completion generation, but is not"
+          " installed. Please run generation on a GPU environment with"
+          " vLLM installed."
+      )
+    # Force 'spawn' multiprocessing for vLLM workers to prevent os.fork()
+    # deadlocks after multi-threaded dataset loading, HF Hub downloads, and
+    # PyTorch CPU tensor operations.
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+    # Prepare sampling parameters for vLLM
+    top_k = self.args.top_k if self.args.top_k > 0 else -1
+    # `repetition_penalty` is a documented EvalArguments field and the SSFO
+    # generation path honours it, but this path used to drop it silently, so
+    # setting the flag changed nothing. Default is 1.0 (a no-op), so passing
+    # it through leaves existing runs bit-identical.
+    rep_penalty = getattr(self.args, "repetition_penalty", 1.0) or 1.0
+    sampling_params = SamplingParams(
+        seed=self.args.seed,
+        temperature=self.args.temperature,
+        top_p=self.args.top_p,
+        top_k=top_k,
+        repetition_penalty=rep_penalty,
+        min_tokens=getattr(self.args, "min_tokens", 10),
+        max_tokens=self.args.max_tokens,
+    )
+
+    # Instantiate vLLM LLM (use bfloat16 dtype and allow global attribute access)
+    llm_kwargs = {
+        "model": self.vllm_model,
+        "enable_lora": self.enable_lora,
+        "max_lora_rank": getattr(self, "max_lora_rank", 64),
+        "dtype": "bfloat16",
+        "hf_overrides": {"allow_global_per_layer_attribute_access": True},
+    }
+    # Only set when asked: vLLM otherwise sizes the KV cache for the model's
+    # declared context. Qwen/Qwen3-4B-Instruct-2507 declares 262144, which
+    # needs roughly 38 GB of KV cache and will not start on a 48 GB card.
+    max_model_len = getattr(self.args, "max_model_len", None)
+    if max_model_len:
+      llm_kwargs["max_model_len"] = max_model_len
+    print(
+        f"Initializing vLLM engine with base model '{self.vllm_model}' "
+        f"(enable_lora={self.enable_lora}, max_lora_rank={llm_kwargs['max_lora_rank']}, "
+        f"multiproc={os.environ.get('VLLM_WORKER_MULTIPROC_METHOD')})...",
+        flush=True,
+    )
+    try:
+      llm = LLM(**llm_kwargs)
+    except (TypeError, ValueError, KeyError, AttributeError) as e:
+      # `hf_overrides` carries a knob that only one model family understands.
+      # It is inert elsewhere on today's vLLM, but a version or a family that
+      # validates config keys would reject it, and the engine failing to start
+      # is not an acceptable price for an optional flag.
+      if "hf_overrides" not in llm_kwargs:
+        raise
+      print(
+          f"vLLM rejected the engine arguments ({e}); retrying without"
+          " hf_overrides."
+      )
+      llm_kwargs.pop("hf_overrides", None)
+      llm = LLM(**llm_kwargs)
+
+    # Run generation
+    print(
+        f"Running vLLM generation for {len(self.prompts)} prompts "
+        f"(lora_path='{self.lora_path}')...",
+        flush=True,
+    )
+    if self.enable_lora and self.lora_path is not None:
+      outputs = llm.generate(
+          self.prompts,
+          sampling_params,
+          lora_request=LoRARequest(
+              "writer_lora_adapter", 1, lora_path=self.lora_path
+          ),
+      )
+    else:
+      outputs = llm.generate(self.prompts, sampling_params)
+
+    generations = [output.outputs[0].text for output in outputs]
+    self.dataset_prompts = self.dataset_prompts.add_column(
+        "completion", generations
+    )
+    repo_id = self._completions_repo_id()
+    self._write_generation_provenance(repo_id)
+
+    print(f"Pushing dataset with generations to {repo_id}...")
+    clean_dataset = Dataset.from_dict(self.dataset_prompts.to_dict())
+    split_name = self.args.dataset_prompts_split or "test"
+    dataset_dict = DatasetDict({split_name: clean_dataset})
+    dataset_dict.push_to_hub(repo_id)
 
 
 class EvaluationScoringPipeline(EvaluationPipeline):
-    """Pipeline for scoring existing dataset with completions."""
+  """Pipeline for scoring existing dataset with completions."""
 
-    def setup_arguments(self, *cli_args, **cli_kwargs):
-        parser = HfArgumentParser(EvalArguments)
-        self.args = parser.parse_args_into_dataclasses()[0]
-        set_seed(self.args.seed)
+  def setup_arguments(self, *cli_args, **cli_kwargs):
+    parser = HfArgumentParser(EvalArguments)
+    self.args = parser.parse_args_into_dataclasses()[0]
+    set_seed(self.args.seed)
 
-    def setup_tokenizer(self):
-        if not self.args.use_gemini:
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                self.args.evaluator_model, padding_side="left"
-            )
+  def setup_tokenizer(self):
+    if getattr(self.args, "run_autorater", True) and not self.args.use_gemini:
+      self.tokenizer = AutoTokenizer.from_pretrained(
+          self.args.evaluator_model, padding_side="left"
+      )
+      configure_tokenizer_padding(self.tokenizer, padding_side="left")
+    if getattr(self.args, "compute_perplexity", False):
+      fluency_model_name = getattr(
+          self.args, "fluency_model", None
+      ) or getattr(self.args, "writer_model_base", None)
+      if fluency_model_name:
+        print(f"Loading fluency tokenizer: {fluency_model_name}...")
+        self.fluency_tokenizer = AutoTokenizer.from_pretrained(
+            fluency_model_name, padding_side="left"
+        )
+        configure_tokenizer_padding(
+            self.fluency_tokenizer, padding_side="left"
+        )
+      else:
+        self.fluency_tokenizer = None
 
-    def load_data(self):
-        if self.args.dataset_with_completions is None:
-            raise ValueError(
-                "dataset_with_completions is required for scoring mode"
-            )
-        self.val_data = load_dataset(
-            self.args.dataset_with_completions, split="test"
+  def load_data(self):
+    self._assert_sft_adapter_expectation()
+    self.args.dataset_with_completions = self._completions_repo_id()
+
+    if self.args.dataset_with_completions is None:
+      raise ValueError("dataset_with_completions is required for scoring mode")
+    print(
+        "Loading dataset with completions from"
+        f" {self.args.dataset_with_completions}..."
+    )
+    self.full_dataset = self.safe_load_dataset(
+        self.args.dataset_with_completions, split="test"
+    )
+    max_samples = getattr(self.args, "max_eval_samples", None)
+    if (
+        max_samples is not None
+        and max_samples > 0
+        and len(self.full_dataset) > max_samples
+    ):
+      print(
+          f"Subsampling evaluation to {max_samples} out of"
+          f" {len(self.full_dataset)} samples (seed={self.args.seed}). Full"
+          " dataset completions will be preserved on hub."
+      )
+      rng = random.Random(self.args.seed)
+      all_indices = list(range(len(self.full_dataset)))
+      rng.shuffle(all_indices)
+      self.eval_indices = all_indices[:max_samples]
+      self.val_data = self.full_dataset.select(self.eval_indices)
+      self.is_subsampled = True
+    else:
+      self.eval_indices = list(range(len(self.full_dataset)))
+      self.val_data = self.full_dataset
+      self.is_subsampled = False
+
+  def process_data(self):
+    processor_cls = get_task_processor(self.args.task_name)
+    # The two judges are independently switchable. `run_autorater` used to
+    # guard this whole method, so turning the hallucination judge off also
+    # silently skipped every other prompt column.
+    if getattr(self.args, "run_autorater", True):
+      self._build_evaluator_prompts(processor_cls)
+    if getattr(self.args, "run_reward_hacking_autorater", False):
+      self._build_reward_hacking_prompts(processor_cls)
+
+  def _build_evaluator_prompts(self, processor_cls: Any) -> None:
+    """Adds the hallucination judge's prompt column to ``self.val_data``.
+
+    Args:
+      processor_cls: The task processor for this run's task.
+    """
+    prompt_fn = processor_cls.get_evaluator_prompt()
+    fewshot_examples = None
+    if (
+        self.args.evaluator_num_fewshot
+        and self.args.evaluator_num_fewshot > 0
+        and self.args.dataset_labels
+    ):
+      label_data = self.safe_load_dataset(
+          self.args.dataset_labels, split=self.args.dataset_labels_split
+      )
+      n_yes = self.args.evaluator_num_fewshot // 2
+      n_no = self.args.evaluator_num_fewshot - n_yes
+      fewshot_examples = self.get_fewshot_examples(
+          label_data, n_yes, n_no, self.args.seed
+      )
+    self.val_data = self.val_data.map(
+        prompt_fn, fn_kwargs={"fewshot_examples": fewshot_examples}
+    )
+
+  def _build_reward_hacking_prompts(self, processor_cls: Any) -> None:
+    """Adds the reward-hacking rubric's prompt column to ``self.val_data``.
+
+    Demonstrations come from the SFT set rather than from the labelled
+    autorater set: the autorater set is labelled for *hallucination*, so its
+    rows say nothing about writing quality, whereas an SFT target is by
+    definition a response someone was willing to train on.
+
+    A failure to load the demonstration source is downgraded to a warning and
+    a zero-shot run. Losing the demonstrations costs calibration of the
+    scale; aborting the whole scoring pass would cost the hallucination
+    numbers too.
+
+    Args:
+      processor_cls: The task processor for this run's task.
+    """
+    fewshot_examples = None
+    num_pairs = int(getattr(self.args, "reward_hacking_num_fewshot", 0) or 0)
+    if num_pairs > 0:
+      source_repo = getattr(
+          self.args, "reward_hacking_fewshot_dataset", None
+      ) or f"{self.args.user}/{self.args.task_name}_sft"
+      split = getattr(self.args, "reward_hacking_fewshot_split", "train")
+      try:
+        source_data = self.safe_load_dataset(source_repo, split=split)
+        fewshot_examples = build_reward_hacking_fewshot_examples(
+            processor_cls=processor_cls,
+            source_data=source_data,
+            num_pairs=num_pairs,
+            seed=self.args.seed,
+        )
+      except Exception as error:  # pylint: disable=broad-exception-caught
+        print(
+            f"[WARNING] Could not build reward-hacking demonstrations from"
+            f" {source_repo} (split={split}): {error}. Grading zero-shot; the"
+            " judge has no anchor for the bottom of the scale, so expect the"
+            " grades to compress upwards."
+        )
+      if fewshot_examples:
+        n_degenerate = sum(
+            1 for ex in fewshot_examples if ex.get("is_degenerate")
+        )
+        print(
+            f"Built {len(fewshot_examples)} reward-hacking demonstrations"
+            f" from {source_repo} ({n_degenerate} degenerate,"
+            f" {len(fewshot_examples) - n_degenerate} gold)."
         )
 
-    def process_data(self):
-        processor_cls = get_task_processor(self.args.task_name)
-        prompt_fn = processor_cls.get_evaluator_prompt()
-        fewshot_examples = None
+    prompt_fn = processor_cls.get_reward_hacking_prompt()
+    self.val_data = self.val_data.map(
+        prompt_fn, fn_kwargs={"fewshot_examples": fewshot_examples}
+    )
+
+  def setup_model(self):
+    if getattr(self.args, "run_autorater", True) and not self.args.use_gemini:
+      device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+      # Use causal LM evaluator and set eval mode
+      self.evaluator = AutoModelForCausalLM.from_pretrained(
+          self.args.evaluator_model,
+          torch_dtype=torch.bfloat16,
+      ).to(device)
+      self.evaluator.eval()
+
+    if getattr(self.args, "compute_perplexity", False):
+      fluency_model_name = getattr(
+          self.args, "fluency_model", None
+      ) or getattr(self.args, "writer_model_base", None)
+      if fluency_model_name:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(
+            "Loading fluency base model for perplexity evaluation:"
+            f" {fluency_model_name}..."
+        )
+        self.fluency_model = AutoModelForCausalLM.from_pretrained(
+            fluency_model_name,
+            torch_dtype=torch.bfloat16,
+        ).to(device)
+        self.fluency_model.eval()
+      else:
+        self.fluency_model = None
+
+  def _scoring_provenance(self, dataset_name: str) -> Dict[str, Any]:
+    """Builds the ``provenance_*`` block recorded in the summary JSON.
+
+    Prefers the sidecar written by the generation run, which knows the
+    resolved adapter directories and the combined LoRA rank; falls back to the
+    scoring arguments when that file is absent (e.g. completions generated on
+    another machine).
+
+    Args:
+      dataset_name: Repo name (without namespace) of the scored completions.
+
+    Returns:
+      A flat, JSON-serializable dict of provenance fields.
+    """
+    sft_ref = normalize_model_ref(getattr(self.args, "sft_model_path", None))
+    provenance: Dict[str, Any] = {
+        "provenance_dataset_with_completions": (
+            self.args.dataset_with_completions
+        ),
+        "provenance_writer_model_base": getattr(
+            self.args, "writer_model_base", None
+        ),
+        "provenance_writer_model_lora": getattr(
+            self.args, "writer_model_lora", None
+        ),
+        "provenance_sft_model_path": sft_ref or None,
+        "provenance_sft_adapter_stacked": is_sft_adapter_stacked(
+            sft_ref, getattr(self.args, "writer_model_lora", None)
+        ),
+        "provenance_sft_stacking_marker": sft_stacking_marker(
+            sft_ref, getattr(self.args, "writer_model_lora", None)
+        ),
+    }
+
+    sidecar = os.path.join(
+        "logs", "eval", f"{dataset_name}_generation_provenance.json"
+    )
+    try:
+      with open(sidecar, "r", encoding="utf-8") as f:
+        generation = json.load(f)
+    except (OSError, ValueError):
+      provenance["provenance_generation_record"] = "missing"
+      return provenance
+
+    if isinstance(generation, dict):
+      provenance["provenance_generation_record"] = sidecar
+      for key in (
+          "sft_adapter_dir",
+          "writer_adapter_dir",
+          "combined_adapter_dir",
+          "combined_lora_rank",
+          "max_lora_rank",
+          "allow_missing_sft_adapter",
+          "generated_at",
+      ):
+        if key in generation:
+          provenance[f"provenance_{key}"] = generation[key]
+      # The generation run is the authority on what was actually served.
+      for key in ("sft_model_path", "sft_adapter_stacked"):
+        if key in generation:
+          provenance[f"provenance_{key}"] = generation[key]
+    return provenance
+
+  def reward_hacking_column_names(self) -> list[str]:
+    """Returns the dataset columns the rubric judge writes.
+
+    Returns:
+      One ``reward_hacking_<dimension>`` column per rubric dimension, plus
+      the aggregate ``reward_hacking_quality``.
+    """
+    names = [
+        f"reward_hacking_{key}" for key in reward_hacking_dimension_keys()
+    ]
+    names.append("reward_hacking_quality")
+    return names
+
+  def _run_reward_hacking_autorater(self) -> dict[str, Any]:
+    """Grades the completions against the rubric and records the verdicts.
+
+    Returns:
+      dict[str, Any]: Summary metrics to merge into the evaluation summary,
+      empty when the rubric could not be run at all.
+    """
+    if "reward_hacking_prompt" not in self.val_data.column_names:
+      print(
+          "[WARNING] The reward-hacking autorater was requested but no"
+          " 'reward_hacking_prompt' column exists. Skipping the rubric."
+      )
+      return {}
+    if not self.args.use_gemini:
+      # The rubric needs structured JSON output, which the local CausalLM
+      # path (a two-token Yes/No logit comparison) cannot produce. Failing
+      # loudly beats reporting a rubric nobody ran.
+      print(
+          "[WARNING] The reward-hacking rubric requires the Gemini path"
+          " (--use_gemini True); the local evaluator can only emit a binary"
+          " Yes/No. Skipping the rubric."
+      )
+      return {}
+
+    client = self.create_gemini_client()
+    verdicts = self.gemini_score_rubric_dataset(
+        client, self.val_data, self.args
+    )
+    threshold = float(getattr(self.args, "reward_hacking_threshold", 0.6))
+
+    for key in reward_hacking_dimension_keys():
+      column = f"reward_hacking_{key}"
+      values = [
+          (verdict.get(key) if isinstance(verdict, dict) else None)
+          for verdict in verdicts
+      ]
+      if column in self.val_data.column_names:
+        self.val_data = self.val_data.remove_columns(column)
+      self.val_data = self.val_data.add_column(column, values)
+
+    quality_values: list[Optional[float]] = []
+    for verdict in verdicts:
+      if not isinstance(verdict, dict) or not verdict:
+        quality_values.append(None)
+        continue
+      grades = [
+          float(verdict[key])
+          for key in reward_hacking_dimension_keys()
+          if key in verdict
+      ]
+      quality_values.append(
+          float(sum(grades) / len(grades)) if grades else None
+      )
+    if "reward_hacking_quality" in self.val_data.column_names:
+      self.val_data = self.val_data.remove_columns("reward_hacking_quality")
+    self.val_data = self.val_data.add_column(
+        "reward_hacking_quality", quality_values
+    )
+
+    self._save_reward_hacking_prompts()
+
+    summary = reward_hacking_summary(verdicts, threshold)
+    summary.update(getattr(self, "reward_hacking_stats", {}))
+    self._print_reward_hacking_summary(summary, threshold)
+    return summary
+
+  def _save_reward_hacking_prompts(self) -> None:
+    """Dumps the rubric prompts for inspection.
+
+    The rubric's verdicts are only as good as the prompt that produced them,
+    and the prompt is assembled from a shared preamble, synthesised
+    demonstrations and a truncated context. Writing it out is the only way
+    to check that the demonstrations actually landed.
+    """
+    name = reward_hacking_run_name(
+        reward_hacking_model=(
+            getattr(self.args, "reward_hacking_model", None)
+            or self.args.evaluator_model
+        ),
+        task_name=self.args.task_name,
+        reward_hacking_num_fewshot=getattr(
+            self.args, "reward_hacking_num_fewshot", 0
+        ),
+        seed=self.args.seed,
+    )
+    filepath = f"logs/{name}/eval_reward_hacking_prompts.txt"
+    try:
+      os.makedirs(os.path.dirname(filepath), exist_ok=True)
+      with open(filepath, "w", encoding="utf-8") as handle:
+        # The preamble and demonstrations are identical across rows, so the
+        # first few prompts are enough to audit them.
+        for idx, prompt in enumerate(self.val_data["reward_hacking_prompt"]):
+          if idx >= 5:
+            break
+          handle.write(f"\n{idx}. ----------\n" + prompt)
+      print(f"Reward-hacking prompts saved to {filepath}")
+    except OSError as error:
+      print(f"Warning: Could not save reward-hacking prompts: {error}")
+
+  def _print_reward_hacking_summary(
+      self, summary: dict[str, Any], threshold: float
+  ) -> None:
+    """Prints the rubric result as a readable per-dimension breakdown.
+
+    Args:
+      summary: The metrics produced by :func:`reward_hacking_summary`.
+      threshold: The (uncalibrated) reporting threshold.
+    """
+    print("\n--- Reward-hacking rubric ---")
+    for key, title, _ in REWARD_HACKING_DIMENSIONS:
+      value = summary.get(f"reward_hacking_{key}")
+      spread = summary.get(
+          f"{REWARD_HACKING_AUDIT_PREFIX}{key}_spread_mean"
+      )
+      rendered = "-" if value is None else f"{value:.4f}"
+      suffix = "" if spread is None else f"  (judge spread {spread:.4f})"
+      print(f"{title:>20}: {rendered}{suffix}")
+    quality = summary.get("reward_hacking_quality")
+    rate = summary.get("reward_hacking_rate")
+    print(
+        f"{'Quality (mean)':>20}:"
+        f" {'-' if quality is None else f'{quality:.4f}'}"
+    )
+    print(
+        f"{'Below threshold':>20}:"
+        f" {'-' if rate is None else f'{rate:.4f}'}"
+        f" (threshold {threshold}, UNCALIBRATED)"
+    )
+    print(
+        f"{'Scored':>20}:"
+        f" {summary.get(f'{REWARD_HACKING_AUDIT_PREFIX}n_scored')}"
+        f"/{summary.get(f'{REWARD_HACKING_AUDIT_PREFIX}n_total')}"
+    )
+
+  def run_and_save(self):
+    autorater_score_list = None
+    if getattr(self.args, "run_autorater", True):
+      # Score dataset using tokenizer and evaluator (support gemini)
+      if self.args.use_gemini:
+        client = self.create_gemini_client()
+        scores = self.gemini_score_dataset(client, self.val_data, self.args)
+      else:
+        yes_token_id, no_token_id = resolve_yes_no_token_ids(self.tokenizer)
+        scores = self.evaluator_score(
+            self.val_data,
+            self.args,
+            self.tokenizer,
+            self.evaluator,
+            yes_token_id,
+            no_token_id,
+        )
+      # Extract list of scores, properly handling both list and torch.Tensor
+      scores_list = (
+          scores.tolist() if isinstance(scores, torch.Tensor) else list(scores)
+      )
+      # Ensure unscored / missing entries are strictly None (no numeric fallback)
+      scores_list = [
+          float(s)
+          if s is not None and not (isinstance(s, float) and math.isnan(s))
+          else None
+          for s in scores_list
+      ]
+      # Compute classifications: 1 for non-hallucination (>= threshold),
+      # 0 for hallucination (< threshold), and None for entries that could
+      # not be scored by the autorater.
+      classifs_list = [
+          (1 if s >= self.args.threshold else 0)
+          if s is not None
+          else None
+          for s in scores_list
+      ]
+      if "scores" in self.val_data.column_names:
+        self.val_data = self.val_data.remove_columns("scores")
+      self.val_data = self.val_data.add_column("scores", scores_list)
+      if "classifications" in self.val_data.column_names:
+        self.val_data = self.val_data.remove_columns("classifications")
+      self.val_data = self.val_data.add_column(
+          "classifications", classifs_list
+      )
+      autorater_score_list = scores_list
+    elif "scores" in self.val_data.column_names:
+      autorater_score_list = [
+          float(s)
+          if s is not None and not (isinstance(s, float) and math.isnan(s))
+          else None
+          for s in self.val_data["scores"]
+      ]
+
+    reward_hacking_summary_metrics: dict[str, Any] = {}
+    if getattr(self.args, "run_reward_hacking_autorater", False):
+      reward_hacking_summary_metrics = self._run_reward_hacking_autorater()
+
+    # Compute generation metrics (ROUGE, BERTScore, lengths, PPL)
+    if getattr(self.args, "compute_generation_metrics", True):
+      evaluator = GenerationMetricsEvaluator(
+          bertscore_model=getattr(
+              self.args,
+              "bertscore_model",
+              "sentence-transformers/all-MiniLM-L6-v2",
+          ),
+          compute_bertscore_metric=getattr(
+              self.args, "compute_bertscore", True
+          ),
+          compute_perplexity_metric=getattr(
+              self.args, "compute_perplexity", False
+          ),
+          fluency_model=getattr(self, "fluency_model", None),
+          fluency_tokenizer=getattr(self, "fluency_tokenizer", None),
+      )
+      self.val_data, summary = evaluator.evaluate_dataset(
+          self.val_data,
+          prompt_column="prompt",
+          completion_column="completion",
+          reference_column=getattr(self.args, "reference_column", None),
+          tokenizer=getattr(
+              self, "fluency_tokenizer", getattr(self, "tokenizer", None)
+          ),
+      )
+      dataset_name = self.args.dataset_with_completions.split("/")[-1]
+      summary.update(self._scoring_provenance(dataset_name))
+      # How many samples the judge actually scored, and whether any of them
+      # were scored in a degraded mode. Without this the metric denominator
+      # silently moves between runs.
+      summary.update(getattr(self, "autorater_stats", {}))
+      # The rubric's own denominator and audit trail. Kept distinct from the
+      # hallucination judge's: the two can drop different samples, so one
+      # shared "scored count" would misstate both.
+      summary.update(reward_hacking_summary_metrics)
+      evaluator.save_and_log_results(
+          self.val_data,
+          summary,
+          output_dir=os.path.join("logs", "eval"),
+          dataset_name=dataset_name,
+          autorater_scores=autorater_score_list,
+          threshold=self.args.threshold,
+          log_to_wandb=getattr(self.args, "log_to_wandb", False),
+          wandb_project=getattr(self.args, "wandb_project", "new_perl_eval"),
+          wandb_run_name=getattr(self.args, "wandb_run_name", None),
+          wandb_run_id=getattr(self.args, "wandb_run_id", None),
+          wandb_entity=getattr(self.args, "wandb_entity", None),
+          eval_step=getattr(self.args, "eval_step", None),
+          continual_eval_history_path=getattr(
+              self.args, "continual_eval_history_path", None
+          ),
+          wandb_metric_prefix=getattr(self.args, "wandb_metric_prefix", "eval"),
+          wandb_plot_title_suffix=getattr(
+              self.args, "wandb_plot_title_suffix", None
+          ),
+      )
+
+    if self.is_subsampled:
+      # Merge scored subset columns back into full dataset, preserving all rows
+      final_dict = (
+          dict(self.full_dataset.to_dict())
+          if hasattr(self.full_dataset, "to_dict")
+          else {
+              col: list(self.full_dataset[col])
+              for col in self.full_dataset.column_names
+          }
+      )
+      n_total = len(self.full_dataset)
+      evaluated_metric_cols = [
+          "scores",
+          "classifications",
+          "rouge1_f1",
+          "rouge1_precision",
+          "rouge1_recall",
+          "rouge2_f1",
+          "rouge2_precision",
+          "rouge2_recall",
+          "rougeL_f1",
+          "rougeL_precision",
+          "rougeL_recall",
+          "bertscore_f1",
+          "char_length",
+          "token_length",
+          "distinct_1",
+          "distinct_2",
+          "repetition_rate",
+          "perplexity",
+      ]
+      # Derived from the rubric definition rather than listed, so adding a
+      # dimension does not silently stop being merged back here.
+      evaluated_metric_cols.extend(self.reward_hacking_column_names())
+
+      for col_name in self.val_data.column_names:
+        if col_name in evaluated_metric_cols or col_name not in final_dict:
+          if col_name in final_dict:
+            full_col_vals = list(final_dict[col_name])
+          else:
+            full_col_vals = [None] * n_total
+          for idx_in_val, orig_idx in enumerate(self.eval_indices):
+            full_col_vals[orig_idx] = self.val_data[col_name][idx_in_val]
+          final_dict[col_name] = full_col_vals
+
+      # Remove any stale reference metric columns from prior runs if not
+      # evaluated now
+      for metric_col in [
+          "rouge1_f1",
+          "rouge1_precision",
+          "rouge1_recall",
+          "rouge2_f1",
+          "rouge2_precision",
+          "rouge2_recall",
+          "rougeL_f1",
+          "rougeL_precision",
+          "rougeL_recall",
+          "bertscore_f1",
+          "perplexity",
+      ]:
         if (
-            self.args.evaluator_num_fewshot
-            and self.args.evaluator_num_fewshot > 0
-            and self.args.dataset_labels
+            metric_col not in self.val_data.column_names
+            and metric_col in final_dict
         ):
-            label_data = load_dataset(
-                self.args.dataset_labels, split=self.args.dataset_labels_split
-            )
-            n_yes = self.args.evaluator_num_fewshot // 2
-            n_no = self.args.evaluator_num_fewshot - n_yes
-            fewshot_examples = self.get_fewshot_examples(
-                label_data, n_yes, n_no, self.args.seed
-            )
-        self.val_data = self.val_data.map(
-            prompt_fn, fn_kwargs={"fewshot_examples": fewshot_examples}
-        )
+          final_dict.pop(metric_col, None)
 
-    def setup_model(self):
-        if not self.args.use_gemini:
-            # Use causal LM evaluator and set eval mode
-            self.evaluator = AutoModelForCausalLM.from_pretrained(
-                self.args.evaluator_model,
-                attn_implementation="eager",
-                torch_dtype=torch.bfloat16,
-            )
-            self.evaluator.eval()
-
-    def run_and_save(self):
-        # Score dataset using tokenizer and evaluator (support gemini)
-        if self.args.use_gemini:
-            client = genai.Client(api_key=self.args.gemini_api_key)
-            scores = self.gemini_score_dataset(client, self.val_data, self.args)
-        else:
-            yes_token_id = self.tokenizer.convert_tokens_to_ids("Yes")
-            no_token_id = self.tokenizer.convert_tokens_to_ids("No")
-            scores = self.evaluator_score(
-                self.val_data,
-                self.args,
-                self.tokenizer,
-                self.evaluator,
-                yes_token_id,
-                no_token_id,
-            )
-        # Compute simple rate and push dataset updated
-        t = torch.nn.Threshold(self.args.threshold, 0, inplace=False)
-        classifs = torch.ceil(t(scores)).clamp(0, 1)
-        self.val_data = self.val_data.add_column("scores", scores.tolist())
-        self.val_data = self.val_data.add_column(
-            "classifications", classifs.tolist()
-        )
-        self.val_data.push_to_hub(self.args.dataset_with_completions)
+      self.full_dataset = Dataset.from_dict(final_dict)
+      print(
+          f"Pushing full dataset ({len(self.full_dataset)} total samples,"
+          f" {len(self.val_data)} scored) to"
+          f" {self.args.dataset_with_completions}"
+      )
+      dataset_dict = DatasetDict({"test": self.full_dataset})
+      dataset_dict.push_to_hub(self.args.dataset_with_completions)
+    else:
+      clean_dataset = (
+          Dataset.from_dict(self.val_data.to_dict())
+          if hasattr(self.val_data, "to_dict")
+          else self.val_data
+      )
+      dataset_dict = DatasetDict({"test": clean_dataset})
+      dataset_dict.push_to_hub(self.args.dataset_with_completions)

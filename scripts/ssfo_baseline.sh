@@ -1,0 +1,204 @@
+#!/bin/bash
+
+# ==============================================================================
+# SSFO Baseline Pipeline Script
+# Paper: "SSFO: Self-Supervised Faithfulness Optimization for Retrieval-Augmented
+#        Generation" (https://arxiv.org/abs/2508.17225)
+#
+# Stages:
+#   1. SFT Training: Train supervised fine-tuned writer model on SFT dataset.
+#   2. Synthetic Preference Data Generation: Contrast SFT model generations
+#      conditioned on (query + context) as preferred, and conditioned only on
+#      (query) as dispreferred (contextual hallucination).
+#   3. DPO Preference Tuning: Optimize policy using Direct Preference Optimization.
+# ==============================================================================
+
+# Core Parameters
+USER="leobianco"
+SEED=130104
+# Overridable from the environment so that swapping the base model does
+# not require editing this script:  MODEL_REPO_ID=Qwen/Qwen3-4B-Instruct-2507 ./ssfo_baseline.sh
+MODEL_REPO_ID="${MODEL_REPO_ID:-google/gemma-4-E4B-it}"
+
+# SFT Training Parameters (Stage 1)
+SFT_BATCH_SIZE=16
+SFT_NUM_EPOCHS=10
+SFT_LR=0.004445051258597345
+SFT_LORA_R=8
+SFT_LORA_ALPHA=8
+
+# SSFO Generation Parameters (Stage 2 - matching evaluator.sh)
+GEN_DATASET_REPO_ID="${GEN_DATASET_REPO_ID:-${USER}/${TASK_NAME}_perl}"
+GEN_TEMP=0.0
+GEN_TOP_P=1.0
+GEN_TOP_K=0
+MAX_NEW_TOKENS=250
+GEN_BATCH_SIZE=16
+MAX_SAMPLES=""  # Set number of samples here directly (e.g. 500), or leave empty for full data
+USE_GROUND_TRUTH_CHOSEN=False
+USE_BASE_MODEL_FOR_REJECTED=True
+
+# DPO Training Parameters (Stage 3)
+DPO_BETA=0.1
+DPO_BATCH_SIZE=8
+DPO_NUM_EPOCHS=1
+DPO_LR=5e-6
+DPO_LORA_R=8
+DPO_LORA_ALPHA=16
+MAX_LENGTH=512
+
+# Infrastructure Parameters
+# Override for a large policy, e.g.
+#   DEEPSPEED_CONFIG=scripts/deepspeed_config_zero3.yaml ./ssfo_baseline.sh
+# The orchestrator picks this automatically from the model size (see
+# src/orchestrator/accel.py); a hand-run script has to be told.
+DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-scripts/deepspeed_config.yaml}"
+
+# Parameters derived from above
+TASK_NAME="$1"
+STAGE="${2:-all}"  # "sft", "generate_data", "dpo", or "all"
+if [ -n "$3" ]; then
+    MAX_SAMPLES="$3"
+fi
+
+# Checks
+if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ] && [ "$TASK_NAME" != "ragtruth-qa" ] && [ "$TASK_NAME" != "ragtruth-summarization" ]; then
+    echo "Invalid task name: $TASK_NAME"
+    echo "Usage: ./scripts/ssfo_baseline.sh <task_name> [stage: all|sft|generate_data|dpo] [max_samples]"
+    echo "Valid task choices: npov, bosch, ragtruth"
+    exit 1
+fi
+
+MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $NF}')
+TIMESTAMP=$(date '+%y%m%d%H%M')
+
+SAMPLES_TAG=""
+if [ -n "$MAX_SAMPLES" ]; then
+    SAMPLES_TAG="_n${MAX_SAMPLES}"
+fi
+
+# Identifiers
+SFT_RUN_IDENTIFIER="${USER}/${TASK_NAME}_SFT_${MODEL_NAME}_S${SEED}_${TIMESTAMP}"
+SFT_MODEL_PATH="${USER}/${TASK_NAME}_SFT_${MODEL_NAME}_S${SEED}_${TIMESTAMP}"
+PREF_DATASET_REPO="${USER}/${TASK_NAME}_ssfo_preference_${MODEL_NAME}${SAMPLES_TAG}_${TIMESTAMP}"
+DPO_RUN_IDENTIFIER="${USER}/${TASK_NAME}_SSFO_DPO_${MODEL_NAME}_S${SEED}_${TIMESTAMP}"
+
+# ------------------------------------------------------------------------------
+# Stage 1: SFT Training
+# ------------------------------------------------------------------------------
+if [ "$STAGE" == "all" ] || [ "$STAGE" == "sft" ]; then
+  echo "======================================================================"
+  echo "Stage 1: Training initial SFT model..."
+  echo "======================================================================"
+
+  accelerate launch \
+    --config_file="${DEEPSPEED_CONFIG}" \
+    src/writer_sft.py \
+    --task_name "$TASK_NAME" \
+    --report_to "wandb" \
+    --run_name "$SFT_RUN_IDENTIFIER" \
+    --logging_steps 1 \
+    --output_dir "./checkpoints/${TASK_NAME}/writer_sft/${SFT_RUN_IDENTIFIER}" \
+    --push_to_hub True \
+    --hub_model_id "$SFT_RUN_IDENTIFIER" \
+    --seed "$SEED" \
+    --dataset_repo_id "${USER}/${TASK_NAME}_sft" \
+    --model_repo_id "${MODEL_REPO_ID}" \
+    --do_train True \
+    --bf16 True \
+    --do_eval True \
+    --eval_strategy "epoch" \
+    --save_strategy "epoch" \
+    --load_best_model_at_end True \
+    --metric_for_best_model "loss" \
+    --greater_is_better False \
+    --save_total_limit 1 \
+    --warmup_ratio 0.1 \
+    --num_train_epochs "$SFT_NUM_EPOCHS" \
+    --learning_rate "$SFT_LR" \
+    --per_device_train_batch_size "$SFT_BATCH_SIZE" \
+    --per_device_eval_batch_size 32 \
+    --auto_find_batch_size True \
+    --peft_type "LORA" \
+    --task_type "CAUSAL_LM" \
+    --lora_r "$SFT_LORA_R" \
+    --lora_alpha "$SFT_LORA_ALPHA"
+fi
+
+# ------------------------------------------------------------------------------
+# Stage 2: SSFO Preference Data Generation
+# ------------------------------------------------------------------------------
+if [ "$STAGE" == "all" ] || [ "$STAGE" == "generate_data" ]; then
+  echo "======================================================================"
+  echo "Stage 2: Generating synthetic preference data via context contrasting on ${GEN_DATASET_REPO_ID} (max_samples=${MAX_SAMPLES:-all})..."
+  echo "======================================================================"
+
+  EXTRA_GEN_ARGS=()
+  if [ -n "$MAX_SAMPLES" ]; then
+    EXTRA_GEN_ARGS+=(--max_samples "$MAX_SAMPLES")
+  fi
+
+  python3 -m src.ssfo_data_generation \
+    --task_name "$TASK_NAME" \
+    --seed "$SEED" \
+    --dataset_repo_id "${GEN_DATASET_REPO_ID}" \
+    --model_repo_id "${MODEL_REPO_ID}" \
+    --sft_model_path "${SFT_MODEL_PATH}" \
+    --output_dataset_repo_id "$PREF_DATASET_REPO" \
+    --temperature "$GEN_TEMP" \
+    --top_p "$GEN_TOP_P" \
+    --top_k "$GEN_TOP_K" \
+    --max_new_tokens "$MAX_NEW_TOKENS" \
+    --batch_size "$GEN_BATCH_SIZE" \
+    --use_ground_truth_chosen "$USE_GROUND_TRUTH_CHOSEN" \
+    --use_base_model_for_rejected "$USE_BASE_MODEL_FOR_REJECTED" \
+    --push_to_hub True \
+    "${EXTRA_GEN_ARGS[@]}"
+fi
+
+# ------------------------------------------------------------------------------
+# Stage 3: DPO Preference Tuning
+# ------------------------------------------------------------------------------
+if [ "$STAGE" == "all" ] || [ "$STAGE" == "dpo" ]; then
+  echo "======================================================================"
+  echo "Stage 3: Preference tuning with DPO (beta=$DPO_BETA)..."
+  echo "======================================================================"
+
+  accelerate launch \
+    --config_file="${DEEPSPEED_CONFIG}" \
+    src/dpo.py \
+    --task_name "$TASK_NAME" \
+    --report_to "wandb" \
+    --run_name "$DPO_RUN_IDENTIFIER" \
+    --logging_steps 1 \
+    --output_dir "./checkpoints/${TASK_NAME}/ssfo_dpo/${DPO_RUN_IDENTIFIER}" \
+    --push_to_hub True \
+    --hub_model_id "$DPO_RUN_IDENTIFIER" \
+    --seed "$SEED" \
+    --dataset_repo_id "$PREF_DATASET_REPO" \
+    --model_repo_id "${MODEL_REPO_ID}" \
+    --sft_model_path "${SFT_MODEL_PATH}" \
+    --do_train True \
+    --bf16 True \
+    --do_eval True \
+    --eval_strategy "epoch" \
+    --save_strategy "epoch" \
+    --load_best_model_at_end True \
+    --metric_for_best_model "loss" \
+    --greater_is_better False \
+    --save_total_limit 1 \
+    --warmup_ratio 0.1 \
+    --beta "$DPO_BETA" \
+    --max_length "$MAX_LENGTH" \
+    --num_train_epochs "$DPO_NUM_EPOCHS" \
+    --learning_rate "$DPO_LR" \
+    --per_device_train_batch_size "$DPO_BATCH_SIZE" \
+    --per_device_eval_batch_size 16 \
+    --auto_find_batch_size True \
+    --peft_type "LORA" \
+    --task_type "CAUSAL_LM" \
+    --lora_r "$DPO_LORA_R" \
+    --lora_alpha "$DPO_LORA_ALPHA"
+fi
+
+echo "SSFO baseline completed successfully!"

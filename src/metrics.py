@@ -1,0 +1,1117 @@
+"""Evaluation metrics module for generative language models.
+
+Provides publication-grade reference alignment (ROUGE-1/2/L, BERTScore F1),
+generation health (character and token length, Distinct-1/2, repetition rate),
+fluency (conditional perplexity), and interactive Weights & Biases (WandB)
+visualization and reporting.
+"""
+
+import json
+import math
+import os
+import re
+from typing import Any, Optional
+
+try:
+  import numpy as np
+except ImportError:
+  np = None
+
+try:
+  import torch
+except ImportError:
+  torch = None
+
+try:
+  from rouge_score import rouge_scorer
+except ImportError:
+  rouge_scorer = None
+
+try:
+  import wandb
+except ImportError:
+  wandb = None
+
+
+def tokenize_words(text: str) -> list[str]:
+  """Extracts word tokens from text using word boundary matching.
+
+  Args:
+      text: The input string.
+
+  Returns:
+      A list of lowercase word tokens.
+  """
+  if not text or not isinstance(text, str):
+    return []
+  return re.findall(r"\b\w+\b", text.lower())
+
+
+def _lcs_length(seq1: list[str], seq2: list[str]) -> int:
+  """Computes length of longest common subsequence."""
+  m, n = len(seq1), len(seq2)
+  dp = [0] * (n + 1)
+  for i in range(1, m + 1):
+    prev = 0
+    for j in range(1, n + 1):
+      temp = dp[j]
+      if seq1[i - 1] == seq2[j - 1]:
+        dp[j] = prev + 1
+      else:
+        dp[j] = max(dp[j], dp[j - 1])
+      prev = temp
+  return dp[n]
+
+
+def _pure_python_rouge_scores(
+    pred_tokens: list[str], ref_tokens: list[str], n: int = 1
+) -> tuple[float, float, float]:
+  """Computes ROUGE-n (precision, recall, f1) in pure Python."""
+  if not pred_tokens or not ref_tokens:
+    return 0.0, 0.0, 0.0
+  if n == 0:  # ROUGE-L via LCS
+    lcs = _lcs_length(pred_tokens, ref_tokens)
+    if lcs == 0:
+      return 0.0, 0.0, 0.0
+    prec = float(lcs / len(pred_tokens))
+    rec = float(lcs / len(ref_tokens))
+    f1 = float(2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+    return prec, rec, f1
+
+  pred_ngrams = [
+      tuple(pred_tokens[i : i + n]) for i in range(len(pred_tokens) - n + 1)
+  ]
+  ref_ngrams = [
+      tuple(ref_tokens[i : i + n]) for i in range(len(ref_tokens) - n + 1)
+  ]
+  if not pred_ngrams or not ref_ngrams:
+    return 0.0, 0.0, 0.0
+
+  pred_counts = {}
+  for ng in pred_ngrams:
+    pred_counts[ng] = pred_counts.get(ng, 0) + 1
+
+  overlap = 0
+  for ng in ref_ngrams:
+    if pred_counts.get(ng, 0) > 0:
+      overlap += 1
+      pred_counts[ng] -= 1
+
+  prec = float(overlap / len(pred_ngrams))
+  rec = float(overlap / len(ref_ngrams))
+  if prec + rec == 0:
+    return prec, rec, 0.0
+  f1 = float(2 * prec * rec / (prec + rec))
+  return prec, rec, f1
+
+
+def compute_rouge(
+    predictions: list[str],
+    references: list[str],
+    use_stemmer: bool = True,
+) -> dict[str, list[float]]:
+  """Computes ROUGE-1, ROUGE-2, and ROUGE-L F1, precision, and recall scores.
+
+  Args:
+      predictions: List of generated completion strings.
+      references: List of ground-truth reference or source context strings.
+      use_stemmer: Whether to apply Porter stemmer in ROUGE evaluation.
+
+  Returns:
+      Dict mapping metric name to list of per-sample float scores:
+      'rouge1_f1', 'rouge1_precision', 'rouge1_recall',
+      'rouge2_f1', 'rouge2_precision', 'rouge2_recall',
+      'rougeL_f1', 'rougeL_precision', 'rougeL_recall'.
+  """
+  if len(predictions) != len(references):
+    raise ValueError(
+        f"Length mismatch: {len(predictions)} predictions vs"
+        f" {len(references)} references"
+    )
+
+  scorer = None
+  if rouge_scorer is not None:
+    try:
+      scorer = rouge_scorer.RougeScorer(
+          ["rouge1", "rouge2", "rougeL"], use_stemmer=use_stemmer
+      )
+    except Exception:
+      scorer = None
+
+  r1_f1, r1_p, r1_r = [], [], []
+  r2_f1, r2_p, r2_r = [], [], []
+  rl_f1, rl_p, rl_r = [], [], []
+
+  for pred, ref in zip(predictions, references):
+    pred_clean = pred.strip() if pred else ""
+    ref_clean = ref.strip() if ref else ""
+    if not pred_clean or not ref_clean:
+      r1_f1.append(0.0)
+      r1_p.append(0.0)
+      r1_r.append(0.0)
+      r2_f1.append(0.0)
+      r2_p.append(0.0)
+      r2_r.append(0.0)
+      rl_f1.append(0.0)
+      rl_p.append(0.0)
+      rl_r.append(0.0)
+      continue
+
+    if scorer is not None:
+      score = scorer.score(ref_clean, pred_clean)
+      r1_f1.append(float(score["rouge1"].fmeasure))
+      r1_p.append(float(score["rouge1"].precision))
+      r1_r.append(float(score["rouge1"].recall))
+      r2_f1.append(float(score["rouge2"].fmeasure))
+      r2_p.append(float(score["rouge2"].precision))
+      r2_r.append(float(score["rouge2"].recall))
+      rl_f1.append(float(score["rougeL"].fmeasure))
+      rl_p.append(float(score["rougeL"].precision))
+      rl_r.append(float(score["rougeL"].recall))
+    else:
+      pred_toks = tokenize_words(pred_clean)
+      ref_toks = tokenize_words(ref_clean)
+      p1, rec1, f1_1 = _pure_python_rouge_scores(pred_toks, ref_toks, n=1)
+      p2, rec2, f1_2 = _pure_python_rouge_scores(pred_toks, ref_toks, n=2)
+      pl, recl, f1_l = _pure_python_rouge_scores(pred_toks, ref_toks, n=0)
+      r1_f1.append(f1_1)
+      r1_p.append(p1)
+      r1_r.append(rec1)
+      r2_f1.append(f1_2)
+      r2_p.append(p2)
+      r2_r.append(rec2)
+      rl_f1.append(f1_l)
+      rl_p.append(pl)
+      rl_r.append(recl)
+
+  return {
+      "rouge1_f1": r1_f1,
+      "rouge1_precision": r1_p,
+      "rouge1_recall": r1_r,
+      "rouge2_f1": r2_f1,
+      "rouge2_precision": r2_p,
+      "rouge2_recall": r2_r,
+      "rougeL_f1": rl_f1,
+      "rougeL_precision": rl_p,
+      "rougeL_recall": rl_r,
+  }
+
+
+# Prevent huggingface_hub / tqdm download overflow bug in Python 3.13
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+
+def compute_bertscore(
+    predictions: list[str],
+    references: list[str],
+    model_type: str = "sentence-transformers/all-MiniLM-L6-v2",
+    batch_size: int = 64,
+    device: Optional[str] = None,
+) -> list[float]:
+  """Computes semantic embedding similarity / BERTScore between predictions and references.
+
+  Supports sentence-transformers embeddings (fast cosine similarity on
+  mean-pooled
+  vectors) and standard transformer encoders (token-level greedy matching
+  BERTScore).
+
+  Args:
+      predictions: List of generated completion strings.
+      references: List of ground-truth reference strings.
+      model_type: HuggingFace model identifier for contextual embeddings.
+      batch_size: Batch size for embedding computation.
+      device: Device string (e.g. 'cuda', 'cpu'). Auto-detected if None.
+
+  Returns:
+      List of per-sample similarity float values in [0.0, 1.0].
+  """
+  if len(predictions) != len(references):
+    raise ValueError(
+        f"Length mismatch: {len(predictions)} predictions vs"
+        f" {len(references)} references"
+    )
+  if not predictions:
+    return []
+  if torch is None:
+    return [0.0] * len(predictions)
+
+  try:
+    from transformers import AutoModel, AutoTokenizer, logging as hf_logging
+  except ImportError:
+    return [0.0] * len(predictions)
+
+  if device is None:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+  # Load model cleanly without noisy weight-initialization warnings
+  prev_verbosity = hf_logging.get_verbosity()
+  hf_logging.set_verbosity_error()
+  try:
+    tokenizer = AutoTokenizer.from_pretrained(model_type)
+    model = AutoModel.from_pretrained(model_type)
+    model.to(device)
+    model.eval()
+  except Exception as e:
+    print(
+        f"Notice: Semantic similarity model '{model_type}' could not be"
+        f" loaded: {e}. Defaulting scores to 0.0."
+    )
+    return [0.0] * len(predictions)
+  finally:
+    hf_logging.set_verbosity(prev_verbosity)
+
+  scores = []
+  is_sentence_emb = any(
+      k in model_type.lower()
+      for k in ["sentence-transformers", "minilm", "bge", "mpnet"]
+  )
+
+  for i in range(0, len(predictions), batch_size):
+    batch_preds = predictions[i : i + batch_size]
+    batch_refs = references[i : i + batch_size]
+
+    valid_pairs = []
+    for idx, (p, r) in enumerate(zip(batch_preds, batch_refs)):
+      p_str = p.strip() if (p and isinstance(p, str)) else ""
+      r_str = r.strip() if (r and isinstance(r, str)) else ""
+      if p_str and r_str:
+        valid_pairs.append((idx, p_str, r_str))
+
+    if not valid_pairs:
+      scores.extend([0.0] * len(batch_preds))
+      continue
+
+    batch_scores = [0.0] * len(batch_preds)
+    v_preds = [item[1] for item in valid_pairs]
+    v_refs = [item[2] for item in valid_pairs]
+
+    try:
+      p_enc = tokenizer(
+          v_preds,
+          padding=True,
+          truncation=True,
+          max_length=512,
+          return_tensors="pt",
+      ).to(device)
+      r_enc = tokenizer(
+          v_refs,
+          padding=True,
+          truncation=True,
+          max_length=512,
+          return_tensors="pt",
+      ).to(device)
+
+      with torch.no_grad():
+        p_out = model(**p_enc)
+        r_out = model(**r_enc)
+
+        if is_sentence_emb:
+          p_mask = p_enc["attention_mask"].unsqueeze(-1).float()
+          p_vec = (p_out.last_hidden_state * p_mask).sum(1) / torch.clamp(
+              p_mask.sum(1), min=1e-9
+          )
+          p_vec = torch.nn.functional.normalize(p_vec, p=2, dim=-1)
+
+          r_mask = r_enc["attention_mask"].unsqueeze(-1).float()
+          r_vec = (r_out.last_hidden_state * r_mask).sum(1) / torch.clamp(
+              r_mask.sum(1), min=1e-9
+          )
+          r_vec = torch.nn.functional.normalize(r_vec, p=2, dim=-1)
+
+          sims = (p_vec * r_vec).sum(dim=-1).cpu().tolist()
+          for (orig_idx, _, _), sim in zip(valid_pairs, sims):
+            batch_scores[orig_idx] = max(0.0, min(1.0, float(sim)))
+        else:
+          for (orig_idx, _, _), p_emb, r_emb, p_m, r_m in zip(
+              valid_pairs,
+              p_out.last_hidden_state,
+              r_out.last_hidden_state,
+              p_enc["attention_mask"],
+              r_enc["attention_mask"],
+          ):
+            p_valid = p_emb[p_m.bool()]
+            r_valid = r_emb[r_m.bool()]
+            if len(p_valid) > 2:
+              p_valid = p_valid[1:-1]
+            if len(r_valid) > 2:
+              r_valid = r_valid[1:-1]
+            p_norm = torch.nn.functional.normalize(p_valid, p=2, dim=-1)
+            r_norm = torch.nn.functional.normalize(r_valid, p=2, dim=-1)
+            sim = torch.matmul(p_norm, r_norm.transpose(0, 1))
+            r_val = sim.max(dim=0).values.mean().item()
+            p_val = sim.max(dim=1).values.mean().item()
+            f1 = (
+                (2.0 * p_val * r_val) / (p_val + r_val)
+                if (p_val + r_val) > 0
+                else 0.0
+            )
+            batch_scores[orig_idx] = max(0.0, min(1.0, float(f1)))
+    except Exception:
+      pass
+
+    scores.extend(batch_scores)
+
+  return scores
+
+
+def compute_length_metrics(
+    completions: list[str],
+    tokenizer: Optional[Any] = None,
+) -> dict[str, list[int]]:
+  """Computes character and token length metrics for a list of completions.
+
+  Args:
+      completions: List of text completions.
+      tokenizer: Optional Hugging Face tokenizer instance. If None, word-level
+        tokenization is used.
+
+  Returns:
+      Dict with 'char_length' and 'token_length' lists.
+  """
+  char_lengths = []
+  token_lengths = []
+
+  for comp in completions:
+    text = comp if comp is not None else ""
+    char_lengths.append(len(text))
+    if tokenizer is not None:
+      tokens = tokenizer.encode(text, add_special_tokens=False)
+      token_lengths.append(len(tokens))
+    else:
+      token_lengths.append(len(tokenize_words(text)))
+
+  return {
+      "char_length": char_lengths,
+      "token_length": token_lengths,
+  }
+
+
+def compute_distinct_n(
+    completions: list[str],
+    n: int = 1,
+) -> list[float]:
+  """Computes Distinct-n metric (ratio of unique n-grams to total n-grams).
+
+  Distinct-n = |Unique n-grams| / |Total n-grams|
+
+  Args:
+      completions: List of text completions.
+      n: The n-gram size (e.g. 1 for unigrams, 2 for bigrams).
+
+  Returns:
+      List of per-sample Distinct-n float scores in [0.0, 1.0].
+  """
+  if n < 1:
+    raise ValueError(f"n must be >= 1, got {n}")
+
+  distinct_scores = []
+  for comp in completions:
+    tokens = tokenize_words(comp)
+    if len(tokens) < n:
+      distinct_scores.append(0.0 if not tokens else 1.0)
+      continue
+
+    ngrams = [tuple(tokens[i : i + n]) for i in range(len(tokens) - n + 1)]
+    total_ngrams = len(ngrams)
+    if total_ngrams == 0:
+      distinct_scores.append(0.0)
+    else:
+      unique_ngrams = len(set(ngrams))
+      distinct_scores.append(float(unique_ngrams / total_ngrams))
+
+  return distinct_scores
+
+
+def compute_repetition_rate(
+    completions: list[str],
+    n: int = 4,
+) -> list[float]:
+  """Computes n-gram repetition rate (fraction of duplicate n-grams).
+
+  Repetition Rate = 1.0 - Distinct-n = (|Total n-grams| - |Unique n-grams|) /
+  |Total n-grams|
+
+  Args:
+      completions: List of text completions.
+      n: The n-gram size (default 4 for 4-gram repetition).
+
+  Returns:
+      List of per-sample repetition rate float scores in [0.0, 1.0].
+  """
+  distinct_scores = compute_distinct_n(completions, n=n)
+  return [float(1.0 - d) for d in distinct_scores]
+
+
+def compute_conditional_perplexity(
+    prompts: list[str],
+    completions: list[str],
+    model: Optional[Any] = None,
+    tokenizer: Optional[Any] = None,
+    batch_size: int = 4,
+    device: Optional[str] = None,
+    max_length: int = 2048,
+) -> list[float]:
+  """Computes conditional perplexity of completions conditioned on prompts.
+
+  Loss is evaluated strictly on the completion tokens with prompt tokens masked.
+  PPL = exp( CrossEntropyLoss(completion | prompt) )
+
+  Args:
+      prompts: List of prompt strings.
+      completions: List of completion strings.
+      model: Pre-trained CausalLM model instance.
+      tokenizer: Pre-trained tokenizer.
+      batch_size: Batch size for evaluation.
+      device: Device to place tensors on.
+      max_length: Maximum sequence length.
+
+  Returns:
+      List of per-sample perplexity values (float).
+  """
+  if len(prompts) != len(completions):
+    raise ValueError(
+        f"Length mismatch: {len(prompts)} prompts vs {len(completions)}"
+        " completions"
+    )
+
+  if model is None or tokenizer is None or torch is None:
+    print(
+        "Warning: Model, tokenizer, or torch not provided for perplexity"
+        " computation. Returning 0.0."
+    )
+    return [0.0] * len(prompts)
+
+  if device is None:
+    try:
+      device = next(model.parameters()).device
+    except Exception:
+      device = "cuda" if (torch is not None and torch.cuda.is_available()) else "cpu"
+
+  if hasattr(model, "eval"):
+    model.eval()
+  loss_fn = torch.nn.CrossEntropyLoss(reduction="none", ignore_index=-100)
+  perplexities = []
+
+  if getattr(tokenizer, "pad_token_id", None) is None:
+    # Never invent an id: token 0 is `<unk>` on Llama/Mistral but a real
+    # vocabulary entry on other tokenizers. Prefer unk, then eos, else leave
+    # it unset (this loop is per-sample and never actually pads).
+    for attr in ("unk_token_id", "eos_token_id"):
+      candidate = getattr(tokenizer, attr, None)
+      if candidate is not None:
+        tokenizer.pad_token_id = candidate
+        break
+
+  for i in range(0, len(prompts), batch_size):
+    batch_prompts = prompts[i : i + batch_size]
+    batch_completions = completions[i : i + batch_size]
+
+    for p, c in zip(batch_prompts, batch_completions):
+      p_clean = p if p else ""
+      c_clean = c.strip() if c else ""
+
+      if not c_clean:
+        perplexities.append(0.0)
+        continue
+
+      prompt_ids = tokenizer.encode(
+          p_clean,
+          add_special_tokens=True,
+          truncation=True,
+          max_length=max_length,
+      )
+      comp_ids = tokenizer.encode(
+          c_clean,
+          add_special_tokens=False,
+          truncation=True,
+          max_length=max_length,
+      )
+
+      if not comp_ids:
+        perplexities.append(0.0)
+        continue
+
+      full_ids = prompt_ids + comp_ids
+      if len(full_ids) > max_length:
+        full_ids = full_ids[-max_length:]
+        prompt_len = max(0, len(full_ids) - len(comp_ids))
+      else:
+        prompt_len = len(prompt_ids)
+
+      input_ids = torch.tensor([full_ids], dtype=torch.long, device=device)
+      labels = torch.tensor([full_ids], dtype=torch.long, device=device)
+      labels[:, :prompt_len] = -100
+
+      with torch.no_grad():
+        outputs = model(input_ids=input_ids)
+        logits = outputs.logits
+
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+
+        loss_per_token = loss_fn(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+        )
+
+        valid_mask = shift_labels.view(-1) != -100
+        num_valid = valid_mask.sum().item()
+
+        if num_valid == 0:
+          perplexities.append(0.0)
+        else:
+          mean_loss = loss_per_token[valid_mask].mean().item()
+          ppl = float(math.exp(min(mean_loss, 20.0)))
+          perplexities.append(ppl)
+
+  return perplexities
+
+
+def compute_summary_statistics(
+    scores: list[float | int],
+) -> dict[str, float]:
+  """Computes mean, standard deviation, median, min, and max for a score list.
+
+  Args:
+      scores: List of numeric values.
+
+  Returns:
+      Dict with 'mean', 'std', 'median', 'min', 'max'.
+  """
+  clean_scores = []
+  for s in scores:
+    if s is not None:
+      try:
+        val = float(s)
+        if not math.isnan(val):
+          clean_scores.append(val)
+      except (ValueError, TypeError):
+        continue
+
+  if not clean_scores:
+    return {"mean": 0.0, "std": 0.0, "median": 0.0, "min": 0.0, "max": 0.0}
+
+  n = len(clean_scores)
+  mean_val = float(sum(clean_scores) / n)
+  variance = float(sum((x - mean_val) ** 2 for x in clean_scores) / n)
+  std_val = float(math.sqrt(variance))
+
+  sorted_scores = sorted(clean_scores)
+  if n % 2 == 1:
+    median_val = float(sorted_scores[n // 2])
+  else:
+    median_val = float(
+        (sorted_scores[n // 2 - 1] + sorted_scores[n // 2]) / 2.0
+    )
+
+  return {
+      "mean": mean_val,
+      "std": std_val,
+      "median": median_val,
+      "min": float(sorted_scores[0]),
+      "max": float(sorted_scores[-1]),
+  }
+
+
+class GenerationMetricsEvaluator:
+  """Orchestrator for evaluating full generation quality suites."""
+
+  def __init__(
+      self,
+      bertscore_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+      compute_bertscore_metric: bool = True,
+      compute_perplexity_metric: bool = False,
+      fluency_model: Optional[Any] = None,
+      fluency_tokenizer: Optional[Any] = None,
+  ):
+    """Initializes the GenerationMetricsEvaluator.
+
+    Args:
+        bertscore_model: Model name for BERTScore embedding computation.
+        compute_bertscore_metric: Whether to compute BERTScore.
+        compute_perplexity_metric: Whether to compute conditional perplexity.
+        fluency_model: Optional CausalLM model for perplexity.
+        fluency_tokenizer: Optional tokenizer for perplexity.
+    """
+    self.bertscore_model = bertscore_model
+    self.compute_bertscore_metric = compute_bertscore_metric
+    self.compute_perplexity_metric = compute_perplexity_metric
+    self.fluency_model = fluency_model
+    self.fluency_tokenizer = fluency_tokenizer
+
+  def find_reference_column(self, column_names: list[str]) -> Optional[str]:
+    """Identifies the reference or context column from dataset column names.
+
+    Args:
+        column_names: List of column names in dataset.
+
+    Returns:
+        The matched reference/context column name, or None if not found.
+    """
+    candidates = [
+        "npov_response",
+        "reference",
+        "target",
+        "ground_truth",
+        "Context",
+        "context",
+        "passages",
+        "source",
+        "chosen",
+        "gold",
+        "answer",
+        "response",
+    ]
+    for c in candidates:
+      if c in column_names:
+        return c
+    return None
+
+  def extract_contexts(
+      self,
+      dataset: Any,
+      context_column: Optional[str] = None,
+  ) -> tuple[list[str], Optional[str]]:
+    """Extracts the source context string for each example in the dataset.
+
+    Supports:
+    - Multi-perspective NPOV arguments (perspective_1 + perspective_2).
+    - Dedicated context columns ('Context', 'context', 'passages', 'source',
+    'document').
+    - Ground-truth references if available ('npov_response', 'reference',
+    'target', 'ground_truth').
+
+    Args:
+        dataset: Dataset object.
+        context_column: Optional explicit column name.
+
+    Returns:
+        Tuple of (list of context strings, description of context source).
+    """
+    col_names = dataset.column_names if hasattr(dataset, "column_names") else []
+
+    # 1. Explicit context column specified
+    if context_column and context_column in col_names:
+      raw = list(dataset[context_column])
+      contexts = [
+          str(c).strip()
+          if (c is not None and not (isinstance(c, float) and math.isnan(c)))
+          else ""
+          for c in raw
+      ]
+      if any(len(c) > 0 for c in contexts):
+        return contexts, context_column
+
+    # 2. Multi-perspective arguments (NPOV task: perspective_1 + perspective_2)
+    if "perspective_1" in col_names and "perspective_2" in col_names:
+      p1_list = list(dataset["perspective_1"])
+      p2_list = list(dataset["perspective_2"])
+      p1_names = (
+          list(dataset["perspective_1_name"])
+          if "perspective_1_name" in col_names
+          else [None] * len(p1_list)
+      )
+      p2_names = (
+          list(dataset["perspective_2_name"])
+          if "perspective_2_name" in col_names
+          else [None] * len(p2_list)
+      )
+      contexts = []
+      for p1, p2, n1, n2 in zip(p1_list, p2_list, p1_names, p2_names):
+        parts = []
+        p1_s = str(p1).strip() if p1 is not None else ""
+        p2_s = str(p2).strip() if p2 is not None else ""
+        if p1_s:
+          parts.append(
+              f"{n1}: {p1_s}" if (n1 and not p1_s.startswith(str(n1))) else p1_s
+          )
+        if p2_s:
+          parts.append(
+              f"{n2}: {p2_s}" if (n2 and not p2_s.startswith(str(n2))) else p2_s
+          )
+        contexts.append("\n".join(parts))
+      if any(len(c) > 0 for c in contexts):
+        return contexts, "provided arguments (perspective_1 + perspective_2)"
+
+    # 3. Context column candidates
+    context_candidates = [
+        "Context",
+        "context",
+        "passages",
+        "source",
+        "source_text",
+        "document",
+        "documents",
+        "article",
+        "input_text",
+        "user_query",
+        "npov_response",
+        "reference",
+        "target",
+        "ground_truth",
+        "response",
+    ]
+    for c in context_candidates:
+      if c in col_names:
+        raw = list(dataset[c])
+        contexts = [
+            str(val).strip()
+            if (
+                val is not None
+                and not (isinstance(val, float) and math.isnan(val))
+            )
+            else ""
+            for val in raw
+        ]
+        if any(len(ctx) > 0 for ctx in contexts):
+          return contexts, c
+
+    return [""] * len(dataset), None
+
+  def evaluate_dataset(
+      self,
+      dataset: Any,
+      prompt_column: str = "prompt",
+      completion_column: str = "completion",
+      reference_column: Optional[str] = None,
+      tokenizer: Optional[Any] = None,
+  ) -> tuple[Any, dict[str, Any]]:
+    """Evaluates a dataset containing prompts and completions across all metrics.
+
+    Args:
+        dataset: Dataset instance or MockDataset.
+        prompt_column: Column name for prompts.
+        completion_column: Column name for generated completions.
+        reference_column: Column name for context / references. If None,
+          auto-detected.
+        tokenizer: Optional tokenizer for length calculation.
+
+    Returns:
+        Tuple of (updated dataset with metric columns, summary metrics dict).
+    """
+    if completion_column not in dataset.column_names:
+      raise ValueError(
+          f"Column '{completion_column}' not found in dataset columns:"
+          f" {dataset.column_names}"
+      )
+
+    prompts = (
+        list(dataset[prompt_column])
+        if prompt_column in dataset.column_names
+        else [""] * len(dataset)
+    )
+    completions = list(dataset[completion_column])
+
+    # 1. Generation Health: Length metrics
+    length_metrics = compute_length_metrics(completions, tokenizer=tokenizer)
+
+    # 2. Generation Health: Diversity & Repetition
+    distinct_1 = compute_distinct_n(completions, n=1)
+    distinct_2 = compute_distinct_n(completions, n=2)
+    repetition_4 = compute_repetition_rate(completions, n=4)
+
+    metric_columns = {
+        "char_length": length_metrics["char_length"],
+        "token_length": length_metrics["token_length"],
+        "distinct_1": distinct_1,
+        "distinct_2": distinct_2,
+        "repetition_rate": repetition_4,
+    }
+
+    # 3. Context Grounding & Alignment (ROUGE & BERTScore w.r.t Context)
+    contexts, context_source = self.extract_contexts(
+        dataset, context_column=reference_column
+    )
+    has_valid_contexts = any(len(c) > 0 for c in contexts)
+    if has_valid_contexts:
+      print(
+          "Computing context grounding metrics (ROUGE, BERTScore) against"
+          f" source context '{context_source}'..."
+      )
+      rouge_dict = compute_rouge(completions, contexts)
+      for k, v in rouge_dict.items():
+        metric_columns[k] = v
+
+      if self.compute_bertscore_metric:
+        bs_scores = compute_bertscore(
+            completions, contexts, model_type=self.bertscore_model
+        )
+        metric_columns["bertscore_f1"] = bs_scores
+    else:
+      print(
+          "Notice: No source context found in dataset."
+          " Skipping ROUGE and BERTScore."
+      )
+
+    # 4. Fluency (Conditional Perplexity)
+    if (
+        self.compute_perplexity_metric
+        and self.fluency_model is not None
+        and self.fluency_tokenizer is not None
+    ):
+      print("Computing conditional perplexity under base fluency model...")
+      ppl_scores = compute_conditional_perplexity(
+          prompts,
+          completions,
+          model=self.fluency_model,
+          tokenizer=self.fluency_tokenizer,
+      )
+      metric_columns["perplexity"] = ppl_scores
+    elif self.compute_perplexity_metric:
+      print(
+          "Notice: compute_perplexity was enabled, but fluency_model /"
+          " fluency_tokenizer was not loaded. Skipping perplexity."
+      )
+
+    # 5. Add columns to dataset
+    updated_dict = (
+        dict(dataset.to_dict())
+        if hasattr(dataset, "to_dict")
+        else {col: list(dataset[col]) for col in dataset.column_names}
+    )
+    for col_name, values in metric_columns.items():
+      updated_dict[col_name] = values
+
+    try:
+      from datasets import Dataset
+
+      updated_dataset = Dataset.from_dict(updated_dict)
+    except Exception:
+      updated_dataset = dataset
+      for col_name, values in metric_columns.items():
+        if col_name in updated_dataset.column_names:
+          updated_dataset = updated_dataset.remove_columns(col_name)
+        updated_dataset = updated_dataset.add_column(col_name, values)
+
+    # 6. Compute summary statistics
+    summary = {}
+    for col_name, values in metric_columns.items():
+      stats = compute_summary_statistics(values)
+      summary[f"{col_name}_mean"] = stats["mean"]
+      summary[f"{col_name}_std"] = stats["std"]
+      summary[f"{col_name}_median"] = stats["median"]
+
+    return updated_dataset, summary
+
+  def save_and_log_results(
+      self,
+      dataset: Any,
+      summary: dict[str, Any],
+      output_dir: str = "logs/eval",
+      dataset_name: str = "eval_results",
+      autorater_scores: Optional[list[float]] = None,
+      threshold: float = 0.5,
+      log_to_wandb: bool = False,
+      wandb_project: str = "new_perl_eval",
+      wandb_run_name: Optional[str] = None,
+      wandb_run_id: Optional[str] = None,
+      wandb_entity: Optional[str] = None,
+      eval_step: Optional[int] = None,
+      continual_eval_history_path: Optional[str] = None,
+      wandb_metric_prefix: str = "eval",
+      wandb_plot_title_suffix: Optional[str] = None,
+  ) -> str:
+    """Saves evaluation summary locally and logs rich dashboards to WandB.
+
+    Args:
+        dataset: Evaluated dataset containing metric columns.
+        summary: Aggregated summary metrics dictionary.
+        output_dir: Local directory for summary JSON files.
+        dataset_name: Identifier name for the dataset.
+        autorater_scores: Optional list of autorater scores (P(No
+          hallucination)).
+        threshold: Threshold for classifying hallucination vs. faithful.
+        log_to_wandb: Whether to initialize and log to WandB.
+        wandb_project: WandB project name.
+        wandb_run_name: WandB run name.
+        wandb_run_id: Optional existing WandB run ID to resume and attach
+          continual evaluation metrics to.
+        wandb_entity: Optional WandB entity/team name.
+        eval_step: Optional training global step associated with the evaluated
+          checkpoint.
+        continual_eval_history_path: Optional path to the JSON file tracking
+          continual evaluation history across steps for Pareto frontier plots.
+        wandb_metric_prefix: WandB pane/metric prefix (default: 'eval', or
+          'eval_perl_only' when scoring PE-RL adapter without SFT).
+        wandb_plot_title_suffix: Optional suffix appended to Pareto scatter
+          plot and figure titles to distinguish adapter stacking modes.
+
+    Returns:
+        Path to the saved local summary JSON file.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    summary_path = os.path.join(output_dir, f"{dataset_name}_summary.json")
+
+    if autorater_scores:
+      clean_autorater = [
+          float(s)
+          for s in autorater_scores
+          if s is not None and not (isinstance(s, float) and math.isnan(s))
+      ]
+      unscored_count = len(autorater_scores) - len(clean_autorater)
+      summary["autorater_scored_count"] = len(clean_autorater)
+      summary["autorater_unscored_count"] = unscored_count
+      if clean_autorater:
+        hallu_rate = float(
+            sum(1.0 for s in clean_autorater if s < threshold)
+            / len(clean_autorater)
+        )
+        faithful_rate = float(1.0 - hallu_rate)
+        summary["hallucination_rate"] = hallu_rate
+        summary["faithfulness_rate"] = faithful_rate
+        autorater_stats = compute_summary_statistics(clean_autorater)
+        summary["autorater_score_mean"] = autorater_stats["mean"]
+        summary["autorater_score_std"] = autorater_stats["std"]
+
+    if eval_step is not None:
+      summary["eval_step"] = int(eval_step)
+
+    with open(summary_path, "w") as f:
+      json.dump(summary, f, indent=2)
+    print(f"Summary metrics saved locally to: {summary_path}")
+
+    continual_history = None
+    if continual_eval_history_path and eval_step is not None:
+      try:
+        from src.continual_eval import update_continual_eval_history
+
+        continual_history = update_continual_eval_history(
+            continual_eval_history_path,
+            step=int(eval_step),
+            summary=summary,
+            dataset_name=dataset_name,
+        )
+      except Exception as e:
+        print(f"Warning: Failed to update continual evaluation history: {e}")
+
+    if log_to_wandb and wandb is not None:
+      try:
+        metric_prefix = (
+            (wandb_metric_prefix or "eval").strip().rstrip("/") or "eval"
+        )
+        is_wandb_active = wandb.run is not None
+        if not is_wandb_active:
+          init_kwargs: dict[str, Any] = {"project": wandb_project}
+          if wandb_entity:
+            init_kwargs["entity"] = wandb_entity
+          if wandb_run_id:
+            # Attach to an existing run (the PE-RL run, for continual
+            # evaluation). Its name and config belong to that run, so it is
+            # only renamed when a name is passed explicitly.
+            init_kwargs["id"] = wandb_run_id
+            init_kwargs["resume"] = "allow"
+            if wandb_run_name:
+              init_kwargs["name"] = wandb_run_name
+          else:
+            init_kwargs["name"] = wandb_run_name or dataset_name
+            init_kwargs["config"] = {
+                "dataset_name": dataset_name,
+                "threshold": threshold,
+            }
+          wandb.init(**init_kwargs)
+
+        if eval_step is not None and hasattr(wandb, "define_metric"):
+          try:
+            wandb.define_metric("train/global_step")
+            wandb.define_metric(
+                f"{metric_prefix}/*", step_metric="train/global_step"
+            )
+          except Exception:
+            pass
+
+        wandb_metrics = {f"{metric_prefix}/{k}": v for k, v in summary.items()}
+        if eval_step is not None:
+          wandb_metrics["train/global_step"] = int(eval_step)
+        wandb.log(wandb_metrics)
+        for k, v in summary.items():
+          wandb.summary[f"{metric_prefix}/{k}"] = v
+
+        table_cols = [
+            "prompt",
+            "completion",
+            "token_length",
+            "distinct_2",
+            "repetition_rate",
+        ]
+        if "rouge1_precision" in dataset.column_names:
+          table_cols.append("rouge1_precision")
+        if "rouge1_recall" in dataset.column_names:
+          table_cols.append("rouge1_recall")
+        if "rougeL_f1" in dataset.column_names:
+          table_cols.append("rougeL_f1")
+        if "bertscore_f1" in dataset.column_names:
+          table_cols.append("bertscore_f1")
+        if "perplexity" in dataset.column_names:
+          table_cols.append("perplexity")
+        if "scores" in dataset.column_names:
+          table_cols.append("scores")
+        if "classifications" in dataset.column_names:
+          table_cols.append("classifications")
+        # Per-sample rubric grades. The aggregate quality score answers
+        # "did the policy degenerate?"; only the per-row grades answer
+        # "on which completions?", which is what the table is for. The
+        # rubric *prompt* column is deliberately excluded - it embeds the
+        # context and few-shot demos, and would dwarf every other cell.
+        for rubric_col in sorted(dataset.column_names):
+          if (
+              rubric_col.startswith("reward_hacking_")
+              and rubric_col != "reward_hacking_prompt"
+              and rubric_col not in table_cols
+          ):
+            table_cols.append(rubric_col)
+
+        for ctx_col in [
+            "perspective_1",
+            "perspective_2",
+            "Context",
+            "context",
+            "npov_response",
+            "reference",
+        ]:
+          if ctx_col in dataset.column_names and ctx_col not in table_cols:
+            table_cols.insert(2, ctx_col)
+
+        table_data = []
+        sample_indices = range(min(500, len(dataset)))
+        for idx in sample_indices:
+          row = [
+              dataset[col][idx] if col in dataset.column_names else None
+              for col in table_cols
+          ]
+          table_data.append(row)
+
+        eval_table = wandb.Table(columns=table_cols, data=table_data)
+        table_payload: dict[str, Any] = {
+            f"{metric_prefix}/generations_table": eval_table
+        }
+        if eval_step is not None:
+          table_payload["train/global_step"] = int(eval_step)
+          table_payload[
+              f"{metric_prefix}/generations_table_step_{int(eval_step)}"
+          ] = eval_table
+        wandb.log(table_payload)
+
+        if continual_history is not None:
+          from src.continual_eval import log_pareto_frontiers_to_wandb
+
+          log_pareto_frontiers_to_wandb(
+              wandb,
+              continual_history,
+              eval_step=eval_step,
+              # Next to the history, i.e. in the PE-RL output directory.
+              output_dir=os.path.dirname(
+                  os.path.abspath(continual_eval_history_path)
+              ),
+              metric_prefix=metric_prefix,
+              title_suffix=wandb_plot_title_suffix,
+          )
+
+        if not is_wandb_active and wandb_run_id and hasattr(wandb, "finish"):
+          wandb.finish()
+
+        print("Logged interactive generation table and metrics to WandB.")
+      except Exception as e:
+        print(f"Warning: Failed to log metrics to WandB: {e}")
+
+    return summary_path

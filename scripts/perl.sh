@@ -3,87 +3,238 @@
 # Core Parameters
 USER="leobianco"
 SEED=130104
-MODEL_REPO_ID="google/gemma-2-2b-it"
-REWARD_MODEL_PATH="${USER}/"
-SFT_MODEL_PATH="${USER}/"
+# Overridable from the environment so that swapping the base model does
+# not require editing this script:  MODEL_REPO_ID=Qwen/Qwen3-4B-Instruct-2507 ./perl.sh
+MODEL_REPO_ID="${MODEL_REPO_ID:-google/gemma-4-E4B-it}"
+SFT_MODEL_PATH="${SFT_MODEL_PATH:-}"
+REWARD_MODEL_PATH="${REWARD_MODEL_PATH:-${USER}/}"
+
+# LoRA Parameters
+LORA_RANK=8
+LORA_ALPHA=16
+LORA_DROPOUT=0.0
 
 # Training Parameters
-TOTAL_EPISODES=10000
+NUM_TRAIN_EPOCHS=1
 LEARNING_RATE=2e-5
 LR_SCHEDULER_TYPE="cosine"
-WARMUP_RATIO=0.05
-KL_COEFF=1e-4
-RESPONSE_LENGTH=150
-RLOO_K=2
-NUM_PPO_EPOCHS=4
-NUM_MINIBATCHES=16
-PER_DEVICE_BATCH_SIZE=1
-LOCAL_ROLLOUT_FORWARD_BATCH_SIZE=8
-TEMPERATURE=0.1
-SAVE_STEPS=25
-NUM_SAMPLE_GENERATIONS=10
-MISSING_EOS_PENALTY=1.0
+WARMUP_RATIO=0.1
+MIN_LR_RATIO="${MIN_LR_RATIO:-0.25}"
+BETA=1e-4
+MAX_COMPLETION_LENGTH=512
+
+# Token budget the reward model uses to score (prompt + completion).
+#
+# MUST be identical to REWARD_MAX_LENGTH in scripts/reward_model.sh, which is
+# where the reward model was trained. If they disagree, the model is trained
+# on one view of the text and queried on another.
+#
+# MUST also leave room for MAX_COMPLETION_LENGTH on top of the prompt.
+# Truncation is applied from the LEFT so the completion always survives, but
+# if the budget is too small the reward model stops seeing enough context to
+# judge groundedness.
+REWARD_MAX_LENGTH="${REWARD_MAX_LENGTH:-2048}"
+
+NUM_GENERATIONS="${NUM_GENERATIONS:-8}"
+NUM_ITERATIONS=1
+STEPS_PER_GENERATION=16
+PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-4}"
+PER_DEVICE_EVAL_BATCH_SIZE=16
+AUTO_FIND_BATCH_SIZE=False
+TEMPERATURE="${TEMPERATURE:-0.7}"
+NUM_FEWSHOT=0
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-8}"
+REWARD_PENALTY_ALPHA="${REWARD_PENALTY_ALPHA:-1.0}"
+SAVE_STRATEGY="steps"
+# Evaluate (and save) every 24 optimizer steps. With CONTINUAL_EVAL=True every
+# evaluation step pauses training, and TRL does not checkpoint its rollout
+# buffer, so a pause must fall on an RLOO generation boundary:
+# EVAL_STEPS x GRADIENT_ACCUMULATION_STEPS must be a multiple of
+# STEPS_PER_GENERATION x NUM_ITERATIONS (24 x 8 = 192 = 12 x 16; it stays
+# aligned when the orchestrator doubles the accumulation for >= 6B models).
+# 24 is also the PE-RL cadence of the orchestrator (scripts/sweep_perl.yaml and
+# the materialization run), so hand-run and orchestrated curves line up.
+SAVE_STEPS=24
+DO_EVAL=True
+EVAL_STRATEGY="steps"
+EVAL_STEPS=24
+EVAL_ON_START=True
+
+# Continual Autorater Evaluation Parameters (Stop -> Generate & Score -> Resume)
+# Off by default; enable with `CONTINUAL_EVAL=True ./perl.sh <task>`. (The
+# orchestrator enables it for its own PE-RL runs and passes its own judge
+# settings.) With CONTINUAL_EVAL=True this script starts a GPU-free coordinator
+# (src/continual_eval.py) instead of `accelerate launch`: it launches every
+# training segment with `accelerate launch --config_file $DEEPSPEED_CONFIG`
+# itself and scores each evaluation checkpoint in between. Every evaluation
+# step costs one vLLM generation pass plus Gemini judge calls on a 1/4 subset
+# (250 samples) of the evaluation set.
+# The judge settings below match the final evaluation (scripts/evaluator.sh);
+# completions are sampled at the PE-RL rollout TEMPERATURE.
+CONTINUAL_EVAL="${CONTINUAL_EVAL:-False}"
+CONTINUAL_EVAL_SEED="${CONTINUAL_EVAL_SEED:-12345}"
+CONTINUAL_EVAL_MAX_SAMPLES="${CONTINUAL_EVAL_MAX_SAMPLES:-250}"
+CONTINUAL_EVAL_MAX_TOKENS="${CONTINUAL_EVAL_MAX_TOKENS:-250}"
+CONTINUAL_EVAL_EVALUATOR_MODEL="${CONTINUAL_EVAL_EVALUATOR_MODEL:-gemini-2.5-flash}"
+CONTINUAL_EVAL_USE_GEMINI="${CONTINUAL_EVAL_USE_GEMINI:-True}"
+CONTINUAL_EVAL_NUM_FEWSHOT="${CONTINUAL_EVAL_NUM_FEWSHOT:-2}"
+CONTINUAL_EVAL_AUTORATER_NUM_SAMPLES="${CONTINUAL_EVAL_AUTORATER_NUM_SAMPLES:-1}"
+CONTINUAL_EVAL_THRESHOLD="${CONTINUAL_EVAL_THRESHOLD:-0.1025}"
+CONTINUAL_EVAL_RUN_REWARD_HACKING="${CONTINUAL_EVAL_RUN_REWARD_HACKING:-True}"
+CONTINUAL_EVAL_REWARD_HACKING_NUM_FEWSHOT="${CONTINUAL_EVAL_REWARD_HACKING_NUM_FEWSHOT:-2}"
+CONTINUAL_EVAL_REWARD_HACKING_THRESHOLD="${CONTINUAL_EVAL_REWARD_HACKING_THRESHOLD:-0.6}"
+CONTINUAL_EVAL_MAX_WORKERS="${CONTINUAL_EVAL_MAX_WORKERS:-32}"
+CONTINUAL_EVAL_BATCH_SIZE="${CONTINUAL_EVAL_BATCH_SIZE:-32}"
+CONTINUAL_EVAL_COMPUTE_BERTSCORE="${CONTINUAL_EVAL_COMPUTE_BERTSCORE:-True}"
+# Off by default: it reloads the base model at every evaluation step and is on
+# neither Pareto frontier.
+CONTINUAL_EVAL_COMPUTE_PERPLEXITY="${CONTINUAL_EVAL_COMPUTE_PERPLEXITY:-False}"
+# Adapter configuration(s) evaluated at each continual-evaluation step:
+# "sft_and_perl" (default), "perl_only", or "sft_and_perl,perl_only" / "both".
+CONTINUAL_EVAL_ADAPTER_MODES="${CONTINUAL_EVAL_ADAPTER_MODES:-sft_and_perl}"
 
 # Infrastructure Parameters
-DEEPSPEED_CONFIG="scripts/deepspeed_config.yaml"
+# Override for a large policy, e.g.
+#   DEEPSPEED_CONFIG=scripts/deepspeed_config_zero3.yaml ./perl.sh
+# The orchestrator picks this automatically from the model size (see
+# src/orchestrator/accel.py); a hand-run script has to be told.
+DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-scripts/deepspeed_config.yaml}"
 SHUTDOWN=false
 
 # Parameters derived from above
 TASK_NAME="$1"
 TIMESTAMP=$(date '+%y%m%d%H%M')
-MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $1}')
-RUN_IDENTIFIER="${USER}/${TASK_NAME}_PERL_${MODEL_NAME}_S${SEED}_eps${TOTAL_EPISODES}_lr${LEARNING_RATE}_kl${KL_COEFF}_${TIMESTAMP}"
+# $NF, not $1: awk -F'/' '{print $1}' returns the *vendor* namespace, so every
+# run identifier said "google" instead of naming the model. Harmless while one
+# model was ever used; with two it makes runs of different models collide.
+MODEL_NAME=$(echo "$MODEL_REPO_ID" | awk -F'/' '{print $NF}')
+FORMATTED_LR=$(python3 -c "import sys; lr=float('${LEARNING_RATE}'); print(f'{lr:.1e}')" 2>/dev/null || echo "$LEARNING_RATE")
+FORMATTED_BETA=$(python3 -c "import sys; b=float('${BETA}'); print(f'{b:.2g}' if b>=0.001 else f'{b:.1e}')" 2>/dev/null || echo "$BETA")
+FORMATTED_EPOCHS=$(python3 -c "import sys; e=float('${NUM_TRAIN_EPOCHS}'); print(f'{e:.2g}')" 2>/dev/null || echo "$NUM_TRAIN_EPOCHS")
+ALPHA_SUFFIX=""
+if [ "$REWARD_PENALTY_ALPHA" != "1.0" ] && [ "$REWARD_PENALTY_ALPHA" != "1" ]; then
+    ALPHA_SUFFIX="_a${REWARD_PENALTY_ALPHA}"
+fi
+RUN_IDENTIFIER="${USER}/${TASK_NAME}_PERL_${MODEL_NAME}_S${SEED}_epo${FORMATTED_EPOCHS}_lr${FORMATTED_LR}_beta${FORMATTED_BETA}_r${LORA_RANK}${ALPHA_SUFFIX}_${TIMESTAMP}"
+
+# Resumption configuration (can be passed via environment variable or second argument)
+RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
+if [ -n "$2" ] && [[ "$2" != --* ]]; then
+    RESUME_FROM_CHECKPOINT="$2"
+fi
+
+OUTPUT_DIR="./checkpoints/${TASK_NAME}/perl/${RUN_IDENTIFIER}"
+if [ -n "$RESUME_FROM_CHECKPOINT" ] && [ "$RESUME_FROM_CHECKPOINT" != "auto" ] && [ "$RESUME_FROM_CHECKPOINT" != "True" ] && [ "$RESUME_FROM_CHECKPOINT" != "true" ]; then
+    if [[ "$RESUME_FROM_CHECKPOINT" == *"checkpoint-"* ]] && [ -d "$RESUME_FROM_CHECKPOINT" ]; then
+        OUTPUT_DIR=$(dirname "$RESUME_FROM_CHECKPOINT")
+        RUN_IDENTIFIER=$(basename "$OUTPUT_DIR")
+    elif [ -d "$RESUME_FROM_CHECKPOINT" ]; then
+        OUTPUT_DIR="$RESUME_FROM_CHECKPOINT"
+        RUN_IDENTIFIER=$(basename "$OUTPUT_DIR")
+    elif [[ "$RESUME_FROM_CHECKPOINT" == *"/"* ]]; then
+        CLEANED_HF_REPO=$(echo "$RESUME_FROM_CHECKPOINT" | sed 's|https://huggingface.co/||g' | sed 's|http://huggingface.co/||g' | sed 's|hf://||g' | sed 's|hf.co/||g' | awk -F'[@:]' '{print $1}')
+        RUN_IDENTIFIER="$CLEANED_HF_REPO"
+        OUTPUT_DIR="./checkpoints/${TASK_NAME}/perl/${RUN_IDENTIFIER}"
+    fi
+fi
+
+EXTRA_ARGS=()
+if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
+    EXTRA_ARGS+=(--resume_from_checkpoint "$RESUME_FROM_CHECKPOINT")
+fi
+if [ -n "$SFT_MODEL_PATH" ] && [ "$SFT_MODEL_PATH" != "none" ] && [ "$SFT_MODEL_PATH" != "None" ] && [ "$SFT_MODEL_PATH" != "${USER}/" ]; then
+    EXTRA_ARGS+=(--sft_model_path "$SFT_MODEL_PATH")
+fi
 
 # Checks
-if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ]; then
+if [ "$TASK_NAME" != "npov" ] && [ "$TASK_NAME" != "bosch" ] && [ "$TASK_NAME" != "ragtruth" ] && [ "$TASK_NAME" != "ragtruth-qa" ] && [ "$TASK_NAME" != "ragtruth-summarization" ]; then
     echo "Invalid task name" 
     echo "$TASK_NAME"
     exit 1
 fi
 
-accelerate launch \
-  --config_file="${DEEPSPEED_CONFIG}" \
-  src/perl.py \
-  -- \
+# CONTINUAL_EVAL=True: a single GPU-free coordinator (python3 -m src.perl)
+# launches each training segment with `accelerate launch` itself and runs the
+# autorater evaluation between segments. Otherwise PE-RL trains in a single
+# `accelerate launch`.
+if [[ "${CONTINUAL_EVAL,,}" == "true" ]]; then
+    LAUNCHER=(python3 -m src.perl)
+    EXTRA_ARGS+=(
+        --continual_eval True
+        --continual_eval_launch_config "$DEEPSPEED_CONFIG"
+        --continual_eval_user "$USER"
+        --continual_eval_seed "$CONTINUAL_EVAL_SEED"
+        --continual_eval_max_samples "$CONTINUAL_EVAL_MAX_SAMPLES"
+        --continual_eval_max_tokens "$CONTINUAL_EVAL_MAX_TOKENS"
+        --continual_eval_evaluator_model "$CONTINUAL_EVAL_EVALUATOR_MODEL"
+        --continual_eval_use_gemini "$CONTINUAL_EVAL_USE_GEMINI"
+        --continual_eval_num_fewshot "$CONTINUAL_EVAL_NUM_FEWSHOT"
+        --continual_eval_autorater_num_samples "$CONTINUAL_EVAL_AUTORATER_NUM_SAMPLES"
+        --continual_eval_threshold "$CONTINUAL_EVAL_THRESHOLD"
+        --continual_eval_run_reward_hacking "$CONTINUAL_EVAL_RUN_REWARD_HACKING"
+        --continual_eval_reward_hacking_num_fewshot "$CONTINUAL_EVAL_REWARD_HACKING_NUM_FEWSHOT"
+        --continual_eval_reward_hacking_threshold "$CONTINUAL_EVAL_REWARD_HACKING_THRESHOLD"
+        --continual_eval_max_workers "$CONTINUAL_EVAL_MAX_WORKERS"
+        --continual_eval_batch_size "$CONTINUAL_EVAL_BATCH_SIZE"
+        --continual_eval_compute_bertscore "$CONTINUAL_EVAL_COMPUTE_BERTSCORE"
+        --continual_eval_compute_perplexity "$CONTINUAL_EVAL_COMPUTE_PERPLEXITY"
+        --continual_eval_adapter_modes "$CONTINUAL_EVAL_ADAPTER_MODES"
+    )
+else
+    LAUNCHER=(accelerate launch --config_file="${DEEPSPEED_CONFIG}" src/perl.py)
+fi
+
+"${LAUNCHER[@]}" \
   --task_name "$TASK_NAME" \
   --seed "$SEED" \
   --report_to "wandb" \
   --run_name "$RUN_IDENTIFIER" \
   --logging_steps 1 \
-  --output_dir "./checkpoints/${TASK_NAME}/perl/${RUN_IDENTIFIER}" \
-  --overwrite_output_dir True \
+  --log_completions True \
+  --output_dir "$OUTPUT_DIR" \
   --push_to_hub True \
   --hub_model_id "$RUN_IDENTIFIER" \
   --dataset_repo_id "${USER}/${TASK_NAME}_perl" \
   --model_repo_id "${MODEL_REPO_ID}" \
-  --stop_token "eos" \
   --do_train True \
-  --save_strategy "steps" \
+  --do_eval "$DO_EVAL" \
+  --eval_strategy "$EVAL_STRATEGY" \
+  --eval_steps "$EVAL_STEPS" \
+  --eval_on_start "$EVAL_ON_START" \
+  --save_strategy "$SAVE_STRATEGY" \
   --save_steps "$SAVE_STEPS" \
-  --save_only_model True \
-  --total_episodes "$TOTAL_EPISODES" \
+  --load_best_model_at_end True \
+  --metric_for_best_model "rewards/reward_fn/mean" \
+  --greater_is_better True \
+  --save_total_limit 2 \
+  --num_train_epochs "$NUM_TRAIN_EPOCHS" \
   --learning_rate "$LEARNING_RATE" \
   --lr_scheduler_type "$LR_SCHEDULER_TYPE" \
   --warmup_ratio "$WARMUP_RATIO" \
-  --response_length "$RESPONSE_LENGTH" \
+  --min_lr_ratio "$MIN_LR_RATIO" \
+  --max_completion_length "$MAX_COMPLETION_LENGTH" \
+  --reward_max_length "$REWARD_MAX_LENGTH" \
   --weight_decay 0.0 \
-  --gradient_accumulation_steps 1 \
-  --per_device_eval_batch_size "$PER_DEVICE_BATCH_SIZE" \
-  --eval_accumulation_steps 1 \
+  --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
+  --reward_penalty_alpha "$REWARD_PENALTY_ALPHA" \
+  --per_device_eval_batch_size "$PER_DEVICE_EVAL_BATCH_SIZE" \
   --reward_model_path "${REWARD_MODEL_PATH}" \
-  --sft_model_path "${SFT_MODEL_PATH}" \
-  --kl_coef "$KL_COEFF" \
-  --rloo_k "$RLOO_K" \
-  --num_ppo_epochs "$NUM_PPO_EPOCHS" \
-  --num_mini_batches "$NUM_MINIBATCHES" \
+  --beta "$BETA" \
+  --num_generations "$NUM_GENERATIONS" \
+  --num_iterations "$NUM_ITERATIONS" \
+  --steps_per_generation "$STEPS_PER_GENERATION" \
   --per_device_train_batch_size "$PER_DEVICE_BATCH_SIZE" \
-  --local_rollout_forward_batch_size "$LOCAL_ROLLOUT_FORWARD_BATCH_SIZE" \
-  --missing_eos_penalty "$MISSING_EOS_PENALTY" \
+  --auto_find_batch_size "$AUTO_FIND_BATCH_SIZE" \
   --temperature "$TEMPERATURE" \
-  --num_sample_generations "$NUM_SAMPLE_GENERATIONS"
+  --peft_type "LORA" \
+  --task_type "CAUSAL_LM" \
+  --lora_r "$LORA_RANK" \
+  --lora_alpha "$LORA_ALPHA" \
+  --lora_dropout "$LORA_DROPOUT" \
+  --num_fewshot "$NUM_FEWSHOT" \
+  "${EXTRA_ARGS[@]}"
 
 if [ "$SHUTDOWN" = true ]; then
   echo "Shutting down the VM..."
   sudo shutdown -h now
 fi
-
