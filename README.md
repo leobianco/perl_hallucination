@@ -71,6 +71,7 @@ From the project folder, run
     * When `(MODE)` is set to `generate`, the model indicated by the `RUN_IDENTIFIER` parameter is used as a writer and generates completions for the prompts in `DATASET_PROMPTS`. This generation is done using vLLM.
     * When `(MODE)` is set to `score`, the `EVALUATOR_MODEL` scores the generations of the previous step, and a rate of hallucination is calculated using `THRESHOLD`. The evaluator uses `EVALUATOR_NUM_FEWSHOT` examples taken from `DATASET_LABELS` to help it classify the samples.
     * When `(MODE)` is set to `autoratereval`, the quality of the evaluator itself is evaluated. We ask for it to score the samples in `DATASET_LABELS`, and we return the best threshold along with the associated metrics.
+    * When `(MODE)` is set to `reward_hacking_autorater_eval`, the reward-hacking rubric judge (configured as in `score`) grades healthy references from `{task}_rm_organic:test` and `{task}_sft:test`. Every flag is a false positive, so the report gives the judge's false-positive rate at `REWARD_HACKING_THRESHOLD` and the largest thresholds that keep it within 1%, 5% and 10%. Report only; see [METRICS.md](METRICS.md#4-reward-hacking-rubric-autorater-writing-quality).
 
 Notice that you can chain commands, *e.g.* `./scripts/evaluator.sh npov generate ; ./scripts/evaluator.sh npov score`.
 

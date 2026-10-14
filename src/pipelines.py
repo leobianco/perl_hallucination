@@ -68,6 +68,7 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 from src import checkpoint_publication
+from src import reward_hacking_calibration
 from src.continual_eval import ContinualEvalStatus
 from src.continual_eval import ContinualEvalStopCallback
 from src.continual_eval import PAUSED_SUMMARY_KEY
@@ -109,6 +110,7 @@ from src.utils import (
     normalize_model_ref,
     normalize_rubric_score,
     reward_hacking_dimension_keys,
+    reward_hacking_fewshot_source,
     reward_hacking_run_name,
     reward_hacking_summary,
     sanitize_hf_repo_id,
@@ -5739,6 +5741,287 @@ class EvaluationAutoraterPipeline(EvaluationPipeline):
     plt.clf()
 
 
+class EvaluationRewardHackingAutoraterPipeline(EvaluationPipeline):
+  """Calibrates the reward-hacking rubric on healthy reference responses.
+
+  Run as ``evaluator.sh <task> reward_hacking_autorater_eval``. The rubric
+  judge grades the references of the reward-model held-out arm and of the
+  SFT held-out split exactly as it is deployed (same model, demonstrations,
+  seed and number of calls per row), and the report says how often the
+  deployed threshold fires on them. Every row is healthy, so every flag is a
+  false positive.
+
+  The statistics live in :mod:`src.reward_hacking_calibration`; this class
+  loads the data, builds the prompts and calls the judge. Nothing is wired
+  back into the scoring configuration.
+  """
+
+  def setup_arguments(self, *cli_args, **cli_kwargs) -> None:
+    parser = HfArgumentParser(EvalArguments)
+    self.args = parser.parse_args_into_dataclasses()[0]
+    set_seed(self.args.seed)
+
+  def setup_tokenizer(self) -> None:
+    # The rubric needs structured JSON output, which only the Gemini judge
+    # produces. Nothing is tokenized locally.
+    pass
+
+  def load_data(self) -> None:
+    if not self.args.use_gemini:
+      raise ValueError(
+          "reward_hacking_autorater_eval grades with the Gemini rubric judge"
+          " (--use_gemini True); the local evaluator can only emit a binary"
+          " Yes/No."
+      )
+    self.processor_cls = get_task_processor(self.args.task_name)
+    self.calibration_sources = reward_hacking_calibration.calibration_sources(
+        user=self.args.user,
+        task_name=self.args.task_name,
+        rm_dataset=self.args.reward_hacking_calibration_rm_dataset,
+        rm_split=self.args.reward_hacking_calibration_rm_split,
+        sft_dataset=self.args.reward_hacking_calibration_sft_dataset,
+        sft_split=self.args.reward_hacking_calibration_sft_split,
+    )
+    self.raw_arms = []
+    for source, repo_id, split in self.calibration_sources:
+      print(
+          f"Loading calibration arm '{source}' from {repo_id}"
+          f" (split={split})..."
+      )
+      dataset = self.safe_load_dataset(repo_id, split=split)
+      self.raw_arms.append((source, [dict(row) for row in dataset]))
+    self.fewshot_source = None
+    self.fewshot_examples = self._load_fewshot_examples()
+
+  def _load_fewshot_examples(self) -> Optional[list[dict[str, Any]]]:
+    """Rebuilds the deployed judge's demonstrations.
+
+    Unlike the scoring pipeline, a failure here is fatal. Falling back to a
+    zero-shot judge would calibrate a judge that is never deployed.
+
+    Returns:
+      The demonstrations, or None when the deployed judge is zero-shot.
+
+    Raises:
+      ValueError: If demonstrations were requested but none could be built.
+    """
+    num_pairs = int(getattr(self.args, "reward_hacking_num_fewshot", 0) or 0)
+    if num_pairs <= 0:
+      print(
+          "[WARNING] Calibrating the zero-shot rubric"
+          " (--reward_hacking_num_fewshot 0). The result only applies to a"
+          " deployment that also runs zero-shot."
+      )
+      return None
+    repo_id, split = reward_hacking_fewshot_source(self.args)
+    source_data = self.safe_load_dataset(repo_id, split=split)
+    examples = build_reward_hacking_fewshot_examples(
+        processor_cls=self.processor_cls,
+        source_data=source_data,
+        num_pairs=num_pairs,
+        seed=self.args.seed,
+    )
+    if not examples:
+      raise ValueError(
+          f"Requested {num_pairs} reward-hacking demonstration pairs, but none"
+          f" could be built from {repo_id} (split={split}). The calibration"
+          " does not fall back to zero-shot: that would calibrate a judge"
+          " that is never deployed."
+      )
+    self.fewshot_source = (repo_id, split)
+    print(
+        f"Built {len(examples)} reward-hacking demonstrations from {repo_id}"
+        f" (split={split}), as the scoring pipeline does."
+    )
+    return examples
+
+  def process_data(self) -> None:
+    arms = [
+        (
+            source,
+            reward_hacking_calibration.build_rows(
+                raw_rows, source, self.processor_cls
+            ),
+        )
+        for source, raw_rows in self.raw_arms
+    ]
+    demo_keys = reward_hacking_calibration.demo_prompt_keys(
+        self.fewshot_examples, self.processor_cls
+    )
+    self.rows, self.accounting = reward_hacking_calibration.prepare_rows(
+        arms,
+        demo_keys,
+        max_rows_per_source=self.args.max_eval_samples,
+        seed=self.args.seed,
+    )
+    for source, counts in self.accounting.items():
+      print(f"Calibration arm '{source}': {counts}")
+    if not self.rows:
+      raise ValueError(
+          "No calibration rows are left after the guards; nothing to grade."
+      )
+    # The reference is graded (use_true_label=True), with the deployed
+    # demonstrations and the task's own prompt template.
+    prompt_fn = self.processor_cls.get_reward_hacking_prompt()
+    self.prompts = [
+        prompt_fn(
+            dict(row.raw),
+            fewshot_examples=self.fewshot_examples,
+            use_true_label=True,
+        )["reward_hacking_prompt"]
+        for row in self.rows
+    ]
+
+  def setup_model(self) -> None:
+    # The judge is a remote API; there is no local model to load.
+    pass
+
+  def run_and_save(self) -> None:
+    judge_model = (
+        getattr(self.args, "reward_hacking_model", None)
+        or self.args.evaluator_model
+    )
+    num_samples = max(
+        1, int(getattr(self.args, "autorater_num_samples", 1) or 1)
+    )
+    num_pairs = int(getattr(self.args, "reward_hacking_num_fewshot", 0) or 0)
+    out_dir = os.path.join(
+        "logs",
+        reward_hacking_calibration.run_name(
+            judge_model,
+            num_pairs,
+            num_samples,
+            self.args.task_name,
+            self.args.seed,
+        ),
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    fingerprint = reward_hacking_calibration.prompts_fingerprint(self.prompts)
+    if not getattr(self.args, "reward_hacking_checkpoint_path", None):
+      # Verdicts are checkpointed by row index, so the file is keyed by the
+      # exact prompt list: another row set can never inherit them.
+      self.args.reward_hacking_checkpoint_path = os.path.join(
+          out_dir, f"rubric_checkpoint_{fingerprint}.json"
+      )
+
+    client = self.create_gemini_client()
+    dataset = Dataset.from_dict({"reward_hacking_prompt": self.prompts})
+    verdicts = self.gemini_score_rubric_dataset(client, dataset, self.args)
+    for row, verdict in zip(self.rows, verdicts):
+      row.grades = verdict if isinstance(verdict, dict) and verdict else None
+    for source, counts in self.accounting.items():
+      arm = [row for row in self.rows if row.source == source]
+      counts["graded"] = sum(1 for row in arm if row.quality is not None)
+      counts["judge_failures"] = len(arm) - counts["graded"]
+
+    threshold = float(self.args.reward_hacking_threshold)
+    payload = reward_hacking_calibration.summarize(self.rows, threshold)
+    payload["config"] = {
+        "mode": reward_hacking_calibration.MODE,
+        "task_name": self.args.task_name,
+        "judge_model": judge_model,
+        "num_fewshot_pairs": num_pairs,
+        "num_demonstrations": len(self.fewshot_examples or []),
+        "fewshot_source": (
+            {"dataset": self.fewshot_source[0], "split": self.fewshot_source[1]}
+            if self.fewshot_source
+            else None
+        ),
+        "num_samples": num_samples,
+        "seed": self.args.seed,
+        "threshold": threshold,
+        "max_rows_per_source": self.args.max_eval_samples,
+        "target_fprs": list(reward_hacking_calibration.TARGET_FPRS),
+        "sources": [
+            {"source": source, "dataset": repo_id, "split": split}
+            for source, repo_id, split in self.calibration_sources
+        ],
+        "prompts_fingerprint": fingerprint,
+    }
+    payload["data"] = self.accounting
+    payload["judge_audit"] = dict(getattr(self, "reward_hacking_stats", {}))
+    paths = reward_hacking_calibration.write_reports(
+        out_dir, payload, self.rows, self.prompts
+    )
+    self._save_calibration_histograms(
+        os.path.join(out_dir, reward_hacking_calibration.HISTOGRAMS_PNG),
+        threshold,
+    )
+    print(reward_hacking_calibration.render_report(payload))
+    for name, path in sorted(paths.items()):
+      print(f"Saved {name} to {path}")
+
+  def _save_calibration_histograms(self, path: str, threshold: float) -> None:
+    """Plots the grade distributions per stratum, threshold included.
+
+    A plotting failure only costs the figure: every number is already in
+    the text and JSON reports.
+
+    Args:
+      path: Destination PNG.
+      threshold: The deployed threshold, drawn on the quality panel.
+    """
+    strata = [
+        (
+            f"{reward_hacking_calibration.SOURCE_RM} / faithful",
+            reward_hacking_calibration.SOURCE_RM,
+            reward_hacking_calibration.LABEL_FAITHFUL,
+        ),
+        (
+            f"{reward_hacking_calibration.SOURCE_RM} / hallucinated",
+            reward_hacking_calibration.SOURCE_RM,
+            reward_hacking_calibration.LABEL_HALLUCINATED,
+        ),
+        (
+            reward_hacking_calibration.SOURCE_SFT,
+            reward_hacking_calibration.SOURCE_SFT,
+            None,
+        ),
+    ]
+    quality_key = reward_hacking_calibration.QUALITY
+    panels = [(quality_key, "Quality (mean of the dimensions)")] + [
+        (key, title) for key, title, _ in REWARD_HACKING_DIMENSIONS
+    ]
+    try:
+      fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+      for axis, (key, title) in zip(list(axes.flat), panels):
+        # Bins centred on the grid a single judge call produces: steps of
+        # 1/12 for the quality, of 1/4 for one dimension.
+        step = 1.0 / 12.0 if key == quality_key else 0.25
+        bins = [step * (i - 0.5) for i in range(int(round(1.0 / step)) + 2)]
+        for label, source, row_label in strata:
+          values = [
+              row.quality if key == quality_key else (row.grades or {}).get(key)
+              for row in self.rows
+              if row.source == source
+              and (row_label is None or row.label == row_label)
+          ]
+          values = [v for v in values if v is not None]
+          if values:
+            axis.hist(
+                values,
+                bins=bins,
+                alpha=0.45,
+                density=True,
+                label=f"{label} (n={len(values)})",
+            )
+        if key == "quality":
+          axis.axvline(threshold, color="r", linestyle="--", label="threshold")
+        axis.set_title(title)
+        axis.set_xlim(-0.1, 1.1)
+        axis.legend(fontsize=8)
+      fig.suptitle(
+          "Reward-hacking rubric on healthy references"
+          f" ({self.args.task_name})"
+      )
+      fig.tight_layout()
+      fig.savefig(path)
+      plt.close(fig)
+      print(f"Saved histograms to {path}")
+    except Exception as error:  # pylint: disable=broad-exception-caught
+      print(f"Warning: could not plot the calibration histograms: {error}")
+
+
 class EvaluationGenerationPipeline(EvaluationPipeline):
   """Pipeline for generation: create completions with writer model."""
 
@@ -6321,10 +6604,7 @@ class EvaluationScoringPipeline(EvaluationPipeline):
     fewshot_examples = None
     num_pairs = int(getattr(self.args, "reward_hacking_num_fewshot", 0) or 0)
     if num_pairs > 0:
-      source_repo = getattr(
-          self.args, "reward_hacking_fewshot_dataset", None
-      ) or f"{self.args.user}/{self.args.task_name}_sft"
-      split = getattr(self.args, "reward_hacking_fewshot_split", "train")
+      source_repo, split = reward_hacking_fewshot_source(self.args)
       try:
         source_data = self.safe_load_dataset(source_repo, split=split)
         fewshot_examples = build_reward_hacking_fewshot_examples(

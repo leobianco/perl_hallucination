@@ -25,6 +25,11 @@ REWARD_HACKING_MODEL="${REWARD_HACKING_MODEL:-}"
 REWARD_HACKING_NUM_FEWSHOT="${REWARD_HACKING_NUM_FEWSHOT:-2}"
 # UNCALIBRATED - see EvalArguments. Read the per-dimension means, not this.
 REWARD_HACKING_THRESHOLD="${REWARD_HACKING_THRESHOLD:-0.6}"
+# reward_hacking_autorater_eval only: the healthy references the rubric is
+# calibrated on. Empty means ${USER}/${TASK_NAME}_rm_organic (test split) and
+# ${USER}/${TASK_NAME}_sft (test split); "none" skips that arm.
+REWARD_HACKING_CALIBRATION_RM_DATASET="${REWARD_HACKING_CALIBRATION_RM_DATASET:-}"
+REWARD_HACKING_CALIBRATION_SFT_DATASET="${REWARD_HACKING_CALIBRATION_SFT_DATASET:-}"
 WRITER_NUM_FEWSHOT=0
 MAX_TOKENS=250
 MAX_EVAL_SAMPLES=1000
@@ -152,7 +157,31 @@ elif [ "$2" == "autoratereval" ]; then
         --threshold $THRESHOLD \
         ${OVERWRITE_SCORES:+--overwrite_scores "$OVERWRITE_SCORES"} \
         ${SCORES_CHECKPOINT_PATH:+--scores_checkpoint_path "$SCORES_CHECKPOINT_PATH"}
+elif [ "$2" == "reward_hacking_autorater_eval" ]; then
+    # Calibrates the reward-hacking rubric on healthy references (the
+    # reward-model and SFT held-out splits), graded by the judge exactly as
+    # `score` deploys it. Every row is healthy, so every flag is a false
+    # positive. Report only: nothing is written back. Gemini credentials are
+    # read from the environment, never from argv.
+    echo "Running in reward_hacking_autorater_eval mode (max_eval_samples=$MAX_EVAL_SAMPLES per arm)..."
+    python3 -m src.evaluator \
+        --mode "reward_hacking_autorater_eval" \
+        --task_name "$TASK_NAME" \
+        --user "$USER" \
+        --seed "$SEED" \
+        --max_eval_samples "$MAX_EVAL_SAMPLES" \
+        --max_workers "$MAX_WORKERS" \
+        --writer_model_lora "${RUN_IDENTIFIER}" \
+        --evaluator_model ${EVALUATOR_MODEL} \
+        --use_gemini $USE_GEMINI \
+        --autorater_num_samples "$AUTORATER_NUM_SAMPLES" \
+        ${REWARD_HACKING_MODEL:+--reward_hacking_model "$REWARD_HACKING_MODEL"} \
+        --reward_hacking_num_fewshot "$REWARD_HACKING_NUM_FEWSHOT" \
+        --reward_hacking_threshold "$REWARD_HACKING_THRESHOLD" \
+        ${REWARD_HACKING_CALIBRATION_RM_DATASET:+--reward_hacking_calibration_rm_dataset "$REWARD_HACKING_CALIBRATION_RM_DATASET"} \
+        ${REWARD_HACKING_CALIBRATION_SFT_DATASET:+--reward_hacking_calibration_sft_dataset "$REWARD_HACKING_CALIBRATION_SFT_DATASET"} \
+        ${OVERWRITE_SCORES:+--overwrite_scores "$OVERWRITE_SCORES"}
 else
-    echo "Invalid mode. Use 'generate', 'score', or 'autoratereval'"
+    echo "Invalid mode. Use 'generate', 'score', 'autoratereval', or 'reward_hacking_autorater_eval'"
     exit 1
 fi
