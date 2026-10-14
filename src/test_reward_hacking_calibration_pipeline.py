@@ -380,6 +380,47 @@ class CalibrationPipelineTest(unittest.TestCase):
         os.path.join(run_dir, f"rubric_checkpoint_{fingerprint}.json"),
     )
 
+    # 6. The markdown report, next to the orchestrator's reports.
+    name = os.path.basename(run_dir)
+    report = os.path.join("reports", "reward_hacking_calibration", f"{name}.md")
+    with open(report, encoding="utf-8") as handle:
+      text = handle.read()
+    self.assertIn("False-positive rate at `0.6`: 33.3%", text)
+    self.assertIn(f"(../../logs/{name}/{rhc.METRICS_JSON})", text)
+    self.assertIn("UTC", metrics["config"]["generated_at"])
+    # No figure was plotted (matplotlib is stubbed), so none is embedded.
+    self.assertNotIn("![", text)
+
+  def test_the_reports_folder_can_be_moved(self):
+    pipe, _ = self._pipeline(reward_hacking_calibration_reports_dir="elsewhere")
+    run_dir, _ = self._run(pipe)
+    name = os.path.basename(run_dir)
+    self.assertTrue(
+        os.path.exists(
+            os.path.join("elsewhere", rhc.REPORT_SUBDIR, f"{name}.md")
+        )
+    )
+    self.assertFalse(os.path.exists("reports"))
+
+  def test_the_histogram_is_copied_next_to_the_report(self):
+    pipe, _ = self._pipeline()
+
+    def fake_plot(path, threshold):
+      del threshold
+      with open(path, "wb") as handle:
+        handle.write(b"PNG")
+
+    pipe._save_calibration_histograms = fake_plot  # pylint: disable=protected-access
+    run_dir, _ = self._run(pipe)
+    name = os.path.basename(run_dir)
+    folder = os.path.join("reports", rhc.REPORT_SUBDIR)
+    with open(os.path.join(folder, f"{name}_histograms.png"), "rb") as handle:
+      self.assertEqual(handle.read(), b"PNG")
+    with open(os.path.join(folder, f"{name}.md"), encoding="utf-8") as handle:
+      text = handle.read()
+    self.assertIn(f"]({name}_histograms.png)", text)
+    self.assertIn(f"(../../logs/{name}/{rhc.HISTOGRAMS_PNG})", text)
+
   def test_judge_failures_are_counted_not_graded(self):
     self.hub[("u/npov_sft", "test")][0]["completion"] = "JUDGE FAILS here."
     pipe, _ = self._pipeline()

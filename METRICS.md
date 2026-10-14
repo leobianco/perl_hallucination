@@ -193,8 +193,8 @@ MAX_EVAL_SAMPLES=-1 ./scripts/evaluator.sh npov score
 # Scoring with Weights & Biases logging enabled:
 LOG_TO_WANDB=True WANDB_PROJECT="my_perl_project" ./scripts/evaluator.sh npov score
 
-# Reward-hacking rubric on healthy references (report only). Writes
-# logs/eval_reward_hacking_autorater_*/rh_autorater_eval_metrics.txt:
+# Reward-hacking rubric on healthy references (report only). Readable report:
+# reports/reward_hacking_calibration/<run>.md (raw files in logs/<run>/):
 ./scripts/evaluator.sh npov reward_hacking_autorater_eval
 # Same, on the reward-model arm only:
 REWARD_HACKING_CALIBRATION_SFT_DATASET=none ./scripts/evaluator.sh npov reward_hacking_autorater_eval

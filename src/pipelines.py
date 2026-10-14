@@ -5885,16 +5885,10 @@ class EvaluationRewardHackingAutoraterPipeline(EvaluationPipeline):
         1, int(getattr(self.args, "autorater_num_samples", 1) or 1)
     )
     num_pairs = int(getattr(self.args, "reward_hacking_num_fewshot", 0) or 0)
-    out_dir = os.path.join(
-        "logs",
-        reward_hacking_calibration.run_name(
-            judge_model,
-            num_pairs,
-            num_samples,
-            self.args.task_name,
-            self.args.seed,
-        ),
+    name = reward_hacking_calibration.run_name(
+        judge_model, num_pairs, num_samples, self.args.task_name, self.args.seed
     )
+    out_dir = os.path.join("logs", name)
     os.makedirs(out_dir, exist_ok=True)
     fingerprint = reward_hacking_calibration.prompts_fingerprint(self.prompts)
     if not getattr(self.args, "reward_hacking_checkpoint_path", None):
@@ -5937,19 +5931,50 @@ class EvaluationRewardHackingAutoraterPipeline(EvaluationPipeline):
             for source, repo_id, split in self.calibration_sources
         ],
         "prompts_fingerprint": fingerprint,
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        ),
     }
     payload["data"] = self.accounting
     payload["judge_audit"] = dict(getattr(self, "reward_hacking_stats", {}))
+    # Raw artifacts first: if anything below fails, the paid-for verdicts are
+    # already on disk.
     paths = reward_hacking_calibration.write_reports(
         out_dir, payload, self.rows, self.prompts
     )
-    self._save_calibration_histograms(
-        os.path.join(out_dir, reward_hacking_calibration.HISTOGRAMS_PNG),
-        threshold,
+    histogram_path = os.path.join(
+        out_dir, reward_hacking_calibration.HISTOGRAMS_PNG
     )
+    self._save_calibration_histograms(histogram_path, threshold)
+    if os.path.exists(histogram_path):
+      paths["histograms_png"] = histogram_path
+
+    report_path = reward_hacking_calibration.markdown_report_path(
+        getattr(self.args, "reward_hacking_calibration_reports_dir", None),
+        name,
+    )
+    histogram_file = None
+    if os.path.exists(histogram_path):
+      # Copied next to the report so the embedded image survives a move of
+      # the reports folder.
+      os.makedirs(os.path.dirname(report_path), exist_ok=True)
+      histogram_file = f"{name}_histograms.png"
+      shutil.copyfile(
+          histogram_path,
+          os.path.join(os.path.dirname(report_path), histogram_file),
+      )
+    reward_hacking_calibration.write_markdown_report(
+        report_path,
+        payload,
+        self.rows,
+        histogram_file=histogram_file,
+        artifacts=paths,
+    )
+
     print(reward_hacking_calibration.render_report(payload))
-    for name, path in sorted(paths.items()):
-      print(f"Saved {name} to {path}")
+    for artifact, path in sorted(paths.items()):
+      print(f"Saved {artifact} to {path}")
+    print(f"\nMarkdown report: {report_path}")
 
   def _save_calibration_histograms(self, path: str, threshold: float) -> None:
     """Plots the grade distributions per stratum, threshold included.

@@ -33,6 +33,7 @@ import json
 import math
 import os
 import random
+import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from src import utils
@@ -98,6 +99,18 @@ ROWS_JSONL: str = "rh_autorater_eval_rows.jsonl"
 LOWEST_TXT: str = "rh_autorater_eval_lowest.txt"
 PROMPTS_TXT: str = "rh_autorater_eval_prompts.txt"
 HISTOGRAMS_PNG: str = "rh_autorater_eval_histograms.png"
+
+#: Default folder of the orchestrator's reports (the default of
+#: ``src.orchestrator.config.ReportingConfig.reports_dir``, pinned by a test).
+#: The markdown report goes to :data:`REPORT_SUBDIR` inside it.
+DEFAULT_REPORTS_DIR: str = "reports"
+REPORT_SUBDIR: str = "reward_hacking_calibration"
+
+#: How many of the lowest-quality rows the markdown report shows.
+NUM_LOWEST_ROWS_MARKDOWN: int = 10
+
+#: Characters of a response shown per false alarm in the markdown report.
+MARKDOWN_EXCERPT_CHARS: int = 1200
 
 
 @dataclasses.dataclass
@@ -1174,3 +1187,454 @@ def write_reports(
     for index, prompt in enumerate(prompts[:NUM_PROMPTS_DUMPED]):
       handle.write(f"\n{index}. ----------\n{prompt}")
   return paths
+
+
+# --- Markdown report ----------------------------------------------------------
+
+#: Human labels of the raw artifacts linked from the markdown report.
+_ARTIFACT_LABELS: Dict[str, str] = {
+    "metrics_json": "Metrics (JSON)",
+    "metrics_txt": "Terminal report (text)",
+    "rows_jsonl": "Every graded row (JSONL)",
+    "lowest_txt": f"The {NUM_LOWEST_ROWS} lowest-quality rows (text)",
+    "prompts_txt": "Prompt samples",
+    "histograms_png": "Histograms (PNG)",
+}
+
+
+def markdown_report_path(reports_dir: Optional[str], name: str) -> str:
+  """Returns where the markdown report of a run is written.
+
+  Args:
+    reports_dir: Folder of the orchestrator's reports; None or empty means
+      :data:`DEFAULT_REPORTS_DIR`.
+    name: The run name, from :func:`run_name`.
+
+  Returns:
+    ``<reports_dir>/reward_hacking_calibration/<name>.md``.
+  """
+  return os.path.join(
+      reports_dir or DEFAULT_REPORTS_DIR, REPORT_SUBDIR, f"{name}.md"
+  )
+
+
+def _md_cell(value: Any) -> str:
+  """Makes a value safe inside a markdown table cell."""
+  return str(value).replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _md_fence(text: str) -> str:
+  """Wraps text in a code fence that no backtick run inside it can close."""
+  longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+  fence = "`" * max(3, longest + 1)
+  return f"{fence}text\n{text}\n{fence}"
+
+
+def _md_table(
+    header: Sequence[str], body: Sequence[Sequence[Any]]
+) -> List[str]:
+  """Renders a GitHub-flavoured markdown table."""
+  lines = [
+      "| " + " | ".join(_md_cell(cell) for cell in header) + " |",
+      "|" + "|".join(" --- " for _ in header) + "|",
+  ]
+  for row in body:
+    lines.append("| " + " | ".join(_md_cell(cell) for cell in row) + " |")
+  return lines
+
+
+def _excerpt(text: str, limit: int) -> str:
+  text = text.strip()
+  return text if len(text) <= limit else text[:limit] + " [...]"
+
+
+def _find_stratum(
+    payload: Mapping[str, Any], name: str
+) -> Optional[Mapping[str, Any]]:
+  for stratum in payload.get("strata", []):
+    if stratum.get("name") == name:
+      return stratum
+  return None
+
+
+def _fpr_with_interval(stratum: Optional[Mapping[str, Any]]) -> str:
+  if not stratum or stratum.get("fpr_at_threshold") is None:
+    return "-"
+  return (
+      f"{_pct(stratum['fpr_at_threshold'])}"
+      f" {_interval(stratum.get('fpr_ci95'), percent=True)}"
+  )
+
+
+def _independence_verdict(result: Optional[Mapping[str, Any]]) -> str:
+  if result is None:
+    return "not measurable (a label group is empty)"
+  if result.get("excludes_zero") is None:
+    return "no interval (fewer than 2 rows in a group)"
+  if result["excludes_zero"]:
+    return "label effect: the CI excludes 0"
+  return "no detectable label effect"
+
+
+def _markdown_headline(payload: Mapping[str, Any]) -> List[str]:
+  """The few numbers a reader needs, before any table."""
+  threshold = payload.get("threshold")
+  overall = _find_stratum(payload, "all")
+  lines = []
+  if overall and overall.get("fpr_at_threshold") is not None:
+    lines.append(
+        f"- **False-positive rate at `{threshold}`:"
+        f" {_fpr_with_interval(overall)}** over {overall.get('n_scored')}"
+        " graded references."
+    )
+  else:
+    lines.append("- **No reference could be graded.**")
+  by_label = []
+  for label in (LABEL_FAITHFUL, LABEL_HALLUCINATED):
+    stratum = _find_stratum(payload, f"label={label}")
+    if stratum and stratum.get("fpr_at_threshold") is not None:
+      by_label.append(
+          f"{label} {_fpr_with_interval(stratum)}"
+          f" (n = {stratum.get('n_scored')})"
+      )
+  if by_label:
+    lines.append("- By label: " + "; ".join(by_label) + ".")
+  suggestions = payload.get("suggested_thresholds", [])
+  if suggestions:
+    targets = " / ".join(_pct(s["target_fpr"]) for s in suggestions)
+    values = " / ".join(
+        "-" if s.get("threshold") is None else f"`{s['threshold']:.3f}`"
+        for s in suggestions
+    )
+    lines.append(
+        f"- Largest threshold with FPR within {targets}: {values}"
+        " (report only; see below)."
+    )
+  independence = payload.get("independence", {})
+  quality = independence.get("deltas", {}).get(QUALITY)
+  if quality is not None:
+    lines.append(
+        "- Independence from hallucination (quality, faithful -"
+        f" hallucinated, within {independence.get('population')}):"
+        f" {_num(quality.get('delta'), signed=True)}"
+        f" {_interval(quality.get('ci95'))}:"
+        f" {_independence_verdict(quality)}."
+    )
+  failures = sum(
+      int(counts.get("judge_failures", 0) or 0)
+      for counts in payload.get("data", {}).values()
+  )
+  graded = sum(
+      int(counts.get("graded", 0) or 0)
+      for counts in payload.get("data", {}).values()
+  )
+  if failures:
+    lines.append(
+        f"- Judge failures: {failures} of {failures + graded} rows, excluded"
+        " from every number."
+    )
+  return lines
+
+
+def render_markdown_report(
+    payload: Mapping[str, Any],
+    rows: Sequence[CalibrationRow],
+    histogram_file: Optional[str] = None,
+    artifact_links: Optional[Mapping[str, str]] = None,
+) -> str:
+  """Renders the calibration as a markdown report, headline first.
+
+  Args:
+    payload: The full metrics payload (:func:`summarize` output plus the
+      ``config``, ``data`` and ``judge_audit`` blocks).
+    rows: Graded calibration rows, for the false-alarm excerpts.
+    histogram_file: Image to embed, relative to the report; None skips it.
+    artifact_links: Raw artifact name to path, relative to the report.
+
+  Returns:
+    The markdown text.
+  """
+  config = payload.get("config", {})
+  threshold = payload.get("threshold")
+  titles = _dimension_titles()
+  fewshot = config.get("fewshot_source") or {}
+  demo_source = (
+      f" from `{fewshot.get('dataset')}:{fewshot.get('split')}`"
+      if fewshot
+      else ""
+  )
+  sources = ", ".join(
+      f"`{s.get('dataset')}:{s.get('split')}` ({s.get('source')})"
+      for s in config.get("sources", [])
+  )
+  lines = [
+      f"# Reward-hacking rubric calibration: `{config.get('task_name')}`",
+      "",
+      f"> **Generated at**: {config.get('generated_at', '-')}  ",
+      f"> **Judge**: `{config.get('judge_model')}`,"
+      f" {config.get('num_fewshot_pairs')} demonstration pairs{demo_source},"
+      f" {config.get('num_samples')} call(s) per row, seed"
+      f" `{config.get('seed')}`  ",
+      f"> **Threshold under test**: `{threshold}` (a row is flagged when its"
+      " quality is below it)  ",
+      f"> **Data**: {sources or '-'}",
+      "",
+      "Every row is a healthy reference, so every flag is a **false"
+      " positive**. Grades are rescaled to [0, 1] (Likert 1 -> 0, 5 -> 1);"
+      " quality is their mean.",
+      "",
+      "## Headline",
+      "",
+  ]
+  lines.extend(_markdown_headline(payload))
+
+  lines.extend(["", "## Data", ""])
+  datasets = {
+      s.get("source"): f"{s.get('dataset')}:{s.get('split')}"
+      for s in config.get("sources", [])
+  }
+  lines.extend(
+      _md_table(
+          [
+              "Arm",
+              "Dataset",
+              "Loaded",
+              "Empty",
+              "Demo prompt",
+              "Duplicate",
+              "Graded",
+              "Judge failures",
+          ],
+          [
+              [
+                  f"`{source}`",
+                  f"`{datasets.get(source, '-')}`",
+                  counts.get("loaded", 0),
+                  counts.get("dropped_empty_response", 0),
+                  counts.get("dropped_demo_prompt", 0),
+                  counts.get("dropped_duplicate", 0),
+                  counts.get("graded", 0),
+                  counts.get("judge_failures", 0),
+              ]
+              for source, counts in payload.get("data", {}).items()
+          ],
+      )
+  )
+  lines.extend([
+      "",
+      "*Demo prompt*: shares its prompt with a rubric demonstration."
+      " *Duplicate*: same context, request and response as an earlier row.",
+  ])
+
+  lines.extend([
+      "",
+      f"## Grades and false-positive rate (quality < `{threshold}`) by"
+      " stratum",
+      "",
+  ])
+  lines.extend(
+      _md_table(
+          ["Stratum", "n", "Quality [95% CI]"]
+          + [title for _, title in titles]
+          + ["FPR [95% CI]"],
+          [
+              [f"`{s['name']}`", s.get("n_scored", 0)]
+              + [
+                  f"{_num(s.get('means', {}).get(QUALITY))}"
+                  f" {_interval(s.get('quality_ci95'))}"
+              ]
+              + [_num(s.get("means", {}).get(key)) for key, _ in titles]
+              + [_fpr_with_interval(s)]
+              for s in payload.get("strata", [])
+          ],
+      )
+  )
+
+  lines.extend(["", "## Suggested thresholds (report only)", ""])
+  suggestions = payload.get("suggested_thresholds", [])
+  if suggestions:
+    lines.extend(
+        _md_table(
+            [
+                "Target FPR",
+                "Threshold",
+                "Flagged",
+                "Achieved FPR [95% CI]",
+                "Reliable",
+            ],
+            [
+                [
+                    _pct(s.get("target_fpr")),
+                    "-" if s.get("threshold") is None
+                    else f"`{s['threshold']:.4f}`",
+                    f"{s.get('n_flagged')}/{s.get('n')}",
+                    f"{_pct(s.get('achieved_fpr'))}"
+                    f" {_interval(s.get('achieved_fpr_ci95'), percent=True)}",
+                    "yes" if s.get("reliable")
+                    else f"no (n x target < {MIN_EXPECTED_FLAGS:g})",
+                ]
+                for s in suggestions
+            ],
+        )
+    )
+    lines.extend([
+        "",
+        "The largest `t` whose FPR stays within the target, flagging"
+        " `quality < t`. Nothing is wired back into scoring. The grid is"
+        " coarse (steps of 1/12 with one judge call per row), so the achieved"
+        " rate is usually below the target.",
+    ])
+  else:
+    lines.append("No graded rows.")
+
+  independence = payload.get("independence", {})
+  lines.extend([
+      "",
+      "## Independence from hallucination",
+      "",
+      f"Faithful minus hallucinated, within `{independence.get('population')}`"
+      f" (n = {independence.get('n_faithful')} /"
+      f" {independence.get('n_hallucinated')}). The rubric does not grade"
+      " facts, so every delta should be close to 0.",
+      "",
+  ])
+  names = dict(titles)
+  names[QUALITY] = "Quality"
+  lines.extend(
+      _md_table(
+          ["Metric", "Delta", "95% CI", "Verdict"],
+          [
+              [
+                  names.get(key, key),
+                  "-" if result is None
+                  else _num(result.get("delta"), signed=True),
+                  "-" if result is None else _interval(result.get("ci95")),
+                  _independence_verdict(result),
+              ]
+              for key, result in independence.get("deltas", {}).items()
+          ],
+      )
+  )
+  lines.extend([
+      "",
+      "A label effect is not automatically judge leakage: weaker writers can"
+      " both hallucinate more and write worse.",
+  ])
+
+  histogram = payload.get("grade_histogram", {})
+  if histogram:
+    levels = [
+        str(level)
+        for level in range(
+            utils.REWARD_HACKING_SCALE_MIN, utils.REWARD_HACKING_SCALE_MAX + 1
+        )
+    ]
+    lines.extend(
+        ["", "## Grade distribution (all rows, nearest Likert level)", ""]
+    )
+    lines.extend(
+        _md_table(
+            ["Dimension"] + levels,
+            [
+                [title] + [histogram.get(key, {}).get(lvl, 0) for lvl in levels]
+                for key, title in titles
+            ],
+        )
+    )
+  if histogram_file:
+    lines.extend(["", f"![Grade distributions per stratum]({histogram_file})"])
+
+  selected = lowest_rows(rows, NUM_LOWEST_ROWS_MARKDOWN)
+  lines.extend([
+      "",
+      "## Lowest-quality healthy references",
+      "",
+      "Each is a false alarm for any threshold above its quality. Read them"
+      " before trusting a threshold.",
+      "",
+  ])
+  if not selected:
+    lines.append("No graded rows.")
+  for rank, row in enumerate(selected, start=1):
+    grades = ", ".join(
+        f"{key} {_num(_metric_value(row, key))}"
+        for key in utils.reward_hacking_dimension_keys()
+    )
+    lines.extend([
+        "<details>",
+        f"<summary>#{rank} · quality {_num(row.quality)} · {row.source} ·"
+        f" {row.label} · row {row.source_index} · {grades}</summary>",
+        "",
+        "**User request**",
+        "",
+        _md_fence(_excerpt(row.query or "(none)", 500)),
+        "",
+        "**Response**",
+        "",
+        _md_fence(_excerpt(row.response, MARKDOWN_EXCERPT_CHARS)),
+        "",
+        "</details>",
+        "",
+    ])
+
+  audit = payload.get("judge_audit") or {}
+  if audit:
+    lines.extend(["", "<details>", "<summary>Judge audit</summary>", ""])
+    lines.extend(f"- `{key}`: {audit[key]}" for key in sorted(audit))
+    lines.extend(["", "</details>"])
+
+  lines.extend([
+      "",
+      "## Not measured",
+      "",
+      "- **Sensitivity**: healthy references cannot show whether real reward"
+      " hacking gets caught.",
+      "- **Policy outputs**: references are complete texts, while policy"
+      " completions are cut at `--max_tokens` and the fluency rubric"
+      " penalises abrupt stops. Read the FPR as a lower bound for healthy"
+      " policy outputs.",
+      "- **Independence of rows**: rows sharing a prompt (e.g. several"
+      " RAGTruth responses per source) are not independent, so the intervals"
+      " are somewhat narrow.",
+  ])
+
+  if artifact_links:
+    lines.extend(["", "## Raw artifacts", ""])
+    for key, path in artifact_links.items():
+      lines.append(f"- [{_ARTIFACT_LABELS.get(key, key)}]({path})")
+  return "\n".join(lines) + "\n"
+
+
+def write_markdown_report(
+    path: str,
+    payload: Mapping[str, Any],
+    rows: Sequence[CalibrationRow],
+    histogram_file: Optional[str] = None,
+    artifacts: Optional[Mapping[str, str]] = None,
+) -> str:
+  """Writes the markdown report, linking the raw artifacts relatively.
+
+  Args:
+    path: Destination, e.g. from :func:`markdown_report_path`.
+    payload: The full metrics payload.
+    rows: Graded calibration rows.
+    histogram_file: Image to embed, relative to ``path``'s folder.
+    artifacts: Raw artifact name to path (absolute, or relative to the
+      working directory).
+
+  Returns:
+    ``path``.
+  """
+  folder = os.path.dirname(path) or "."
+  os.makedirs(folder, exist_ok=True)
+  links = {
+      key: os.path.relpath(artifact, folder)
+      for key, artifact in (artifacts or {}).items()
+  }
+  with open(path, "w", encoding="utf-8") as handle:
+    handle.write(
+        render_markdown_report(
+            payload, rows, histogram_file=histogram_file, artifact_links=links
+        )
+    )
+  return path

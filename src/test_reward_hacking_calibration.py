@@ -23,6 +23,7 @@ import json
 import math
 import os
 import random
+import re
 import tempfile
 import unittest
 
@@ -597,6 +598,131 @@ class NamingTest(unittest.TestCase):
     self.assertEqual(base, rhc.prompts_fingerprint(["a", "b"]))
     self.assertNotEqual(base, rhc.prompts_fingerprint(["b", "a"]))
     self.assertNotEqual(base, rhc.prompts_fingerprint(["ab"]))
+
+
+def _table_cells(line):
+  """Splits a markdown table row on its unescaped pipes."""
+  return re.split(r"(?<!\\)\|", line.strip())[1:-1]
+
+
+class MarkdownReportTest(unittest.TestCase):
+
+  def _payload(self, rows):
+    payload = RenderingTest()._payload(rows)  # pylint: disable=protected-access
+    payload["config"]["generated_at"] = "2026-10-14 12:00:00 UTC"
+    payload["config"]["fewshot_source"] = {
+        "dataset": "u/npov_sft",
+        "split": "train",
+    }
+    return payload
+
+  def _rows(self):
+    return RenderingTest()._rows()  # pylint: disable=protected-access
+
+  def test_it_lands_in_a_subfolder_of_the_orchestrator_reports(self):
+    from src.orchestrator.config import ReportingConfig  # pylint: disable=g-import-not-at-top
+
+    self.assertEqual(rhc.DEFAULT_REPORTS_DIR, ReportingConfig().reports_dir)
+    args = utils.EvalArguments(
+        task_name="npov", user="u", writer_model_lora="unused"
+    )
+    self.assertEqual(
+        args.reward_hacking_calibration_reports_dir, rhc.DEFAULT_REPORTS_DIR
+    )
+    self.assertEqual(
+        rhc.markdown_report_path(None, "run"),
+        os.path.join("reports", "reward_hacking_calibration", "run.md"),
+    )
+    self.assertEqual(
+        rhc.markdown_report_path("/tmp/r", "run"),
+        os.path.join("/tmp/r", "reward_hacking_calibration", "run.md"),
+    )
+
+  def test_the_headline_comes_first(self):
+    text = rhc.render_markdown_report(self._payload(self._rows()), [])
+    headline = text.split("## Headline")[1].split("## Data")[0]
+    # Two graded rows, the hallucinated one below 0.6.
+    self.assertIn("False-positive rate at `0.6`: 50.0%", headline)
+    self.assertIn("By label: faithful 0.0%", headline)
+    self.assertIn("Judge failures: 1 of 3 rows", headline)
+    self.assertIn("2026-10-14 12:00:00 UTC", text.split("## Headline")[0])
+    self.assertIn("`u/npov_sft:train`", text.split("## Headline")[0])
+
+  def test_every_section_is_present(self):
+    text = rhc.render_markdown_report(self._payload(self._rows()), [])
+    for section in (
+        "## Data",
+        "## Grades and false-positive rate",
+        "## Suggested thresholds (report only)",
+        "## Independence from hallucination",
+        "## Grade distribution",
+        "## Lowest-quality healthy references",
+        "## Not measured",
+        "<summary>Judge audit</summary>",
+    ):
+      with self.subTest(section=section):
+        self.assertIn(section, text)
+
+  def test_tables_are_well_formed(self):
+    text = rhc.render_markdown_report(self._payload(self._rows()), [])
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+      if not line.startswith("| ") or lines[index - 1].startswith("|"):
+        continue  # Only table headers.
+      width = len(_table_cells(line))
+      with self.subTest(header=line):
+        self.assertTrue(lines[index + 1].startswith("| --- |"))
+        body = index + 2
+        while body < len(lines) and lines[body].startswith("|"):
+          self.assertEqual(len(_table_cells(lines[body])), width)
+          body += 1
+
+  def test_text_is_escaped(self):
+    self.assertEqual(rhc._md_cell("a|b\nc"), "a\\|b c")  # pylint: disable=protected-access
+    fenced = rhc._md_fence("x ``` y")  # pylint: disable=protected-access
+    self.assertTrue(fenced.startswith("````text\n"))
+    self.assertTrue(fenced.endswith("\n````"))
+
+  def test_the_histogram_is_embedded_only_when_given(self):
+    payload = self._payload(self._rows())
+    self.assertNotIn("![", rhc.render_markdown_report(payload, []))
+    self.assertIn(
+        "](run_histograms.png)",
+        rhc.render_markdown_report(
+            payload, [], histogram_file="run_histograms.png"
+        ),
+    )
+
+  def test_false_alarms_are_capped_and_sorted(self):
+    rows = [
+        _row(i, grades=_grades(i / 20), response=f"answer {i} with ``` ticks")
+        for i in range(rhc.NUM_LOWEST_ROWS_MARKDOWN + 5)
+    ]
+    text = rhc.render_markdown_report(self._payload(rows), rows)
+    summaries = re.findall(r"<summary>#(\d+) · quality ([0-9.]+)", text)
+    self.assertEqual(len(summaries), rhc.NUM_LOWEST_ROWS_MARKDOWN)
+    qualities = [float(q) for _, q in summaries]
+    self.assertEqual(qualities, sorted(qualities))
+    self.assertIn("````text\nanswer 0 with ``` ticks\n````", text)
+
+  def test_write_links_the_raw_artifacts_relatively(self):
+    rows = self._rows()
+    with tempfile.TemporaryDirectory() as tmp:
+      metrics = os.path.join(tmp, "logs", "run", rhc.METRICS_JSON)
+      path = rhc.markdown_report_path(os.path.join(tmp, "reports"), "run")
+      rhc.write_markdown_report(
+          path, self._payload(rows), rows, artifacts={"metrics_json": metrics}
+      )
+      with open(path, encoding="utf-8") as handle:
+        text = handle.read()
+    self.assertIn(
+        f"- [Metrics (JSON)](../../logs/run/{rhc.METRICS_JSON})", text
+    )
+
+  def test_a_bare_payload_still_renders(self):
+    text = rhc.render_markdown_report(rhc.summarize([], threshold=0.6), [])
+    self.assertIn("No reference could be graded.", text)
+    self.assertIn("No graded rows.", text)
 
 
 if __name__ == "__main__":

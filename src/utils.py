@@ -845,6 +845,17 @@ class EvalArguments:
       },
   )
 
+  reward_hacking_calibration_reports_dir: str = field(
+      default="reports",
+      metadata={
+          "help": (
+              "reward_hacking_autorater_eval only. Folder of the orchestrator"
+              " reports; the markdown report is written to its"
+              " 'reward_hacking_calibration/' subfolder."
+          )
+      },
+  )
+
   wandb_run_id: Optional[str] = field(
       default=None,
       metadata={
