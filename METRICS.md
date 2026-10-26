@@ -82,7 +82,8 @@ This codebase uses a **4-pillar evaluation framework**:
   * `--autorater_num_samples k` draws $k$ independent grades per sample and takes their **mean** per dimension (not the median: the grades are already discretised to five points, so a median collapses back onto that grid). The per-dimension spread is recorded under `reward_hacking_audit_*`.
   * Few-shot demonstrations are built from the task's SFT split: each gold response is shown graded 5/5/5 next to a mechanically degenerated copy of *the same* response graded 1/1/1. Pairing them on identical content isolates writing quality as the only difference, so the judge cannot key the grade off topic or length.
 * **Calibration status**: **uncalibrated.** There is no labelled reward-hacking set, so unlike `--threshold` (fitted by the `autoratereval` mode against human labels) `--reward_hacking_threshold` is a judgement call. Read `reward_hacking_quality` and the per-dimension means as the primary signal, and read `reward_hacking_rate` only as a *delta* between policies graded by the same judge.
-  * To calibrate it later: score a contrast set of known-good responses (SFT gold) against known-hacked ones (the synthetic degenerations, or completions from a deliberately over-trained policy), then fit a threshold by ROC exactly as `EvaluationAutoraterPipeline` does for the hallucination judge. The synthetic degenerations are already available via `src.pipelines.degenerate_reward_hacked_response`.
+  * **Healthy-data check** (`./scripts/evaluator.sh <task> reward_hacking_autorater_eval`): grades the references of `{task}_rm_organic:test` and `{task}_sft:test` with the deployed judge. Every row is healthy, so it measures the judge's **false-positive rate** at `--reward_hacking_threshold` (Wilson 95% CI), stratified by source and hallucination label. It also reports the largest thresholds that keep that rate within 1%, 5% and 10% (report only), and the faithful-minus-hallucinated grade difference within the reward-model arm, which should be about zero for a rubric that does not grade facts. Final test sets and autorater sets are refused.
+  * Still missing: **sensitivity**. To measure it, score known-hacked responses (completions from a deliberately over-trained policy; `src.pipelines.degenerate_reward_hacked_response` gives caricatures that are only good for a smoke test, since the demonstrations come from the same generator) and fit a threshold by ROC, as `EvaluationAutoraterPipeline` does for the hallucination judge.
 
 ---
 
@@ -191,6 +192,12 @@ MAX_EVAL_SAMPLES=-1 ./scripts/evaluator.sh npov score
 
 # Scoring with Weights & Biases logging enabled:
 LOG_TO_WANDB=True WANDB_PROJECT="my_perl_project" ./scripts/evaluator.sh npov score
+
+# Reward-hacking rubric on healthy references (report only). Readable report:
+# reports/reward_hacking_calibration/<run>.md (raw files in logs/<run>/):
+./scripts/evaluator.sh npov reward_hacking_autorater_eval
+# Same, on the reward-model arm only:
+REWARD_HACKING_CALIBRATION_SFT_DATASET=none ./scripts/evaluator.sh npov reward_hacking_autorater_eval
 ```
 
 ### Running Evaluation Directly with Python

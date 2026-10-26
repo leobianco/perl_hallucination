@@ -467,7 +467,12 @@ class EvalArguments:
   mode: Optional[str] = field(
       default=None,
       metadata={
-          "help": "Evaluation mode: 'generate', 'score', or 'autoratereval'."
+          "help": (
+              "Evaluation mode: 'generate', 'score', 'autoratereval', or"
+              " 'reward_hacking_autorater_eval' (calibrate the"
+              " reward-hacking rubric on healthy reference responses; see"
+              " src/reward_hacking_calibration.py)."
+          )
       },
   )
 
@@ -782,7 +787,9 @@ class EvalArguments:
               " 'reward_hacking_rate'. UNCALIBRATED: unlike the hallucination"
               " threshold, nothing fits this against labelled data, so the"
               " rate is a reporting convenience and only the per-dimension"
-              " means are comparable across runs."
+              " means are comparable across runs. The"
+              " 'reward_hacking_autorater_eval' mode measures its"
+              " false-positive rate on healthy references."
           )
       },
   )
@@ -795,6 +802,56 @@ class EvalArguments:
               " Kept separate from --scores_checkpoint_path: the two judges"
               " produce different payloads and resuming one from the other's"
               " file would silently discard every rubric verdict."
+          )
+      },
+  )
+
+  reward_hacking_calibration_rm_dataset: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": (
+              "reward_hacking_autorater_eval only. Reward-model dataset whose"
+              " held-out arm (both labels) is graded. Defaults to"
+              " '{user}/{task_name}_rm_organic'; 'none' skips this arm."
+              " Final test sets and autorater sets are refused."
+          )
+      },
+  )
+
+  reward_hacking_calibration_rm_split: str = field(
+      default="test",
+      metadata={
+          "help": "Split of --reward_hacking_calibration_rm_dataset."
+      },
+  )
+
+  reward_hacking_calibration_sft_dataset: Optional[str] = field(
+      default=None,
+      metadata={
+          "help": (
+              "reward_hacking_autorater_eval only. SFT dataset whose held-out"
+              " split (faithful targets) is graded. Defaults to"
+              " '{user}/{task_name}_sft'; 'none' skips this arm. The rubric's"
+              " demonstrations come from the train split, so keep this one"
+              " held out."
+          )
+      },
+  )
+
+  reward_hacking_calibration_sft_split: str = field(
+      default="test",
+      metadata={
+          "help": "Split of --reward_hacking_calibration_sft_dataset."
+      },
+  )
+
+  reward_hacking_calibration_reports_dir: str = field(
+      default="reports",
+      metadata={
+          "help": (
+              "reward_hacking_autorater_eval only. Folder of the orchestrator"
+              " reports; the markdown report is written to its"
+              " 'reward_hacking_calibration/' subfolder."
           )
       },
   )
@@ -1054,6 +1111,28 @@ def reward_hacking_run_name(
       f"_task_{task_name or 'unknown'}"
       f"_seed_{seed}"
   )
+
+
+def reward_hacking_fewshot_source(args: Any) -> tuple[str, str]:
+  """Resolves the dataset split the rubric's demonstrations are drawn from.
+
+  Shared by the scoring pipeline and the rubric calibration, so that the
+  judge being calibrated is the judge being deployed.
+
+  Args:
+      args (Any): Parsed ``EvalArguments`` (or any object carrying ``user``,
+        ``task_name`` and, optionally, the ``reward_hacking_fewshot_*``
+        overrides).
+
+  Returns:
+      tuple[str, str]: ``(repo_id, split)``; ``{user}/{task_name}_sft`` and
+      ``train`` unless overridden.
+  """
+  repo_id = getattr(args, "reward_hacking_fewshot_dataset", None) or (
+      f"{args.user}/{args.task_name}_sft"
+  )
+  split = getattr(args, "reward_hacking_fewshot_split", None) or "train"
+  return repo_id, split
 
 
 def hallucination_rate_from_score_file(

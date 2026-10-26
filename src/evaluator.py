@@ -8,6 +8,9 @@ To score these completions
 
 To evaluate the quality of the autorater model:
 ./scripts/evaluator.sh npov autoratereval
+
+To measure how often the reward-hacking rubric flags healthy references:
+./scripts/evaluator.sh npov reward_hacking_autorater_eval
 """
 
 # Patch transformers heterogeneity configuration to allow global attribute access in vLLM
@@ -24,9 +27,11 @@ try:
 except Exception:
   pass
 
+from src import reward_hacking_calibration
 from src.pipelines import (
     EvaluationAutoraterPipeline,
     EvaluationGenerationPipeline,
+    EvaluationRewardHackingAutoraterPipeline,
     EvaluationScoringPipeline,
 )
 from src.utils import EvalArguments
@@ -38,7 +43,11 @@ def main():
   script_args = parser.parse_args_into_dataclasses()[0]
   set_seed(script_args.seed)
 
-  if script_args.mode == "autoratereval" or script_args.evaluate_evaluator:
+  # Checked first: this mode must never fall through to the hallucination
+  # autorater evaluation because --evaluate_evaluator was left on.
+  if script_args.mode == reward_hacking_calibration.MODE:
+    pipe = EvaluationRewardHackingAutoraterPipeline()
+  elif script_args.mode == "autoratereval" or script_args.evaluate_evaluator:
     pipe = EvaluationAutoraterPipeline()
   elif script_args.mode == "generate":
     pipe = EvaluationGenerationPipeline()
